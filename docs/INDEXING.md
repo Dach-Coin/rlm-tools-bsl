@@ -1232,6 +1232,152 @@ for r in results:
     print(f"{r['name']} ({r['type']}) в {r['module_path']}")
 ```
 
+### Symbol provider API для внешних адаптеров
+
+Группа `rlm-bsl-index provider` возвращает машиночитаемый JSON для внешних
+потребителей, например `claude-context`.
+API только читает уже существующий `bsl_index.db`: он не строит, не обновляет,
+не удаляет и не мигрирует индекс.
+
+Доступны два режима:
+
+- `provider query <path> <query> --limit N --json` — точечный поиск кандидатов
+  по имени метода, объекта или файла.
+- `provider export <path> --json` — полный снимок символов существующего
+  индекса для обогащения внешнего поискового индекса.
+
+Пример безопасного argv-вызова без shell interpolation:
+
+```bash
+rlm-bsl-index provider query "/repo/Проект с пробелом" \
+  "ПараметрыЗаполненияЗаписейСкладскогоЖурнала" --limit 10 --json
+
+rlm-bsl-index provider export "/repo/Проект с пробелом" --json
+```
+
+Stdout в этом режиме содержит только JSON. Диагностика и ошибки возвращаются
+в структурных полях ответа, чтобы вызывающий процесс не парсил человекочитаемый
+текст.
+
+Схема ответа v1:
+
+```json
+{
+  "schemaVersion": 1,
+  "provider": "rlm-tools-bsl",
+  "status": "available",
+  "sourceRoot": "/repo/cf",
+  "query": "ПараметрыЗаполненияЗаписейСкладскогоЖурнала",
+  "limit": 10,
+  "capabilities": {
+    "hasMethodsFts": true,
+    "hasObjects": true,
+    "hasFilePaths": true
+  },
+  "candidates": [
+    {
+      "kind": "method",
+      "relativePath": "CommonModules/СкладскойЖурнал/Ext/Module.bsl",
+      "symbolName": "ПараметрыЗаполненияЗаписейСкладскогоЖурнала",
+      "declarationKind": "procedure",
+      "startLine": 12,
+      "endLine": 18,
+      "isExport": true,
+      "objectName": "СкладскойЖурнал",
+      "modulePath": "CommonModules/СкладскойЖурнал/Ext/Module.bsl",
+      "rank": -1.25,
+      "source": "methods_fts"
+    }
+  ],
+  "diagnostics": {
+    "indexStatus": "fresh",
+    "elapsedMs": 3.7
+  }
+}
+```
+
+Схема снимка `provider export` v1:
+
+```json
+{
+  "schemaVersion": 1,
+  "provider": "rlm-tools-bsl",
+  "status": "available",
+  "sourceRoot": "/repo/cf",
+  "sourceFingerprint": "sha256...",
+  "capabilities": {
+    "hasMethods": true,
+    "hasObjects": true,
+    "hasFilePaths": true
+  },
+  "files": [
+    {
+      "relativePath": "CommonModules/СкладскойЖурнал/Ext/Module.bsl",
+      "objectName": "СкладскойЖурнал",
+      "objectKind": "CommonModules",
+      "moduleKind": "Module",
+      "synonyms": [],
+      "symbols": [
+        {
+          "name": "ПараметрыЗаполненияЗаписейСкладскогоЖурнала",
+          "declarationKind": "procedure",
+          "startLine": 12,
+          "endLine": 18,
+          "isExport": true,
+          "params": ""
+        }
+      ]
+    }
+  ],
+  "diagnostics": {
+    "indexStatus": "fresh",
+    "stats": {
+      "modules": 24055,
+      "methods": 617207,
+      "exports": 206207,
+      "file_paths": 106692,
+      "object_synonyms": 13340,
+      "bsl_count": 24055,
+      "builder_version": "..."
+    },
+    "elapsedMs": 18.4
+  }
+}
+```
+
+`sourceFingerprint` строится из нормализованного `sourceRoot` и сохранённых в
+индексе признаков набора исходников, включая `paths_hash`, число BSL-файлов,
+количество модулей и методов, версию построителя и git-коммит при наличии.
+Потребитель может использовать его как доказательство свежести снимка; при
+`missing_index`, `busy` и `error` значение пустое.
+
+Документированные `status` значения:
+
+- `available` — индекс свежий, запрос выполнен.
+- `missing_index` — `bsl_index.db` не найден; provider не запускает build/update.
+- `stale` — freshness check вернул stale-состояние; provider не обновляет индекс.
+- `busy` — рядом с БД найден lock-файл сборки/обновления; provider не читает индекс.
+- `error` — структурированная ошибка, например некорректный путь.
+
+Кандидаты могут иметь `kind=method`, `kind=object` или `kind=file`.
+Для `method` возвращаются `relativePath`, `symbolName`, `declarationKind`,
+`startLine`, `endLine`, `objectName`, `isExport`, `params`, `modulePath`,
+`rank` и `source` при наличии данных в индексе. Для `object` возвращаются
+`objectName`, `objectKind`, `synonym`, `relativePath`/file path и `source`.
+Для `file` возвращается найденный `relativePath`.
+
+Снимок `export` группирует данные по `files[].relativePath`. В каждом файле
+возвращаются контекст объекта и модуля (`objectName`, `objectKind`,
+`moduleKind`, `formName` при наличии), нормализованные синонимы объекта и
+`symbols[]` с объявлениями процедур и функций. В v1 не возвращаются права,
+дерево формы, ссылки метаданных, подсистемы и граф вызовов.
+
+Внешний адаптер должен мапить результат по `sourceRoot + relativePath`.
+Если `sourceRoot` является вложенным корнем внутри большего репозитория,
+потребитель должен сначала привести `sourceRoot` к своему indexed root, а затем
+искать chunk по относительному пути и диапазону строк. Provider намеренно не
+возвращает unrelated absolute paths за пределами `sourceRoot`.
+
 ### Секция INDEX в стратегии
 
 Когда индекс загружен, в стратегии `rlm_start` добавляется секция `== INDEX ==` с информацией:

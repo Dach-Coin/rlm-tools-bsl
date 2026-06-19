@@ -6,11 +6,13 @@ Usage::
     rlm-bsl-index index update <path>
     rlm-bsl-index index info <path>
     rlm-bsl-index index drop <path>
+    rlm-bsl-index provider export <path> --json
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -369,6 +371,22 @@ def _cmd_drop(args: argparse.Namespace) -> None:
         pass
 
 
+def _cmd_provider_query(args: argparse.Namespace) -> None:
+    from rlm_tools_bsl.symbol_provider import query_symbol_provider
+
+    response = query_symbol_provider(args.path, args.query, limit=args.limit)
+    json.dump(response, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def _cmd_provider_export(args: argparse.Namespace) -> None:
+    from rlm_tools_bsl.symbol_provider import export_symbol_snapshot
+
+    response = export_symbol_snapshot(args.path)
+    json.dump(response, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -417,6 +435,20 @@ def main() -> None:
     drop_p = idx_sub.add_parser("drop", help="Delete index")
     drop_p.add_argument("path", help="Root directory of 1C configuration")
 
+    # --- provider group ---
+    provider_parser = sub.add_parser("provider", help="Machine-readable symbol provider")
+    provider_sub = provider_parser.add_subparsers(dest="command")
+
+    provider_query_p = provider_sub.add_parser("query", help="Query an existing BSL symbol index")
+    provider_query_p.add_argument("path", help="Root directory of 1C configuration")
+    provider_query_p.add_argument("query", help="Symbol, object, or file query")
+    provider_query_p.add_argument("--limit", type=int, default=20, help="Maximum merged candidates to return")
+    provider_query_p.add_argument("--json", action="store_true", help="Emit JSON only on stdout")
+
+    provider_export_p = provider_sub.add_parser("export", help="Export an existing BSL symbol snapshot")
+    provider_export_p.add_argument("path", help="Root directory of 1C configuration")
+    provider_export_p.add_argument("--json", action="store_true", help="Emit JSON only on stdout")
+
     args = parser.parse_args()
 
     if args.group is None:
@@ -432,6 +464,15 @@ def main() -> None:
             "update": _cmd_update,
             "info": _cmd_info,
             "drop": _cmd_drop,
+        }
+        handlers[args.command](args)
+    elif args.group == "provider":
+        if args.command is None:
+            provider_parser.print_help()
+            sys.exit(0)
+        handlers = {
+            "query": _cmd_provider_query,
+            "export": _cmd_provider_export,
         }
         handlers[args.command](args)
     else:
