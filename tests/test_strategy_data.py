@@ -145,3 +145,35 @@ def test_extension_critical_block_mentions_new_phrasing():
     text = _extension_strategy(ctx, {})
     assert "PermissionError" in text
     assert "read_procedure" in text and "extract_procedures" in text
+
+
+# ── v1.27.0 — get_index_info() nudge: strengthened BATCHING copies + co-location ──
+
+
+def _batching_nudge_line(text):
+    for ln in text.splitlines():
+        if "Не зови get_index_info на старте" in ln:
+            return ln
+    return None
+
+
+def test_get_index_info_nudge_strengthened_and_synced_slim_and_full():
+    """Both BATCHING copies call out the wasted execute AND stay byte-identical."""
+    from rlm_tools_bsl.bsl_knowledge import _STRATEGY_HEADER
+
+    slim = _batching_nudge_line(STRATEGY_SECTIONS["batching"])
+    full = _batching_nudge_line(_STRATEGY_HEADER)
+    assert slim is not None and full is not None
+    assert slim == full  # no drift between slim and full copies
+    assert "пустая трата execute" in slim
+
+
+def test_index_block_colocates_get_index_info_nudge():
+    """The dynamic INDEX block carries the "don't call get_index_info() on start" nudge
+    right next to the data it duplicates (rlm_start.index)."""
+    from rlm_tools_bsl.bsl_knowledge import _render_index_block
+
+    block = _render_index_block({"builder_version": 14, "methods": 10, "calls": 5}, [])
+    assert "== INDEX ==" in block
+    assert "get_index_info" in block
+    assert "rlm_start.index" in block

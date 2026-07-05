@@ -1085,7 +1085,8 @@ def _rlm_execute(
             response["duplicates"] = duplicates
 
     # Server-side efficiency nudges (session-cumulative, throttled). Response metadata
-    # ONLY — never in the helper return or stdout. Stable ids: read_files/reuse_var/batch.
+    # ONLY — never in the helper return or stdout. Stable ids: read_files/reuse_var/batch/
+    # redundant_get_index_info.
     if result.efficiency_hints:
         response["efficiency_hints"] = result.efficiency_hints
 
@@ -2357,6 +2358,16 @@ def _setup_file_logging():
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "server.log"
 
+    # Time-based retention: drop entries older than RLM_LOG_RETENTION_DAYS (default 20)
+    # so server.log doesn't grow unbounded. Skipped under the Windows service
+    # (RLM_UNDER_SERVICE=1) — there the service purges before it opens the file for the
+    # child's stderr redirect, so the child must not truncate a file the service holds open.
+    retention_stats = None
+    if not os.environ.get("RLM_UNDER_SERVICE"):
+        from rlm_tools_bsl.log_retention import log_retention_days, purge_log_older_than
+
+        retention_stats = purge_log_older_than(log_path, days=log_retention_days())
+
     handler = RotatingFileHandler(
         log_path,
         maxBytes=5 * 1024 * 1024,  # 5 MB
@@ -2375,6 +2386,13 @@ def _setup_file_logging():
     # [WinError 10054] in _call_connection_lost). Idempotent — safe to re-call.
     _install_asyncio_conn_reset_filter()
     logger.info("File logging enabled: %s", log_path)
+    if retention_stats and retention_stats.get("status") == "purged":
+        logger.info(
+            "Log retention: dropped %d lines older than %d days (kept %d)",
+            retention_stats["removed_lines"],
+            log_retention_days(),
+            retention_stats["kept_lines"],
+        )
 
 
 def _warmup_imports():

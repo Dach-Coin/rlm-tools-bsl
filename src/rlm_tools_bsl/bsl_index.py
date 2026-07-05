@@ -4751,7 +4751,32 @@ def _insert_file_paths(conn: sqlite3.Connection, rows: list[tuple]) -> None:
 # ---------------------------------------------------------------------------
 # Regex for register movements (in-band extraction from Document BSL)
 # ---------------------------------------------------------------------------
-_MOVEMENTS_RE = re.compile(r"\u0414\u0432\u0438\u0436\u0435\u043d\u0438\u044f\.(\w+)")  # Движения.RegName
+# Capture the register name after ``Движения.`` but reject BSL method-calls on the
+# recordset-manager itself (``Движения.Записать()`` — commit-all method; likewise
+# .Очистить()/.Прочитать()/…). The negative lookahead ``(?!\w+\s*\()`` is placed
+# BEFORE the capture on purpose: after a greedy ``(\w+)`` it would backtrack to
+# ``Записат`` (dropping the trailing ``ь``) and slip a truncated artefact through.
+# Placed first, it rejects the whole ``<ident>(`` position; a real register
+# (``Движения.Рег.`` / ``Движения.Рег[…]``) is never immediately followed by ``(``.
+_MOVEMENTS_RE = re.compile(r"\u0414\u0432\u0438\u0436\u0435\u043d\u0438\u044f\.(?!\w+\s*\()(\w+)")  # Движения.RegName
+# Unambiguous collection-methods of the ``Движения`` recordset manager. Used as a
+# read-time stop-set to clean pre-existing indexes (rows built before the lookahead
+# fix) AND as belt-and-suspenders on build/live. Conservative on purpose (Codex #3):
+# ambiguous names that could be a real register (Количество/Получить/Найти/Добавить/
+# Отбор/…) are deliberately excluded — the lookahead already drops their call form.
+_MOVEMENT_METHOD_NOISE = frozenset(
+    {
+        "записать",
+        "прочитать",
+        "читать",
+        "очистить",
+        "записывать",
+        "выгрузить",
+        "загрузить",
+        "модифицированность",
+        "обойти",
+    }
+)
 _ERP_MECHANISM_RE = re.compile(
     r"\u041c\u0435\u0445\u0430\u043d\u0438\u0437\u043c\u044b\u0414\u043e\u043a\u0443\u043c\u0435\u043d\u0442\u0430"
     r'\.\u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c\(\s*"(\w+)"'
@@ -4887,7 +4912,12 @@ def _extract_movements(
 
     if info.module_type == "ObjectModule":
         for m in _MOVEMENTS_RE.finditer(content):
-            results.append((m.group(1), "code", rel_path))
+            reg = m.group(1)
+            # Belt-and-suspenders: the lookahead already rejects Движения.Method(),
+            # but a paren-less Движения.Записать would still capture — drop stop-set names.
+            if reg.lower() in _MOVEMENT_METHOD_NOISE:
+                continue
+            results.append((reg, "code", rel_path))
     elif info.module_type == "ManagerModule":
         for m in _ERP_MECHANISM_RE.finditer(content):
             results.append((m.group(1), "erp_mechanism", rel_path))
@@ -8890,7 +8920,18 @@ class IndexReader:
                 except sqlite3.Error:
                     return None
 
-            return [{"register_name": r["register_name"], "source": r["source"], "file": r["file"]} for r in rows]
+            # Read-time noise scrub (v1.27.0): drop code-extracted rows whose register name is
+            # really a Движения collection-method (Записать/Очистить/…). Cleans pre-existing
+            # indexes built before the lookahead fix WITHOUT a rebuild, and centrally covers
+            # every consumer of this reader (find_register_movements + get_object_profile's
+            # registers section). Only source=="code" is filtered — erp_mechanism/manager_table/
+            # adapted come from quoted-name regexes and are trusted. Empty/missing table → None
+            # is decided above, so an all-noise document returns [] (authoritative), never None.
+            return [
+                {"register_name": r["register_name"], "source": r["source"], "file": r["file"]}
+                for r in rows
+                if not (r["source"] == "code" and (r["register_name"] or "").lower() in _MOVEMENT_METHOD_NOISE)
+            ]
 
     @_transient_safe(lambda: None)
     def get_register_writers(self, register_name: str) -> list[dict] | None:
@@ -8915,7 +8956,16 @@ class IndexReader:
                 except sqlite3.Error:
                     return None
 
-            return [{"document_name": r["document_name"], "source": r["source"], "file": r["file"]} for r in rows]
+            # Read-time consistency with get_register_movements: a reverse lookup by a noise
+            # method-name (get_register_writers("Записать")) must not surface code-rows from a
+            # pre-existing index. Filter code-source rows when the QUERIED name is stop-set;
+            # non-code sources (real quoted-name mechanisms) are kept.
+            arg_is_noise = (register_name or "").lower() in _MOVEMENT_METHOD_NOISE
+            return [
+                {"document_name": r["document_name"], "source": r["source"], "file": r["file"]}
+                for r in rows
+                if not (arg_is_noise and r["source"] == "code")
+            ]
 
     @_transient_safe(lambda: None)
     def get_roles(self, object_name: str) -> list[dict] | None:
@@ -8982,10 +9032,15 @@ class IndexReader:
         with self._lock:
             try:
                 if include_members:
+                    # Escape LIKE wildcards in the ref so a literal '_' or '%' (both legal in
+                    # 1C identifiers, e.g. тст_Смета) cannot act as a wildcard and over-match a
+                    # near-homonym's member grants. The trailing '.%' stays the intended wildcard;
+                    # the '=' branch is exact (no LIKE) and needs no escaping.
+                    like_prefix = object_ref.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                     rows = self._conn.execute(
                         "SELECT role_name, object_name, right_name, file FROM role_rights "
-                        "WHERE object_name = ? COLLATE NOCASE OR object_name LIKE ? || '.%'",
-                        (object_ref, object_ref),
+                        "WHERE object_name = ? COLLATE NOCASE OR object_name LIKE ? || '.%' ESCAPE '\\'",
+                        (object_ref, like_prefix),
                     ).fetchall()
                 else:
                     rows = self._conn.execute(

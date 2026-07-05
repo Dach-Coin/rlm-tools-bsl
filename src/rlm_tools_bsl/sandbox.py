@@ -375,7 +375,7 @@ class Sandbox:
         Lives in the ``rlm_execute`` response metadata (never the helper return / stdout —
         see ``test_sandbox_helper_return_value_unchanged``). Each hint:
         ``{id, message, trigger, helper?, count?}`` with stable ids
-        ``read_files`` / ``reuse_var`` / ``batch``."""
+        ``read_files`` / ``reuse_var`` / ``batch`` / ``redundant_get_index_info``."""
         out: list[dict] = []
         nc = self._session_helper_name_counts
         emitted = self._emitted_efficiency_hints
@@ -447,6 +447,29 @@ class Sandbox:
                     ),
                 }
             )
+
+        # (4) get_index_info() at session start — its payload (builder_version/has_*/counts)
+        # already ships in rlm_start.index, so a discovery call on start wastes a round-trip.
+        # Gate on the MINIMAL seq of get_index_info in THIS execute: seq<=2 = 1st/2nd call of
+        # the session (start signal). A mid-session call for niche fields (has_regions/
+        # has_module_headers/extension_overrides) has a high seq → no false nudge. Throttled once.
+        if "redundant_get_index_info" not in emitted:
+            gii_seqs = [c.seq for c in self._helper_calls if c.name == "get_index_info"]
+            if gii_seqs and min(gii_seqs) <= 2:
+                emitted.add("redundant_get_index_info")
+                out.append(
+                    {
+                        "id": "redundant_get_index_info",
+                        "helper": "get_index_info",
+                        "count": len(gii_seqs),
+                        "trigger": f"get_index_info() as session call #{min(gii_seqs)} (payload already in rlm_start.index)",
+                        "message": (
+                            "builder_version/has_*/counts уже пришли в rlm_start.index (поле index) — "
+                            "не трать execute на get_index_info() на старте; отдельный вызов нужен лишь "
+                            "для has_regions/has_module_headers/extension_overrides."
+                        ),
+                    }
+                )
         return out
 
     @contextmanager

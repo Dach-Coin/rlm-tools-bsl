@@ -10,7 +10,7 @@ import os
 import tempfile
 
 from rlm_tools_bsl.format_detector import detect_format
-from rlm_tools_bsl.sandbox import Sandbox
+from rlm_tools_bsl.sandbox import HelperCall, Sandbox
 
 
 def _txt_sandbox(tmpdir, names=("a", "b", "c")):
@@ -155,3 +155,60 @@ def test_hints_in_metadata_not_stdout_and_return_unchanged():
         assert "HINT" not in res.stdout
         # helper return value unchanged (x is the file content)
         assert "CONTENT" in res.stdout
+
+
+# ── v1.27.0 — redundant get_index_info() at session start ────────────────────
+# get_index_info() runs only with an index, and the gate only inspects HelperCall.seq,
+# so these drive _compute_efficiency_hints via a simulated _helper_calls list.
+
+
+def test_redundant_get_index_info_hint_fires_at_session_start():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = Sandbox(base_path=tmpdir)
+        sb._helper_calls = [HelperCall("get_index_info", 0.0, seq=1)]
+        hints = sb._compute_efficiency_hints()
+        ids = {h["id"] for h in hints}
+        assert "redundant_get_index_info" in ids
+        h = next(h for h in hints if h["id"] == "redundant_get_index_info")
+        assert h["helper"] == "get_index_info"
+        assert "rlm_start.index" in h["message"]
+
+
+def test_redundant_get_index_info_hint_fires_as_second_call():
+    """seq==2 is still a start signal (called 2nd) → nudge fires."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = Sandbox(base_path=tmpdir)
+        sb._helper_calls = [
+            HelperCall("find_module", 0.0, seq=1),
+            HelperCall("get_index_info", 0.0, seq=2),
+        ]
+        ids = {h["id"] for h in sb._compute_efficiency_hints()}
+        assert "redundant_get_index_info" in ids
+
+
+def test_redundant_get_index_info_hint_absent_mid_session():
+    """A high-seq mid-session call (e.g. fetching has_regions) must NOT nudge."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = Sandbox(base_path=tmpdir)
+        sb._helper_calls = [HelperCall("get_index_info", 0.0, seq=5)]
+        ids = {h["id"] for h in sb._compute_efficiency_hints()}
+        assert "redundant_get_index_info" not in ids
+
+
+def test_redundant_get_index_info_hint_throttled_once_per_session():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = Sandbox(base_path=tmpdir)
+        sb._helper_calls = [HelperCall("get_index_info", 0.0, seq=1)]
+        first = {h["id"] for h in sb._compute_efficiency_hints()}
+        sb._helper_calls = [HelperCall("get_index_info", 0.0, seq=2)]
+        second = {h["id"] for h in sb._compute_efficiency_hints()}
+        assert "redundant_get_index_info" in first
+        assert "redundant_get_index_info" not in second
+
+
+def test_no_get_index_info_no_hint():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = Sandbox(base_path=tmpdir)
+        sb._helper_calls = [HelperCall("find_module", 0.0, seq=1)]
+        ids = {h["id"] for h in sb._compute_efficiency_hints()}
+        assert "redundant_get_index_info" not in ids

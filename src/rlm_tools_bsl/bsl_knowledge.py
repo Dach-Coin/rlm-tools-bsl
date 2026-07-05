@@ -486,7 +486,7 @@ If output is truncated (ends with '... [output truncated]'), split into smaller 
 Print only summaries (counts, first N items) — never dump raw data.
 Ответ может нести 'duplicates' (тот же хелпер с теми же args дважды — переиспользуй переменную, они живут между rlm_execute)
   и 'efficiency_hints' (подсказки по батчингу/агрегатам — следуй им).
-Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index).
+Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index); вызов на старте = пустая трата execute (нужен лишь для has_regions/has_module_headers/extension_overrides).
 
 Call help('keyword') for code recipes — e.g. help('exports'), help('movements'), help('flow')
 """
@@ -1514,6 +1514,13 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
             label += f" v{config_version}"
     label += ")."
     idx_lines.append(label)
+    # Co-located nudge (v1.27.0): the counts/has_*/builder_version below ARE the get_index_info()
+    # payload (rlm_start.index carries the same subset), so calling it on start wastes an execute.
+    idx_lines.append(
+        "⚠️ Эти данные (builder_version/has_*/counts) уже в rlm_start.index — НЕ вызывай "
+        "get_index_info() на старте (пустая трата execute); он нужен лишь для "
+        "has_regions/has_module_headers/extension_overrides."
+    )
 
     instant_helpers = ["extract_procedures()", "find_exports()"]
     if calls_count:

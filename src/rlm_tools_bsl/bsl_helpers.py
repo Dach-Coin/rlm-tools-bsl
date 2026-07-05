@@ -17,7 +17,7 @@ from rlm_tools_bsl.bsl_knowledge import (
     _normalize_method_params,
     _split_params,
 )
-from rlm_tools_bsl.bsl_index import _make_callee_key, _scan_module
+from rlm_tools_bsl.bsl_index import _make_callee_key, _MOVEMENT_METHOD_NOISE, _scan_module
 from rlm_tools_bsl.cache import load_index, save_index
 from rlm_tools_bsl.helpers import _SKIP_DIRS as _GENERIC_SKIP_DIRS
 from rlm_tools_bsl.regex_safety import NESTED_QUANTIFIER_ERROR, has_catastrophic_nesting
@@ -4141,7 +4141,11 @@ def make_bsl_helpers(
         def _sec_roles() -> dict:
             if not has_index:
                 return _unavailable("no_index")
-            rows = idx_reader.get_roles_exact(ref)
+            # include_members=True counts member-level grants (Command/Attribute/… under the
+            # object) the same way find_roles does, so the aggregate no longer undercounts. The
+            # WHERE is anchored (object_name = ref OR LIKE ref || '.%'), so homonyms like
+            # ВходящееПисьмоВложение are NOT over-matched — the aggregate is stricter than find_roles.
+            rows = idx_reader.get_roles_exact(ref, include_members=True)
             return _from_reader_list(
                 rows,
                 summary_fn=lambda rs: {"roles": len(rs)},
@@ -4686,7 +4690,9 @@ def make_bsl_helpers(
             _maybe_add_postability_hint(result, document_name)
             return result
 
-        movement_re = re.compile(r"Движения\.(\w+)", re.IGNORECASE)
+        # Lookahead-before-capture rejects method-calls on the Движения collection
+        # (Движения.Записать()/…) — mirror of _MOVEMENTS_RE in bsl_index (see there).
+        movement_re = re.compile(r"Движения\.(?!\w+\s*\()(\w+)", re.IGNORECASE)
         code_registers: dict[str, dict] = {}  # name -> {name, lines, file}
         modules_scanned: list[str] = []
 
@@ -4700,6 +4706,9 @@ def make_bsl_helpers(
             for i, line in enumerate(content.splitlines(), 1):
                 for m in movement_re.finditer(line):
                     reg_name = m.group(1)
+                    # Belt-and-suspenders alongside the lookahead: skip paren-less stop-set names.
+                    if reg_name.lower() in _MOVEMENT_METHOD_NOISE:
+                        continue
                     if reg_name not in code_registers:
                         code_registers[reg_name] = {
                             "name": reg_name,
@@ -4820,7 +4829,9 @@ def make_bsl_helpers(
         needle = f"движения.{register_name}".lower()
         matched = _parallel_prefilter(doc_modules, needle, base_path)
 
-        movement_re = re.compile(r"Движения\." + re.escape(register_name), re.IGNORECASE)
+        # Tail (?!\s*\() rejects the method-call form Движения.Записать() so a reverse lookup by
+        # a noise name yields nothing; a real register is never immediately followed by '('.
+        movement_re = re.compile(r"Движения\." + re.escape(register_name) + r"(?!\s*\()", re.IGNORECASE)
         writers: list[dict] = []
         for rel, info in matched:
             try:

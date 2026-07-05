@@ -76,10 +76,23 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         # lines. Belt-and-braces with the reconfigure() in server.main().
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        # The child skips its own log-retention purge (see server._setup_file_logging):
+        # we purge here, before opening server.log for the child's stderr redirect, so the
+        # child never truncates a file this service holds open.
+        env["RLM_UNDER_SERVICE"] = "1"
 
         log_dir = _config_path().parent / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "server.log"
+
+        # Time-based retention BEFORE the file is opened below (drop entries older than
+        # RLM_LOG_RETENTION_DAYS, default 20). Best-effort — never block service start.
+        try:
+            from rlm_tools_bsl.log_retention import log_retention_days, purge_log_older_than
+
+            purge_log_older_than(log_path, days=log_retention_days())
+        except Exception:
+            pass
 
         max_restarts = 5
         restart_count = 0
