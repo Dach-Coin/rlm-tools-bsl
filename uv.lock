@@ -1109,7 +1109,7 @@ wheels = [
 
 [[package]]
 name = "rlm-tools-bsl"
-version = "1.26.0"
+version = "1.26.1"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },

@@ -239,6 +239,81 @@ def _normalize_and_validate_path(raw_path: str) -> tuple[str, str | None]:
     return (effective, None)
 
 
+def _recover_index_base_path_for_missing_source(raw_path: str) -> str | None:
+    """Locate an existing index by its stored metadata when the source dir is gone.
+
+    Issue #16: ``rlm_index(action='drop'|'info')`` operate on the cache/index —
+    which lives under ``get_index_dir_root()/<md5(effective_path)>/`` and stores
+    the effective ``base_path`` in ``index_meta`` — not on the source tree. When
+    the source directory has been deleted (project decommissioned) we can no
+    longer run ``resolve_config_root`` to recompute the effective path, so we
+    scan the index root and match a stored ``base_path`` against the requested
+    (canonicalized) path, mirroring ``resolve_config_root``'s own contract:
+
+    * exact match — registered path IS the config root (flat/``cf`` layout); or
+    * a **direct child** of the requested path — ``resolve_config_root`` only
+      ever selects the container itself or a depth-1 subdirectory (a single
+      MAIN, or the ``cf`` subdir as tie-breaker among several MAINs). We apply
+      the same rule: a single direct-child index wins; when several direct-child
+      indexes exist we prefer the one named ``cf`` (matching the build-time
+      tie-breaker). Nested/grandchild indexes (e.g. a separately-built extension
+      index deeper in the tree) are ignored, so they no longer cause a false
+      ``ambiguous`` bail (codex finding).
+
+    Returns the stored effective ``base_path``, or ``None`` if nothing matches
+    (or the direct-child match is genuinely ambiguous).
+    """
+    from rlm_tools_bsl.bsl_index import _read_index_meta, get_index_dir_root
+
+    canonical = _canonicalize_path(raw_path)
+    root = get_index_dir_root()
+    try:
+        if not root.is_dir():
+            return None
+        subdirs = list(root.iterdir())
+    except OSError:
+        return None
+
+    norm_target = os.path.normcase(os.path.normpath(canonical))
+    exact: list[str] = []
+    children: list[tuple[str, str]] = []  # (stored base_path, lowercased basename)
+    for sub in subdirs:
+        try:
+            if not sub.is_dir():
+                continue
+        except OSError:
+            continue
+        db_path = sub / "bsl_index.db"
+        if not db_path.exists():
+            db_path = sub / "method_index.db"  # legacy name (see _migrate_old_index_db)
+            if not db_path.exists():
+                continue
+        meta = _read_index_meta(db_path)
+        if not meta:
+            continue
+        stored = meta.get("base_path")
+        if not stored:
+            continue
+        norm_stored = os.path.normcase(os.path.normpath(stored))
+        if norm_stored == norm_target:
+            exact.append(stored)
+        elif os.path.dirname(norm_stored) == norm_target:
+            children.append((stored, os.path.basename(norm_stored)))
+
+    if exact:
+        return exact[0]
+    if len(children) == 1:
+        return children[0][0]
+    if len(children) > 1:
+        # Case-insensitive `cf` tie-breaker (mirror resolve_config_root's
+        # `.name.lower() == "cf"`): normcase is a no-op on POSIX, so a dir named
+        # `CF` would not fold to lowercase here — lower() explicitly.
+        cf_matches = [stored for stored, name in children if name.lower() == "cf"]
+        if len(cf_matches) == 1:
+            return cf_matches[0]
+    return None
+
+
 # --- Background build jobs (MCP async fire-and-forget) ---
 _build_jobs_lock = threading.Lock()
 # Key = resolved filesystem path (str).
@@ -908,6 +983,48 @@ def resolve_session_limits(
     return effort, max_llm_calls, max_execute_calls
 
 
+# Default cap (chars) for the agent code echoed into the rlm_execute log line.
+# A single-intent execute block (a few helper calls + print) is typically
+# 100-400 chars; 300 captures most whole while still bounding runaway code.
+_DEFAULT_EXECUTE_CODE_LOG_CAP = 300
+
+
+def _execute_code_log_field(code: str) -> str:
+    """Return a ``code=<...>`` suffix for the rlm_execute completion log line.
+
+    The executed ``code`` IS the agent's query — helper calls with their
+    parameters (``find_object("…")`` etc.). Logging it lets us later analyse
+    which queries recur and where helpers could be improved.
+
+    Controlled by ``RLM_LOG_EXECUTE_CODE`` (default: ON, capped):
+      * unset / ``1`` / ``true`` / ``on`` / ``yes`` / ``all`` → default cap
+        (``_DEFAULT_EXECUTE_CODE_LOG_CAP`` chars)
+      * ``0`` / ``false`` / ``off`` / ``no`` → disabled (empty suffix)
+      * positive integer ``N`` → cap at ``N`` chars (``<= 0`` → disabled)
+
+    Newlines are flattened to ``⏎`` so the whole event stays one log line
+    (grep-/parse-friendly). The log handlers are UTF-8, so Cyrillic in the code
+    (object names) and the ``⏎``/``…`` markers are safe.
+    """
+    raw = os.environ.get("RLM_LOG_EXECUTE_CODE")
+    cap = _DEFAULT_EXECUTE_CODE_LOG_CAP
+    if raw is not None:
+        v = raw.strip().lower()
+        if v in ("0", "false", "off", "no"):
+            return ""
+        if v not in ("", "1", "true", "on", "yes", "all"):
+            try:
+                cap = int(v)
+            except ValueError:
+                cap = _DEFAULT_EXECUTE_CODE_LOG_CAP
+            if cap <= 0:
+                return ""
+    flat = code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "⏎")
+    if len(flat) > cap:
+        flat = flat[:cap] + "…"
+    return f" code=<{flat}>"
+
+
 def _rlm_execute(
     session_id: str,
     code: str,
@@ -1014,7 +1131,7 @@ def _rlm_execute(
     if result.efficiency_hints:
         hints_log = " hints=" + ",".join(h["id"] for h in result.efficiency_hints)
     logger.info(
-        "rlm_execute: session=%s call=%d/%d error=%s elapsed=%.2fs out_chars=%d out_tokens~%d%s%s",
+        "rlm_execute: session=%s call=%d/%d error=%s elapsed=%.2fs out_chars=%d out_tokens~%d%s%s%s",
         session_id,
         session.execute_calls,
         session.max_execute_calls,
@@ -1024,6 +1141,7 @@ def _rlm_execute(
         int(out_chars / 1.75),
         helpers_summary,
         hints_log,
+        _execute_code_log_field(code),
     )
     return result_json
 
@@ -1919,18 +2037,21 @@ async def rlm_index(
 
         if action == "drop":
             resolved_path, err_json = _normalize_and_validate_path(matches[0]["path"])
-            if err_json is not None:
-                return err_json
-            with _build_jobs_lock:
-                job = _build_jobs.get(resolved_path)
-                if job and job["status"] == "building":
-                    return json.dumps(
-                        {
-                            "error": f"Cannot drop: build/update in progress for '{project_name}'. "
-                            "Wait for it to finish or restart the server.",
-                        },
-                        ensure_ascii=False,
-                    )
+            # Issue #16: a deleted source dir must not block dropping the index.
+            # If the path no longer resolves, no build can be in progress for it,
+            # so skip the in-progress guard and let _rlm_index recover the index
+            # by its stored metadata. Only genuine in-progress builds are blocked.
+            if err_json is None:
+                with _build_jobs_lock:
+                    job = _build_jobs.get(resolved_path)
+                    if job and job["status"] == "building":
+                        return json.dumps(
+                            {
+                                "error": f"Cannot drop: build/update in progress for '{project_name}'. "
+                                "Wait for it to finish or restart the server.",
+                            },
+                            ensure_ascii=False,
+                        )
 
     return await anyio.to_thread.run_sync(
         lambda: _rlm_index(
@@ -1988,7 +2109,17 @@ def _rlm_index(
 
     resolved, err_json = _normalize_and_validate_path(path)
     if err_json is not None:
-        return err_json
+        # Issue #16: drop/info act on the cache/index, not the sources. If the
+        # source directory was deleted (project decommissioned) the index can
+        # still be inspected/removed — recover its effective base_path from the
+        # stored index metadata. Only when the dir is genuinely gone (not for a
+        # dir-exists ambiguity error).
+        recovered: str | None = None
+        if action in ("info", "drop") and not os.path.isdir(_canonicalize_path(path)):
+            recovered = _recover_index_base_path_for_missing_source(path)
+        if recovered is None:
+            return err_json
+        resolved = recovered
 
     try:
         if action == "build":
@@ -2123,16 +2254,29 @@ def _rlm_index(
                 reader.close()
 
         if action == "drop":
+            from rlm_tools_bsl.cache import purge_project_cache
+
             db_path = get_index_db_path(resolved)
-            if not db_path.exists():
+            db_existed = db_path.exists()
+            if db_existed:
+                db_path.unlink()
+                # Remove parent dir if empty
+                try:
+                    db_path.parent.rmdir()
+                except OSError:
+                    pass
+            # Complete decommission: also drop the project's file-listing cache
+            # (<cache_root>/<hash>/file_index.json). Done best-effort even when the
+            # DB is already gone/lost, so an orphaned cache dir still gets cleaned
+            # up (matches the issue #16 manual workaround) instead of leaking.
+            dropped_cache = purge_project_cache(resolved)
+            if not db_existed and not dropped_cache:
                 return json.dumps({"error": "Index not found", "path": resolved}, ensure_ascii=False)
-            db_path.unlink()
-            # Remove parent dir if empty
-            try:
-                db_path.parent.rmdir()
-            except OSError:
-                pass
-            result = {"action": "drop", "path": resolved, "dropped": str(db_path)}
+            result: dict = {"action": "drop", "path": resolved}
+            if db_existed:
+                result["dropped"] = str(db_path)
+            if dropped_cache:
+                result["dropped_cache"] = dropped_cache
             if resolved_project_name:
                 result["project"] = resolved_project_name
             return json.dumps(result, ensure_ascii=False)
@@ -2252,15 +2396,25 @@ def main():
     global session_manager
     from rlm_tools_bsl._config import load_project_env
 
-    # Line-buffered stdio so log lines (basicConfig → stderr) reach the
-    # service log file immediately, not in 4-8 KB block-buffered chunks.
-    # Belt-and-braces with PYTHONUNBUFFERED in _service_win.py — only one of
-    # them needs to work. Has no effect when stdio is already line-buffered
-    # (interactive tty) or unbuffered.
+    # Force UTF-8 + line-buffered stdio.
+    #
+    # UTF-8: the Windows service redirects this child's stderr into server.log
+    # (see _service_win.py). On Windows a *redirected* (non-console) stderr
+    # otherwise encodes with the legacy ANSI code page (cp1251), so log records
+    # carrying Cyrillic (object names, and the rlm_execute `code=<…>` field) were
+    # written as cp1251 while the RotatingFileHandler writes UTF-8 — a mixed-
+    # encoding file that no single decoder reads. Non-cp1251 chars (e.g. the ⏎
+    # newline marker U+23CE) degraded to `⏎` via backslashreplace. Pinning
+    # UTF-8 makes every sink consistent and the log fully readable. Belt-and-
+    # braces with PYTHONUTF8 set by _service_win.py.
+    #
+    # line_buffering: log lines reach the service log file immediately, not in
+    # 4-8 KB block-buffered chunks (also covered by PYTHONUNBUFFERED). Has no
+    # effect when stdio is already line-buffered (interactive tty) or unbuffered.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(line_buffering=True)
-        except (AttributeError, OSError):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
+        except (AttributeError, OSError, ValueError):
             pass
 
     load_project_env()

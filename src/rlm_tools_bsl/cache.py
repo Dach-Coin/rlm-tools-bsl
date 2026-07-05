@@ -182,6 +182,29 @@ def touch_project_cache(base_path: str) -> None:
         _logger.debug("touch_project_cache: %s failed: %s", proj_dir, exc)
 
 
+def purge_project_cache(base_path: str) -> str | None:
+    """Remove a project's on-disk cache subdirectory (``<cache_root>/<hash12>/``).
+
+    Used by ``rlm_index(action='drop')`` to complete a project decommission:
+    the index DB and its file-listing cache should disappear together, otherwise
+    a stale ``file_index.json`` is left orphaned (issue #16). Best-effort — a
+    missing directory or an ``OSError`` is swallowed and reported via the return
+    value (``None`` = nothing removed).
+
+    Returns the removed directory path as a string, or ``None`` if it did not
+    exist / could not be removed.
+    """
+    proj_dir = _cache_dir(base_path)
+    try:
+        if not proj_dir.is_dir():
+            return None
+        shutil.rmtree(proj_dir)
+        return str(proj_dir)
+    except OSError as exc:
+        _logger.debug("purge_project_cache: %s failed: %s", proj_dir, exc)
+        return None
+
+
 def _project_last_used(project_dir: pathlib.Path) -> float:
     """Return the effective "last used" mtime for a project cache directory.
 

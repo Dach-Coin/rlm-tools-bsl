@@ -69,6 +69,13 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         # (which go to stderr via basicConfig and get redirected here) appear
         # in server.log immediately, not in 4-8 KB block-buffered chunks.
         env.setdefault("PYTHONUNBUFFERED", "1")
+        # Force UTF-8 std streams in the subprocess. We redirect its stderr into
+        # server.log below; without this, Windows encodes a redirected stderr
+        # with the legacy ANSI code page (cp1251) → Cyrillic (and the rlm_execute
+        # `code=<…>` field) become mojibake next to the UTF-8 RotatingFileHandler
+        # lines. Belt-and-braces with the reconfigure() in server.main().
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
 
         log_dir = _config_path().parent / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
