@@ -237,13 +237,44 @@ _REF_CANONICAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("DefinedType.", "DefinedType."),
 )
 
+_CANONICAL_REF_HEADS = (
+    "Catalog",
+    "Document",
+    "Enum",
+    "InformationRegister",
+    "AccumulationRegister",
+    "AccountingRegister",
+    "CalculationRegister",
+    "ChartOfAccounts",
+    "ChartOfCharacteristicTypes",
+    "ChartOfCalculationTypes",
+    "ExchangePlan",
+    "BusinessProcess",
+    "Task",
+    "Constant",
+    "DefinedType",
+    "Subsystem",
+    "Role",
+    "FunctionalOption",
+    "EventSubscription",
+    "ScheduledJob",
+    "CommonModule",
+    "CommonForm",
+    "CommonCommand",
+    "Report",
+    "DataProcessor",
+    "DocumentJournal",
+)
+_CANONICAL_REF_HEAD_BY_CASEFOLD = {head.casefold(): head for head in _CANONICAL_REF_HEADS}
 
-def canonicalize_type_ref(type_str: str) -> str:
+
+def canonicalize_type_ref(type_str: str, *, fold_case: bool = True) -> str:
     """Convert 1C reference type form to canonical metadata reference.
 
     Examples:
         "cfg:CatalogRef.Контрагенты"   -> "Catalog.Контрагенты"
         "DocumentObject.Заказ"          -> "Document.Заказ"
+        "document.Заказ"                -> "Document.Заказ"
         "EnumRef.СтавкиНДС"             -> "Enum.СтавкиНДС"
         "DefinedType.Сумма"             -> "DefinedType.Сумма"
         "xs:string"                     -> "" (not a metadata reference)
@@ -255,39 +286,16 @@ def canonicalize_type_ref(type_str: str) -> str:
     if not s or "." not in s:
         return ""
     for prefix, canonical in _REF_CANONICAL_PREFIXES:
-        if s.startswith(prefix):
+        prefix_matches = s[: len(prefix)].casefold() == prefix.casefold() if fold_case else s.startswith(prefix)
+        if prefix_matches:
             return canonical + s[len(prefix) :]
     # Already canonical form like "Catalog.X"?
-    head = s.split(".", 1)[0]
-    if head in {
-        "Catalog",
-        "Document",
-        "Enum",
-        "InformationRegister",
-        "AccumulationRegister",
-        "AccountingRegister",
-        "CalculationRegister",
-        "ChartOfAccounts",
-        "ChartOfCharacteristicTypes",
-        "ChartOfCalculationTypes",
-        "ExchangePlan",
-        "BusinessProcess",
-        "Task",
-        "Constant",
-        "DefinedType",
-        "Subsystem",
-        "Role",
-        "FunctionalOption",
-        "EventSubscription",
-        "ScheduledJob",
-        "CommonModule",
-        "CommonForm",
-        "CommonCommand",
-        "Report",
-        "DataProcessor",
-        "DocumentJournal",
-    }:
-        return s
+    head, suffix = s.split(".", 1)
+    canonical_head = _CANONICAL_REF_HEAD_BY_CASEFOLD.get(head.casefold()) if fold_case else head
+    if not fold_case and canonical_head not in _CANONICAL_REF_HEADS:
+        canonical_head = ""
+    if canonical_head:
+        return f"{canonical_head}.{suffix}"
     return ""
 
 

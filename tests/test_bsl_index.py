@@ -1930,6 +1930,25 @@ def _minimal_index_with_meta(tmp_path, monkeypatch):
     return db_path
 
 
+def _index_with_subscriptions(tmp_path, monkeypatch, subs):
+    """subs: list[(name, source_types, event)] → db_path с засеянной event_subscriptions.
+
+    Строится поверх _minimal_index_with_meta — тот пинит RLM_INDEX_DIR в tmp, без чего
+    сборка ушла бы в общий индекс-каталог машины.
+    """
+    db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+    conn = sqlite3.connect(str(db_path))
+    conn.executemany(
+        "INSERT INTO event_subscriptions (name, synonym, event, handler_module, "
+        "handler_procedure, source_types, source_count, file) "
+        "VALUES (?, '', ?, 'ОбщийМодуль', 'Обработчик', ?, ?, 'x.xml')",
+        [(n, ev, json.dumps(st, ensure_ascii=False), len(st)) for n, st, ev in subs],
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
 class TestExactRefReaders:
     """get_roles_exact / get_event_subscriptions_exact / get_functional_options_exact."""
 
@@ -2090,6 +2109,143 @@ class TestExactRefReaders:
         reader = IndexReader(str(db_path))
         try:
             assert reader.get_event_subscriptions_exact("Document.НетТакого") == []
+        finally:
+            reader.close()
+
+    def test_get_event_subscriptions_exact_includes_universal(self, tmp_path, monkeypatch):
+        """#2 (v1.28.0): universal (пустой source_types) подписки-catch-all включаются
+        в exact-выборку (паритет с find_event_subscriptions), помечаются scope и идут
+        ПОСЛЕ exact (стабильно). Именованное точное сопоставление сохранено — non-matching
+        named подписка (Catalog.Контрагенты) в выборку по документу НЕ попадает."""
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        conn = sqlite3.connect(str(db_path))
+        conn.executemany(
+            "INSERT INTO event_subscriptions (name, synonym, event, handler_module, "
+            "handler_procedure, source_types, source_count, file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                # universal catch-all (пустой source_types) — раньше молча дропалась.
+                ("ПодпискаUniversal", "", "OnWrite", "ОМ", "H0", json.dumps([], ensure_ascii=False), 0, "u.xml"),
+                # exact named source (type-форма → канонизируется).
+                (
+                    "ПодпискаЗаказ",
+                    "",
+                    "BeforeWrite",
+                    "ОМ",
+                    "H1",
+                    json.dumps(["DocumentObject.ЗаказПоставщику"], ensure_ascii=False),
+                    1,
+                    "f1.xml",
+                ),
+                # non-matching named source — не должна попасть в выборку по документу.
+                (
+                    "ПодпискаКонтр",
+                    "",
+                    "OnWrite",
+                    "ОМ",
+                    "H2",
+                    json.dumps(["CatalogRef.Контрагенты"], ensure_ascii=False),
+                    1,
+                    "f3.xml",
+                ),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        reader = IndexReader(str(db_path))
+        try:
+            subs = reader.get_event_subscriptions_exact("Document.ЗаказПоставщику")
+            names = [s["name"] for s in subs]
+            assert set(names) == {"ПодпискаЗаказ", "ПодпискаUniversal"}
+            assert "ПодпискаКонтр" not in names  # именованный non-match не протекает
+            by_name = {s["name"]: s for s in subs}
+            assert by_name["ПодпискаЗаказ"]["scope"] == "exact"
+            assert by_name["ПодпискаUniversal"]["scope"] == "universal"
+            # exact ПЕРЕД universal (preview всегда показывает явные первыми).
+            assert names.index("ПодпискаЗаказ") < names.index("ПодпискаUniversal")
+        finally:
+            reader.close()
+
+    def test_get_event_subscriptions_exact_first_no_substring_false_positive(self, tmp_path, monkeypatch):
+        """Полное имя объекта НЕ должно цеплять более длинный омоним (ДРУГОЙ объект)."""
+        db = _index_with_subscriptions(
+            tmp_path,
+            monkeypatch,
+            [
+                ("ПодпискаТочная", ["DocumentObject.РеализацияТоваровУслуг"], "ПередЗаписью"),
+                ("ПодпискаОмоним", ["CatalogObject.РеализацияТоваровУслугПрисоединенныеФайлы"], "ПередЗаписью"),
+                ("ПодпискаUniversal", [], "ПередЗаписью"),
+            ],
+        )
+        reader = IndexReader(str(db))
+        try:
+            rows = reader.get_event_subscriptions("РеализацияТоваровУслуг")
+            by_name = {r["name"]: r for r in rows}
+            assert "ПодпискаОмоним" not in by_name, rows
+            assert by_name["ПодпискаТочная"]["scope"] == "exact"
+            assert by_name["ПодпискаUniversal"]["scope"] == "universal"
+            assert [r["scope"] for r in rows] == ["exact", "universal"]  # exact-первыми
+        finally:
+            reader.close()
+
+    def test_get_event_subscriptions_partial_fallback_when_no_exact(self, tmp_path, monkeypatch):
+        """Фрагмент имени (точных совпадений нет) → substring-фолбэк по именной части."""
+        db = _index_with_subscriptions(
+            tmp_path,
+            monkeypatch,
+            [
+                ("ПодпискаОмоним", ["CatalogObject.РеализацияТоваровУслугПрисоединенныеФайлы"], "ПередЗаписью"),
+                ("ПодпискаДругая", ["DocumentObject.ЗаказКлиента"], "ПередЗаписью"),
+            ],
+        )
+        reader = IndexReader(str(db))
+        try:
+            rows = reader.get_event_subscriptions("Реализация")
+            assert {r["name"] for r in rows} == {"ПодпискаОмоним"}, rows
+            assert rows[0]["scope"] == "partial"
+        finally:
+            reader.close()
+
+    def test_get_event_subscriptions_event_filter_does_not_resurrect_homonym(self, tmp_path, monkeypatch):
+        """exact/partial решается по ПОЛНОМУ набору, event_filter — ПОСЛЕ.
+
+        У точного источника события 'ПередЗаписью' НЕТ, у длинного омонима — ЕСТЬ.
+        Если фильтровать по событию ДО классификации, exact-набор опустеет, включится
+        partial-фолбэк и вернётся чужой объект. Правильный ответ — пусто (у нашего
+        объекта нет подписок на это событие)."""
+        db = _index_with_subscriptions(
+            tmp_path,
+            monkeypatch,
+            [
+                ("ПодпискаТочная", ["DocumentObject.РеализацияТоваровУслуг"], "ПриЗаписи"),
+                ("ПодпискаОмоним", ["CatalogObject.РеализацияТоваровУслугПрисоединенныеФайлы"], "ПередЗаписью"),
+            ],
+        )
+        reader = IndexReader(str(db))
+        try:
+            rows = reader.get_event_subscriptions("РеализацияТоваровУслуг", event_filter=["ПередЗаписью"])
+            assert rows == [], rows  # НЕ ПодпискаОмоним
+            rows2 = reader.get_event_subscriptions("РеализацияТоваровУслуг", event_filter=["ПриЗаписи"])
+            assert [r["name"] for r in rows2] == ["ПодпискаТочная"]
+        finally:
+            reader.close()
+
+    def test_get_event_subscriptions_object_ref_is_category_aware(self, tmp_path, monkeypatch):
+        """Типизированный вход (canonical ref) различает Document.X и Catalog.X-омонимы;
+        голое имя — category-blind (обратная совместимость)."""
+        db = _index_with_subscriptions(
+            tmp_path,
+            monkeypatch,
+            [
+                ("ПодпискаДок", ["DocumentObject.Дубль"], "ПередЗаписью"),
+                ("ПодпискаСпр", ["CatalogObject.Дубль"], "ПередЗаписью"),
+            ],
+        )
+        reader = IndexReader(str(db))
+        try:
+            typed = reader.get_event_subscriptions("Дубль", object_ref="Document.Дубль")
+            assert [r["name"] for r in typed] == ["ПодпискаДок"], typed
+            bare = reader.get_event_subscriptions("Дубль")
+            assert {r["name"] for r in bare} == {"ПодпискаДок", "ПодпискаСпр"}  # category-blind
         finally:
             reader.close()
 

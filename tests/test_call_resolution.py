@@ -10,6 +10,7 @@ and find_call_hierarchy expose an exact (resolved) mode with explicit
 exact/fallback markers in _meta.
 """
 
+import re
 import sqlite3
 
 import pytest
@@ -668,17 +669,220 @@ def test_strategy_hint_tip_consistent_across_modes(monkeypatch, mode):
     assert "ТОЧНОСТЬ" in s
 
 
-def test_posting_recipe_uses_module_hint():
-    # The «проведение» recipe walks ОбработкаПроведения — the canonical
-    # high-collision object method. It must teach module_hint, otherwise the
-    # agent gets root_exact=False and false edges from namesakes.
+# Платформенные обработчики модуля объекта: их вызывает ПЛАТФОРМА, а не BSL, поэтому в графе
+# ВЫЗОВОВ входящего ребра у них нет и callers всегда 0. Трассировать их call-хелперами нельзя.
+_PLATFORM_HANDLERS = "ОбработкаПроведения|ПередЗаписью|ПриЗаписи|ОбработкаЗаполнения"
+# Ловим именно ВЫЗОВ хелпера на обработчике. Просто `not in` тут не годится: рецепты обязаны
+# УПОМИНАТЬ find_call_hierarchy — в предупреждении «не зови его на обработчике».
+_TRACES_PLATFORM_HANDLER = re.compile(rf"find_call(?:_hierarchy|ers_context)\(\s*['\"](?:{_PLATFORM_HANDLERS})")
+
+
+@pytest.mark.parametrize("fmt", ["compact", "full"])
+def test_posting_recipe_never_traces_the_platform_handler(fmt):
+    """Прежний тест (test_posting_recipe_uses_module_hint) требовал в рецепте строку
+    find_call_hierarchy('ОбработкаПроведения', module_hint=...) — «канонический одноимённый
+    объектный метод». Посылка оказалась ЛОЖНОЙ: обработчик зовёт ПЛАТФОРМА, у него callers=0
+    ВСЕГДА, и module_hint его не «оживит». Тест цементировал тупиковый совет, а e2e v1.28.0
+    показал, как агент по нему упирается в ноль. Здесь пинится НОВЫЙ маршрут.
+
+    module_hint без покрытия не остался: он пинится в test_help_sig_mentions_hint_and_meta
+    (registry), test_help_topic_recipe_reflects_hint (топик «иерархия вызовов») и
+    test_strategy_hint_tip_consistent_across_modes (обе копии стратегии)."""
     from rlm_tools_bsl.bsl_knowledge import _get_topic_recipe
 
-    rec = _get_topic_recipe("проведение", format="full")
+    rec = _get_topic_recipe("проведение", format=fmt)
     assert rec is not None
-    blob = " ".join(rec["steps"])
-    assert "find_call_hierarchy('ОбработкаПроведения'" in blob
-    assert "module_hint" in blob
+    blob = " ".join(rec["steps"]) + " " + rec.get("code_hint", "")
+
+    m = _TRACES_PLATFORM_HANDLER.search(blob)
+    assert not m, f"рецепт «проведение»/{fmt} снова зовёт call-хелпер на обработчике: {m.group(0) if m else ''}"
+
+    # Рабочий маршрут вместо тупика. Он живёт в result['hint']: тело обработчика разбирает СЕРВЕР
+    # (агент не может — CFE-модуль ему не прочитать, а получателя слева от точки не разрешить),
+    # поэтому рецепт обязан вести ИМЕННО ТУДА, а не пересказывать развилку своими словами.
+    assert "hint" in blob, f"рецепт «проведение»/{fmt} не ведет в result['hint'] с разбором тела: {blob}"
+    # Корень, а не словоформа: тексты говорят и «ПЛАТФОРМА», и «вызов от ПЛАТФОРМЫ».
+    assert "ПЛАТФОРМ" in blob, f"рецепт «проведение»/{fmt} не объясняет, почему callers=0 — это норма"
+
+
+@pytest.mark.parametrize("fmt", ["compact", "full"])
+def test_posting_recipe_does_not_leave_the_receiver_to_the_agent(fmt):
+    """Точка НЕ доказывает модуль: слева бывает переменная или РЕКВИЗИТ документа, а при наличии
+    общего модуля-однофамильца find_definition отработает УСПЕШНО и молча вернёт ЧУЖОЕ тело —
+    отказ, который выглядит как ответ.
+
+    Разрешить получателя агент не может В ПРИНЦИПЕ: текстовые маркеры не видят реквизит, а
+    «подтверждение по category» тавтологично (module_hint 'ОбщийМодуль.X' сам же и фильтрует по
+    этой категории в SQL). Поэтому разрешает СЕРВЕР, а рецепт обязан: назвать возможные виды
+    получателя, назвать цену ошибки и запретить тавтологическое «подтверждение»."""
+    from rlm_tools_bsl.bsl_knowledge import _get_topic_recipe
+
+    rec = _get_topic_recipe("проведение", format=fmt)
+    blob = " ".join(rec["steps"]) + " " + rec.get("code_hint", "")
+    up = blob.upper()
+    assert "ПЕРЕМЕННАЯ" in up, f"рецепт «проведение»/{fmt} не называет вид получателя «переменная»: {blob}"
+    assert "РЕКВИЗИТ" in up, (
+        f"рецепт «проведение»/{fmt} не называет РЕКВИЗИТ — а это тот случай, где текстовая эвристика "
+        f"бессильна и агент молча читал чужое тело: {blob}"
+    )
+    assert "ЧУЖОЕ" in up, f"рецепт «проведение»/{fmt} не называет ЦЕНУ ошибки (молча чужое тело): {blob}"
+    # Тавтология названа тавтологией: иначе агент «подтвердит» чужой модуль проверкой, которая
+    # истинна по построению, и получит ложную уверенность вместо ответа.
+    assert "ТАВТОЛОГИ" in up or "ВСЕГДА ИСТИННА" in up, (
+        f"рецепт «проведение»/{fmt} не запрещает подтверждение по category (оно круговое): {blob}"
+    )
+
+
+@pytest.mark.parametrize("fmt", ["compact", "full"])
+def test_call_hierarchy_recipe_example_is_not_a_platform_handler(fmt):
+    """Рецепт темы «иерархия вызовов» показывал find_call_hierarchy('ОбработкаПроведения', ...)
+    как КАНОНИЧЕСКИЙ пример module_hint. Пример заведомо пустой (callers=0) и прямо противоречит
+    рецепту «проведение», который запрещает так делать. Пример обязан быть на методе, который
+    РЕАЛЬНО зовут из BSL."""
+    from rlm_tools_bsl.bsl_knowledge import _get_topic_recipe
+
+    rec = _get_topic_recipe("иерархия вызовов", format=fmt)
+    assert rec is not None
+    blob = " ".join(rec["steps"]) + " " + rec.get("code_hint", "")
+
+    m = _TRACES_PLATFORM_HANDLER.search(blob)
+    assert not m, f"пример в «иерархия вызовов»/{fmt} вернёт callers=0: {m.group(0) if m else ''}"
+    assert "ПЛАТФОРМ" in blob, f"«иерархия вызовов»/{fmt} не предупреждает про платформенные обработчики"
+
+
+# Целый ВЫЗОВ call-хелпера на платформенном обработчике (а не просто упоминание имени).
+_CALL_ON_HANDLER = re.compile(rf"find_call(?:_hierarchy|ers_context|ers)\(\s*['\"](?:{_PLATFORM_HANDLERS})[^)]*\)")
+
+
+def test_no_registry_recipe_traces_a_platform_handler_without_triggers(project):
+    """Сплошной гейт по ВСЕМ рецептам реестра — а не только по тем, что мы вспомнили руками.
+    Именно ручной выбор «радиуса» уже дважды пропускал этот дефект: тупиковый совет нашёлся и в
+    рецепте find_definition («дальше: find_callers_context('ОбработкаПроведения')» → вернёт 0).
+
+    Инвариант с исключением, а не запрет: единственный ОСМЫСЛЕННЫЙ вызов call-хелпера на
+    платформенном обработчике — `find_call_hierarchy(..., include_triggers=True)`. Он честно
+    вернёт callers=0, но ПОКАЖЕТ CFE-перехват обработчика расширением, а это ровно та причина,
+    по которой на обработчик вообще стоит смотреть. Всё остальное (голый find_call_hierarchy,
+    любой find_callers_context / find_callers — они include_triggers не поддерживают в принципе)
+    гарантированно отдаст пусто и научит агента читать это как «мёртвый код»."""
+    reg = _registry(project)
+    offenders = []
+    for name, entry in reg.items():
+        text = f"{entry.get('sig') or ''} {entry.get('recipe') or ''}"
+        for call in _CALL_ON_HANDLER.findall(text):
+            if "include_triggers=True" not in call:
+                offenders.append(f"{name}: {call}")
+    assert not offenders, "рецепты зовут call-хелпер на платформенном обработчике (вернёт 0):\n" + "\n".join(offenders)
+
+
+def _agent_facing_texts(project, monkeypatch) -> dict[str, str]:
+    """ВСЕ тексты, которые уходят агенту: registry (sig+recipe), топик-рецепты (обе формы), обе
+    стратегии (обязательно с idx_stats — без индекса блок INDEX TIPS не рендерится вовсе)."""
+    from rlm_tools_bsl.bsl_knowledge import _BUSINESS_RECIPES, _get_topic_recipe, get_strategy
+
+    texts: dict[str, str] = {}
+    for name, entry in _registry(project).items():
+        texts[f"registry:{name}"] = f"{entry.get('sig') or ''}\n{entry.get('recipe') or ''}"
+    for topic in _BUSINESS_RECIPES:
+        for fmt in ("compact", "full"):
+            rec = _get_topic_recipe(topic, format=fmt) or {}
+            texts[f"recipe:{topic}/{fmt}"] = " ".join(rec.get("steps", [])) + " " + (rec.get("code_hint") or "")
+    idx_stats = {"methods": 100, "calls": 200, "has_fts": True}
+    for mode in ("slim", "full"):
+        monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
+        texts[f"strategy:{mode}"] = get_strategy("medium", None, idx_stats=idx_stats, query="")
+    return texts
+
+
+# Плейсхолдер ВНУТРИ вызова: `read_procedure(<файл делегата>, ...)`. Угловые скобки в прозе
+# законны (`Движения.<Регистр>`), а в аргументах — это псевдокод, который агент скопирует дословно.
+_PSEUDOCODE_IN_CALL = re.compile(r"\w\(\s*<")
+
+
+def test_no_agent_facing_text_puts_pseudocode_inside_a_call(project, monkeypatch):
+    """`read_procedure(<файл делегата>, ...)` — невалидный Python в тексте, который агент копирует
+    ДОСЛОВНО. Первый раз это нашли в hint и починили — а та же строка преспокойно осталась в
+    рецепте find_register_movements, потому что гейт проверял ТОЛЬКО hint. Гейт обязан быть
+    сплошным, иначе он ловит ровно то место, где мы уже посмотрели."""
+    offenders = [
+        f"{where}: ...{text[max(0, m.start() - 40) : m.end() + 40]}..."
+        for where, text in _agent_facing_texts(project, monkeypatch).items()
+        if (m := _PSEUDOCODE_IN_CALL.search(text))
+    ]
+    assert not offenders, "псевдокод в аргументах вызова (агент скопирует и получит SyntaxError):\n" + "\n".join(
+        offenders
+    )
+
+
+def test_contract_docs_do_not_overclaim_zero_callers():
+    """Документация дрейфовала ДВАЖДЫ за релиз, и оба раза мимо гейтов — они покрывали только код.
+    HELPERS.md описывал маршрут, которого в hint уже нет; в ARCHITECTURE.md абсолютное «callers
+    пусты» я повторил в той самой строке, которую в тот момент и правил.
+
+    Инвариант тот же, что и для agent-facing текстов: если контрактный документ говорит про callers
+    рядом с платформенным обработчиком, он обязан оговорить, что ЯВНЫЕ BSL-вызовы находятся.
+
+    Список файлов ЯВНЫЙ, а не docs/*.md, и вот почему:
+      * full_analysis_prompt.md — это e2e-ХАРНЕСС. По методике сравнительных прогонов он обязан
+        оставаться идентичным прошлому релизу, иначе метрики релиз-к-релизу несопоставимы. Там
+        find_call_hierarchy('ОбработкаПроведения') — механическое упражнение хелпера, а не совет.
+      * INDEXING.md — не контрактный документ (там ОбработкаПроведенияДокументов лишь в примере
+        строки индекса), гейт дал бы ложное срабатывание."""
+    from pathlib import Path
+
+    docs = Path(__file__).resolve().parents[1] / "docs"
+    handler_re = re.compile(_PLATFORM_HANDLERS)
+    zero_callers_re = re.compile(r"callers\s*=\s*0|пуст\w*\s+callers", re.IGNORECASE)
+    offenders = []
+    for name in ("HELPERS.md", "ARCHITECTURE.md"):
+        lines = (docs / name).read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if not handler_re.search(line):
+                continue
+            # HELPERS хранит контракт каждого хелпера в одной bullet-строке; ARCHITECTURE
+            # переносит NB на три строки. Локальное окно покрывает обе формы, но не позволяет
+            # постороннему «явно» за сотню строк завизировать неверное утверждение здесь.
+            context = line if name == "HELPERS.md" else "\n".join(lines[max(0, index - 1) : index + 3])
+            if zero_callers_re.search(context) and "явн" not in context.lower():
+                offenders.append(f"{name}:{index + 1}")
+    assert not offenders, (
+        "документ говорит про callers у платформенного обработчика, но не оговаривает, что явные "
+        "BSL-вызовы находятся — снова противоречит продукту:\n" + "\n".join(offenders)
+    )
+
+
+def test_platform_handler_texts_do_not_overclaim_zero_callers(project, monkeypatch):
+    """«У платформенного обработчика callers=0 ВСЕГДА / он вообще не трассируется» — это СИЛЬНЕЕ
+    фактического контракта, и в таком виде совет ВРЕДЕН.
+
+    В граф вызовов не попадает именно ПЛАТФОРМЕННЫЙ вход. Но find_call_hierarchy не исключает
+    методы по имени: если BSL-код где-то ЯВНО зовёт ОбработкаПроведения(...) (скажем, из другого
+    метода того же ObjectModule), билдер пишет обычное call-ребро и хелпер его вернёт. Текст,
+    объявляющий такие методы нетрассируемыми, заставит агента ПРОИГНОРИРОВАТЬ реальное ребро —
+    то есть чинить одну ложь другой.
+
+    Инвариант: текст, объясняющий «callers=0 — норма» рядом с платформенным обработчиком, обязан
+    тут же оговорить, что ЯВНЫЕ BSL-вызовы всё же находятся. Проверяются ВСЕ agent-facing
+    поверхности разом (registry sig+recipe, все топик-рецепты в обеих формах, обе стратегии) —
+    выборочный обход по памяти в этом релизе промахивался трижды."""
+    handler_re = re.compile(_PLATFORM_HANDLERS)
+    offenders = [
+        where
+        for where, text in _agent_facing_texts(project, monkeypatch).items()
+        if "callers=0" in text and handler_re.search(text) and "явн" not in text.lower()
+    ]
+    assert not offenders, (
+        "текст объявляет callers=0 у платформенного обработчика, но НЕ оговаривает, что явные "
+        "BSL-вызовы всё же находятся (агент проигнорирует реальное ребро):\n" + "\n".join(offenders)
+    )
+    absolute_zero = [
+        where
+        for where, text in _agent_facing_texts(project, monkeypatch).items()
+        if handler_re.search(text) and "их и так 0" in text.lower()
+    ]
+    assert not absolute_zero, (
+        "локальная абсолютная формулировка противоречит оговорке про явные BSL-вызовы:\n" + "\n".join(absolute_zero)
+    )
 
 
 def _fs_helpers(base):

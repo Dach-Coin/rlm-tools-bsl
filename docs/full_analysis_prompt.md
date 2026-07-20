@@ -406,13 +406,13 @@ Replace `<path>` with the actual path to your 1C source code that has nearby ext
    - Проверь extension_context из ответа rlm_start — какая роль конфигурации, есть ли расширения рядом
 
 2. **Обзор всех перехватов из индекса**:
-   - get_overrides() без фильтров → `total` (полное число), `source`, `truncated`. ВНИМАНИЕ: `overrides` несёт только ПЕРВЫЕ 200; если `truncated=True`, группировка ниже неполная — опирайся на `total` и/или сужай get_overrides('Объект') по объектам
-   - Сгруппируй по расширениям: для каждого расширения — количество перехватов и назначение (purpose)
-   - Сгруппируй по типам аннотаций: сколько &Перед, &После, &Вместо, &ИзменениеИКонтроль
+   - get_overrides() без фильтров → сначала проверь `partial`. При `partial=False` `total` и агрегаты посчитаны по ПОЛНОМУ выбранному источнику; при `partial=True` это нижняя оценка по успешно прочитанной части, а причины перечислены в `_meta.failed_extension_roots`. **Сводку строй по АГРЕГАТАМ**, а не по срезу: `by_annotation`, `by_object_top` (топ-20 объектов), `by_extension_top` (топ-20 расширений), `unique_objects`/`unique_methods`/`unique_extensions`. Список `overrides` — усечённый срез (первые 200), **группировать его вручную НЕЛЬЗЯ**
+   - Разбивка по расширениям — из `by_extension_top` (+ `unique_extensions`); назначение (purpose) каждого расширения возьми из extension_context/detect_extensions()
+   - Разбивка по типам аннотаций (&Перед, &После, &Вместо, &ИзменениеИКонтроль) — из `by_annotation`
 
 3. **Прицельный поиск перехватов**:
-   - Выбери объект с наибольшим количеством перехватов
-   - get_overrides('ИмяОбъекта') → перехваты этого объекта (первые 200; проверь `truncated`)
+   - Выбери объект с наибольшим количеством перехватов — из `by_object_top` (НЕ из среза `overrides`)
+   - get_overrides('ИмяОбъекта') → перехваты этого объекта (срез — первые 200; проверь `truncated`)
    - Для каждого перехвата: метод, тип аннотации, метод расширения, файл расширения
 
 4. **Обогащение extract_procedures**:
@@ -459,7 +459,7 @@ This prompt verifies the extension overrides indexing pipeline from v1.5.0: the 
 |------|-----------------|----------------|
 | Index diagnostics | `get_index_info()` | builder_version=9, has_extension_overrides=True, count>0 |
 | Extension context | `rlm_start` response | extension_context with nearby extensions, live overrides |
-| Indexed overrides | `get_overrides()` | source="index", instant response, first 200 rows (`total`/`truncated` present; filter by object if `truncated`) |
+| Indexed overrides | `get_overrides()` | source="index", `partial=false`, instant response; `overrides` = deterministic slice of first 200 rows (`total`/`truncated` present). Stats come from the aggregates (`by_annotation`, `by_object_top`, `by_extension_top`, `unique_*`), not from grouping the slice. On a live fallback, `partial=true` makes these stats lower bounds; inspect `_meta.failed_extension_roots` |
 | Filtered overrides | `get_overrides(object_name)` | Correct filtering by object |
 | Procedure enrichment | `extract_procedures(path)` | overridden_by field on intercepted methods |
 | Read original | `read_procedure(path, name)` | Clean body without override data (regression) |
@@ -960,7 +960,7 @@ print(full['total'], full['code_total'], full['code_by_kind'])
 # Reverse-Index Coverage Audit Prompt — E2E Test for v1.9.0 reverse-index breadth
 
 Данный промпт нагружает **новый reverse-index** (`metadata_references`) шире чем точечный where-used: проходит по нескольким kinds сразу, проверяет раскрытие `ОпределяемогоТипа` и поведение `partial` flag. Используется для:
-1. валидации новых kinds после фиксов парсера CF Owners (`xr:Item`) и `parse_command_parameter_type` (`<CommonCommand>` + `<v8:TypeSet>`);
+1. валидации kinds парсера CF Owners (`xr:Item`) и `parse_command_parameter_type` (`<CommonCommand>` + `<v8:TypeSet>`);
 2. регрессионной проверки `find_defined_types()` (примитивы должны сохраняться);
 3. **проверки live-fallback** на проектах без индекса (или старого v11) — `partial=True` должно работать корректно.
 
@@ -1006,13 +1006,13 @@ print(full['total'], full['code_total'], full['code_by_kind'])
 
 5. **Owner-references regression** — для CF-проекта:
    попробуй найти владельца хотя бы одного подчинённого справочника. Используй фильтр
-   kinds=['owner']. Если результат пустой и проект — CF, это потенциально регрессия фикса
-   парсера xr:Item (issue v1.9.0 round-2). Сообщи об этом.
+   kinds=['owner']. Если результат пустой и проект — CF, это потенциальное несоответствие
+   контракту парсера `xr:Item`. Сообщи об этом.
 
 6. **CommandParameterType coverage** — попробуй фильтр kinds=['command_parameter_type'] на
    произвольном объекте, который часто фигурирует в CommonCommands (например ExchangePlan.Х
-   или DefinedType.Y). Если в проекте есть CommonCommands и результат 0 — потенциальная
-   регрессия фикса <CommonCommand>+<v8:TypeSet>.
+   или DefinedType.Y). Если в проекте есть CommonCommands и результат 0 — потенциальное
+   несоответствие контракту `<CommonCommand>` + `<v8:TypeSet>`.
 
 7. **Truncation/priority** — если total > limit (по умолчанию 1000), вызови с limit=10 и
    проверь, что:
@@ -1052,7 +1052,7 @@ print(full['total'], full['code_total'], full['code_by_kind'])
 | Без индекса | `True` (live fallback) | сравнимо | ≥4 kinds | dummy `seen_objects` дедуп должен исключить дубли |
 | Truncation `limit=10` | — | оригинал ≥ 10 | первые 10 — высокоприоритетные | `truncated=True`, `by_kind` отражает полный набор |
 
-**Regression checks** (если что-то из перечисленного провалится — это баг, требующий фикса):
+**Проверки контрактов** (если что-то из перечисленного провалится, зафиксируй несоответствие):
 - CF индекс с 0 owner refs → `xr:Item` парсер сломан
 - CF индекс с 0 command_parameter_type refs (при наличии CommonCommands) → `<CommonCommand>` или `<v8:TypeSet>` парсинг сломан
 - DefinedType с потерянными примитивами → indexed path в `_normalize_dt_type` сломан
@@ -1182,7 +1182,7 @@ ranked merge of indexed + extension results in `search_*` / `find_attributes` /
 
 Replace `<path>` with the path to a main 1C source root that has at least one
 extension directory next to it. Index v12 recommended (`rlm-bsl-index index build <path>`),
-но не обязателен — фикс работает и без индекса (медленнее).
+но не обязателен — сценарий поддерживается и без индекса (медленнее).
 
 ## Prompt
 
@@ -1224,9 +1224,12 @@ extension directory next to it. Index v12 recommended (`rlm-bsl-index index buil
 
 3. **Перехваты типового поведения**:
    - get_overrides() без фильтров. Если результат непустой:
-     - сгруппируй по object_name и по annotation;
-     - выбери ОДИН наиболее «нагруженный» объект (с максимальным числом
-       перехватов) и:
+     - сначала проверь `partial`: при `False` разбивку по объектам и аннотациям бери из
+       агрегатов `by_object_top` / `by_annotation` (они по всем перехватам); при `True`
+       это нижняя оценка, а недочитанные корни перечислены в `_meta.failed_extension_roots`;
+       список `overrides` — усечённый
+       срез (первые 200), группировать его вручную нельзя;
+     - выбери ОДИН наиболее «нагруженный» объект (первый ключ `by_object_top`) и:
        - найди оригинальный модуль через find_module(object_name);
        - возьми один перехваченный метод и сравни 3 вызова на одном пути:
          - extract_procedures(path) → найди этот метод и покажи
@@ -1308,12 +1311,12 @@ contract change:
 |---|---|---|
 | 1 | Stand-up reveals extensions | `rlm_start` → `extension_context.nearby_extensions`; `Sandbox(extension_paths=[...])` is wired by `server._rlm_start` only when `current.role == MAIN` |
 | 2 | Ext objects + modules surface in discovery | `find_by_type` and `search_objects("")` return entries with `path`/`file` prefixed by `../` (paths to ext config); `_extension_paths_set` is populated by `_load_extensions_into_index_state` |
-| 2 | Ext synonyms in alphabetical listing | `search_objects("")` merge+sort: ext rows alphabetically interleaved with main, not starved when main saturates `limit` (codex round 2/3) |
-| 2 | Ext module headers via reservation | `search_module_headers("")` returns ext headers thanks to `_reserve_merge_ext_into_main` (codex round 5) |
+| 2 | Ext synonyms in alphabetical listing | `search_objects("")` merge+sort: ext rows alphabetically interleaved with main, not starved when main saturates `limit` |
+| 2 | Ext module headers via reservation | `search_module_headers("")` returns ext headers thanks to `_reserve_merge_ext_into_main` |
 | 3 | Overrides table populated | `get_overrides()` returns rows for nearby ext; `extract_procedures(path)` enriches matching methods with `overridden_by`; `read_procedure(path, name, include_overrides=True)` appends `=== Перехвачен ... ===` sections |
 | 4 | Multi-line signatures | `_merge_proc_continuations` collapses split `Процедура X(a,\n b,\n c)` headers into a single logical line for `BSL_PATTERNS["procedure_def"]`; `extract_procedures` reports `line` on the `Процедура`/`Функция` row and `end_line` on `КонецПроцедуры`/`КонецФункции`; `read_procedure` returns the whole body including the full signature |
 | 4 | Live-fill for indexed paths | Even when the on-disk index missed a multi-line method, `extract_procedures` opportunistically appends it via `_parse_procedures(path)` and applies the same `overrides_map` (round 4 of plan) |
-| 5 | Synonym-only ranking | `find_attributes(name=...)` with `_rank_merge_ext_into_main` over `("attr_name", "attr_synonym")` — ext rows matching by Russian synonym claim rank 0/1 even when main saturates `limit` (codex round 6); `search(query, scope="attributes")` carries `source_file` so `path` is non-empty |
+| 5 | Synonym-only ranking | `find_attributes(name=...)` with `_rank_merge_ext_into_main` over `("attr_name", "attr_synonym")` — ext rows matching by Russian synonym claim rank 0/1 even when main saturates `limit`; `search(query, scope="attributes")` carries `source_file` so `path` is non-empty |
 | 5 | Predefined live-fallback | `find_predefined(name=...)` analogous via `("item_name", "item_synonym")`; `search(query, scope="predefined")` `path` non-empty |
 | 6 | Sandbox contract on `../` paths | `_ext_resolve_safe` accepts paths under any extension root for BSL helpers; generic `_resolve_safe` in `helpers.py` still raises `PermissionError` — the docstring of `read_file` is enforced |
 
@@ -1501,11 +1504,11 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
      появляется ТОЛЬКО при include_triggers=True).
 
 3. **Перехваты расширений (CFE) и их триггеры**:
-   - get_overrides() → сводка: total, source, разбивка по расширениям (поле extension_name) и
-     по аннотациям (&Перед/&После/&Вместо/&ИзменениеИКонтроль). (Помни: get_overrides() — это dict
-     {overrides, total, truncated, source}, перехваты в res['overrides'] — ПЕРВЫЕ 200; если
-     res['truncated'] — сводка неполная, сузь get_overrides('Объект') / find_ext_overrides(ext_path).)
-   - Возьми объект с наибольшим числом перехватов; для одного его перехваченного метода построй
+   - get_overrides() → сначала `partial`: при `False` сводка `total`/`by_extension_top`/
+     `by_annotation`/`unique_*` полна для выбранного источника; при `True` это нижняя оценка,
+     причины — в `_meta.failed_extension_roots`. `res['overrides']` — усечённый срез первых
+     200 строк, группировать его вручную нельзя.
+   - Возьми объект с наибольшим числом перехватов (первый ключ `by_object_top`); для одного его перехваченного метода построй
      find_call_hierarchy(метод, module_hint=<этот объект>, include_triggers=True) и подтверди, что в
      triggers появляется ребро edge_type='cfe_override' с resolved=True.
 
@@ -1572,8 +1575,9 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Reachability (NEW) | `find_path(from, to, to_hint=...)` | СНАЧАЛА `if 'error' in res` (многозначное имя без hint → `{error, hint, candidates}`); затем forward path; `_meta.precision` exact/heuristic; `call_line` = edge line; `found=False`+`budget_exceeded=False`+нет `error` = truly unreachable |
 | Data path (NEW) | `find_data_path(from, to)` → `find_metadata_refs_from` | edge list {from,to,kind}; bare endpoint → structural hint (no traversal); `partial` on old index |
 | Recipes (NEW) | `help('достижимость')`, `help('путь данных')` | recipes resolve |
-| Contract: get_overrides | `get_overrides()` | dict `{overrides,total,truncated,source}`; `overrides`=первые 200 (`truncated` сигналит обрезку); key `extension_name` (incl. live extension session) |
-| Contract: register movements | `find_register_movements()` | `code_registers`=list[dict]; `erp_mechanisms`/`manager_tables`/`adapted_registers`=list[str] |
+| Contract: get_overrides | `get_overrides()` | dict `{overrides,total,truncated,partial,source,by_annotation,by_object_top,by_extension_top,unique_objects,unique_methods,unique_extensions,_meta?}`; `overrides`=отсортированный срез первых 200. При `partial=false` агрегаты полны для выбранного источника; при `true` — нижняя оценка, см. `_meta.failed_extension_roots`. Каждый row несёт `extension_name` (incl. live extension session) |
+| Contract: register movements | `find_register_movements()` | `code_registers`=Posting/CFE-фильтрованные кандидаты list[dict]; main-строки — снимок SQLite и после изменения кода проверяются по живому файлу. При `is_postable=False` строки статические; если хотя бы один CFE `&Вместо` не вызывает напрямую `ПродолжитьВызов`/`ProceedWithCall`, handler-only main rows переходят в `suppressed_main_code_registers` и объясняются в `_meta.cfe_posting_replacement`; `erp_mechanisms`/`manager_tables`/`adapted_registers`=list[str] |
+| Contract: register writers | `find_register_writers()` | `writers` — статические кандидаты, `runtime_filtered=false`: CFE/`Posting=Deny` не применены; forward-helper применяет эти фильтры, свежесть main-строки проверяется по живому файлу |
 | Contract: roles | `find_roles()` | `rights` = list[str] |
 | Contract: doc flow | `analyze_document_flow()` | dict with documented keys |
 | Contract: form attrs | `parse_form()` | attribute key `types` (not `attr_type`) |
@@ -1587,7 +1591,7 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | `find_call_hierarchy(...)` без флага | ключа `triggers` на узлах нет |
 | `find_call_hierarchy(..., include_triggers=True)` | у узлов есть `triggers` (list, может быть пустым) |
 | триггеры для проводимого документа | ≥1 `subscription` и/или `form_event`; на перехваченном методе — `cfe_override` |
-| `get_overrides()` | dict; каждый перехват имеет `extension_name`; `source='index'` (или `'live'` на сессии-расширении) |
+| `get_overrides()` | dict; каждый перехват имеет `extension_name`; `source='index'` (или `'live'` на сессии-расширении); `partial=false` либо явные причины неполноты в `_meta` |
 | `find_path` на связанной паре | `found=True`, `path` непустой, `_meta.precision='exact'` при разрешённых рёбрах |
 | `find_path` на несвязанной паре | `found=False`, `budget_exceeded=False`, нет `error` |
 | `find_path` многозначное имя без hint | `found=False` + `error`/`hint`/`candidates`, `_meta.ambiguous=True` (обход НЕ запущен); с hint нужного конца — нормальный обход |

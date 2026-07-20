@@ -53,6 +53,18 @@ class TestCanonicalize:
         assert canonicalize_type_ref("Catalog.X") == "Catalog.X"
         assert canonicalize_type_ref("DefinedType.Сумма") == "DefinedType.Сумма"
 
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("document.Заказ", "Document.Заказ"),
+            ("DOCUMENT.Заказ", "Document.Заказ"),
+            ("documentobject.Заказ", "Document.Заказ"),
+            ("CFG:catalogref.Контрагенты", "Catalog.Контрагенты"),
+        ],
+    )
+    def test_english_prefixes_are_case_insensitive(self, raw, expected):
+        assert canonicalize_type_ref(raw) == expected
+
     def test_primitive_returns_empty(self):
         assert canonicalize_type_ref("xs:string") == ""
         assert canonicalize_type_ref("String") == ""

@@ -82,6 +82,9 @@ MODULE_TYPE_MAP: dict[str, str] = {
     "ExternalConnectionModule.bsl": "ExternalConnectionModule",
     "ValueManagerModule.bsl": "ValueManagerModule",
 }
+_MODULE_TYPE_MAP_CASEFOLD: dict[str, str] = {
+    name.casefold(): module_type for name, module_type in MODULE_TYPE_MAP.items()
+}
 
 
 def detect_format(base_path: str) -> FormatInfo:
@@ -184,7 +187,7 @@ def parse_bsl_path(file_path: str, base_path: str) -> BslFileInfo:
             # The next part might be the filename itself if it's a form module
             # In EDT style: Forms/MyForm.bsl  -> form_name = "MyForm" (strip extension)
             candidate = parts[forms_index + 1]
-            if candidate.endswith(".bsl"):
+            if candidate.casefold().endswith(".bsl"):
                 form_name = candidate[:-4]
             else:
                 form_name = candidate
@@ -196,14 +199,14 @@ def parse_bsl_path(file_path: str, base_path: str) -> BslFileInfo:
             command_name = parts[commands_index + 1]
         elif commands_index + 1 == len(parts) - 1:
             candidate = parts[commands_index + 1]
-            if candidate.endswith(".bsl"):
+            if candidate.casefold().endswith(".bsl"):
                 command_name = candidate[:-4]
             else:
                 command_name = candidate
 
     # Get filename and look up module type
     filename = parts[-1]
-    module_type = MODULE_TYPE_MAP.get(filename)
+    module_type = _MODULE_TYPE_MAP_CASEFOLD.get(filename.casefold())
 
     # is_form_module: True when this .bsl belongs to a form
     is_form_module = form_name is not None

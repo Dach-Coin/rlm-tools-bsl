@@ -814,7 +814,7 @@ Unified reverse-index всех ссылок объектов метаданны�
 
 **Что ловит** (лёгкий источник-aware regex-слой):
 - `manager` — обращение к менеджеру коллекции `Документы.X` / `Documents.X` (ищется в коде; строки и комментарии сняты через multiline-aware `_scan_module`);
-- `ref_type` — тип в строковом литерале `"ДокументСсылка.X"` (RU) / `"DocumentRef.X"` (EN, через `canonicalize_type_ref`);
+- `ref_type` — тип в строковом литерале `"ДокументСсылка.X"` (RU) / `"DocumentRef.X"` (EN, через `canonicalize_type_ref` в строгом BUILD-режиме). Публичная нормализация принимает регистр-независимые варианты, но BUILD сохраняет прежнее регистрозависимое множество входов до отдельной миграции builder version;
 - `query` — путь метаданных в тексте запроса (строковый литерал) `Документ.X` и `Документ.X.Товары` (3-я группа = имя ТЧ → `member_path`).
 
 **Что НЕ ловит** (осознанно, документировано):
@@ -856,7 +856,7 @@ Unified reverse-index всех ссылок объектов метаданны�
 | `default_object_form`          |           1 190 |           1 190 |
 | `based_on`                     |             631 |             594 |
 
-Поле `line` заполнено для attribute‑level kind (~17–22% от общего числа ссылок) — `find_references_to_object` выдаёт точную позицию `<Name>X</Name>` в XML‑файле для `attribute_type`/`dimension`/`resource`/TS‑attribute. Для object‑level kind (`owner`, `based_on`, формы и т.п.) `line=None` по контракту.
+Поле `line` заполнено для attribute‑level kind (~17–22% от общего числа ссылок) — `find_references_to_object` выдаёт best-effort позицию первого по XML‑файлу `<Name>X</Name>` (CF) / `<name>X</name>` (EDT) для `attribute_type`/`dimension`/`resource`/TS‑attribute. При одноимённых элементах якорь может относиться к более раннему блоку; это не позиция тега типа (`<v8:Type>` в CF / `<types>` в EDT). Для object‑level kind (`owner`, `based_on`, формы и т.п.) `line=None` по контракту.
 
 **Распределение по `source_category` (топ-5 на CF):** Subsystems 30 511, Roles 18 445, ExchangePlans 17 944, Documents 17 808, DefinedTypes 15 035.
 

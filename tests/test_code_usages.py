@@ -70,6 +70,14 @@ class TestExtractor:
         rows = _extract_code_usages(['Т = Тип("DocumentRef.Заказ");'])
         assert ("Document.Заказ", None, "ref_type", 1) in rows
 
+    def test_builder_extraction_keeps_pre_1_28_case_contract(self):
+        """Public canonicalization accepts case variants, persisted BUILD does not widen."""
+        assert canonicalize_type_ref("documentref.Заказ") == "Document.Заказ"
+        exact = _extract_code_usages(['Т = Тип("DocumentRef.Заказ");'])
+        lower = _extract_code_usages(['Т = Тип("documentref.Заказ");'])
+        assert ("Document.Заказ", None, "ref_type", 1) in exact
+        assert ("Document.Заказ", None, "ref_type", 1) not in lower
+
     def test_query_with_tabular_section_member(self):
         rows = _extract_code_usages(['Текст = "ИЗ Документ.ПриобретениеТоваровУслуг.Товары";'])
         assert ("Document.ПриобретениеТоваровУслуг", "Товары", "query", 1) in rows

@@ -37,17 +37,26 @@ def _overrides_for(ctx, per_ext: int):
 # ── Юнит: прямой вызов _extension_strategy (mode-agnostic) ──────────────────
 
 
-def test_default_counts_only_no_per_method_dump(monkeypatch):
+def test_default_pointer_only_no_counters(monkeypatch):
+    """#1 (v1.28.0): по умолчанию (budget==0) ext-блок стратегии — счётчик total +
+    указатель на nearby_extensions, БЕЗ перечня имён/префиксов в заголовке и БЕЗ
+    построчных счётчиков "РасшN: M overrides" (зеркало nearby_extensions[].overrides_count)."""
     monkeypatch.delenv("RLM_EXT_OVERRIDE_DETAIL", raising=False)
     ctx = _ctx_main(14)
     ovr = _overrides_for(ctx, per_ext=90)  # 14*90 = 1260 перехватов
     text = _extension_strategy(ctx, ovr)
 
-    assert "Расш0" in text and "Расш13" in text  # счётчики на каждое
-    assert "90" in text  # число в счётчике
+    # Нет построчных счётчиков "РасшN: M overrides" (зеркало nearby_extensions).
+    assert re.search(r"Расш\d+: \d+ overrides", text) is None
+    # Нет перечня имён/префиксов в заголовке.
+    assert "(prefix:" not in text
     assert "Метод0" not in text  # БЕЗ поимённого дампа
     assert "&Перед(" not in text
-    assert "get_overrides(" in text  # указатель on-demand
+    # Счётчик всех расширений + указатель на структурный источник + on-demand pointer.
+    assert "EXTENSIONS DETECTED" in text
+    assert "14 EXTENSIONS DETECTED" in text  # total в заголовке
+    assert "nearby_extensions" in text
+    assert "get_overrides(" in text
     assert len(text) < 4000, f"ext-блок раздут: {len(text)}"
 
 
@@ -192,7 +201,13 @@ def test_slim_strategy_bounded_with_many_extensions(monkeypatch):
         query="продажи",
     )
     assert "Метод0" not in s
-    assert "Расш13" in s
+    # #1 (v1.28.0): без перечня префиксов и без построчных счётчиков; счётчик total +
+    # указатель на nearby_extensions. Имя расширения может законно всплыть в другой прозе
+    # (detected_prefixes/CUSTOM PREFIXES), поэтому проверяем ПАТТЕРНЫ, а не голое имя.
+    assert re.search(r"Расш\d+: \d+ overrides", s) is None
+    assert "(prefix:" not in s
+    assert "EXTENSIONS DETECTED" in s
+    assert "get_overrides(" in s
     assert "== HELP ==" in s  # slim-маркер на месте
     assert len(s) < 12000, f"slim-стратегия раздута расширениями: {len(s)}"
 
@@ -253,9 +268,10 @@ def test_extension_no_false_marker_at_exact_boundary(monkeypatch):
 # ── Task 1.3: e2e на реальной CF+CFE фикстуре (через _rlm_start) ─────────────
 
 
-def test_e2e_main_with_extension_counts_and_pointer(tmp_path, monkeypatch):
+def test_e2e_main_with_extension_pointer_no_counts(tmp_path, monkeypatch):
     """e2e: реальные CF main + CFE расширение через _rlm_start — расширение
-    детектится, счётчик overrides верный, поимённого дампа нет, есть pointer.
+    детектится, но по умолчанию (#1, v1.28.0) в стратегии ТОЛЬКО счётчик total +
+    указатель на nearby_extensions: ни построчных счётчиков overrides, ни поимённого дампа.
     Fixture перехватывает &После("ОбработкаЗаполнения") и &Вместо("ПередЗаписью")."""
     from test_extension_overrides import _make_main_with_extension
     from rlm_tools_bsl.server import _rlm_start, _rlm_end
@@ -269,7 +285,9 @@ def test_e2e_main_with_extension_counts_and_pointer(tmp_path, monkeypatch):
     try:
         s = resp["strategy"]
         assert "EXTENSIONS DETECTED" in s
-        assert "ТестовоеРасширение: 2 overrides" in s  # счётчик == реальному числу
+        assert "1 EXTENSIONS DETECTED" in s  # total (1 расширение) в заголовке
+        assert "nearby_extensions" in s  # указатель на структурный источник
+        assert re.search(r": \d+ overrides", s) is None  # НЕТ построчных счётчиков
         # Без поимённого дампа по умолчанию. ВАЖНО: сами имена методов
         # (ОбработкаЗаполнения/ПередЗаписью) встречаются в boilerplate-примерах
         # стратегии, поэтому проверяем именно ДАМП-формат &Аннотация("Метод") —

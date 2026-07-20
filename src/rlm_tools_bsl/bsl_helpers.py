@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time as _time_mod
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from rlm_tools_bsl.format_detector import parse_bsl_path, BslFileInfo, FormatInfo
@@ -17,7 +18,12 @@ from rlm_tools_bsl.bsl_knowledge import (
     _normalize_method_params,
     _split_params,
 )
-from rlm_tools_bsl.bsl_index import _make_callee_key, _MOVEMENT_METHOD_NOISE, _scan_module
+from rlm_tools_bsl.bsl_index import (
+    _BSL_GLOBAL_FUNCS_LOWER,
+    _make_callee_key,
+    _MOVEMENT_METHOD_NOISE,
+    _scan_module,
+)
 from rlm_tools_bsl.cache import load_index, save_index
 from rlm_tools_bsl.helpers import _SKIP_DIRS as _GENERIC_SKIP_DIRS
 from rlm_tools_bsl.regex_safety import NESTED_QUANTIFIER_ERROR, has_catastrophic_nesting
@@ -32,6 +38,337 @@ from rlm_tools_bsl.bsl_xml_parsers import (
     parse_functional_option_xml,
     parse_rights_xml,
 )
+
+# Прямое обращение к коллекции движений в ЖИВОМ модуле: ``Движения.<Регистр>``.
+# Lookahead-before-capture отбрасывает вызовы методов самой коллекции
+# (``Движения.Записать()`` и т.п.) — зеркало ``_MOVEMENTS_RE`` в bsl_index (там же и
+# развёрнутое объяснение, почему запрет стоит ДО захвата). Единственная копия на весь
+# модуль: её используют И live-ветка find_register_movements, И перепроверка
+# posting_handler_present — иначе две «почти одинаковые» регулярки разъезжаются.
+_MOVEMENTS_LIVE_RE = re.compile(r"(?:Движения|RegisterRecords)\s*\.\s*(?!\w+\s*\()(\w+)", re.IGNORECASE)
+
+# Объявление обработчика проведения. Ключевые слова — как в BSL_PATTERNS["procedure_def"]:
+# 1С принимает и английский синтаксис (Procedure/Function), и своя «только русская» регулярка
+# дала бы false-negative на валидном модуле. Якорь ^\s* (MULTILINE) + ``\b`` после имени:
+# не путаем с однофамильцем-суффиксом (ОбработкаПроведенияДоп). ``\s+`` покрывает и перенос
+# строки между ключевым словом и именем, и multiline-сигнатуру (имя всегда в одной строке с
+# ключевым словом, продолжение уезжает внутрь скобок).
+_POSTING_HANDLER_DECL_RE = re.compile(
+    r"^\s*(?:Процедура|Функция|Procedure|Function)\s+ОбработкаПроведения\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+# CFE-перехваты проведения живут в том же ObjectModule, но имя процедуры у них произвольное:
+# ``&После("ОбработкаПроведения") Процедура ПослеПроведения(...)``. Само объявление целевого
+# метода поэтому их не покрывает. Эти две регулярки используются только на уже отобранных ТОЧНЫХ
+# ObjectModule документа; аннотацию читаем по сырой строке с якорем (строка-продолжение BSL
+# начинается с ``|``, комментарий — с ``//``), а тело процедуры затем разбираем обычным live-кодом.
+_CFE_POSTING_ANNOTATION_RE = re.compile(
+    r'^\s*&(Перед|После|Вместо|ИзменениеИКонтроль)\s*\(\s*"ОбработкаПроведения"\s*\)',
+    re.IGNORECASE,
+)
+_ANY_PROC_DECL_RE = re.compile(
+    r"^\s*(?:Процедура|Функция|Procedure|Function)\s+(\w+)\b",
+    re.IGNORECASE,
+)
+_CFE_POSTING_REPLACEMENTS = frozenset({"вместо", "изменениеиконтроль"})
+_CONTINUE_MAIN_RE = re.compile(r"\b(ПродолжитьВызов|ProceedWithCall)\s*\(", re.IGNORECASE)
+
+# --- Разбор тела обработчика (v1.28.0 follow-up) --------------------------------------------
+# Классификацию получателя (`X.Метод()` — это общий модуль? переменная? реквизит?) делает СЕРВЕР,
+# а не агент. Причины ровно две, и обе — отказы, а не эстетика:
+#   1) АГЕНТ НЕ МОЖЕТ ПРОЧИТАТЬ МОДУЛЬ, если обработчик уехал в CFE-расширение: путь оттуда
+#      `../<Ext>/...` лежит ВНЕ песочницы, и generic read_file бросает PermissionError
+#      (helpers.py `_resolve_safe`). Сервер читает через `_ext_read_file` — ему можно.
+#   2) АГЕНТ НЕ МОЖЕТ ПОДТВЕРДИТЬ РЕЗУЛЬТАТ: проверка `definitions[0]['category'] == 'CommonModules'`
+#      ТАВТОЛОГИЧНА — `module_hint='ОбщийМодуль.X'` уже добавляет в SQL `mod.category='CommonModules'`
+#      (bsl_index `_normalize_module_hint` + WHERE), поэтому она истинна ПО ПОСТРОЕНИЮ и про
+#      настоящего получателя не говорит НИЧЕГО.
+# У сервера есть и живой текст модуля, и `_index_state`, и индекс реквизитов — то есть ровно то,
+# чем получателя можно РАЗРЕШИТЬ, а не угадать. Агенту уходят факты и только исполнимые шаги.
+# Прямая запись регистра платформой: набор записей ИЛИ менеджер записи. Оба вида называют
+# регистр прямо в строке создания — этого достаточно, чтобы отдать агенту готовый факт.
+_RECORD_SET_RE = re.compile(
+    r"\b(?P<manager>Регистры(?:Накопления|Сведений|Бухгалтерии|Расчета)|"
+    r"(?:Accumulation|Information|Accounting|Calculation)Registers)\s*\.\s*"
+    r"(?P<register>\w+)\s*\.\s*(?:Создать(?:НаборЗаписей|МенеджерЗаписи)|"
+    r"Create(?:RecordSet|RecordManager))",
+    re.IGNORECASE,
+)
+# Получатель — ЦЕПОЧКА из одного или более идентификаторов: `Сервис.М()`, но и
+# `ЭтотОбъект.Реквизит.М()`. Одноидентификаторная версия теряла цепочку свойств ЦЕЛИКОМ —
+# вызов не попадал даже в НЕ ОПОЗНАН, все списки фактов пустели, и hint честно врал
+# «движений не пишет». Хвост после `()` цепочкой НЕ считается (перед стартом цепочки
+# запрещены и `\w`, и `.`): `Запрос.Выполнить().Выбрать()` матчится как Запрос.Выполнить.
+_DOTTED_CALL_RE = re.compile(r"(?<![\w.])(\w+(?:\s*\.\s*\w+)*)\s*\.\s*(\w+)\s*\(", re.UNICODE)
+_DOTLESS_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\(", re.UNICODE)
+_PROC_END_RE = re.compile(
+    r"^\s*(?:КонецПроцедуры|КонецФункции|EndProcedure|EndFunction)\b", re.IGNORECASE | re.MULTILINE
+)
+# Получатели, которые НЕ являются ни модулем, ни переменной пользователя: платформенные
+# пространства имён и сам объект. Их не классифицируем и в делегаты не записываем.
+# NB: «Объект» здесь НЕТ намеренно: в ObjectModule это НЕ предопределённое имя (форменная
+# сущность живёт в модулях форм), а обычная переменная — `Объект = ПолучитьСервис();
+# Объект.ОтразитьДвижения()` содержит настоящего делегата, и глотать его receiver-шумом нельзя.
+_MANAGER_RECEIVER_CATEGORIES = {
+    "документы": "Documents",
+    "справочники": "Catalogs",
+    "перечисления": "Enums",
+    "константы": "Constants",
+    "планывидовхарактеристик": "ChartsOfCharacteristicTypes",
+    "планысчетов": "ChartsOfAccounts",
+    "регистрынакопления": "AccumulationRegisters",
+    "регистрысведений": "InformationRegisters",
+    "регистрыбухгалтерии": "AccountingRegisters",
+    "регистрырасчета": "CalculationRegisters",
+    "documents": "Documents",
+    "catalogs": "Catalogs",
+    "enums": "Enums",
+    "constants": "Constants",
+    "chartsofcharacteristictypes": "ChartsOfCharacteristicTypes",
+    "chartsofaccounts": "ChartsOfAccounts",
+    "accumulationregisters": "AccumulationRegisters",
+    "informationregisters": "InformationRegisters",
+    "accountingregisters": "AccountingRegisters",
+    "calculationregisters": "CalculationRegisters",
+}
+_REGISTER_MANAGER_RECEIVERS = frozenset(
+    {
+        "регистрынакопления",
+        "регистрысведений",
+        "регистрыбухгалтерии",
+        "регистрырасчета",
+        "accumulationregisters",
+        "informationregisters",
+        "accountingregisters",
+        "calculationregisters",
+    }
+)
+_RECEIVER_NOISE = frozenset(
+    {
+        "движения",
+        "этотобъект",
+        "новый",
+        "new",
+        "thisobject",
+    }
+) | frozenset(_MANAGER_RECEIVER_CATEGORIES)
+
+# English aliases of the same platform-global families.  The call-graph curated set
+# historically contains mostly Russian spellings, while BSL permits an English script
+# variant (and even mixing both variants in one module).  Keep this list local to the
+# posting analyzer: broadening the persisted call-graph cleanup is a separate contract.
+_DOTLESS_PLATFORM_GLOBALS_EN_LOWER = frozenset(
+    name.casefold()
+    for name in {
+        # strings
+        "Message",
+        "Format",
+        "NStr",
+        "StrTemplate",
+        "StrFind",
+        "StrReplace",
+        "StrLen",
+        "StrSplit",
+        "StrConcat",
+        "StrLineCount",
+        "StrOccurrenceCount",
+        "StrGetLine",
+        "StrStartsWith",
+        "StrEndsWith",
+        "StrCompare",
+        "Upper",
+        "Lower",
+        "Title",
+        "TrimL",
+        "TrimR",
+        "TrimAll",
+        "Left",
+        "Right",
+        "Mid",
+        "Char",
+        "CharCode",
+        "IsBlankString",
+        # dates
+        "CurrentDate",
+        "SessionDate",
+        "Year",
+        "Month",
+        "Day",
+        "Hour",
+        "Minute",
+        "Second",
+        "WeekDay",
+        "AddMonth",
+        "BegOfYear",
+        "EndOfYear",
+        "BegOfQuarter",
+        "EndOfQuarter",
+        "BegOfMonth",
+        "EndOfMonth",
+        "BegOfDay",
+        "EndOfDay",
+        "BegOfWeek",
+        "EndOfWeek",
+        # math, types and casts
+        "Int",
+        "Round",
+        "Max",
+        "Min",
+        "Abs",
+        "Pow",
+        "Sqrt",
+        "Exp",
+        "TypeOf",
+        "ValueIsFilled",
+        "IsNull",
+        "PredefinedValue",
+        "String",
+        "Number",
+        "Date",
+        "Boolean",
+        "Structure",
+        "Map",
+        "ValueList",
+        "Query",
+        "QuerySchema",
+        "NotifyDescription",
+        "TypeDescription",
+        "StringQualifiers",
+        "NumberQualifiers",
+        "ValueStorage",
+        "Color",
+        # transactions, forms and other common global-context methods
+        "BeginTransaction",
+        "CommitTransaction",
+        "RollbackTransaction",
+        "TransactionActive",
+        "LockDataForEdit",
+        "OpenForm",
+        "GetForm",
+        "FillPropertyValues",
+        "ExecuteNotifyProcessing",
+        "GetFunctionalOption",
+        "ShowQueryBox",
+        "ShowWarning",
+        "ShowUserNotification",
+        "DoQueryBox",
+        "DoMessageBox",
+        "NotifyChanged",
+        "SetPrivilegedMode",
+        "PrivilegedMode",
+        "PutToTempStorage",
+        "GetFromTempStorage",
+        "DeleteFromTempStorage",
+        "ErrorInfo",
+        "Status",
+        "AccessRight",
+        "AttachIdleHandler",
+        "ValueToFormData",
+        "CopyFormData",
+        "FormAttributeToValue",
+        "WriteLogEvent",
+        "Notify",
+        "ClearMessages",
+    }
+)
+
+# Ключевые слова BSL и зарезервированные глобальные функции платформы, которые синтаксически
+# выглядят как вызов без точки. Локальное объявление проверяется ДО этого набора, поэтому
+# одноимённый метод текущего модуля сохраняется. Платформенную часть не дублируем вручную:
+# это курируемый набор call-graph extractor с отдельно исключёнными реальными коллизиями.
+_DOTLESS_NOISE = (
+    frozenset(
+        {
+            "если",
+            "иначеесли",
+            "пока",
+            "для",
+            "возврат",
+            "новый",
+            "сообщить",
+            "тип",
+            "типзнч",
+            "формат",
+            "строка",
+            "число",
+            "дата",
+            "булево",
+            "значениезаполнено",
+            "выполнить",
+            "найти",
+            "и",
+            "или",
+            "не",
+            "вызватьисключение",
+            "and",
+            "or",
+            "not",
+            "raise",
+            "if",
+            "while",
+            "for",
+            "return",
+            "new",
+        }
+    )
+    | _BSL_GLOBAL_FUNCS_LOWER
+    | _DOTLESS_PLATFORM_GLOBALS_EN_LOWER
+)
+# Методы платформы: `НаборЗаписей.Записать()` — это НЕ делегат, а запись уже созданного набора.
+# Без этого списка разбор объявил бы «делегатом» каждый служебный вызов и утопил бы в шуме
+# единственный настоящий. ВНИМАНИЕ: шум применяется ПАРОЙ (вид получателя, метод), а НЕ одним
+# именем метода — экспортный метод общего модуля законно зовётся Записать/Выполнить/Получить
+# (боевой паттерн: `ПроведениеДокументов.Записать(ЭтотОбъект, Отказ)`), и фильтр по одному имени
+# терял бы единственного делегата, а hint заявлял бы «движений не пишет». Шумом эти имена
+# считаются только у НЕ-модульных получателей (переменная/реквизит/неопознанный).
+_DELEGATE_METHOD_NOISE = frozenset(
+    {
+        "записать",
+        "прочитать",
+        "очистить",
+        "добавить",
+        "вставить",
+        "удалить",
+        "выполнить",
+        "установить",
+        "получить",
+        "загрузить",
+        "выгрузить",
+        "найти",
+        "заблокировать",
+        "разблокировать",
+        "количество",
+        "создатьнаборзаписей",
+        "выбрать",
+        "установитьпараметр",
+        "write",
+        "read",
+        "clear",
+        "add",
+        "insert",
+        "delete",
+        "execute",
+    }
+)
+
+
+def _live_code_only(body: str) -> str:
+    """Тело модуля БЕЗ комментариев и строковых литералов (общесистемный ``_scan_module``).
+
+    И «объявление процедуры», и «прямое обращение `Движения.<Регистр>`» — это утверждения про
+    КОД, а не про текст в комментарии или в тексте запроса. Общий парсер методов
+    (``BSL_PATTERNS["procedure_def"]``) применяется через неякорный ``.search()`` к СЫРОЙ строке
+    и потому считает процедурой даже `// Процедура X()`; экстрактор движений в билдере тоже
+    матчит по сырому content. Мы на это НЕ опираемся: обе перепроверки этого хелпера идут по
+    вырезанному коду, поэтому отвечают ровно то, что обещает контракт.
+
+    NB: сквозная слепота билдера к комментариям/строкам (закомментированная процедура попадает
+    в таблицу ``methods``, закомментированное `Движения.X` — в ``register_movements``) — ОТДЕЛЬНЫЙ
+    пре-существующий дефект. Лечится только в билдере, а это бамп BUILDER_VERSION + пересборка
+    индексов, что в этот релиз не входит. Здесь мы лишь не тиражируем его в новый сигнал.
+    """
+    return "\n".join(code for _lineno, code, _strings in _scan_module(body.splitlines()))
+
 
 # Regex metacharacters. A pattern with none of these is a plain literal, so a
 # ``git grep -F`` over it is identical to a Python ``re.search`` — that lets
@@ -343,11 +680,16 @@ def make_bsl_helpers(
 
     _base_path_resolved = Path(base_path).resolve()
     _ext_paths_raw: list[str] = list(extension_paths or [])
+    # Любой сконфигурированный root расширения обязан быть проверен целиком. Если root нельзя
+    # даже разрешить или открыть, пустой набор локаторов означает «не смогли посмотреть», а не
+    # «расширения ничего не добавляют» — live-проверка реквизитов тогда НЕПОЛНАЯ.
+    _ext_metadata_scan_failed: list[bool] = [False]
     _ext_roots_resolved: list[Path] = []
     for ext in _ext_paths_raw:
         try:
             _ext_roots_resolved.append(Path(ext).resolve())
         except OSError:
+            _ext_metadata_scan_failed[0] = True
             continue
 
     # Caches/structures filled during _ensure_index extension pass.
@@ -544,10 +886,12 @@ def make_bsl_helpers(
         except Exception:  # pragma: no cover - defensive
             _iter_metadata_xml_files = None  # type: ignore[assignment]
             _collect_object_synonyms = None  # type: ignore[assignment]
+            _ext_metadata_scan_failed[0] = True
 
         total_ext_files = 0
         for ext_root in _ext_roots_resolved:
             if not ext_root.is_dir():
+                _ext_metadata_scan_failed[0] = True
                 continue
             ext_root_str = str(ext_root)
 
@@ -575,12 +919,23 @@ def make_bsl_helpers(
                     locators = _iter_metadata_xml_files(ext_root_str)
                 except Exception:
                     locators = []
+                    # «Не смогли перечислить» != «нечего перечислять»: молча пустой список
+                    # позволил бы live-проверке реквизитов заявить полноту, которой не было.
+                    _ext_metadata_scan_failed[0] = True
                 for cat, obj_name, rel_to_ext in locators:
                     try:
                         rel_to_base = os.path.relpath(str(ext_root / rel_to_ext), base_path).replace("\\", "/")
                     except ValueError:
+                        # Кросс-дисковое расширение (Windows: база на D:, расширение на E:) —
+                        # relpath невыразим. «Не смогли выразить путь» = «не смогли посмотреть»:
+                        # молча выпавший локатор позволил бы live-проверке реквизитов заявить
+                        # полноту, которой не было (contract extension_paths допускает
+                        # абсолютные пути с любого диска).
+                        _ext_metadata_scan_failed[0] = True
                         continue
                     _extension_metadata_xml.append((cat, obj_name, rel_to_base))
+            else:
+                _ext_metadata_scan_failed[0] = True
 
             # --- Synonyms pass: parity with index for search_objects ---
             if _collect_object_synonyms is not None:
@@ -610,6 +965,57 @@ def make_bsl_helpers(
             _load_main_into_index_state()
             _load_extensions_into_index_state()
             _index_built[0] = True
+
+    # ``_index_state`` may come from an older SQLite build.  Searches advertised as
+    # live must enumerate the current main source tree instead of treating that
+    # snapshot as a file catalog.  The source tree is immutable for the lifetime of
+    # one helper session, so one filesystem pass is both sufficient and deterministic.
+    _live_bsl_catalog: list[tuple[str, BslFileInfo]] = []
+    _live_bsl_catalog_built: list[bool] = [False]
+    _live_bsl_catalog_lock = threading.Lock()
+
+    def _ensure_live_bsl_catalog() -> list[tuple[str, BslFileInfo]]:
+        if _live_bsl_catalog_built[0]:
+            return _live_bsl_catalog
+        with _live_bsl_catalog_lock:
+            if _live_bsl_catalog_built[0]:
+                return _live_bsl_catalog
+            _ensure_index()
+
+            if idx_reader is None:
+                # The non-SQLite index was itself built from the current filesystem.
+                entries = list(_index_state)
+            else:
+                entries = []
+                # Do not use glob_files_fn here: in the production sandbox that helper
+                # is itself index-backed and therefore can expose the same stale module
+                # list we are deliberately bypassing.
+                main_root = Path(base_path).resolve()
+                for dirpath, dirnames, filenames in os.walk(main_root):
+                    dirnames[:] = [
+                        name for name in dirnames if name not in _GENERIC_SKIP_DIRS and not name.startswith(".")
+                    ]
+                    for filename in filenames:
+                        if not filename.lower().endswith(".bsl"):
+                            continue
+                        try:
+                            resolved = (Path(dirpath) / filename).resolve()
+                            resolved.relative_to(main_root)
+                        except (OSError, ValueError):
+                            continue
+                        info = parse_bsl_path(str(resolved), str(main_root))
+                        entries.append((info.relative_path, info))
+                # Extension modules are already enumerated live by the side-load pass;
+                # the direct walk above is intentionally scoped to the main root.
+                entries.extend((rel, info) for rel, info in _index_state if rel in _extension_paths_set)
+
+            unique: dict[str, tuple[str, BslFileInfo]] = {}
+            for rel, info in entries:
+                normalized = rel.replace("\\", "/")
+                unique.setdefault(normalized.casefold(), (normalized, info))
+            _live_bsl_catalog.extend(sorted(unique.values(), key=lambda item: item[0].casefold()))
+            _live_bsl_catalog_built[0] = True
+            return _live_bsl_catalog
 
     # --- Auto-detect custom prefixes from object names ---
     _detected_prefixes: list[str] = []
@@ -833,6 +1239,38 @@ def make_bsl_helpers(
             "recipe": recipe,
         }
 
+    def _find_module_matches(
+        name: str = "",
+        module_type: str = "",
+        category: str = "",
+        max_results: int | None = None,
+        entries: list[tuple[str, BslFileInfo]] | None = None,
+    ) -> list[dict]:
+        """Shared matcher for public ``find_module`` and internally exhaustive scans."""
+        name = _strip_meta_prefix(name)
+        if entries is None:
+            _ensure_index()
+            entries = _index_state
+        name_lower = name.lower()
+        mt_lower = module_type.lower() if module_type else ""
+        cat_lower = category.lower() if category else ""
+        results = []
+        for relative_path, info in entries:
+            matched = False
+            if info.object_name and name_lower in info.object_name.lower():
+                matched = True
+            if not matched and name_lower in relative_path.lower():
+                matched = True
+            if matched and mt_lower and (info.module_type or "").lower() != mt_lower:
+                matched = False
+            if matched and cat_lower and (info.category or "").lower() != cat_lower:
+                matched = False
+            if matched:
+                results.append(_info_to_dict(relative_path, info))
+            if max_results is not None and len(results) >= max_results:
+                break
+        return results
+
     def find_module(name: str = "", module_type: str = "", category: str = "") -> list[dict]:
         """Find BSL modules by name fragment (case-insensitive).
 
@@ -844,28 +1282,7 @@ def make_bsl_helpers(
         ``name`` means "any module", narrowed by the filters and capped at 50.
 
         Returns: list of dicts {path, category, object_name, module_type, form_name}."""
-        name = _strip_meta_prefix(name)
-        _ensure_index()
-        name_lower = name.lower()
-        mt_lower = module_type.lower() if module_type else ""
-        cat_lower = category.lower() if category else ""
-        results = []
-        for relative_path, info in _index_state:
-            matched = False
-            if info.object_name and name_lower in info.object_name.lower():
-                matched = True
-            if not matched and name_lower in relative_path.lower():
-                matched = True
-            # Optional filters applied BEFORE the cap so up to 50 FILTERED rows return.
-            if matched and mt_lower and (info.module_type or "").lower() != mt_lower:
-                matched = False
-            if matched and cat_lower and (info.category or "").lower() != cat_lower:
-                matched = False
-            if matched:
-                results.append(_info_to_dict(relative_path, info))
-            if len(results) >= 50:
-                break
-        return results
+        return _find_module_matches(name, module_type, category, max_results=50)
 
     def find_by_type(meta_type: str, name: str = "") -> list[dict]:
         """Find BSL modules by metadata category, optionally filtered by object name.
@@ -1067,11 +1484,21 @@ def make_bsl_helpers(
         ``params`` — список имён параметров (list[str], v1.18.0)."""
         return [p for p in extract_procedures(path) if p["is_export"]]
 
-    def safe_grep(pattern: str, name_hint: str = "", max_files: int = 20) -> list[dict]:
+    def safe_grep(
+        pattern: str,
+        name_hint: str = "",
+        max_files: int = 20,
+        _result_cap: int | None = None,
+    ) -> list[dict]:
         r"""Parallel grep across BSL files, optionally scoped by module name hint.
 
-        Contract is unchanged: returns ``[{file, line, text}]`` (no sentinel, no
-        result cap — scope is bounded by *max_files* candidates). When the sources
+        Public contract is unchanged: returns ``[{file, line, text}]`` (no sentinel,
+        no result cap — scope is bounded by *max_files* candidates).  Generated
+        internal routes may pass ``_result_cap``; then scanning stops in bounded
+        batches and an early stop is reported by a final
+        ``{"_truncated": True, "shown": N}`` sentinel. ``file`` is always
+        POSIX-separated (``/``), homogeneous across the git/Python/extension branches
+        (#7, v1.28.0). When the sources
         are under git **and** *pattern* is a plain literal, the non-extension
         (base) candidates are searched with a single ``git grep`` call instead of
         a thread-pool of per-file Python greps — the result is identical (literal
@@ -1096,18 +1523,31 @@ def make_bsl_helpers(
         # поэтому полагаться на guard внутри grep_fn нельзя.
         if has_catastrophic_nesting(pattern):
             raise ValueError(NESTED_QUANTIFIER_ERROR)
-        _ensure_index()
+        # Validate the regex up-front too (#5): a syntactically broken pattern (e.g. "(")
+        # used to raise a raw ``re.error`` traceback далеко ниже (после прогрева индекса и
+        # выбора файлов). Compile ЗДЕСЬ — до _ensure_index/find_module — и переиспользуем
+        # ``compiled`` в _grep_one; кривой паттерн даёт чистый ValueError, а не сырой re.error.
+        try:
+            compiled = re.compile(pattern)
+        except re.error as e:
+            raise ValueError(f"Некорректный regex: {e}. Упростите паттерн или используйте литерал/name_hint.") from None
+        live_catalog = _ensure_live_bsl_catalog()
 
         if name_hint:
-            candidates = find_module(name_hint)
+            # Public find_module is intentionally capped at 50. safe_grep has its own
+            # max_files contract, so routing through that public cap made max_files > 50
+            # silently ineffective and could undercount exhaustive internal scans.
+            candidates = _find_module_matches(name_hint, entries=live_catalog)
             paths = [c["path"] for c in candidates[:max_files]]
         else:
-            paths = [relative_path for relative_path, _ in _index_state[:max_files]]
+            paths = [relative_path for relative_path, _ in live_catalog[:max_files]]
 
         if not paths:
             return []
 
+        result_cap = None if _result_cap is None else max(0, int(_result_cap))
         results: list[dict] = []
+        truncated = result_cap == 0
         py_paths: list[str] = list(paths)  # files still needing the Python path
 
         # Fast literal path via git grep over base (non-extension) candidates.
@@ -1122,7 +1562,7 @@ def make_bsl_helpers(
                     literal_files=base_paths,
                     regex=False,
                     mode="lines",
-                    max_results=10**9,  # no cap: scope already bounded by max_files
+                    max_results=result_cap + 1 if result_cap is not None else 10**9,
                     max_per_file=0,  # no per-file cap (parity with Python path)
                     include_truncation_sentinel=False,  # strict [{file,line,text}]
                 )
@@ -1130,9 +1570,17 @@ def make_bsl_helpers(
                     results.extend(git_res)
                     base_set = set(base_paths)
                     py_paths = [p for p in paths if p not in base_set]
+                    if result_cap is not None and len(results) > result_cap:
+                        results = results[:result_cap]
+                        truncated = True
+                        py_paths = []
+                    elif result_cap is not None and len(results) == result_cap and py_paths:
+                        # Reaching the cap with unsearched extension files is a partial
+                        # search even if those files would ultimately add no hits.
+                        truncated = True
+                        py_paths = []
 
-        compiled = re.compile(pattern)
-
+        # ``compiled`` was validated/compiled up-front (before _ensure_index) — reuse it.
         def _grep_one(path: str) -> list[dict]:
             # Base paths: delegate to generic grep (cached, sandbox-checked).
             # Extension paths: read via _ext_read_file (sandbox base-only grep
@@ -1146,24 +1594,51 @@ def make_bsl_helpers(
                 for i, line in enumerate(content.splitlines(), 1):
                     if compiled.search(line):
                         out.append({"file": path, "line": i, "text": line.strip()})
+                        if result_cap is not None and len(out) > result_cap:
+                            break
                 return out
             try:
-                return grep_fn(pattern, path) or []
+                matches = grep_fn(pattern, path) or []
+                return matches[: result_cap + 1] if result_cap is not None else matches
             except Exception:
                 return []
 
-        if len(py_paths) > 1:
+        if not truncated and py_paths:
             from concurrent.futures import ThreadPoolExecutor as _TP
 
-            with _TP(max_workers=min(8, len(py_paths))) as pool:
-                all_results = list(pool.map(_grep_one, py_paths))
-            for batch in all_results:
-                results.extend(batch)
-        elif py_paths:
-            results.extend(_grep_one(py_paths[0]))
+            # Public calls preserve the one-shot behavior.  Capped generated routes
+            # use small batches so a common method does not read the entire tree after
+            # enough candidates have already been collected.
+            path_batch_size = len(py_paths) if result_cap is None else min(64, len(py_paths))
+            for start in range(0, len(py_paths), path_batch_size):
+                path_batch = py_paths[start : start + path_batch_size]
+                if len(path_batch) > 1:
+                    with _TP(max_workers=min(8, len(path_batch))) as pool:
+                        all_results = list(pool.map(_grep_one, path_batch))
+                    for matches in all_results:
+                        results.extend(matches)
+                else:
+                    results.extend(_grep_one(path_batch[0]))
 
+                if result_cap is not None and len(results) >= result_cap:
+                    batch_end = start + len(path_batch)
+                    truncated = len(results) > result_cap or batch_end < len(py_paths)
+                    results = results[:result_cap]
+                    break
+
+        # #7: normalize `file` to POSIX '/' at the single assembly point — covers the
+        # git, Python base-grep and extension branches at once, so a single result set is
+        # homogeneous (helpers.grep directory-walk yields '\' on Windows) and the (file,
+        # line) sort is stable. Convention as in find_roles ('.replace("\\","/")').
+        # COPY, never mutate in place: ``grep_fn`` is normally ``helpers.grep``, which
+        # caches its result list and hands the SAME dicts back on a cache hit — an
+        # in-place rewrite would silently and permanently change what a later direct
+        # ``grep()`` returns in this session (low-level grep contract stays untouched).
+        results = [{**m, "file": str(m["file"]).replace("\\", "/")} if m.get("file") else m for m in results]
         # Deterministic order: sort by (file, line)
         results.sort(key=lambda m: (m.get("file", ""), m.get("line", 0)))
+        if truncated:
+            results.append({"_truncated": True, "shown": len(results)})
         return results
 
     def git_search(
@@ -1207,8 +1682,28 @@ def make_bsl_helpers(
                 search. Applied on top of the positive scope; with no positive
                 scope the exclusion spans the whole tree.
 
-        Returns the hit list, or ``[{"error": ...}]`` if git grep failed / timed
-        out / a filter was malformed (distinct from ``[]`` = nothing found).
+        Returns the hit list, or ``[{"error": ..., "hint": ...}]`` (distinct from ``[]``
+        = nothing found). **Причина НАЗВАНА.** Аргументные ошибки классифицируются здесь и
+        называют виновника: ``mode``, ``pattern`` (NL/NUL; при ``regex=True`` — еще и
+        некомпилируемое выражение), ``path``, ``file_types``, ``exclude_path``. **Но проверить
+        POSIX ERE на стороне Python НЕЛЬЗЯ** (``re`` — надмножество: ``(?=a)``, ``(?P<x>a)``
+        компилируются, а ``git grep -E`` их отвергает), поэтому вердикт по таким выражениям
+        выносит САМ git: ``_git_grep`` отдает причину через ``err``.
+        **Виновника при ``rc>=2`` называет STDERR, а не флаг ``regex``:** тем же ``rc=128`` git
+        отвечает и на битое выражение, и на настоящий отказ (не git-репозиторий, поврежденный
+        индекс). Ошибку компиляции git печатает ЭХОМ паттерна (``fatal: -e option, '(': ...``) —
+        только тогда ответ винит **pattern**. Иначе это ``"git grep failed or timed out"``, и оно
+        остается РОВНО за настоящим отказом git (недоступен / не репозиторий / поврежден /
+        таймаут) при ЛЮБОМ значении ``regex``.
+        Раньше ``_git_grep`` отдавал ``None`` на ВСЕ причины разом, хелпер схлопывал их в одно
+        сообщение — и агент, сломавший СВОЙ аргумент, шел чинить git.
+        Форма ошибки ЕДИНАЯ: ``hint`` есть на КАЖДОМ ошибочном пути, поэтому ``result[0]["hint"]``
+        безопасен. Fallback в hint НЕ равноценен ДВАЖДЫ: ``safe_grep`` ищет только по BSL и без
+        ``name_hint`` ограничен ``max_files`` кандидатами (для не-BSL и широкого поиска hint уводит
+        в ``find_module``/``glob_files`` + ``grep(pattern, конкретный_путь)``), И меняет СЕМАНТИКУ
+        паттерна: ``git_search`` по умолчанию литеральный (``git grep -F``), а ``safe_grep``/``grep``
+        компилируют аргумент как Python-regex — поэтому hint велит экранировать (``re.escape``) и
+        предупреждает про расхождение диалектов POSIX ERE vs Python ``re``.
         """
         # v1.18.0 Фикс 4a: пустой/пробельный паттерн -> внятный [{error, hint}]
         # (list-форма, как и любой результат git_search), а не таймаут-заглушка.
@@ -1222,8 +1717,140 @@ def make_bsl_helpers(
                     ),
                 }
             ]
-        from rlm_tools_bsl.bsl_index import _git_grep
+        from rlm_tools_bsl.bsl_index import (
+            _git_grep,
+            _sanitize_grep_excludes,
+            _sanitize_grep_file_types,
+            _sanitize_grep_path,
+        )
 
+        # РАЗВОДИМ ПРИЧИНЫ. ``_git_grep`` отдаёт None на ВСЁ подряд: битый фильтр
+        # (path/file_types/exclude_path), неподдерживаемый ``mode``, NL/NUL в ``pattern`` — и на
+        # настоящий сбой/таймаут git. Хелпер схлопывал это в "git grep failed or timed out", и
+        # агент, сломавший СВОЙ аргумент, читал ответ как «git сломался» — шёл чинить не то (или
+        # вовсе бросал git_search). Классифицируем КАЖДУЮ аргументную причину ЗДЕСЬ и называем
+        # виновника; только после этого ``res is None`` означает РОВНО отказ git.
+        # Порядок и содержание проверок ОБЯЗАНЫ повторять ранние guard'ы _git_grep
+        # (bsl_index: mode -> pattern -> pathspec) — иначе классификация разъедется с реальностью.
+        _FILTER_HINT = (
+            "ожидается ОТНОСИТЕЛЬНЫЙ литеральный путь внутри конфигурации (напр. "
+            "'CommonModules/ИмяМодуля'); Windows-разделитель '\\' допустим — он нормализуется. "
+            "Отвергаются: rooted/абсолютные пути (\\CommonModules, C:\\...), UNC "
+            "(\\\\server\\...), '..'-сегменты, "
+            "NUL, glob-метасимволы (* ? [ ]) и git pathspec-magic (':/', ':(...)')."
+        )
+        if mode not in ("lines", "files"):
+            return [
+                {
+                    "error": f"некорректный mode={mode!r}",
+                    "hint": "допустимо 'lines' (по умолчанию, отдает {file,line,text}) или 'files' (только {file}).",
+                }
+            ]
+        if "\n" in pattern or "\x00" in pattern:
+            return [
+                {
+                    "error": "pattern содержит перевод строки или NUL",
+                    "hint": (
+                        "git трактовал бы их как НЕСКОЛЬКО -e паттернов (неожиданный OR-поиск) — не "
+                        "поддержано. Ищи по одной строке; для нескольких токенов зови git_search несколько раз."
+                    ),
+                }
+            ]
+        if regex:
+            # БЫСТРАЯ отсечка, а НЕ полная проверка: ловит выражения, битые и в Python, и в ERE
+            # (несбалансированные скобки, nothing to repeat) — без запуска подпроцесса.
+            # ПОЛНОТЫ здесь быть не может: git зовется с -E (POSIX ERE), а Python re — надмножество,
+            # поэтому lookahead (?=a) и именованные группы (?P<x>a) КОМПИЛИРУЮТСЯ здесь, но git их
+            # отвергает (rc=128, "Invalid preceding regular expression"). Такие случаи ловятся ниже
+            # по вердикту САМОГО git (err["kind"]=="rc") — гадать на нашей стороне бессмысленно.
+            # FutureWarning глушим: POSIX-класс [[:space:]] (наша же каноничная рекомендация
+            # поиска объявлений) Python считает «possible nested set», но исполняет паттерн git,
+            # а здесь — только sanity-отсечка; warning на КАЖДЫЙ рекомендованный вызов засорял
+            # бы server.log.
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FutureWarning)
+                    re.compile(pattern)
+            except re.error as exc:
+                return [
+                    {
+                        "error": f"некорректный pattern={pattern!r} (regex=True)",
+                        "hint": (
+                            f"выражение не компилируется: {exc}. git зовется с -E (POSIX ERE) и отвергнет "
+                            "его так же. Экранируй спецсимволы или ищи подстроку буквально: regex=False."
+                        ),
+                    }
+                ]
+        if _sanitize_grep_path(path) is None:
+            return [{"error": f"некорректный path={path!r}", "hint": _FILTER_HINT}]
+        if _sanitize_grep_file_types(file_types) is None:
+            return [
+                {
+                    "error": f"некорректный file_types={file_types!r}",
+                    "hint": "ожидается список расширений без точек и глобов, напр. 'bsl,xml'.",
+                }
+            ]
+        if _sanitize_grep_excludes(exclude_path) is None:
+            return [{"error": f"некорректный exclude_path={exclude_path!r}", "hint": _FILTER_HINT}]
+
+        # ЗАМЕНА неравноценна ДВАЖДЫ, и вторая половина важнее первой. (1) Область поиска:
+        # safe_grep ходит только по BSL. (2) СЕМАНТИКА PATTERN: git_search по умолчанию
+        # ЛИТЕРАЛЬНЫЙ (git grep -F), а safe_grep/grep компилируют аргумент как Python-regex
+        # (helpers.grep: re.compile; safe_grep: то же). Отправить агента с литеральным '(' в
+        # safe_grep — значит отправить его в ValueError, а литеральную '.' тихо превратить в
+        # «любой символ». Молчать об этом нельзя: подсказка на аварийном пути обязана быть
+        # исполнимой, иначе она — второй отказ подряд.
+        # Аварийный совет обязан быть ИСПОЛНИМЫМ ДОСЛОВНО: в свежей песочнице нет ни переменной
+        # `pattern`, ни предзагруженного `re` (модуль лишь РАЗРЕШЕН к import) — совет вида
+        # safe_grep(re.escape(pattern), ...) после настоящего отказа git давал бы NameError,
+        # то есть второй отказ подряд. Поэтому эквивалент готовит СЕРВЕР: он сам экранирует
+        # литеральный паттерн (re.escape) и вставляет РЕЗУЛЬТАТ готовым Python-литералом.
+        # Гигантский паттерн (не наш случай в 99%) раздул бы hint — тогда маршрут с явным import.
+        if len(pattern) <= 300:
+            if regex:
+                _semantics_route = (
+                    f"Эквивалент с ТЕМ ЖЕ выражением (про разницу диалектов — ниже): "
+                    f"safe_grep({pattern!r}, 'ИмяМодуля'); для выбранного не-BSL файла — "
+                    f"grep({pattern!r}, 'конкретный/путь'). "
+                )
+            else:
+                escaped_pattern = re.escape(pattern)
+                _semantics_route = (
+                    f"Готовый эквивалент — экранирование (re.escape) уже применил СЕРВЕР, копируй как "
+                    f"есть, подставив только модуль/путь: safe_grep({escaped_pattern!r}, 'ИмяМодуля'); "
+                    f"для выбранного не-BSL файла — grep({escaped_pattern!r}, 'конкретный/путь'). "
+                )
+        elif regex:
+            # Для regex экранирование НЕ эквивалент, а смена смысла: re.escape превратил бы
+            # выражение в литерал — и совет противоречил бы соседнему «при regex=True
+            # экранировать не надо».
+            _semantics_route = (
+                "Паттерн длинный — перенеси выражение в safe_grep/grep КАК ЕСТЬ, БЕЗ re.escape "
+                "(экранирование превратило бы regex в литерал); для grep сначала выбери конкретный файл; "
+                "про разницу диалектов — ниже. "
+            )
+        else:
+            _semantics_route = (
+                "Паттерн длинный — собери эквивалент сам: import re; p = re.escape('<твой литерал>'); "
+                "safe_grep(p, 'ИмяМодуля'); для выбранного не-BSL файла — grep(p, 'конкретный/путь') "
+                "(модуль re в песочнице разрешен, но НЕ предзагружен — import обязателен). "
+            )
+        _FALLBACK_HINT = (
+            "ЗАМЕНА НЕ РАВНОЦЕННАЯ, и дело не только в области поиска. "
+            "(1) ОБЛАСТЬ: safe_grep ищет ТОЛЬКО по BSL и без name_hint смотрит лишь первые max_files "
+            "кандидатов. Для не-BSL (xml и пр.) или широкого поиска сузь область через "
+            "find_module/glob_files и зови grep с подготовленным ниже паттерном и КОНКРЕТНЫМ путем из их ответа — "
+            "grep по широкому каталогу откажет намеренно. "
+            "(2) СЕМАНТИКА PATTERN: git_search по умолчанию ЛИТЕРАЛЬНЫЙ (git grep -F), а safe_grep и grep "
+            "компилируют аргумент как Python-regex: литеральная '(' у них упадет ошибкой, а '.' станет "
+            f"«любым символом». {_semantics_route}"
+            "При regex=True экранировать не надо, но диалекты РАЗНЫЕ: "
+            "у git POSIX ERE, у замен Python re — lookahead (?=...), (?P<x>...), \\d есть только в Python re."
+        )
+        # err — канал ПРИЧИНЫ (см. _git_grep). Без него «git лежит» и «git отверг ТВОЙ pattern»
+        # неразличимы, и хелперу остается гадать. Гадание и было корнем: битый ERE уезжал в
+        # "git grep failed". Теперь причину называет САМ git.
+        err: dict = {}
         res = _git_grep(
             base_path,
             pattern,
@@ -1235,9 +1862,53 @@ def make_bsl_helpers(
             mode=mode,
             max_results=max_results,
             include_truncation_sentinel=True,
+            err=err,
         )
         if res is None:
-            return [{"error": "git grep failed or timed out"}]
+            # Форма ошибки ЕДИНАЯ ({error, hint}) на ВСЕХ путях — потребитель, которому докстринг
+            # обещал hint, не должен ловить KeyError именно на аварийном.
+            git_msg = ""
+            if err.get("kind") == "rc":
+                # git запустился и САМ сказал, что не так. Его сообщение точнее любой эвристики.
+                lines = [ln for ln in (err.get("stderr") or "").splitlines() if ln.strip()]
+                stderr = err.get("stderr") or ""
+                git_msg = lines[0].strip()[:200] if lines else f"rc={err.get('rc')}"
+                # СУДЬЯ — stderr, а НЕ флаг regex. rc>=2 это не синоним «git отверг твой pattern»:
+                # тем же rc=128 git отвечает на повреждённый индекс, отсутствующий объект и
+                # «not a git repository». Классификация по regex обвинила бы КОРРЕКТНОЕ ERE-выражение
+                # («перепиши») и увела бы настоящий отказ из "git grep failed or timed out" — то есть
+                # воспроизвела бы ровно тот дефект, который этот код чинит (валим вину не на того).
+                # Разводит их сам git: ошибку компиляции выражения он печатает ЭХОМ паттерна
+                # (fatal: -e option, '(': Unmatched ( or \(), а отказ — без него. Проверяем оба
+                # маркера: "-e option" (прямой) и эхо паттерна в кавычках (переживает локализацию git).
+                if "-e option" in stderr or f"'{pattern}'" in stderr:
+                    ere_hint = (
+                        "git ищет по POSIX ERE, а не по синтаксису Python: lookahead (?=...), "
+                        "lookbehind, именованные группы (?P<...>), \\d/\\A/\\Z в нем НЕ "
+                        "поддержаны (re.compile их принимает — потому предварительная проверка "
+                        "их и пропускает). Перепиши выражение в ERE или ищи подстроку "
+                        "буквально: regex=False."
+                    )
+                    return [
+                        {
+                            "error": f"pattern отвергнут git grep -E: {git_msg}",
+                            "hint": ere_hint if regex else f"{git_msg}. {_FALLBACK_HINT}",
+                        }
+                    ]
+            # Сюда попадают ТОЛЬКО настоящие отказы: git недоступен / не git-репозиторий /
+            # повреждён репозиторий / таймаут / не удалось запустить процесс. Аргументы уже
+            # провалидированы выше, а pattern git не оспаривал — значит сообщение честное.
+            return [
+                {
+                    "error": "git grep failed or timed out",
+                    "hint": (
+                        "git недоступен, каталог не под git, репозиторий поврежден или поиск упал по "
+                        "таймауту (git_search работает ТОЛЬКО в git-репозитории)."
+                        + (f" git ответил: {git_msg}." if git_msg else "")
+                        + f" {_FALLBACK_HINT}"
+                    ),
+                }
+            ]
         return res
 
     def _read_procedure_one(
@@ -4087,6 +4758,20 @@ def make_bsl_helpers(
                 "_meta": meta,
             }
 
+        def _profile_movement_pairs(movement_rows: list[dict]) -> list[tuple[str, str]]:
+            """Lossy compact representation, deduplicated after dropping file provenance."""
+            ordered: list[tuple[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            for movement in movement_rows:
+                source = str(movement.get("source", "code"))
+                register_name = str(movement.get("register_name") or "")
+                key = (source.casefold(), register_name.casefold())
+                if key in seen:
+                    continue
+                seen.add(key)
+                ordered.append((source, register_name))
+            return ordered
+
         def _sec_registers() -> dict:
             if not has_index:
                 return _unavailable("no_index")
@@ -4101,11 +4786,116 @@ def make_bsl_helpers(
                     "_meta": {"source": "index", "reason": "not_a_document"},
                 }
             rows = idx_reader.get_register_movements(object_name)
+            # Compact-профиль сохраняет zero-live fast path, когда SQLite уже знает хотя бы
+            # одно прямое code-движение документа. English bridge нужен для устранения ложного
+            # нуля; полный live-union при непустом снимке остается подробному helper.
+            has_indexed_code_movements = rows is not None and any(
+                str(row.get("source") or "code").casefold() == "code" for row in rows
+            )
+            main_alias_movements = [] if has_indexed_code_movements else _live_main_alias_movements(object_name)
+            (
+                cfe_movements,
+                cfe_modules_scanned,
+                cfe_modules_unreadable,
+                cfe_interceptors,
+            ) = _live_extension_movements(object_name)
+            _cfe_active, _cfe_suppressed, cfe_replacement_meta = _apply_cfe_posting_replacement(
+                cfe_movements, cfe_interceptors
+            )
+            live_alias_movements = _merge_movement_rows(main_alias_movements, cfe_movements)
             if rows is None:
-                return _unavailable("capability_missing")
+                # Таблица register_movements пуста ГЛОБАЛЬНО (или отсутствует) — мы НЕ вправе
+                # заявлять code_registers=0 для main. Но точные live-движения CFE — положительный
+                # факт, его нельзя прятать из-за неизвестной полноты main: отдаём известный
+                # lower-bound со status=unavailable + partial-marker. Без CFE сохраняем прежний
+                # unavailable и прикрепляем сигнал обработчика, если он доказан.
+                suppressible_main_rows = (
+                    _main_handler_only_movement_keys(object_name)
+                    if cfe_replacement_meta and not cfe_replacement_meta["main_handler_continuation_visible"]
+                    else set()
+                )
+                live_alias_movements, suppressed_main, cfe_replacement_meta = _apply_cfe_posting_replacement(
+                    live_alias_movements, cfe_interceptors, suppressible_main_rows
+                )
+                if live_alias_movements:
+                    ordered = _profile_movement_pairs(live_alias_movements)
+                    total = len(ordered)
+                    page = ordered[: max(0, int(limit))]
+                    summary = {
+                        "code_registers": total,
+                        "erp_mechanisms": 0,
+                        "manager_tables": 0,
+                        "adapted_registers": 0,
+                    }
+                    suppressed_pairs = _profile_movement_pairs(suppressed_main)
+                    if suppressed_pairs:
+                        summary["main_code_registers_suppressed_by_cfe"] = len(suppressed_pairs)
+                    return {
+                        "status": "unavailable",
+                        "summary": summary,
+                        "items": [{"register": register_name, "source": source} for source, register_name in page],
+                        "total": total,
+                        "returned": len(page),
+                        "has_more": total > len(page),
+                        "_meta": {
+                            "source": "live",
+                            "reason": (
+                                "main_index_capability_missing_and_extension_modules_unreadable"
+                                if cfe_modules_unreadable
+                                else "main_index_capability_missing"
+                            ),
+                            "partial": True,
+                            "extension_modules_scanned": len(cfe_modules_scanned),
+                            **(
+                                {"extension_modules_unreadable": cfe_modules_unreadable}
+                                if cfe_modules_unreadable
+                                else {}
+                            ),
+                            **({"cfe_posting_replacement": cfe_replacement_meta} if cfe_replacement_meta else {}),
+                        },
+                    }
+                sec = _unavailable("capability_missing")
+                suppressed_pairs = _profile_movement_pairs(suppressed_main)
+                if suppressed_pairs:
+                    sec.setdefault("summary", {})["main_code_registers_suppressed_by_cfe"] = len(suppressed_pairs)
+                if cfe_replacement_meta:
+                    sec["_meta"]["cfe_posting_replacement"] = cfe_replacement_meta
+                if cfe_modules_unreadable:
+                    sec["_meta"].update(
+                        {
+                            "reason": "main_index_capability_missing_and_extension_modules_unreadable",
+                            "partial": True,
+                            "extension_modules_scanned": len(cfe_modules_scanned),
+                            "extension_modules_unreadable": cfe_modules_unreadable,
+                        }
+                    )
+                found = _live_posting_signal(object_name, index_prefilter=True)
+                if found:
+                    # Флаг кладём В SUMMARY — там же, где он лежит в нормальной ветке
+                    # (рецепты ведут агента именно в registers.summary; два разных места для
+                    # одного сигнала = он не будет найден). code_registers НЕ добавляем:
+                    # таблицы движений нет, заявлять «0 регистров» мы не вправе.
+                    sec.setdefault("summary", {})["posting_handler_present"] = True
+                    sec["hint"] = _build_posting_hint(
+                        object_name, found[0], found[1], profile=True, interceptors=found[2]
+                    )
+                return sec
+            suppressible_main_rows = (
+                _main_handler_only_movement_keys(object_name)
+                if cfe_replacement_meta and not cfe_replacement_meta["main_handler_continuation_visible"]
+                else set()
+            )
+            rows = _merge_movement_rows(rows, live_alias_movements)
+            rows, suppressed_main, replacement_meta = _apply_cfe_posting_replacement(
+                rows, cfe_interceptors, suppressible_main_rows
+            )
             # items = the ONE main list (all movement targets, code first) so total/returned/
             # has_more are self-consistent; the per-source breakdown lives in summary (R5 #6).
-            ordered = [(mv.get("source", "code"), mv.get("register_name")) for mv in rows]
+            # Helper rows intentionally preserve provenance (main and CFE may both write the
+            # same register and carry different ``file`` values). The compact profile drops
+            # ``file``, however, so such rows would become indistinguishable and inflate its
+            # summary. Collapse only that lossy representation, preserving stable display case.
+            ordered = _profile_movement_pairs(rows)
             by_source: dict[str, list[str]] = {"code": [], "erp_mechanism": [], "manager_table": [], "adapted": []}
             for src, n in ordered:
                 by_source.setdefault(src, []).append(n)
@@ -4115,27 +4905,78 @@ def make_bsl_helpers(
                 "manager_tables": len(by_source["manager_table"]),
                 "adapted_registers": len(by_source["adapted"]),
             }
+            suppressed_pairs = _profile_movement_pairs(suppressed_main)
+            if suppressed_pairs:
+                summary["main_code_registers_suppressed_by_cfe"] = len(suppressed_pairs)
             total = len(ordered)
             page = ordered[: max(0, int(limit))]
             items = [{"register": n, "source": s} for s, n in page]
-            return {
-                "status": "empty" if total == 0 else "ok",
+            section = {
+                "status": "unavailable" if cfe_modules_unreadable else ("empty" if total == 0 else "ok"),
                 "summary": summary,
                 "items": items,
                 "total": total,
                 "returned": len(items),
                 "has_more": total > len(page),
-                "_meta": {"source": "index"},
+                "_meta": {
+                    "source": "mixed" if main_alias_movements or cfe_modules_scanned else "index",
+                    **({"extension_modules_scanned": len(cfe_modules_scanned)} if cfe_modules_scanned else {}),
+                    **(
+                        {
+                            "reason": "extension_modules_unreadable",
+                            "partial": True,
+                            "extension_modules_unreadable": cfe_modules_unreadable,
+                        }
+                        if cfe_modules_unreadable
+                        else {}
+                    ),
+                    **({"cfe_posting_replacement": replacement_meta} if replacement_meta else {}),
+                },
             }
+            # get_object_profile — ДЕФОЛТНЫЙ маршрут агента, а он читает reader напрямую и
+            # нуджа из find_register_movements не видит. Дублируем сигнал сюда, иначе рецепт
+            # «проведение» продолжит уводить в ложный вывод «документ непроводим».
+            # ОБЕ половины сигнала проверяет _live_posting_signal — по ОДНОМУ живому телу и той
+            # же проверкой, что в find_register_movements: доверять индексу нельзя ни в одной
+            # половине (в methods попадает закомментированная процедура, а движения могли
+            # дописать в файл после сборки). Чтение гейтится index-отсевом, поэтому на общем
+            # пути секция файлов не открывает.
+            # Постановку (Posting=Deny) здесь НЕ проверяем и НЕ обещаем: posting живет только в
+            # live-XML, а тянуть его в секцию мы не будем. Это зафиксировано в hint и в docs.
+            if summary["code_registers"] == 0:
+                found = _live_posting_signal(object_name, index_prefilter=True)
+                if found:
+                    summary["posting_handler_present"] = True
+                    section["hint"] = _build_posting_hint(
+                        object_name, found[0], found[1], profile=True, interceptors=found[2]
+                    )
+                elif suppressed_main:
+                    section["hint"] = _replacement_hint(suppressed_main) + _POSTING_PROFILE_TAIL.format(doc=object_name)
+            elif suppressed_main:
+                section["hint"] = _replacement_hint(suppressed_main) + _POSTING_PROFILE_TAIL.format(doc=object_name)
+            return section
 
         def _sec_subscriptions() -> dict:
             if not has_index:
                 return _unavailable("no_index")
             rows = idx_reader.get_event_subscriptions_exact(ref)
+
+            def _sub_summary(rs) -> dict:
+                # #2: split exact vs universal (empty-source catch-all) so the count
+                # matches find_event_subscriptions AND the split is visible to the agent.
+                exact = sum(1 for r in rs if r.get("scope") == "exact")
+                universal = sum(1 for r in rs if r.get("scope") == "universal")
+                return {"subscriptions": len(rs), "exact": exact, "universal": universal}
+
             return _from_reader_list(
                 rows,
-                summary_fn=lambda rs: {"subscriptions": len(rs)},
-                item_fn=lambda r: {"name": r.get("name"), "event": r.get("event"), "handler": r.get("handler")},
+                summary_fn=_sub_summary,
+                item_fn=lambda r: {
+                    "name": r.get("name"),
+                    "event": r.get("event"),
+                    "handler": r.get("handler"),
+                    "scope": r.get("scope"),
+                },
             )
 
         def _sec_roles() -> dict:
@@ -4330,8 +5171,18 @@ def make_bsl_helpers(
         Uses SQLite index when available (instant), falls back to XML parsing.
 
         Args:
-            object_name: Object name to filter by (case-insensitive substring
-                         match against source types). Empty = return all.
+            object_name: Имя объекта. Матчинг EXACT-С-ФОЛБЭКОМ (v1.28.0): сперва точное
+                         совпадение с ИМЕННОЙ частью типа-источника; если точных нет —
+                         подстрочный фолбэк (поиск по фрагменту). Полное имя больше НЕ
+                         цепляет более длинные омонимы (X не тянет XПрисоединенныеФайлы).
+                         С ЯВНЫМ префиксом ('Документ.X') матчинг canonical и category-AWARE
+                         (Document.X и Catalog.X не смешиваются), фолбэка нет. Голое имя —
+                         category-blind. Пустое значение = вернуть все.
+                         Universal-подписки (пустой source_types) включаются всегда.
+                         ПРИ НЕПУСТОМ object_name каждая строка несет scope:
+                         exact | partial | universal (без object_name — прежний компактный
+                         список БЕЗ scope и без source_types).
+                         event_filter применяется ПОСЛЕ классификации.
             custom_only: If True, return only subscriptions whose name starts
                          with a detected custom prefix (auto-detected from codebase).
             event_filter: List of event substrings (case-insensitive) — отбор
@@ -4349,8 +5200,31 @@ def make_bsl_helpers(
             Default (limit is None): list[dict] of subscriptions.
             With limit: dict {"subscriptions": [...], "total": N, "returned": K,
                               "has_more": bool}."""
+        # Явный префикс (Документ./Document./Справочник.) → canonical ref: матчинг станет
+        # category-AWARE и сойдётся с get_object_profile (он всегда ходит по canonical ref).
+        # Голое имя оставляем category-blind — обратная совместимость.
+        object_ref = ""
         if object_name:
-            object_name = _strip_meta_prefix(object_name)
+            from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref as _ctr
+
+            object_name = object_name.strip()  # обе ветки одинаково терпимы к паддингу
+            canon, _forms = _normalize_object_ref(object_name)
+            # ``_ctr(canon)`` — гейт РАСПОЗНАННОСТИ префикса: _normalize_object_ref при неудаче
+            # канонизации отдаёт вход ВЕРБАТИМ, поэтому одной проверки "." мало. Нераспознанный
+            # dotted-ввод ('Последовательность.Партии', 'РегламентноеЗадание.X') стал бы заведомо
+            # несопоставимым object_ref, а у category-aware ветки НЕТ partial-фолбэка — выдача
+            # схлопнулась бы до одних universal. Не распознали → обычный матчинг по имени.
+            canonical_ref = _ctr(canon) if canon else ""
+            if canonical_ref and "." in canonical_ref:
+                # Короткое имя берём из canonical suffix, а НЕ из регистрозависимого
+                # _strip_meta_prefix: "документ.X" канонизируется (casefold), а
+                # _strip_meta_prefix оставил бы префикс на месте. Пустой suffix известного
+                # префикса остается пустым обзором при любом регистре букв.
+                object_name = canonical_ref.split(".", 1)[1]
+                if object_name:
+                    object_ref = canonical_ref
+            else:
+                object_name = _strip_meta_prefix(object_name)
 
         # Normalize event_filter: голая строка → [строка]. Иначе Python итерирует
         # по символам ('BeforeWrite' → ['B','e',...]) и каждый одно-символьный
@@ -4361,7 +5235,9 @@ def make_bsl_helpers(
         # --- Fast path: SQLite index ---
         result: list[dict] | None = None
         if idx_reader is not None:
-            idx_result = idx_reader.get_event_subscriptions(object_name, event_filter=event_filter)
+            idx_result = idx_reader.get_event_subscriptions(
+                object_name, event_filter=event_filter, object_ref=object_ref
+            )
             if idx_result is not None:
                 if custom_only:
                     prefixes = _ensure_prefixes()
@@ -4372,22 +5248,37 @@ def make_bsl_helpers(
         if result is None:
             all_subs = _ensure_event_subscriptions()
 
-            if not object_name:
+            if not object_name and not object_ref:
                 # Return without source_types to keep output compact
                 result = [{k: v for k, v in s.items() if k != "source_types"} for s in all_subs]
             else:
+                # Тот же матчер, что в IndexReader.get_event_subscriptions (см. там развёрнутый
+                # комментарий): exact по именной части (или по canonical ref при явном префиксе),
+                # подстрока — только когда точных нет, universal — всегда. Ветки индекса и live
+                # ОБЯЗАНЫ совпадать: иначе одна конфигурация ответит по-разному до и после сборки
+                # индекса. event_filter (ниже) применяется ПОСЛЕ классификации — как в reader.
+                from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref as _ctr
+
                 name_lower = object_name.lower()
-                result = []
+                ref_lower = object_ref.lower()
+                exact_hits: list[dict] = []
+                partial_hits: list[dict] = []
+                universal: list[dict] = []
                 for s in all_subs:
-                    # Include subscriptions that explicitly list this object in source_types,
-                    # OR subscriptions with empty source_types (source_count=0) — these apply
-                    # to all objects of a given type (catch-all subscriptions).
-                    if not s["source_types"]:
-                        matched = True
-                    else:
-                        matched = any(name_lower in t.lower() for t in s["source_types"])
-                    if matched:
-                        result.append(dict(s))  # include source_types for filtered results
+                    types = s["source_types"]
+                    if not types:
+                        universal.append({**dict(s), "scope": "universal"})
+                        continue
+                    if ref_lower:
+                        if any(t and _ctr(t).lower() == ref_lower for t in types):
+                            exact_hits.append({**dict(s), "scope": "exact"})
+                        continue  # типизированный вход — без partial-фолбэка
+                    names = [(t.split(".", 1)[1] if "." in t else t).lower() for t in types if t]
+                    if any(n == name_lower for n in names):
+                        exact_hits.append({**dict(s), "scope": "exact"})
+                    elif any(name_lower in n for n in names):
+                        partial_hits.append({**dict(s), "scope": "partial"})
+                result = (exact_hits if exact_hits else partial_hits) + universal
 
             if event_filter:
                 evs_lower = [e.lower() for e in event_filter]
@@ -4625,6 +5516,8 @@ def make_bsl_helpers(
                     seen_refs.add(item["ref"])
         return results
 
+    _postable_memo: dict[str, dict] = {}
+
     def _check_document_postable(document_name: str) -> dict:
         """Live read of Document.posting via parse_object_xml.
         Returns {"is_postable": bool, "posting": "Allow|Deny|UseSelectively|None"}
@@ -4632,29 +5525,420 @@ def make_bsl_helpers(
 
         UseSelectively means part of the document types post — НЕ ставим is_postable=False.
         Только Deny → is_postable=False.
-        """
-        try:
-            meta = parse_object_xml(f"Documents/{document_name}")
-        except Exception:
-            return {}
-        if not isinstance(meta, dict) or meta.get("object_type") != "Document":
-            return {}
-        posting = (meta.get("posting") or "").strip()
-        if not posting:
-            return {"posting": None}
-        is_postable = posting.lower() != "deny"
-        return {"posting": posting, "is_postable": is_postable}
 
-    def find_register_movements(document_name: str) -> dict:
+        Результат мемоизирован на сессию: функцию зовут два нуджа подряд
+        (_maybe_add_postability_hint и _maybe_add_posting_handler_hint), а parse_object_xml
+        каждый раз заново парсит XML (кешируется лишь чтение файла). Для документа с пустым
+        code_registers, но непустыми manager_tables — основной кейс — это был бы двойной
+        разбор. Postability документа внутри сессии не меняется.
+        """
+        memo_key = (document_name or "").lower()
+        if memo_key in _postable_memo:
+            return _postable_memo[memo_key]
+
+        def _compute() -> dict | None:
+            """dict — стабильный результат (мемоизируем); None — транзиентный сбой (НЕ мемоизируем)."""
+            try:
+                meta = parse_object_xml(f"Documents/{document_name}")
+            except Exception:
+                # Сбой чтения/разбора XML может быть транзиентным. Закешировав его, мы бы
+                # заглушили postability документа до КОНЦА СЕССИИ (до мемоизации каждый вызов
+                # пробовал заново). Отдаём прежний пустой контракт, но в кеш не кладём.
+                return None
+            if not isinstance(meta, dict) or meta.get("object_type") != "Document":
+                return {}  # стабильный факт: это не документ
+            posting = (meta.get("posting") or "").strip()
+            if not posting:
+                return {"posting": None}
+            is_postable = posting.lower() != "deny"
+            return {"posting": posting, "is_postable": is_postable}
+
+        res = _compute()
+        if res is None:
+            return {}
+        _postable_memo[memo_key] = res
+        return res
+
+    def _extract_live_procedure_code(module_body: str, method_name: str) -> str:
+        """Return one procedure/function from live BSL with comments and strings removed.
+
+        The extractor is deliberately small and shared by the posting analyzer and CFE
+        replacement handling.  Keeping a single implementation matters here: a visible
+        ``ПродолжитьВызов`` must be evaluated in exactly the same lexical body that feeds
+        the agent-facing posting facts, never in comments, strings, or a neighbouring
+        procedure.
+        """
+        code = _live_code_only(module_body or "")
+        decl_re = (
+            _POSTING_HANDLER_DECL_RE
+            if method_name.casefold() == "обработкапроведения"
+            else re.compile(
+                r"^\s*(?:Процедура|Функция|Procedure|Function)\s+" + re.escape(method_name) + r"\b",
+                re.IGNORECASE | re.MULTILINE,
+            )
+        )
+        match = decl_re.search(code)
+        if not match:
+            return ""
+        tail = code[match.start() :]
+        end = _PROC_END_RE.search(tail, 1)
+        return tail[: end.end()] if end else tail
+
+    def _posting_interceptors_for_module(rel_path: str, body: str) -> list[dict]:
+        """Live CFE annotations targeting ``ОбработкаПроведения`` in one exact module."""
+        if rel_path not in _extension_paths_set:
+            return []
+        result: list[dict] = []
+        lines = body.splitlines()
+        for pos, line in enumerate(lines):
+            annotation_match = _CFE_POSTING_ANNOTATION_RE.match(line)
+            if not annotation_match:
+                continue
+            for candidate in lines[pos + 1 :]:
+                stripped = candidate.strip()
+                if not stripped or stripped.startswith("//") or stripped.startswith(("#", "&")):
+                    continue
+                proc_match = _ANY_PROC_DECL_RE.match(candidate)
+                if proc_match:
+                    result.append(
+                        {
+                            "path": rel_path,
+                            "method": proc_match.group(1),
+                            "body": body,
+                            "annotation": annotation_match.group(1),
+                        }
+                    )
+                break
+        return result
+
+    def _has_direct_main_continuation(module_body: str, procedure_code: str) -> bool:
+        """Whether the replacement directly calls the platform continuation primitive.
+
+        A qualified homonym (``Service.ProceedWithCall``) is an ordinary method call, and a
+        module-local declaration shadows the global primitive.  Both must stay false even
+        though the token itself is visible in the exact replacement procedure.
+        """
+        declared_names = {
+            match.group(1).casefold()
+            for line in _live_code_only(module_body or "").splitlines()
+            if (match := _ANY_PROC_DECL_RE.match(line))
+        }
+        for line in (procedure_code or "").splitlines():
+            if _ANY_PROC_DECL_RE.match(line):
+                continue
+            for match in _CONTINUE_MAIN_RE.finditer(line):
+                if line[: match.start()].rstrip().endswith("."):
+                    continue
+                if match.group(1).casefold() in declared_names:
+                    continue
+                return True
+        return False
+
+    def _live_movement_names(code: str) -> set[str]:
+        return {
+            match.group(1).casefold()
+            for match in _MOVEMENTS_LIVE_RE.finditer(code or "")
+            if match.group(1).casefold() not in _MOVEMENT_METHOD_NOISE
+        }
+
+    def _live_main_object_module_paths(document_name: str) -> list[str]:
+        """Exact main ObjectModule paths from the snapshot plus the current CF/EDT tree."""
+        _ensure_index()
+        target = (document_name or "").casefold()
+        candidates = [
+            rel_path
+            for rel_path, info in _index_state
+            if rel_path not in _extension_paths_set
+            and (info.category or "") == "Documents"
+            and info.module_type == "ObjectModule"
+            and (info.object_name or "").casefold() == target
+        ]
+        candidate_keys = {path.replace("\\", "/").casefold() for path in candidates}
+
+        documents_root = _base_path_resolved / "Documents"
+        direct_object_dir = documents_root / document_name
+        object_dirs = [direct_object_dir]
+        try:
+            if not direct_object_dir.is_dir():
+                object_dirs.extend(
+                    child for child in documents_root.iterdir() if child.is_dir() and child.name.casefold() == target
+                )
+        except (OSError, PermissionError):
+            pass
+
+        object_dir_keys: set[str] = set()
+        for object_dir in object_dirs:
+            try:
+                object_dir_key = os.path.normcase(os.path.abspath(str(object_dir.resolve())))
+            except (OSError, PermissionError):
+                continue
+            if object_dir_key in object_dir_keys:
+                continue
+            object_dir_keys.add(object_dir_key)
+            for full_path in (object_dir / "Ext" / "ObjectModule.bsl", object_dir / "ObjectModule.bsl"):
+                try:
+                    full_path = full_path.resolve()
+                    if not full_path.is_file():
+                        continue
+                    rel_path = os.path.relpath(str(full_path), base_path).replace("\\", "/")
+                except (OSError, PermissionError, ValueError):
+                    continue
+                rel_key = rel_path.casefold()
+                if rel_key not in candidate_keys:
+                    candidates.append(rel_path)
+                    candidate_keys.add(rel_key)
+        return candidates
+
+    _live_main_object_body_cache: dict[str, str | None] = {}
+
+    def _live_main_object_module_body(rel_path: str) -> str | None:
+        """Session-stable main ObjectModule body shared by the exact live posting passes."""
+        key = rel_path.replace("\\", "/").casefold()
+        if key not in _live_main_object_body_cache:
+            try:
+                _live_main_object_body_cache[key] = _ext_read_file(rel_path)
+            except Exception:
+                _live_main_object_body_cache[key] = None
+        return _live_main_object_body_cache[key]
+
+    def _main_handler_only_movement_keys(
+        document_name: str,
+        bodies: dict[str, str] | None = None,
+    ) -> set[tuple[str, str]]:
+        """Live-proven ``(file, register)`` rows confined to main posting handlers.
+
+        The SQLite row has module provenance but no procedure provenance because the
+        builder extracts ``Движения.X`` from the whole ObjectModule.  Suppressing every
+        main-file row on ``&Вместо`` would therefore hide helpers that the replacement may
+        call directly.  A row is suppressible only when its live register reference occurs
+        in ``ОбработкаПроведения`` and nowhere else in that main ObjectModule.
+        """
+        suppressible: set[tuple[str, str]] = set()
+        for rel_path in _live_main_object_module_paths(document_name):
+            body = (bodies or {}).get(rel_path)
+            if body is None:
+                body = _live_main_object_module_body(rel_path)
+                if body is None:
+                    continue
+            full_code = _live_code_only(body)
+            handler_code = _extract_live_procedure_code(body, "ОбработкаПроведения")
+            if not handler_code:
+                continue
+            handler_pos = full_code.find(handler_code)
+            if handler_pos < 0:
+                continue
+            outside_code = full_code[:handler_pos] + full_code[handler_pos + len(handler_code) :]
+            handler_only = _live_movement_names(handler_code) - _live_movement_names(outside_code)
+            path_key = rel_path.replace("\\", "/").casefold()
+            suppressible.update((path_key, register_name) for register_name in handler_only)
+        return suppressible
+
+    def _apply_cfe_posting_replacement(
+        movement_rows: list[dict],
+        interceptors: list[dict],
+        suppressible_main_rows: set[tuple[str, str]] | None = None,
+    ) -> tuple[list[dict], list[dict], dict | None]:
+        """Separate main code rows suppressed by a live CFE posting replacement.
+
+        ``&Вместо``/``&ИзменениеИКонтроль`` replace the main handler.  Main-handler rows
+        remain possible only when every replacement body visibly contains the direct
+        platform call ``ПродолжитьВызов`` / ``ProceedWithCall``.  Comments, strings,
+        qualified homonyms and other procedures do not count.
+
+        Returns ``(active_rows, suppressed_main_rows, public_replacement_meta)``.  CFE
+        rows are never removed.  Non-code sources (ERP mechanisms/manager tables) retain
+        their historical contract because this pass has evidence only about ObjectModule
+        code rows.
+        """
+        replacements = [
+            item for item in interceptors if str(item.get("annotation") or "").casefold() in _CFE_POSTING_REPLACEMENTS
+        ]
+        if not replacements:
+            return list(movement_rows), [], None
+
+        public_items: list[dict] = []
+        continuation_visible = True
+        for item in replacements:
+            procedure_code = _extract_live_procedure_code(str(item.get("body") or ""), str(item.get("method") or ""))
+            continues_main = _has_direct_main_continuation(str(item.get("body") or ""), procedure_code)
+            continuation_visible = continuation_visible and continues_main
+            public_items.append(
+                {
+                    "annotation": item.get("annotation") or "",
+                    "method": item.get("method") or "",
+                    "file": item.get("path") or "",
+                    "continues_main": continues_main,
+                }
+            )
+
+        public_meta = {
+            "main_handler_continuation_visible": continuation_visible,
+            "interceptors": public_items,
+        }
+        if continuation_visible:
+            return list(movement_rows), [], public_meta
+
+        active: list[dict] = []
+        suppressed: list[dict] = []
+        for row in movement_rows:
+            source = str(row.get("source") or "code").casefold()
+            path = str(row.get("file") or "")
+            row_key = (
+                path.replace("\\", "/").casefold(),
+                str(row.get("register_name") or row.get("name") or "").casefold(),
+            )
+            if source == "code" and path not in _extension_paths_set and row_key in (suppressible_main_rows or set()):
+                suppressed.append(row)
+            else:
+                active.append(row)
+        return active, suppressed, public_meta
+
+    def _replacement_hint(suppressed_rows: list[dict]) -> str:
+        names = sorted(
+            {
+                str(row.get("register_name") or row.get("name") or "")
+                for row in suppressed_rows
+                if row.get("register_name") or row.get("name")
+            },
+            key=str.casefold,
+        )
+        listed = ", ".join(names)
+        return (
+            "CFE-перехват &Вместо/&ИзменениеИКонтроль заменяет ОбработкаПроведения, а прямой "
+            "ПродолжитьВызов/ProceedWithCall хотя бы в одной точной процедуре замены не найден. Поэтому ссылки main-handler "
+            f"({listed}) не включены в выполняемые code_registers и сохранены отдельно в "
+            "suppressed_main_code_registers как статический снимок. Движения из CFE в "
+            "code_registers остаются действующими кандидатами; при динамическом продолжении "
+            "проверь тело указанного в _meta.cfe_posting_replacement перехвата. "
+        )
+
+    def _live_main_alias_movements(document_name: str) -> list[dict]:
+        """Read-time bridge for English ``RegisterRecords.X`` on old SQLite builds.
+
+        The persisted extractor remains unchanged in 1.28.0, so no builder-version
+        migration is needed. Only the exact main ObjectModule is inspected and only
+        English collection references are added; Russian rows keep their index contract.
+        """
+        rows: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for path in _live_main_object_module_paths(document_name):
+            body = _live_main_object_module_body(path)
+            if body is None:
+                continue
+            code = _live_code_only(body)
+            if not re.search(r"\bRegisterRecords\s*\.", code, re.IGNORECASE):
+                continue
+            for movement in _MOVEMENTS_LIVE_RE.finditer(code):
+                if not movement.group(0).lstrip().casefold().startswith("registerrecords"):
+                    continue
+                register_name = movement.group(1)
+                if register_name.casefold() in _MOVEMENT_METHOD_NOISE:
+                    continue
+                key = (path.replace("\\", "/").casefold(), register_name.casefold())
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"register_name": register_name, "source": "code", "file": path})
+        return rows
+
+    def _live_extension_movements(
+        document_name: str,
+    ) -> tuple[list[dict], list[str], list[str], list[dict]]:
+        """Direct ``Движения.X`` rows from exact CFE ObjectModules, in reader shape.
+
+        The persistent index belongs to the main configuration; nearby extensions are
+        side-loaded into ``_index_state`` only for the live helper session. Consequently
+        an authoritative ``[]`` from ``IndexReader.get_register_movements`` says nothing
+        about CFE modules. Scan only exact extension ObjectModules for the requested
+        document and merge these rows additively with the main-index answer.
+
+        Returns ``(movement_rows, modules_scanned, modules_unreadable, posting_interceptors)``.
+        A path enters
+        ``modules_scanned`` only after a successful read; callers must expose a non-empty
+        ``modules_unreadable`` as partial rather than treating the known rows as complete.
+        Comments and strings are stripped because this is a live read and therefore does
+        not need to inherit the builder's documented raw-regex limitation.
+        """
+        if not _ext_paths_raw:
+            return [], [], [], []
+        _ensure_index()
+        target = (document_name or "").casefold()
+        candidates = sorted(
+            rel_path
+            for rel_path, info in _index_state
+            if rel_path in _extension_paths_set
+            and (info.category or "") == "Documents"
+            and info.module_type == "ObjectModule"
+            and (info.object_name or "").casefold() == target
+        )
+        rows: list[dict] = []
+        scanned: list[str] = []
+        unreadable: list[str] = []
+        posting_interceptors: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for path in candidates:
+            try:
+                raw_body = _ext_read_file(path)
+                code = _live_code_only(raw_body)
+            except Exception:
+                unreadable.append(path)
+                continue
+            scanned.append(path)
+            posting_interceptors.extend(_posting_interceptors_for_module(path, raw_body))
+            for line in code.splitlines():
+                for match in _MOVEMENTS_LIVE_RE.finditer(line):
+                    register_name = match.group(1)
+                    if register_name.casefold() in _MOVEMENT_METHOD_NOISE:
+                        continue
+                    key = (register_name.casefold(), path.replace("\\", "/").casefold())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(
+                        {
+                            "register_name": register_name,
+                            "source": "code",
+                            "file": path,
+                        }
+                    )
+        return rows, scanned, unreadable, posting_interceptors
+
+    def _merge_movement_rows(base_rows: list[dict], extra_rows: list[dict]) -> list[dict]:
+        """Add movement rows without changing the existing reader row semantics/order."""
+        merged = list(base_rows)
+        seen = {
+            (
+                str(row.get("register_name") or "").casefold(),
+                str(row.get("source") or "").casefold(),
+                str(row.get("file") or "").replace("\\", "/").casefold(),
+            )
+            for row in merged
+        }
+        for row in extra_rows:
+            key = (
+                str(row.get("register_name") or "").casefold(),
+                str(row.get("source") or "").casefold(),
+                str(row.get("file") or "").replace("\\", "/").casefold(),
+            )
+            if key not in seen:
+                seen.add(key)
+                merged.append(row)
+        return merged
+
+    def find_register_movements(document_name: str, posting_calls_offset: int = 0) -> dict:
         """Find all registers that a document writes to during posting.
         Searches ObjectModule code for 'Движения.RegisterName' pattern.
 
         Args:
             document_name: Document name (or fragment).
+            posting_calls_offset: Zero-based page offset for compact posting facts
+                                  (record-set names and overflow call names). Detailed
+                                  routes remain capped; use the exact next-page call
+                                  from the hint.
 
-        Returns: dict with document, code_registers, modules_scanned, и при пустом
-                 итоговом результате — is_postable + hint, если документ непроводимый
-                 (Posting=Deny в XML)."""
+        Returns: dict with document, code_registers, modules_scanned. При Posting=Deny
+                 всегда добавляются is_postable=False + hint; найденные статические строки
+                 сохраняются с явной пометкой, что при проведении они недостижимы."""
         document_name = _strip_meta_prefix(document_name)
 
         result: dict
@@ -4662,6 +5946,23 @@ def make_bsl_helpers(
         if idx_reader is not None:
             idx_movements = idx_reader.get_register_movements(document_name)
             if idx_movements is not None:
+                idx_movements = _merge_movement_rows(idx_movements, _live_main_alias_movements(document_name))
+                (
+                    cfe_movements,
+                    cfe_modules_scanned,
+                    cfe_modules_unreadable,
+                    cfe_interceptors,
+                ) = _live_extension_movements(document_name)
+                idx_movements = _merge_movement_rows(idx_movements, cfe_movements)
+                _active, _suppressed, pre_replacement_meta = _apply_cfe_posting_replacement([], cfe_interceptors)
+                suppressible_main_rows = (
+                    _main_handler_only_movement_keys(document_name)
+                    if pre_replacement_meta and not pre_replacement_meta["main_handler_continuation_visible"]
+                    else set()
+                )
+                idx_movements, suppressed_main, replacement_meta = _apply_cfe_posting_replacement(
+                    idx_movements, cfe_interceptors, suppressible_main_rows
+                )
                 result = {
                     "document": document_name,
                     "code_registers": [
@@ -4669,15 +5970,46 @@ def make_bsl_helpers(
                         for m in idx_movements
                         if m["source"] == "code"
                     ],
-                    "modules_scanned": [],
+                    "modules_scanned": cfe_modules_scanned,
                     "erp_mechanisms": [m["register_name"] for m in idx_movements if m["source"] == "erp_mechanism"],
                     "manager_tables": [m["register_name"] for m in idx_movements if m["source"] == "manager_table"],
                     "adapted_registers": [m["register_name"] for m in idx_movements if m["source"] == "adapted"],
                 }
+                if suppressed_main:
+                    result["suppressed_main_code_registers"] = [
+                        {"name": m["register_name"], "source": m["source"], "file": m["file"]} for m in suppressed_main
+                    ]
+                if replacement_meta:
+                    result.setdefault("_meta", {})["cfe_posting_replacement"] = replacement_meta
+                if cfe_modules_unreadable:
+                    result["partial"] = True
+                    result.setdefault("_meta", {}).update(
+                        {
+                            "reason": "extension_modules_unreadable",
+                            "extension_modules_scanned": len(cfe_modules_scanned),
+                            "extension_modules_unreadable": cfe_modules_unreadable,
+                        }
+                    )
                 _maybe_add_postability_hint(result, document_name)
+                _maybe_add_posting_handler_hint(result, document_name, posting_calls_offset)
                 return result
 
-        modules = find_by_type("Documents", document_name)
+        # Exact document identity must win before the historical substring fallback.
+        # ``find_by_type`` caps its fuzzy result at 50, so using it unconditionally can
+        # omit an exact CFE ObjectModule appended after many similarly named main modules
+        # and silently miss a blocking replacement.  The exact branch is uncapped and
+        # includes every main/CFE module; fragments retain the legacy capped lookup.
+        _ensure_index()
+        exact_document_name = document_name.casefold()
+        exact_modules = [
+            _info_to_dict(relative_path, info)
+            for relative_path, info in _index_state
+            if info.category
+            and info.category.casefold() == "documents"
+            and info.object_name
+            and info.object_name.casefold() == exact_document_name
+        ]
+        modules = exact_modules or find_by_type("Documents", document_name)
         obj_modules = [m for m in modules if m.get("module_type") == "ObjectModule"]
 
         if not obj_modules:
@@ -4690,39 +6022,75 @@ def make_bsl_helpers(
             _maybe_add_postability_hint(result, document_name)
             return result
 
-        # Lookahead-before-capture rejects method-calls on the Движения collection
-        # (Движения.Записать()/…) — mirror of _MOVEMENTS_RE in bsl_index (see there).
-        movement_re = re.compile(r"Движения\.(?!\w+\s*\()(\w+)", re.IGNORECASE)
-        code_registers: dict[str, dict] = {}  # name -> {name, lines, file}
+        movement_re = _MOVEMENTS_LIVE_RE
+        # Keep per-file provenance internally.  The legacy no-index response still
+        # collapses duplicate register names below, but replacement semantics must first
+        # be able to remove a main row without accidentally removing the same register
+        # written by CFE.
+        live_code_rows: list[dict] = []
+        live_code_by_origin: dict[tuple[str, str], dict] = {}
+        cfe_interceptors: list[dict] = []
         modules_scanned: list[str] = []
+        extension_modules_scanned: list[str] = []
+        extension_modules_unreadable: list[str] = []
+        object_module_bodies: dict[str, str] = {}
 
         for mod in obj_modules:
             path = mod["path"]
-            modules_scanned.append(path)
             try:
                 content = _ext_read_file(path)
             except Exception:
+                if path in _extension_paths_set:
+                    extension_modules_unreadable.append(path)
                 continue
+            modules_scanned.append(path)
+            object_module_bodies[path] = content
+            if path in _extension_paths_set:
+                extension_modules_scanned.append(path)
+                cfe_interceptors.extend(_posting_interceptors_for_module(path, content))
             for i, line in enumerate(content.splitlines(), 1):
                 for m in movement_re.finditer(line):
                     reg_name = m.group(1)
                     # Belt-and-suspenders alongside the lookahead: skip paren-less stop-set names.
                     if reg_name.lower() in _MOVEMENT_METHOD_NOISE:
                         continue
-                    if reg_name not in code_registers:
-                        code_registers[reg_name] = {
+                    origin_key = (reg_name.casefold(), path.replace("\\", "/").casefold())
+                    if origin_key not in live_code_by_origin:
+                        row = {
                             "name": reg_name,
                             "lines": [],
                             "file": path,
                         }
-                    if i not in code_registers[reg_name]["lines"]:
-                        code_registers[reg_name]["lines"].append(i)
+                        live_code_by_origin[origin_key] = row
+                        live_code_rows.append(row)
+                    if i not in live_code_by_origin[origin_key]["lines"]:
+                        live_code_by_origin[origin_key]["lines"].append(i)
+
+        _active, _suppressed, pre_replacement_meta = _apply_cfe_posting_replacement([], cfe_interceptors)
+        suppressible_main_rows = (
+            _main_handler_only_movement_keys(document_name, object_module_bodies)
+            if pre_replacement_meta and not pre_replacement_meta["main_handler_continuation_visible"]
+            else set()
+        )
+        active_code_rows, suppressed_main, replacement_meta = _apply_cfe_posting_replacement(
+            live_code_rows, cfe_interceptors, suppressible_main_rows
+        )
+        code_registers: dict[str, dict] = {}
+        for row in active_code_rows:
+            # Preserve the historical no-index shape/dedup: one row per display name,
+            # first module wins.  The only new behaviour is that a suppressed main origin
+            # is removed before this collapse, so a same-named CFE origin can survive.
+            code_registers.setdefault(row["name"], row)
 
         result = {
             "document": document_name,
             "code_registers": list(code_registers.values()),
             "modules_scanned": modules_scanned,
         }
+        if suppressed_main:
+            result["suppressed_main_code_registers"] = suppressed_main
+        if replacement_meta:
+            result.setdefault("_meta", {})["cfe_posting_replacement"] = replacement_meta
 
         # ── ERP framework fallback ──────────────────────────────
         # Look for ManagerModule to find ERP-style movement definitions
@@ -4736,7 +6104,11 @@ def make_bsl_helpers(
             try:
                 mgr_content = _ext_read_file(mgr_path)
             except Exception:
+                if mgr_path in _extension_paths_set:
+                    extension_modules_unreadable.append(mgr_path)
                 continue
+            if mgr_path in _extension_paths_set:
+                extension_modules_scanned.append(mgr_path)
 
             # ЗарегистрироватьУчетныеМеханизмы → МеханизмыДокумента.Добавить("X")
             mech_body = read_procedure(mgr_path, "ЗарегистрироватьУчетныеМеханизмы")
@@ -4764,8 +6136,18 @@ def make_bsl_helpers(
         result["erp_mechanisms"] = erp_mechanisms
         result["manager_tables"] = manager_tables
         result["adapted_registers"] = adapted_registers
+        if extension_modules_unreadable:
+            result["partial"] = True
+            result.setdefault("_meta", {}).update(
+                {
+                    "reason": "extension_modules_unreadable",
+                    "extension_modules_scanned": len(extension_modules_scanned),
+                    "extension_modules_unreadable": extension_modules_unreadable,
+                }
+            )
 
         _maybe_add_postability_hint(result, document_name)
+        _maybe_add_posting_handler_hint(result, document_name, posting_calls_offset)
         return result
 
     def _maybe_add_postability_hint(result: dict, document_name: str) -> None:
@@ -4795,15 +6177,1495 @@ def make_bsl_helpers(
                 "регистры сведений с типом источника = документ."
             )
 
+    # РАЗБОР ТЕЛА ДЕЛАЕТ СЕРВЕР, А НЕ АГЕНТ — и это не стилистика, а два подтверждённых отказа.
+    # (1) CFE: обработчик может жить ТОЛЬКО в расширении, и тогда handler_path это '../<Ext>/...'.
+    #     Такой путь ВНЕ песочницы: generic read_file (helpers._resolve_safe) бросает
+    #     PermissionError. Прошлая версия hint велела агенту звать read_file(path) — и на
+    #     делегированном проведении в CFE (ровно тот случай, ради которого сигнал и делался)
+    #     маршрут обрывался исключением. Сервер читает через _ext_read_file — ему можно.
+    # (2) ТАВТОЛОГИЯ: подтверждать делегата проверкой definitions[0]['category'] == 'CommonModules'
+    #     БЕССМЫСЛЕННО: module_hint='ОбщийМодуль.X' уже добавляет в SQL mod.category='CommonModules'
+    #     (bsl_index._normalize_module_hint + WHERE), поэтому проверка истинна ПО ПОСТРОЕНИЮ и про
+    #     настоящего получателя не говорит ничего. Агент, получив тело одноимённого общего модуля,
+    #     считал бы его «подтверждённым» — отказ хуже падения, потому что выглядит как ответ.
+    # У сервера есть живой текст модуля, _index_state (какие общие модули существуют) и индекс
+    # реквизитов — то есть средства РАЗРЕШИТЬ получателя, а не гадать о нём. Поэтому в hint уходят
+    # ФАКТЫ («получатель X — реквизит документа, а не общий модуль») и только те шаги, которые в
+    # песочнице действительно исполнимы (read_procedure / find_definition / git_search — ext-safe).
+    # Разбор — BEST-EFFORT по телу обработчика: вложенные вызовы он не раскручивает. Но он не врёт:
+    # чего не смог разрешить, то помечает «НЕ ОПОЗНАН».
+    _POSTING_PREAMBLE = (
+        "У документа есть ОбработкаПроведения, но выполняемых обращений "
+        "`Движения.<Регистр>`/`RegisterRecords.<Register>` в ObjectModule не найдено. "
+        "Это НЕ означает «документ непроводимый»: движения МОГУТ писаться не через коллекцию Движения "
+        "(делегированы в общие модули или записаны наборами записей — типовой паттерн БГУ/ERP), "
+        "а могут и отсутствовать вовсе — по этим данным не доказано ни то, ни другое. "
+    )
+    _POSTING_TAIL = (
+        "КОГДА ТЕЛО ПИШУЩЕГО МЕТОДА НАЙДЕНО: увидел прямые `Движения.<Регистр>` -> "
+        "find_register_writers('ИмяРегистра') покажет статические reverse-кандидаты. "
+        "find_register_movements(document) применяет Posting/CFE, но main code_registers берет из снимка "
+        "индекса: для измененного после build main-модуля проверь живое тело найденного пути. Увидел НАБОР ЗАПИСЕЙ "
+        "(Регистры<Тип>.X.СоздатьНаборЗаписей() — любого вида: Накопления/Сведений/Бухгалтерии/Расчета) -> "
+        "find_register_writers ИХ НЕ НАЙДЕТ (он ищет только прямые Движения.X в ObjectModule документов): "
+        "ищи имя регистра через git_search (он идет по ВСЕМУ дереву и любым типам файлов). "
+        "РАЗБОР ТЕЛА ВЫШЕ СДЕЛАН СЕРВЕРОМ по живому модулю (комментарии и строковые литералы вырезаны) и он "
+        "BEST-EFFORT: смотрит ТОЛЬКО тело обработчика и не раскручивает вложенные вызовы. Что не удалось "
+        "разрешить — помечено «НЕ ОПОЗНАН», а не выдано за факт. "
+        "Движения через find_call_hierarchy НА САМОМ обработчике не ищи: вызов от ПЛАТФОРМЫ в граф "
+        "вызовов не попадает, поэтому callers=0 — это норма, а НЕ мертвый код. Обработчики по имени "
+        "хелпер не исключает: ЯВНЫЙ вызов ОбработкаПроведения(...) из BSL, если он есть, он покажет — "
+        "просто движений этим не найти. Трассируй им ДЕЛЕГАТА, а не обработчик."
+    )
+    _POSTING_PROFILE_TAIL = (
+        " Постановку (Posting=Deny -> движений нет В ПРИНЦИПЕ) эта секция НЕ проверяет: поля posting "
+        "в индексе нет, а live-чтение XML нарушило бы дешевый контракт профиля. Нужна постановка -> "
+        "find_register_movements('{doc}') (там is_postable). "
+        "Сам обработчик подтвержден по ЖИВОМУ модулю (не по таблице methods), поэтому ЛОЖНЫМ этот "
+        "сигнал не бывает. Но КАНДИДАТА профиль ищет по индексу и чужих модулей не открывает: если "
+        "индекс устарел и метода в нем еще нет, профиль ПРОМОЛЧИТ (промолчит, но не соврет). "
+        "Сомневаешься -> find_register_movements('{doc}'): он читает модули напрямую."
+    )
+    _KIND_LABEL = {
+        "common_module": "ОБЩИЙ МОДУЛЬ",
+        "manager_module": "ЭКСПОРТНЫЙ МЕТОД МОДУЛЯ МЕНЕДЖЕРА",
+        "manager_unverified": "MANAGER-ВЫЗОВ, ПОЛЬЗОВАТЕЛЬСКИЙ ЭКСПОРТ НЕ ПОДТВЕРЖДЕН",
+        "variable": "ПЕРЕМЕННАЯ (или параметр) ЭТОГО модуля",
+        "attribute": "РЕКВИЗИТ ДОКУМЕНТА",
+        "shadow_risk": "ОБЩИЙ МОДУЛЬ С ТАКИМ ИМЕНЕМ ЕСТЬ, НО ВОЗМОЖНО ЗАТЕНЕН ПЕРЕМЕННОЙ",
+        "module_unverified": "ОБЩИЙ МОДУЛЬ С ТАКИМ ИМЕНЕМ ЕСТЬ, НО РЕКВИЗИТЫ ДОКУМЕНТА НЕ ПРОВЕРЕНЫ",
+        "unknown": "НЕ ОПОЗНАН",
+    }
+
+    def _analyze_posting_handler(
+        document_name: str,
+        handler_path: str,
+        module_body: str,
+        *,
+        live_attributes: bool = False,
+        live_manager_modules: bool = True,
+        entry_method: str = "ОбработкаПроведения",
+    ) -> dict:
+        """Факты о теле обработчика: наборы записей, делегаты и КЕМ является получатель слева от точки.
+
+        Получателя РАЗРЕШАЕМ, а не угадываем, и приоритет — как в самом BSL: переменная/параметр
+        затеняет всё (имя переменной перекрывает одноимённый общий модуль), затем реквизит документа,
+        и только потом общий модуль — и лишь если такой в конфигурации ДЕЙСТВИТЕЛЬНО есть. Иначе
+        честное «НЕ ОПОЗНАН»: молчание лучше уверенной лжи.
+
+        Читаем по коду с ВЫРЕЗАННЫМИ комментариями и строками (_live_code_only), поэтому
+        `// СервисПроведения = ...` больше не выставляет ложный признак переменной, а
+        закомментированный вызов не рождает делегата.
+        """
+        code = _live_code_only(module_body or "")
+        handler_code = _extract_live_procedure_code(module_body or "", entry_method)
+        params: set[str] = set()
+        if handler_code:
+            # Сигнатура BSL законно продолжается на следующих строках. Разбираем её тем же
+            # штатным merger/parser, что extract_procedures: чтение только первой физической
+            # строки теряло параметры-продолжения и позволяло одноимённому общему модулю
+            # ошибочно победить параметр в правилах затенения.
+            merged_decl, _line_map = _merge_proc_continuations(handler_code.splitlines())
+            if merged_decl:
+                decl_match = re.compile(BSL_PATTERNS["procedure_def"], re.IGNORECASE).search(merged_decl[0])
+                if decl_match:
+                    params.update(name.casefold() for name in _split_params(decl_match.group(3) or ""))
+
+        # СОЗДАНИЕ набора/менеджера — еще НЕ запись: СоздатьНаборЗаписей()/СоздатьМенеджерЗаписи()
+        # регистр не трогают до вызова Записать() (`Набор.Прочитать()` — чтение). Поэтому статус
+        # раздваивается: «записан» — по результату фабрики виден Записать()/Write() (цепочкой сразу
+        # за фабрикой либо на переменной, куда фабрика присвоена в позиции оператора); «создан без
+        # видимой записи» — иначе. Записать() по переменной ищется ТОЛЬКО на участке от фабрики до
+        # СЛЕДУЮЩЕГО присваивания той же переменной: имя переиспользуется законно (`Набор = ...А...;
+        # Набор.Записать(); Набор = ...Б...; Набор.Прочитать();`), и поиск по всему телу приписал бы
+        # раннюю запись А еще и регистру Б. Ветвления НЕ анализируем (это dataflow, регэкспам он не
+        # по зубам) — сомнительный случай безопасно понижается до «создан, запись не видна».
+        # Прежняя версия объявляла ЗАПИСЬЮ само создание — ложь на каждом чтении набора.
+        rs_written: dict[str, bool] = {}
+        for m_rs in _RECORD_SET_RE.finditer(handler_code):
+            item = f"{m_rs.group('manager')}.{m_rs.group('register')}"
+            written = bool(
+                re.match(
+                    r"\s*\([^()]*\)\s*\.\s*(?:Записать|Write)\s*\(",
+                    handler_code[m_rs.end() :],
+                    re.IGNORECASE,
+                )
+            )
+            if not written:
+                stmt_prefix = re.split(r"[;\n]", handler_code[: m_rs.start()])[-1]
+                am = re.search(
+                    r"(?:^|\bТогда\b|\bИначе\b|\bЦикл\b|\bThen\b|\bElse\b|\bDo\b)\s*(\w+)\s*=\s*\Z",
+                    stmt_prefix,
+                    re.IGNORECASE,
+                )
+                if am:
+                    var_esc = re.escape(am.group(1))
+                    region = handler_code[m_rs.end() :]
+                    next_assign = re.search(
+                        rf"(?:^|[;\n]|\bТогда\b|\bИначе\b|\bЦикл\b|\bThen\b|\bElse\b|\bDo\b)\s*{var_esc}\s*=(?!=)",
+                        region,
+                        re.IGNORECASE,
+                    )
+                    if next_assign:
+                        region = region[: next_assign.start()]
+                    if re.search(rf"\b{var_esc}\s*\.\s*(?:Записать|Write)\s*\(", region, re.IGNORECASE):
+                        written = True
+            rs_written[item] = rs_written.get(item, False) or written
+        record_sets = [k for k, v in rs_written.items() if v]
+        record_sets_created = [k for k, v in rs_written.items() if not v]
+
+        # Локальные методы берём ИЗ УЖЕ ПРОЧИТАННОГО кода, а не через _parse_procedures: тот
+        # открыл бы модуль ВТОРОЙ раз (_ext_read_file → read_file_fn), и секция registers профиля
+        # перестала бы держать своё обещание «открываю не больше одного модуля-кандидата».
+        # Комментарии здесь уже вырезаны, поэтому закомментированная процедура в набор не попадёт
+        # (в отличие от таблицы methods, куда билдер её кладёт).
+        local_methods = {
+            name.casefold()
+            for name in re.findall(
+                r"^\s*(?:Процедура|Функция|Procedure|Function)\s+(\w+)", code, re.IGNORECASE | re.MULTILINE
+            )
+        }
+
+        indexed_common_module_paths: dict[str, list[str]] = {}
+        manager_module_paths: dict[tuple[str, str], list[str]] = {}
+        for rel, info in _index_state:
+            object_key = (info.object_name or "").casefold()
+            if not object_key:
+                continue
+            if (info.category or "") == "CommonModules":
+                indexed_common_module_paths.setdefault(object_key, []).append(rel)
+            if info.module_type == "ManagerModule" and info.category:
+                manager_module_paths.setdefault((info.category, object_key), []).append(rel)
+
+        # `_index_state` при idx_reader — снимок SQLite и может помнить уже удалённый модуль.
+        # Проверяем живьём только имена, реально встретившиеся слева от точки; полный обход всех
+        # общих модулей превратил бы точечный posting-hint в дорогой прогрев конфигурации.
+        live_module_cache: dict[str, str | None] = {}
+        live_common_cache: dict[str, tuple[list[str], bool]] = {}
+
+        def _live_module_text(rel_path: str) -> str | None:
+            if rel_path not in live_module_cache:
+                try:
+                    live_module_cache[rel_path] = _ext_read_file(rel_path)
+                except Exception:
+                    live_module_cache[rel_path] = None
+            return live_module_cache[rel_path]
+
+        def _live_module_exists(rel_path: str) -> bool:
+            # Для факта существования достаточно live-ФС. Не открываем каждый встреченный общий
+            # модуль целиком: профиль держит отдельный бюджет чтений, а содержимое здесь не нужно.
+            try:
+                return _ext_resolve_safe(rel_path).is_file()
+            except Exception:
+                return False
+
+        def _live_common_modules(name: str) -> tuple[list[str], bool]:
+            """(живые пути, был ли такой модуль в снимке)."""
+            key = name.casefold()
+            if key not in live_common_cache:
+                indexed_paths = indexed_common_module_paths.get(key, [])
+                candidates = list(indexed_paths)
+                candidate_keys: set[str] = set()
+                for path in candidates:
+                    try:
+                        candidate_keys.add(os.path.normcase(os.path.abspath(str(_ext_resolve_safe(path)))))
+                    except (OSError, PermissionError):
+                        pass
+                # SQLite и lazy-index — снимки. Для получателя с уже известным точным
+                # именем проверяем только два штатных CF/EDT-пути в main и configured CFE:
+                # новый CommonModule после build должен классифицироваться по живому файлу.
+                for root in (_base_path_resolved, *_ext_roots_resolved):
+                    common_root = root / "CommonModules"
+                    direct_object_dir = common_root / name
+                    object_dirs = [direct_object_dir]
+                    try:
+                        # На Windows и при точном регистре это O(1). Перечень соседей нужен
+                        # только на регистрозависимой ФС, когда BSL-получатель написан иначе.
+                        if not direct_object_dir.is_dir():
+                            object_dirs.extend(
+                                child
+                                for child in common_root.iterdir()
+                                if child.is_dir() and child.name.casefold() == key
+                            )
+                    except (OSError, PermissionError):
+                        pass
+                    object_dir_keys: set[str] = set()
+                    for object_dir in object_dirs:
+                        try:
+                            object_dir_key = os.path.normcase(os.path.abspath(str(object_dir.resolve())))
+                        except (OSError, PermissionError):
+                            continue
+                        if object_dir_key in object_dir_keys:
+                            continue
+                        object_dir_keys.add(object_dir_key)
+                        module_paths = (object_dir / "Ext" / "Module.bsl", object_dir / "Module.bsl")
+                        for full_path in module_paths:
+                            try:
+                                full_path = full_path.resolve()
+                                full_key = os.path.normcase(os.path.abspath(str(full_path)))
+                                if full_key in candidate_keys or not full_path.is_file():
+                                    continue
+                                rel_path = os.path.relpath(str(full_path), base_path).replace("\\", "/")
+                            except (OSError, PermissionError, ValueError):
+                                continue
+                            candidates.append(rel_path)
+                            candidate_keys.add(full_key)
+                live_common_cache[key] = (
+                    [path for path in candidates if _live_module_exists(path)],
+                    bool(indexed_paths),
+                )
+            return live_common_cache[key]
+
+        manager_export_cache: dict[tuple[str, str], tuple[str | None, bool]] = {}
+        manager_exports_cache: dict[str, set[str] | None] = {}
+
+        def _manager_exports(rel_path: str) -> set[str] | None:
+            """Живые export-имена ManagerModule; None означает, что файл проверить не удалось."""
+            if rel_path not in manager_exports_cache:
+                text = _live_module_text(rel_path)
+                if text is None:
+                    manager_exports_cache[rel_path] = None
+                else:
+                    exports: set[str] = set()
+                    merged_lines, _line_map = _merge_proc_continuations(_live_code_only(text).splitlines())
+                    proc_re = re.compile(BSL_PATTERNS["procedure_def"], re.IGNORECASE)
+                    for merged_line in merged_lines:
+                        proc_match = proc_re.search(merged_line)
+                        if proc_match and proc_match.group(4) and proc_match.group(4).strip():
+                            exports.add(proc_match.group(2).casefold())
+                    manager_exports_cache[rel_path] = exports
+            return manager_exports_cache[rel_path]
+
+        def _manager_export_path(receiver: str, method: str) -> tuple[str | None, bool]:
+            """``(живой ManagerModule, проверка полна)`` для manager-вызова.
+
+            Само пространство менеджеров шумом не является: рядом с платформенным
+            `Документы.X.НайтиПоНомеру()` законно живёт `Документы.X.МойЭкспорт()` из
+            ManagerModule. Отличаем их по объявлению, а не по ненадёжному списку имён.
+
+            SQLite и lazy extension-index — снимки: новый ManagerModule может появиться после
+            их сборки. Поэтому точечно проверяем два штатных live-пути (CF/EDT) в основной
+            конфигурации и в КАЖДОМ уже сконфигурированном соседнем extension-root, не делая
+            широкого glob. ``complete=False`` запрещает считать вызов платформенным: так бывает
+            в compact-профиле (чужие ManagerModule он намеренно не открывает) либо при ошибке
+            проверки/чтения живого кандидата.
+            """
+            if not live_manager_modules:
+                return None, False
+            cache_key = (receiver.casefold(), method.casefold())
+            if cache_key in manager_export_cache:
+                return manager_export_cache[cache_key]
+            parts = receiver.split(".")
+            if len(parts) != 2:
+                manager_export_cache[cache_key] = (None, False)
+                return manager_export_cache[cache_key]
+            category = _MANAGER_RECEIVER_CATEGORIES.get(parts[0].casefold())
+            if category is None:
+                manager_export_cache[cache_key] = (None, False)
+                return manager_export_cache[cache_key]
+
+            complete = len(_ext_roots_resolved) == len(_ext_paths_raw)
+            candidates = list(manager_module_paths.get((category, parts[1].casefold()), []))
+            candidate_keys: set[str] = set()
+            for path in candidates:
+                try:
+                    candidate_keys.add(os.path.normcase(os.path.abspath(str(_ext_resolve_safe(path)))))
+                except (OSError, PermissionError):
+                    # Stale indexed path всё равно оставляем кандидатом: _manager_exports ниже
+                    # вернёт None. Здесь лишь не даём dedup-проверке превратить его в исключение.
+                    complete = False
+            # Ни main, ни соседние roots расширений после build широко не glob'им. Их точные
+            # объектные пути детерминированы форматом дампа и безопасны: category из фиксированной
+            # карты, имя объекта — BSL-идентификатор из разобранного вызова.
+            for root in (_base_path_resolved, *_ext_roots_resolved):
+                try:
+                    if not root.is_dir():
+                        complete = False
+                        continue
+                    for suffix in (
+                        Path(category) / parts[1] / "Ext" / "ManagerModule.bsl",
+                        Path(category) / parts[1] / "ManagerModule.bsl",
+                    ):
+                        full_path = (root / suffix).resolve()
+                        full_key = os.path.normcase(os.path.abspath(str(full_path)))
+                        if full_key in candidate_keys or not full_path.is_file():
+                            continue
+                        try:
+                            rel_path = os.path.relpath(str(full_path), base_path).replace("\\", "/")
+                        except ValueError:
+                            # Штатная топология — соседние исходники на одном диске. Не изобретаем
+                            # для manager-probe отдельную абсолютную адресацию: необычный root
+                            # лишь делает проверку неполной и не позволяет проглотить вызов.
+                            complete = False
+                            continue
+                        candidates.append(rel_path)
+                        candidate_keys.add(full_key)
+                except (OSError, PermissionError):
+                    # Невозможность проверить точный configured-root — не доказательство платформы.
+                    complete = False
+
+            for rel_path in candidates:
+                exports = _manager_exports(rel_path)
+                if exports is None:
+                    complete = False
+                    continue
+                if method.casefold() in exports:
+                    manager_export_cache[cache_key] = (rel_path, True)
+                    return manager_export_cache[cache_key]
+            manager_export_cache[cache_key] = (None, complete)
+            return manager_export_cache[cache_key]
+
+        # РЕКВИЗИТЫ: без них получателя НЕ разрешить (реквизит затеняет одноимённый общий модуль).
+        # attrs_source называет ИСТОЧНИК проверки — 'live' | 'live_partial' | 'index' | 'none' — и
+        # уходит в hint: факт стоит ровно столько, сколько стоит его проверка. В `attributes`
+        # попадают ТОЛЬКО имена из ЖИВОГО XML — имена из индекса НЕ подмешиваются: снимок может
+        # и отставать от XML (реквизит добавлен после сборки), и ОПЕРЕЖАТЬ его (реквизит УДАЛЁН
+        # из XML без пересборки). Смешанный набор выдавал удалённый реквизит за live-факт
+        # «РЕКВИЗИТ ДОКУМЕНТА» и уводил от настоящего модуля-делегата. Поэтому index-позитив не
+        # порождает НИКАКОГО факта — от индекса остаётся лишь attrs_source='index' как честная
+        # ПРИЧИНА развилки; профиль (live-чтение запрещено контрактом) на любом получателе даёт
+        # развилку либо НЕ ОПОЗНАН, а сильные утверждения остаются live-маршруту хелпера.
+        attributes: set[str] = set()
+        attrs_source = "none"
+        if idx_reader is not None:
+            try:
+                rows = idx_reader.get_object_attributes(object_name=document_name, category="Documents")
+            except Exception:
+                rows = None
+            if rows is not None:
+                attrs_source = "index"
+        if live_attributes:
+
+            def _collect_attrs(meta: dict) -> None:
+                for a in meta.get("attributes") or []:
+                    nm = (a.get("name") or a.get("attr_name") or "") if isinstance(a, dict) else ""
+                    if nm:
+                        attributes.add(str(nm).casefold())
+                for ts in meta.get("tabular_sections") or []:
+                    nm = (ts.get("name") or "") if isinstance(ts, dict) else ""
+                    if nm:
+                        attributes.add(str(nm).casefold())
+
+            try:
+                meta = parse_object_xml(f"Documents/{document_name}") or {}
+            except Exception:
+                meta = {}
+            main_live_ok = isinstance(meta, dict) and bool(meta)
+            if main_live_ok:
+                _collect_attrs(meta)
+            ext_live_complete = not _ext_metadata_scan_failed[0]
+            # Реквизит, добавленный РАСШИРЕНИЕМ, живет только в его метаданных — ни индекс
+            # (main-only), ни основной XML его не видят. Локаторы берем у ШТАТНОГО обходчика
+            # (_iter_metadata_xml_files -> _extension_metadata_xml): он знает ВСЕ поддержанные
+            # диалекты дампа (sibling Documents/X.xml, EDT Documents/X/X.mdo, CF Ext/Document.xml)
+            # — захардкоженный путь видел лишь один из них, и реквизит EDT-расширения молча
+            # пропадал. А парсим САМ файл расширения по локатору: _resolve_object_xml здесь НЕ
+            # годится — для adopted-объекта (расширение меняет существующий документ) он вернул
+            # бы XML ОСНОВНОЙ конфигурации, и добавленный реквизит потерялся бы снова (по той же
+            # причине не подходит кеш _live_attributes_in_extensions — он построен на резолвере).
+            for _cat, _obj, _rel in _extension_metadata_xml:
+                if _cat.casefold() != "documents" or (_obj or "").casefold() != document_name.casefold():
+                    continue
+                try:
+                    _meta_ext = parse_metadata_xml(_ext_read_file(_rel))
+                except Exception:
+                    _meta_ext = None
+                if isinstance(_meta_ext, dict) and _meta_ext:
+                    _collect_attrs(_meta_ext)
+                else:
+                    # Файл расширения есть, а прочитать/разобрать его не удалось: проверка
+                    # НЕПОЛНАЯ. Молча продолжить значило бы заявить «сверено, включая XML
+                    # расширений» о проверке, которой не было, — и потерять реквизит,
+                    # добавленный расширением, вместе с настоящим получателем.
+                    ext_live_complete = False
+            if main_live_ok:
+                # Собранные имена остаются полезными в ЛЮБОМ случае (наличие доказуемо всегда),
+                # но ФАКТ «это общий модуль» требует ПОЛНОЙ проверки отсутствия — неполный live
+                # даёт только развилку.
+                attrs_source = "live" if ext_live_complete else "live_partial"
+
+        # ОБЛАСТЬ ВИДИМОСТИ для маркеров переменной: секция модульных переменных (до первой
+        # процедуры) + ТЕЛО обработчика + главный раздел модуля (после последней процедуры).
+        # `Перем X` и `X = ...` ВНУТРИ ДРУГОЙ процедуры — ЕЕ локальная переменная, к обработчику
+        # отношения не имеет: межпроцедурный поиск объявлял «переменной» получателя, который в
+        # обработчике разрешается в общий модуль, — и точный маршрут find_definition подменялся
+        # широким поиском. Модульные же переменные (Перем до процедур) и присваивания в главном
+        # разделе видимы обработчику ЗАКОННО — их из области не выкидываем.
+        _first_proc = re.search(r"^\s*(?:Процедура|Функция|Procedure|Function)\b", code, re.IGNORECASE | re.MULTILINE)
+        _module_prelude = code[: _first_proc.start()] if _first_proc else code
+        _proc_ends = list(_PROC_END_RE.finditer(code))
+        _module_trailing = code[_proc_ends[-1].end() :] if _proc_ends else ""
+        shadow_scope = "\n".join((_module_prelude, handler_code, _module_trailing))
+
+        def _shadowing(name: str) -> str:
+            """Затеняет ли имя переменная: 'declared' | 'maybe' | 'no'.
+
+            В BSL `=` — это И присваивание, И СРАВНЕНИЕ, поэтому голое `X =` доказательством НЕ
+            является: на `Если ОбщийМодульУчета = Неопределено Тогда` мы объявили бы НАСТОЯЩИЙ
+            общий модуль «переменной» — то есть соврали бы ровно тем способом, который этот релиз
+            и чинит, только в другую сторону. Поэтому маркеры РАЗДЕЛЕНЫ:
+              * 'declared' — ФАКТ: параметр, `Перем X`, переменная `Для Каждого X Из ...`, либо
+                `X =` в позиции ОПЕРАТОРА (начало строки / после ';' / после
+                Тогда|Иначе|Цикл) — там сравнение невозможно;
+              * 'maybe'    — `X =` в иной позиции: скорее всего сравнение, но поручиться нельзя;
+              * 'no'       — упоминаний нет.
+            Все маркеры ищутся в shadow_scope (модульные переменные + тело обработчика + главный
+            раздел), а НЕ по всему модулю: локальная переменная ЧУЖОЙ процедуры — другая область
+            видимости, и считать ее затенением значит уводить от рабочего модуля-получателя.
+            Регистр и пробелы не важны: BSL регистронезависим, и `сервис=Получить()` объявляет ту
+            же переменную, которую зовёт `Сервис.Метод()`.
+            """
+            if name.casefold() in params:
+                return "declared"
+            esc = re.escape(name)
+            if re.search(rf"\b(?:Перем|Var)\b[^;\n]*\b{esc}\b", shadow_scope, re.IGNORECASE):
+                return "declared"
+            if re.search(
+                rf"\b(?:Для\s+Каждого|For\s+Each)\s+{esc}\s+(?:Из|In)\b",
+                shadow_scope,
+                re.IGNORECASE,
+            ):
+                return "declared"
+            if re.search(
+                rf"(?m)(?:^|;|\bТогда\b|\bИначе\b|\bЦикл\b|\bThen\b|\bElse\b|\bDo\b)\s*{esc}\s*=(?!=)",
+                shadow_scope,
+                re.IGNORECASE,
+            ):
+                return "declared"
+            if re.search(rf"\b{esc}\s*=(?!=)", shadow_scope, re.IGNORECASE):
+                return "maybe"
+            return "no"
+
+        def _platform_sourced(name: str) -> bool:
+            """Присвоено ли имени значение ПЛАТФОРМЕННОЙ фабрики — единственное основание скрыть
+            его Записать()/Выполнить() как платформенный вызов.
+
+            Суждение — по ТЕЛУ ОБРАБОТЧИКА, и только когда возразить нечем: КАЖДОЕ присваивание
+            имени в теле — платформенная фабрика. Почему так строго:
+              * присваивание в ДРУГОЙ процедуре — это ДРУГАЯ переменная (локальная область
+                видимости); искать «по всему модулю» значило бы навсегда пометить имя как
+                платформенное и подавить настоящий делегат в обработчике;
+              * порядок присваиваний внутри тела мы НЕ анализируем (это dataflow, регэкспам он
+                не по зубам): после `Сервис = СоздатьНаборЗаписей(); Сервис = ПолучитьСервис();`
+                в точке вызова значение уже другое — любое НЕплатформенное присваивание
+                дисквалифицирует подавление целиком, и вызов ПОКАЗЫВАЕТСЯ.
+            Сравнения (`Если Сервис = Неопределено`) завышают счёт непплатформенных присваиваний
+            и тем самым тоже ведут к показу — безопасное направление.
+            """
+            esc = re.escape(name)
+            assigns = re.findall(rf"\b{esc}\s*=(?!=)", handler_code, re.IGNORECASE)
+            if not assigns:
+                return False
+            platform = re.findall(
+                rf"\b{esc}\s*=\s*(?:(?:Регистры(?:Накопления|Сведений|Бухгалтерии|Расчета)|"
+                rf"(?:Accumulation|Information|Accounting|Calculation)Registers)\s*\.\s*\w+\s*\.\s*"
+                rf"(?:Создать(?:НаборЗаписей|МенеджерЗаписи)|Create(?:RecordSet|RecordManager))\b|"
+                rf"(?:Новый|New)\b)",
+                handler_code,
+                re.IGNORECASE,
+            )
+            return len(platform) == len(assigns)
+
+        delegates: list[dict] = []
+        local_calls: list[dict] = []
+        global_calls: list[str] = []
+        dynamic_calls: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        # Позиции ИМЕН МЕТОДОВ dotted-вызовов: dotted-регулярка терпит пробелы вокруг точки
+        # (`Модуль . Метод()`), а dotless-регулярка запрещает точку только ВПЛОТНУЮ перед именем —
+        # без этого набора то же `Метод(` матчилось бы еще и как «вызов без точки», и hint рядом с
+        # правильным маршрутом по модулю печатал бы ложный «экспортный метод ГЛОБАЛЬНОГО модуля».
+        dotted_method_starts: set[int] = set()
+        for m_call in _DOTTED_CALL_RE.finditer(handler_code):
+            dotted_method_starts.add(m_call.start(2))
+            receiver, method = m_call.group(1), m_call.group(2)
+            receiver = re.sub(r"\s*\.\s*", ".", receiver)
+            rl, ml = receiver.casefold(), method.casefold()
+            if (rl, ml) in seen:
+                continue
+            seen.add((rl, ml))
+            head, _, chain_rest = rl.partition(".")
+            if head in _MANAGER_RECEIVER_CATEGORIES:
+                # Эти две фабрики уже разобраны выше как record-set facts. Даже compact-профилю
+                # не нужно открывать ManagerModule, чтобы отличить штатную фабрику регистра от
+                # пользовательского экспорта; иначе один вызов давал бы одновременно точный факт
+                # о наборе и ложную развилку «manager-вызов не проверен».
+                if head in _REGISTER_MANAGER_RECEIVERS and ml in (
+                    "создатьнаборзаписей",
+                    "создатьменеджерзаписи",
+                    "createrecordset",
+                    "createrecordmanager",
+                ):
+                    continue
+                manager_path, manager_resolution_complete = _manager_export_path(receiver, method)
+                if manager_path is None:
+                    if not manager_resolution_complete:
+                        # Не смешиваем «экспорта нет» с «проверить не удалось». Профиль сохраняет
+                        # дешевый контракт и не читает чужие ManagerModule; live-хелпер аналогично
+                        # не имеет права проглотить вызов при stale/нечитаемом модуле.
+                        delegates.append(
+                            {
+                                "receiver": receiver,
+                                "method": method,
+                                "kind": "manager_unverified",
+                                "homonym_module": False,
+                                "stale_homonym_module": False,
+                                "platform_method_name": ml in _DELEGATE_METHOD_NOISE,
+                            }
+                        )
+                    # Только ПОЛНАЯ live-проверка без такого export доказывает платформенный
+                    # manager-вызов (`НайтиПоНомеру`, `СоздатьНаборЗаписей` ...).
+                    continue
+                delegates.append(
+                    {
+                        "receiver": receiver,
+                        "method": method,
+                        "kind": "manager_module",
+                        "module_path": manager_path,
+                        "homonym_module": False,
+                        "stale_homonym_module": False,
+                        "platform_method_name": False,
+                    }
+                )
+                continue
+            if not chain_rest and rl in ("этотобъект", "thisobject"):
+                # `ЭтотОбъект.Имя()` — вызов СВОЕГО метода (эквивалент локального `Имя()`), и
+                # выбрасывать его целиком нельзя: локальный метод может вести к движениям. Имя,
+                # не объявленное в этом модуле, — платформенный метод объекта (Записать/
+                # Проверить/...), делегатом не является.
+                if ml in local_methods and not any(c["name"].casefold() == ml for c in local_calls):
+                    local_calls.append({"name": method, "path": handler_path})
+                continue
+            if head in _RECEIVER_NOISE and head not in ("этотобъект", "thisobject"):
+                # Голова цепочки — платформенное пространство имен (Документы.X.Метод() и т.п.):
+                # менеджерный вызов, не делегат. `ЭтотОбъект.X...` под это НЕ подпадает — там
+                # дальше настоящий получатель (реквизит/свойство объекта).
+                continue
+            if chain_rest:
+                # ЦЕПОЧКА СВОЙСТВ (`ЭтотОбъект.Реквизит.М()`, `А.Б.М()`): текстовый разбор такого
+                # получателя НЕ разрешает — это dataflow, и честный ответ здесь НЕ ОПОЗНАН, а не
+                # молчание. Раньше цепочка выпадала из анализа ЦЕЛИКОМ: все списки фактов пустели,
+                # и hint заявлял «движений не пишет», пряча настоящего делегата. Исключение одно:
+                # `ЭтотОбъект.X.М()` с X-реквизитом, найденным в ЖИВОМ XML (attributes собираются
+                # только из него), — это доказуемый РЕКВИЗИТ: НАЛИЧИЕ доказуемо и при неполном
+                # live (полнота нужна лишь для доказательства ОТСУТСТВИЯ — факта «общий модуль»).
+                # _shadowing/_platform_sourced к цепочке неприменимы (они про ОДНО имя переменной).
+                segs = rl.split(".")
+                kind = "unknown"
+                if head in ("этотобъект", "thisobject") and len(segs) == 2 and segs[1] in attributes:
+                    kind = "attribute"
+                live_homonyms, indexed_homonym = _live_common_modules(segs[-1])
+                delegates.append(
+                    {
+                        "receiver": receiver,
+                        "method": method,
+                        "kind": kind,
+                        # Однофамилец проверяется по ПОСЛЕДНЕМУ звену: именно его агент по ошибке
+                        # принял бы за модуль в find_definition(..., 'ОбщийМодуль.<звено>').
+                        "homonym_module": bool(live_homonyms),
+                        "stale_homonym_module": indexed_homonym and not live_homonyms,
+                        "platform_method_name": ml in _DELEGATE_METHOD_NOISE,
+                    }
+                )
+                continue
+            shadow = _shadowing(receiver)
+            live_module_paths, indexed_module = _live_common_modules(receiver)
+            is_module = bool(live_module_paths)
+            if shadow == "declared":
+                kind = "variable"
+            elif rl in attributes:
+                kind = "attribute"
+            elif is_module and shadow == "maybe":
+                # `X =` есть, но в позиции, где это МОЖЕТ быть сравнением. Общий модуль с таким
+                # именем существует — и мы НЕ ЗНАЕМ, кто из них тут получатель. Честный ответ —
+                # назвать оба варианта, а не выбрать удобный: молчание лучше уверенной лжи, но
+                # уверенная ложь в ЛЮБУЮ сторону хуже честной развилки.
+                kind = "shadow_risk"
+            elif is_module and attrs_source == "live":
+                kind = "common_module"
+            elif is_module:
+                # СТРУКТУРНЫЙ ПОТОЛОК: факт «это общий модуль» разрешен ТОЛЬКО при live-проверке
+                # реквизитов. Index-источник сюда тоже попадает: успешный SQL-запрос не доказывает
+                # полноту снимка (реквизит, добавленный после сборки, из него не виден), а факт с
+                # оговоркой «индекс может отставать» — все равно ложный факт на stale-индексе.
+                # Слабый источник не имеет права порождать сильное утверждение — только развилку.
+                kind = "module_unverified"
+            else:
+                kind = "unknown"
+            # Шум по имени метода обоснован ТОЛЬКО ПРОСЛЕЖЕННЫМ источником получателя.
+            # Пара (вид получателя, имя метода) ничего не доказывает: статически
+            # `МенеджерЗаписи.Записать()` и пользовательский `Сервис.Записать()` неотличимы,
+            # и выбрасывать второй значит снова выдать эвристику за отрицательный факт
+            # («движений не пишет»). Скрываем вызов лишь когда переменная присвоена из
+            # ПЛАТФОРМЕННОЙ фабрики (Создать(НаборЗаписей|МенеджерЗаписи) — регистр уже назван
+            # в record_sets — либо `Новый ...`); непрослеженный источник -> вызов ПОКАЗЫВАЕМ,
+            # с оговоркой о платформенном имени.
+            if ml in _DELEGATE_METHOD_NOISE and kind == "variable" and _platform_sourced(receiver):
+                continue
+            delegates.append(
+                {
+                    "receiver": receiver,
+                    "method": method,
+                    "kind": kind,
+                    # Однофамилец-модуль при НЕ-модульном получателе — это и есть ловушка, из-за
+                    # которой агент молча читал ЧУЖОЕ тело. Называем её явно.
+                    "homonym_module": kind != "common_module" and is_module,
+                    "stale_homonym_module": indexed_module and not is_module,
+                    # Имя метода совпадает с платформенным -> в hint уйдет оговорка о двусмысленности.
+                    "platform_method_name": ml in _DELEGATE_METHOD_NOISE,
+                }
+            )
+
+        for m_call in _DOTLESS_CALL_RE.finditer(handler_code):
+            if m_call.start(1) in dotted_method_starts:
+                # Это имя метода dotted-вызова с пробелом после точки — оно уже классифицировано
+                # выше по своему получателю, вторым «вызовом без точки» ему быть нельзя.
+                continue
+            name = m_call.group(1)
+            nl = name.casefold()
+            # ``Новый Структура(...)`` / ``New Structure(...)`` is a type constructor,
+            # not a dotless method call. _live_code_only keeps whitespace positions, so
+            # this also covers multiline formatting and comments between the tokens.
+            if re.search(r"(?:\bНовый|\bNew)\s+$", handler_code[: m_call.start(1)], re.IGNORECASE):
+                continue
+            if nl == entry_method.casefold():
+                continue
+            if nl in local_methods:
+                # Локальный метод проверяется ДО любого шума: процедура этого модуля может
+                # законно называться Записать/Выполнить — она объявлена, значит это не платформа.
+                if not any(c["name"].casefold() == nl for c in local_calls):
+                    local_calls.append({"name": name, "path": handler_path})
+            elif nl in ("выполнить", "execute"):
+                # Встроенное динамическое выполнение — не обычный «шум»: внутри строки/переменной
+                # может находиться весь код записи регистра. _live_code_only намеренно вырезает
+                # строки, поэтому содержимое здесь статически НЕ видно. Локальная процедура с тем
+                # же именем уже поймана веткой выше и остается обычным локальным делегатом.
+                if not any(n.casefold() == nl for n in dynamic_calls):
+                    dynamic_calls.append(name)
+            elif nl in _DOTLESS_NOISE:
+                continue
+            elif name not in global_calls:
+                # Методный шум сюда НЕ применяем: голых платформенных Записать()/Получить()/
+                # Загрузить() не существует (реальные голые платформенные — Выполнить/Найти —
+                # уже в _DOTLESS_NOISE), а экспортный метод ГЛОБАЛЬНОГО общего модуля законно
+                # зовется как угодно — глотать его значило бы потерять делегата.
+                # Вызов БЕЗ точки, которого в ЭТОМ модуле НЕ объявлено. «Значит метод тут же» —
+                # неверно: без точки зовутся и экспортные методы ГЛОБАЛЬНОГО общего модуля, и
+                # методы глобального контекста платформы. Молча выбросить такой вызов значило бы
+                # потерять единственного делегата (и объявить, что обработчик движений не пишет).
+                global_calls.append(name)
+
+        return {
+            "record_sets": record_sets,
+            "record_sets_created": record_sets_created,
+            "delegates": delegates,
+            "local_calls": local_calls,
+            "global_calls": global_calls,
+            "dynamic_calls": dynamic_calls,
+            "attrs_source": attrs_source,
+        }
+
+    # --- Capability-aware маршруты поиска для posting-hint --------------------------------------
+    # git_search регистрируется ТОЛЬКО когда исходники под git (_want_git_search вычисляется ниже
+    # по коду фабрики, к моменту вызова хелперов он уже есть). Безусловный совет git_search(...)
+    # на не-git конфигурации — NameError ровно на fallback-пути: хелпера просто НЕТ в namespace.
+    # Поэтому каждый терминальный совет в hint строится из хелперов, реально зарегистрированных
+    # в ЭТОЙ песочнице, — а когда исчерпывающего маршрута нет, hint честно называет ограничение
+    # вместо обещания несуществующего шага.
+
+    def _all_bsl_decl_search_call(meth: str) -> str:
+        """Exact declaration search over the current session's live BSL catalog.
+
+        ``git grep -iE`` on Git for Windows can return a false zero for Cyrillic identifiers
+        combined with a whitespace quantifier. Python ``re.IGNORECASE`` has the required BSL
+        semantics.  The internal result cap prevents a common method from producing an
+        unbounded hint; its sentinel makes an early stop explicit.
+        """
+        live_catalog = _ensure_live_bsl_catalog()
+        live_pattern = rf"(?i)^\s*(?:Процедура|Функция|Procedure|Function)\s+{re.escape(meth)}\b"
+        return f"safe_grep({live_pattern!r}, max_files={len(live_catalog)}, _result_cap=50)"
+
+    def _decl_search_call(meth: str) -> str | None:
+        """Чистый ИСПОЛНИМЫЙ вызов поиска объявления метода по всему дереву, или None,
+        когда исчерпывающего маршрута в этой песочнице нет (не под git и без индекса)."""
+        if _want_git_search:
+            return _all_bsl_decl_search_call(meth)
+        if idx_reader is not None:
+            return f"find_definition({meth!r})"
+        return None
+
+    def _live_decl_search_call(meth: str) -> str:
+        """Поиск объявления без доверия к stale methods/modules из SQLite."""
+        return _all_bsl_decl_search_call(meth)
+
+    def _decl_search_note(*, live: bool = False) -> str:
+        if live or _want_git_search:
+            reason = (
+                "git_search намеренно не используется: git grep -iE на Windows дает ложный ноль "
+                "для кириллицы с whitespace-квантором"
+                if _want_git_search
+                else "live-маршрут не доверяет stale snapshot"
+            )
+            return (
+                "точный live Python-regex проверяет процедуры/функции, русский/английский синтаксис, "
+                f"регистр и BSL-пробелы по текущему BSL-каталогу с потолком 50 кандидатов; {reason}; "
+                "финальный элемент с _truncated=True означает, что поиск остановлен досрочно и кандидаты "
+                "могут оставаться; без него каталог проверен полностью"
+            )
+        return (
+            "git_search здесь НЕ зарегистрирован (исходники не под git), поэтому маршрут — "
+            "find_definition БЕЗ module-hint: кандидаты по всему индексу, выбирай по category "
+            "сам; индекс может отставать от свежих правок"
+        )
+
+    def _decl_search_route(meth: str, known_module: str = "") -> str:
+        """Маршрут поиска объявления ПРОЗОЙ (вызов + оговорка источника). known_module — когда
+        модуль-получатель уже разрешен и объявление можно искать прямо в нем (safe_grep живой,
+        индекса и git не требует)."""
+        if not _want_git_search and known_module:
+            return (
+                f"safe_grep({meth!r}, {known_module!r}) — git_search не зарегистрирован (исходники "
+                "не под git), но модуль-получатель уже известен: ищем объявление прямо в нем, живьем"
+            )
+        call = _decl_search_call(meth)
+        if call is None:
+            return (
+                "исчерпывающего поиска по дереву в этой песочнице НЕТ (git_search не зарегистрирован: "
+                "исходники не под git; индекса тоже нет) — сузь кандидатов через find_module и "
+                f"проверь каждого: safe_grep({meth!r}, 'ИмяМодуля')"
+            )
+        return f"{call} ({_decl_search_note()})"
+
+    def _register_search_route() -> str:
+        """Куда идти за ОСТАЛЬНЫМИ писателями регистра, найденного набором/менеджером записи."""
+        if _want_git_search:
+            return "git_search('ИмяРегистра')"
+        all_bsl_candidates = len(_ensure_live_bsl_catalog())
+        return (
+            f"safe_grep('ИмяРегистра', max_files={all_bsl_candidates}) по ВСЕМ {all_bsl_candidates} "
+            "известным BSL-модулям (git_search не зарегистрирован: исходники не под git; "
+            "XML/тексты запросов safe_grep не покрывает)"
+        )
+
+    def _build_posting_hint(
+        document_name: str,
+        handler_path: str,
+        module_body: str,
+        *,
+        profile: bool,
+        interceptors: list[dict] | None = None,
+        posting_calls_offset: int = 0,
+    ) -> str:
+        """Hint = ФАКТЫ разбора + только те шаги, которые в песочнице ИСПОЛНИМЫ.
+
+        Шаги нумеруются подряд «(N) код -> пояснение» и являются валидным Python: тест вырезает их
+        из текста и ИСПОЛНЯЕТ — псевдокод здесь = SyntaxError = красный тест. Ни один шаг не зовёт
+        generic read_file: handler_path может указывать в CFE-расширение, а туда песочнице хода нет
+        (read_procedure / find_definition / git_search — ext-safe).
+        """
+        entrypoints = [
+            {
+                "path": handler_path,
+                "method": "ОбработкаПроведения",
+                "body": module_body,
+                "annotation": "",
+            },
+            *(interceptors or []),
+        ]
+        facts = {
+            "record_sets": [],
+            "record_sets_created": [],
+            "delegates": [],
+            "local_calls": [],
+            "global_calls": [],
+            "dynamic_calls": [],
+            "attrs_source": "none",
+        }
+        created_candidates: list[str] = []
+        source_rank = {"none": 0, "index": 1, "live_partial": 2, "live": 3}
+        replacement_annotations = {
+            entry["annotation"].casefold()
+            for entry in entrypoints[1:]
+            if (entry.get("annotation") or "").casefold() in ("вместо", "изменениеиконтроль")
+        }
+        _active, _suppressed, replacement_meta = _apply_cfe_posting_replacement([], entrypoints[1:])
+        main_continuation_visible = bool(replacement_meta and replacement_meta["main_handler_continuation_visible"])
+        # &Вместо и &ИзменениеИКонтроль заменяют исходную точку входа. Код main может выполниться
+        # лишь если replacement явно продолжит вызов.  Видимый ПродолжитьВызов — тот же
+        # conservative possible-execution сигнал, по которому code_registers сохраняет main rows.
+        # Сами CFE-entrypoint (и соседние &Перед/&После) анализируются в обоих случаях.
+        analyzed_entrypoints = (
+            entrypoints[1:] if replacement_annotations and not main_continuation_visible else entrypoints
+        )
+        for entry in analyzed_entrypoints:
+            found = _analyze_posting_handler(
+                document_name,
+                entry["path"],
+                entry["body"],
+                live_attributes=not profile,
+                live_manager_modules=not profile,
+                entry_method=entry["method"],
+            )
+            for reg in found["record_sets"]:
+                if reg not in facts["record_sets"]:
+                    facts["record_sets"].append(reg)
+            for reg in found["record_sets_created"]:
+                if reg not in created_candidates:
+                    created_candidates.append(reg)
+            for delegate in found["delegates"]:
+                key = (
+                    delegate["receiver"].casefold(),
+                    delegate["method"].casefold(),
+                    delegate["kind"],
+                )
+                if not any(
+                    (
+                        d["receiver"].casefold(),
+                        d["method"].casefold(),
+                        d["kind"],
+                    )
+                    == key
+                    for d in facts["delegates"]
+                ):
+                    facts["delegates"].append(delegate)
+            for call in found["local_calls"]:
+                key = (call["name"].casefold(), call["path"].casefold())
+                if not any((c["name"].casefold(), c["path"].casefold()) == key for c in facts["local_calls"]):
+                    facts["local_calls"].append(call)
+            for field in ("global_calls", "dynamic_calls"):
+                for name in found[field]:
+                    if not any(existing.casefold() == name.casefold() for existing in facts[field]):
+                        facts[field].append(name)
+            if source_rank.get(found["attrs_source"], 0) > source_rank.get(facts["attrs_source"], 0):
+                facts["attrs_source"] = found["attrs_source"]
+        # Если в одном entrypoint набор лишь создан, а в другом для того же регистра видна
+        # запись, итоговый факт должен быть сильнейшим и не противоречить сам себе.
+        facts["record_sets_created"] = [r for r in created_candidates if r not in facts["record_sets"]]
+
+        parts = [_POSTING_PREAMBLE]
+        step = 1
+        primary_note = (
+            "CFE-замена может подавить это тело, поэтому его записи НЕ включены в ФАКТЫ ниже без "
+            "явно прослеженного продолжения вызова; читай для проверки. "
+            if replacement_annotations and not main_continuation_visible
+            else "сервер его уже разобрал, ФАКТЫ ниже; читай, если хочешь увидеть глазами. "
+        )
+        parts.append(
+            f"({step}) body = read_procedure({handler_path!r}, 'ОбработкаПроведения') -> тело обработчика "
+            f"({primary_note})"
+        )
+        step += 1
+        for idx, entry in enumerate(entrypoints[1:], start=1):
+            annotation = entry.get("annotation") or "перехват"
+            parts.append(
+                f"({step}) cfe_body_{idx} = read_procedure({entry['path']!r}, {entry['method']!r}) -> "
+                f'тело CFE-перехвата &{annotation}("ОбработкаПроведения"); сервер включил его в ФАКТЫ ниже. '
+            )
+            step += 1
+        if replacement_annotations:
+            labels = ", ".join(f"&{name}" for name in sorted(replacement_annotations))
+            if main_continuation_visible:
+                parts.append(
+                    f"CFE-ЗАМЕНА ({labels}): во всех точных процедурах замены виден прямой "
+                    "ПродолжитьВызов/ProceedWithCall, поэтому main-handler включен в возможные ФАКТЫ. "
+                )
+            else:
+                parts.append(
+                    f"CFE-ЗАМЕНА ({labels}): исходная ОбработкаПроведения не считается "
+                    "выполненной — прямой ПродолжитьВызов/ProceedWithCall хотя бы в одной точной процедуре замены "
+                    "не найден. При динамическом продолжении проследи путь по показанным телам. "
+                )
+
+        # БЮДЖЕТ РАЗМЕРА: развернутые маршруты ограничены, но имена record set
+        # раньше оставались без потолка и могли сами вытолкнуть хвост за ~15К. Одна
+        # компактная страница теперь делится между ВСЕМИ длинными списками: записанными
+        # и только созданными наборами, а также вызовами сверх route-budget. Смещение
+        # остается прежним публичным posting_calls_offset, поэтому старые continuation-
+        # вызовы совместимы, а новый hint всегда даёт точный offset следующего окна.
+        _MAX_DELEGATE_ROUTES = 6
+        _MAX_CALL_ROUTES = 6
+        overflow_delegates = facts["delegates"][_MAX_DELEGATE_ROUTES:]
+        overflow_local = facts["local_calls"][_MAX_CALL_ROUTES:]
+        overflow_global = facts["global_calls"][_MAX_CALL_ROUTES:]
+        compact_entries: list[tuple[str, str]] = (
+            [("record_written", r) for r in facts["record_sets"]]
+            + [("record_created", r) for r in facts["record_sets_created"]]
+            + [("call", f"{d['receiver']}.{d['method']}") for d in overflow_delegates]
+            + [("call", f"{c['name']}() [локальный]") for c in overflow_local]
+            + [("call", f"{n}() [без точки]") for n in overflow_global]
+        )
+        compact_offset = max(0, int(posting_calls_offset))
+        compact_page: list[tuple[str, str]] = []
+        compact_chars = 0
+        # Count-cap preserves the existing calls-only continuation offset (=40 for
+        # 50 calls); char-cap bounds pages with unusually long valid BSL identifiers.
+        for entry in compact_entries[compact_offset:]:
+            entry_chars = len(entry[1]) + 3
+            if compact_page and (len(compact_page) >= 40 or compact_chars + entry_chars > 2400):
+                break
+            compact_page.append(entry)
+            compact_chars += entry_chars
+        compact_page_end = compact_offset + len(compact_page)
+        paged_record_sets = [value for kind, value in compact_page if kind == "record_written"]
+        paged_record_sets_created = [value for kind, value in compact_page if kind == "record_created"]
+        paged_calls = [value for kind, value in compact_page if kind == "call"]
+        compact_has_more = compact_page_end < len(compact_entries)
+
+        if paged_record_sets:
+            regs = ", ".join(paged_record_sets)
+            # «Идти дальше некуда» — правда ТОЛЬКО когда кроме прямой записи в теле ничего нет.
+            # Обработчик законно пишет один регистр набором И делегирует остальные движения;
+            # безусловная фраза противоречила бы соседнему абзацу этого же hint (который делегата
+            # показывает), и агент, поверивший первой инструкции, потерял бы остальные движения.
+            # Набор, СОЗДАННЫЙ без видимой записи, — тоже «еще есть куда идти»: его судьба не
+            # прослежена, и финал «некуда» рядом с такой развилкой был бы самопротиворечием.
+            more = bool(
+                facts["delegates"]
+                or facts["local_calls"]
+                or facts["global_calls"]
+                or facts["dynamic_calls"]
+                or facts["record_sets_created"]
+                or compact_has_more
+            )
+            closing = (
+                "но выдача ЭТИМ НЕ исчерпана — ниже есть другие вызовы или точный переход "
+                "к следующей компактной странице. "
+                if more
+                else "делегата нет, идти дальше некуда. "
+            )
+            parts.append(
+                f"ЗАПИСЬ РЕГИСТРОВ ПРЯМО В ОБРАБОТЧИКЕ (набор/менеджер записи: после создания виден "
+                f"Записать() по нему): {regs} -> регистры УЖЕ НАЗВАНЫ, {closing}"
+                "ВНИМАНИЕ: find_register_writers их НЕ НАЙДЕТ (он ищет только прямые "
+                f"Движения.X в ObjectModule документов) — статические reverse-кандидаты ищи через "
+                f"{_register_search_route()}, затем проверяй живой вызывающий путь. "
+            )
+
+        if paged_record_sets_created:
+            regs_created = ", ".join(paged_record_sets_created)
+            # Создание — НЕ запись: СоздатьНаборЗаписей()/СоздатьМенеджерЗаписи() не меняют регистр
+            # до вызова Записать() (`Набор.Прочитать()` — чтение). Прежняя версия объявляла ЗАПИСЬЮ
+            # само создание — ложный «факт» на каждом чтении набора в обработчике. Формулировка
+            # честно про ВИДИМОСТЬ: Записать() мог уехать в метод, куда набор передан параметром.
+            parts.append(
+                f"НАБОР/МЕНЕДЖЕР ЗАПИСИ СОЗДАН, НО Записать() ПО НЕМУ НЕ ВИДНО (смотрим от создания "
+                f"до следующего присваивания той же переменной): {regs_created}. "
+                "СОЗДАНИЕ — ЕЩЕ НЕ ЗАПИСЬ (Прочитать() — чтение), фактом записи это НЕ считай. "
+                "Набор мог уйти параметром в другой метод — проверь вызовы ниже и само тело (шаг 1). "
+            )
+
+        # На каждый вызов строится крупный маршрут, поэтому подробно раскрывается только
+        # фиксированное число вызовов. Остальные имена уже включены в compact_page вместе
+        # с record set facts: теряется только повторяющийся шаблон маршрута.
+
+        for d in facts["delegates"][:_MAX_DELEGATE_ROUTES]:
+            recv, meth, kind = d["receiver"], d["method"], d["kind"]
+            label = _KIND_LABEL[kind]
+            # У цепочки свойств «модулем-однофамильцем» может быть только ПОСЛЕДНЕЕ звено — ровно
+            # его агент подставил бы в find_definition. У одиночного получателя это он сам.
+            module_ref = f"ОбщийМодуль.{recv.split('.')[-1]}"
+            if kind == "manager_module":
+                manager_path = d["module_path"]
+                parts.append(
+                    f"ДЕЛЕГАТ: {recv}.{meth}(...) — {label}; экспортное объявление подтверждено "
+                    f"по живому файлу {manager_path!r}, поэтому это не платформенный manager-вызов. "
+                    f"({step}) read_procedure({manager_path!r}, {meth!r}) -> тело делегата. "
+                )
+                step += 1
+            elif kind == "manager_unverified":
+                route_call = _decl_search_call(meth)
+                profile_note = (
+                    f"Compact-профиль чужие ManagerModule живьем не открывает; перепроверь через "
+                    f"find_register_movements({document_name!r}). "
+                    if profile
+                    else "Живой ManagerModule прочитать/разобрать не удалось. "
+                )
+                if route_call is not None:
+                    parts.append(
+                        f"ВЫЗОВ {recv}.{meth}(...): {label}. {profile_note}"
+                        f"Не считай его платформенным без проверки: ({step}) {route_call} -> "
+                        f"ищи объявление метода по всему доступному дереву ({_decl_search_note()}). "
+                    )
+                    step += 1
+                else:
+                    parts.append(
+                        f"ВЫЗОВ {recv}.{meth}(...): {label}. {profile_note}"
+                        f"Не считай его платформенным без проверки; {_decl_search_route(meth)}. "
+                    )
+            elif kind == "common_module":
+                # Факт разрешен ТОЛЬКО live-источнику (структурный потолок в классификации),
+                # поэтому формулировка одна и не нуждается в оговорках «может отставать»:
+                # оговорка не чинит классификацию, а факт со звездочкой — все равно ложь на
+                # stale-снимке. Слабые источники сюда не доходят — они дают развилку.
+                checked = (
+                    "не реквизит и не табличная часть документа (сверено по ЖИВОМУ XML, включая XML "
+                    "расширений), а общий модуль с таким именем в конфигурации ЕСТЬ. "
+                )
+                parts.append(
+                    f"ДЕЛЕГАТ: {recv}.{meth}(...) — получатель '{recv}' это {label}. Проверено ЗДЕСЬ, по живому "
+                    f"модулю: он не переменная и не параметр этого модуля; {checked}"
+                    f"({step}) d = find_definition({meth!r}, {module_ref!r}) -> определение делегата (префикс "
+                    "категории обязателен: голое имя category-blind, и одноименный справочник дал бы ЧУЖОЕ тело). "
+                )
+                step += 1
+                parts.append(
+                    f"({step}) read_procedure(d['definitions'][0]['file'], {meth!r}) if d.get('definitions') else None "
+                    "-> тело делегата. Guard обязателен: пустой результат это definitions=[] (НЕ ошибка), а без "
+                    f"индекса ключа 'definitions' нет вовсе. Пусто -> делегат новее индекса: "
+                    f"{_decl_search_route(meth, known_module=recv.split('.')[-1])}. "
+                    "НЕ ПОДТВЕРЖДАЙ результат проверкой category == 'CommonModules': префикс 'ОбщийМодуль.' уже "
+                    "фильтрует запрос по ЭТОЙ ЖЕ категории в SQL, поэтому проверка ВСЕГДА истинна и не подтверждает "
+                    "НИЧЕГО. Получателя уже разрешил сервер — см. выше. "
+                )
+                step += 1
+            elif kind == "module_unverified":
+                # Развилка, а не факт. Причина зависит от источника: 'index' — снимок мог отстать
+                # от XML (успешный SQL-запрос полноту не доказывает), 'none' — проверить нечем
+                # вовсе. В обоих случаях реквизит-однофамилец затенил бы модуль, и find_definition
+                # молча отдал бы ЧУЖОЕ тело — поэтому решение отдается агенту с исполнимым шагом.
+                if facts["attrs_source"] == "index":
+                    reason = (
+                        "но реквизиты сверены только ПО ИНДЕКСУ, который может отставать от XML "
+                        "(реквизит, добавленный после сборки, отсюда НЕ виден — успешный запрос к "
+                        "индексу полноту снимка не доказывает), а реквизит "
+                    )
+                elif facts["attrs_source"] == "live_partial":
+                    reason = (
+                        "но метаданные РАСШИРЕНИЙ прочитать/разобрать не удалось (проверка реквизитов "
+                        "НЕПОЛНАЯ: реквизит, добавленный расширением, мог остаться невидимым), а реквизит "
+                    )
+                else:
+                    reason = "но РЕКВИЗИТЫ документа серверу проверить НЕЧЕМ, а реквизит "
+                # Ни ПОЛОЖИТЕЛЬНЫЙ, ни отрицательный ответ get_object_full_structure здесь не
+                # классифицирует получателя: при index_used=True это все тот же снимок, который
+                # может и отставать от XML, и ОПЕРЕЖАТЬ его (удаленный реквизит останется в
+                # индексе). Прежний положительный шаг «есть -> это РЕКВИЗИТ» делал именно такую
+                # stale-запись ложным фактом и уводил от настоящего общего модуля. Безопасный
+                # маршрут в обоих мирах — поиск объявления по всему дереву; профилю дополнительно
+                # дается find_register_movements — единственная полная live-перепроверка, включая
+                # расширения (хелперу не предлагаем самого себя: это был бы цикл).
+                recheck = (
+                    (
+                        f"Самая точная перепроверка — find_register_movements({document_name!r}): он сверяет "
+                        "реквизиты ЖИВЬЕМ (включая расширения), и его hint разрешит получателя. "
+                    )
+                    if profile
+                    else ""
+                )
+                parts.append(
+                    f"ВЫЗОВ {recv}.{meth}(...): {label}. Переменной/параметром ЭТОГО модуля получатель не "
+                    f"затенен (проверено по телу), {reason}"
+                    f"'{recv}' затенил бы одноименный общий модуль — и find_definition молча отдал бы ЧУЖОЕ "
+                    "тело. Снимок можно посмотреть, но НЕ классифицируй получателя по нему: "
+                    f"({step}) s = get_object_full_structure({document_name!r}) -> и наличие, и отсутствие "
+                    f"'{recv}' среди attributes/tabular_sections НИЧЕГО НЕ ДОКАЗЫВАЕТ о ЖИВОМ коде. При "
+                    "index_used=True get_object_full_structure читает ТОТ ЖЕ индекс (флаг говорит об источнике, "
+                    "не о полноте): он может не видеть свежий реквизит или, наоборот, помнить уже УДАЛЕННЫЙ. "
+                    "Поэтому при любом ответе НЕ ходи в find_definition по 'ОбщийМодуль.<получатель>' — маршрут "
+                    "один и тот же, "
+                    f"по всему дереву: {_decl_search_route(meth)}; он найдет объявление и в общем модуле, "
+                    f"если получатель был им. {recheck}"
+                )
+                step += 1
+            elif kind == "shadow_risk":
+                # Честная РАЗВИЛКА вместо удобного ответа. В BSL `=` это и присваивание, и
+                # сравнение: `Если X = Неопределено Тогда` — сравнение, а `Тогда X = Получить();` —
+                # присваивание. Позицию оператора мы разбираем, но общий случай не разрешаем, и
+                # выдать догадку за факт нельзя НИ В ОДНУ сторону: назвать переменной — увести от
+                # рабочего делегата; назвать модулем — молча подсунуть чужое тело.
+                parts.append(
+                    f"ВЫЗОВ {recv}.{meth}(...): {label}. В модуле встречается '{recv} =', но в позиции, где это "
+                    "МОЖЕТ быть сравнением, а не присваиванием (в BSL '=' означает и то, и другое) — поэтому "
+                    "получателя сервер НЕ разрешил и гадать не станет. РЕШИ ПО ТЕЛУ (шаг 1): "
+                    f"если '{recv}' там ПРИСВАИВАЕТСЯ — это переменная, маршрут поиска объявления: "
+                    f"{_decl_search_route(meth)}; "
+                    f"если только СРАВНИВАЕТСЯ — это общий модуль: "
+                    f"({step}) d = find_definition({meth!r}, {module_ref!r}) -> определение делегата, далее "
+                    f"read_procedure(d['definitions'][0]['file'], {meth!r}) if d.get('definitions') else None. "
+                )
+                step += 1
+            else:
+                trap = ""
+                if d["homonym_module"]:
+                    trap = (
+                        f"ЛОВУШКА: в конфигурации ЕСТЬ общий модуль-однофамилец '{recv}' — "
+                        f"find_definition({meth!r}, {module_ref!r}) отработал бы УСПЕШНО и молча отдал ЕГО тело, "
+                        "ЧУЖОЕ. Не ходи туда. "
+                    )
+                stale_note = ""
+                if d.get("stale_homonym_module"):
+                    stale_note = (
+                        f"ИНДЕКС ПОМНИТ общий модуль-однофамилец '{recv}', но его файл ЖИВЬЕМ не "
+                        "читается (удален/перемещен после сборки); считать модуль существующим и идти "
+                        "в stale find_definition нельзя. "
+                    )
+                platform_note = ""
+                if d.get("platform_method_name"):
+                    # Вызов показан, потому что источник получателя НЕ прослежен, — но имя метода
+                    # платформенное, и молчать об этой двусмысленности значило бы отправить агента
+                    # искать «Процедуру Записать» там, где была платформенная запись.
+                    platform_note = (
+                        f"NB: имя '{meth}' совпадает с платформенным методом. Если получатель создан "
+                        "платформенной фабрикой (Создать(НаборЗаписей|МенеджерЗаписи) / Новый ...) — это "
+                        "платформенная запись, а не делегат; здесь источник получателя НЕ прослежен, поэтому "
+                        "вызов показан. "
+                    )
+                force_live_decl = bool(d.get("stale_homonym_module"))
+                route_call = _live_decl_search_call(meth) if force_live_decl else _decl_search_call(meth)
+                if route_call is not None:
+                    parts.append(
+                        f"ВЫЗОВ {recv}.{meth}(...): получатель '{recv}' — {label}, а НЕ общий модуль. "
+                        f"{trap}{stale_note}{platform_note}"
+                        "Тип получателя по имени не восстановить, поэтому ищи ОБЪЯВЛЕНИЕ метода ПО ВСЕМУ ДЕРЕВУ: "
+                        f"({step}) {route_call} -> объявление ({_decl_search_note(live=force_live_decl)}). "
+                    )
+                    step += 1
+                else:
+                    # Исполнимого исчерпывающего шага нет (не под git и без индекса) — честное
+                    # ограничение вместо нумерованного шага с несуществующим хелпером.
+                    parts.append(
+                        f"ВЫЗОВ {recv}.{meth}(...): получатель '{recv}' — {label}, а НЕ общий модуль. "
+                        f"{trap}{stale_note}{platform_note}"
+                        f"Тип получателя по имени не восстановить; {_decl_search_route(meth)}. "
+                    )
+
+        for call in facts["local_calls"][:_MAX_CALL_ROUTES]:
+            name, local_path = call["name"], call["path"]
+            parts.append(
+                f"ЛОКАЛЬНЫЙ ВЫЗОВ {name}(...): метод объявлен в ЭТОМ ЖЕ модуле (вызов без точки), find_definition "
+                f"не нужен. ({step}) read_procedure({local_path!r}, {name!r}) -> его тело. "
+            )
+            step += 1
+
+        for name in facts["global_calls"][:_MAX_CALL_ROUTES]:
+            # Под git доступен полный live-каталог BSL: он нужен и без индекса, и когда snapshot
+            # отстал и дал definitions=[]. Без git при живом индексе find_definition — единственный
+            # полный маршрут; без git и без индекса повторный find_definition был бы циклом.
+            if _want_git_search:
+                no_index_fallback = (
+                    f"Если d.get('definitions') пуст (индекса нет или snapshot отстал) — тогда "
+                    f"{_decl_search_call(name)}. "
+                )
+            elif idx_reader is not None:
+                no_index_fallback = ""
+            else:
+                no_index_fallback = (
+                    "Индекса нет — find_definition вернет error 'no index', а git_search не "
+                    "зарегистрирован (исходники не под git): сузь кандидатов через find_module и "
+                    f"проверь каждого: safe_grep({name!r}, 'ИмяМодуля'). "
+                )
+            parts.append(
+                f"ВЫЗОВ БЕЗ ТОЧКИ {name}(...): в ЭТОМ модуле такой метод НЕ объявлен, значит это экспортный метод "
+                "ГЛОБАЛЬНОГО общего модуля либо метод глобального контекста платформы (в модуле объекта их нет). "
+                f"({step}) d = find_definition({name!r}) -> кандидаты по всему дереву; выбирай по category "
+                f"(глобальный общий модуль -> category='CommonModules'). {no_index_fallback}"
+            )
+            step += 1
+
+        if facts["dynamic_calls"]:
+            names = ", ".join(f"{name}(...)" for name in facts["dynamic_calls"])
+            parts.append(
+                f"ДИНАМИЧЕСКОЕ ВЫПОЛНЕНИЕ: {names}. Аргумент может содержать код создания и записи "
+                "набора регистра, но строки намеренно вырезаны статическим разбором, а значение переменной "
+                "без dataflow не восстановить. Поэтому отрицательный вывод о движениях ЗАПРЕЩЕН: проследи "
+                "аргумент динамического вызова по телам из нумерованных шагов выше. "
+            )
+
+        if paged_calls:
+            listed = "; ".join(paged_calls)
+            parts.append(
+                f"ЕЩЕ ВЫЗОВЫ ИЗ ОБРАБОТЧИКА — всего "
+                f"{len(overflow_delegates) + len(overflow_local) + len(overflow_global)} шт. без "
+                f"развернутого маршрута; текущая компактная страница: {listed}. Лимит "
+                f"{_MAX_DELEGATE_ROUTES} делегатов и {_MAX_CALL_ROUTES} вызовов на категорию, иначе hint "
+                "обрезался бы лимитом вывода. "
+                "Маршруты — как в шагах выше: локальный -> read_procedure по этому же пути; делегат -> "
+                "тот же маршрут поиска объявления, что в шагах выше. "
+            )
+
+        if compact_entries and (compact_has_more or compact_offset > 0):
+            navigation: list[str] = []
+            if compact_has_more:
+                next_offset = 0 if profile else compact_page_end
+                navigation.append(
+                    "следующая страница: "
+                    f"find_register_movements({document_name!r}, posting_calls_offset={next_offset})"
+                )
+            if compact_offset > 0:
+                navigation.append(f"к началу: find_register_movements({document_name!r}, posting_calls_offset=0)")
+            page_range = f"{compact_offset + 1}–{compact_page_end}" if compact_page else f"offset={compact_offset}"
+            parts.append(
+                f"КОМПАКТНЫЕ ФАКТЫ/ВЫЗОВЫ: элементы {page_range} из {len(compact_entries)}; {'; '.join(navigation)}. "
+            )
+
+        if (
+            not facts["record_sets"]
+            and not facts["record_sets_created"]
+            and not facts["delegates"]
+            and not facts["local_calls"]
+            and not facts["global_calls"]
+            and not facts["dynamic_calls"]
+        ):
+            parts.append(
+                "В теле обработчика НЕ НАЙДЕНО ни наборов записей, ни вызовов-делегатов: судя по коду, движений "
+                "он не пишет. Это ЗАКОННЫЙ ответ, а не ошибка — но разбор смотрит только тело обработчика, поэтому "
+                "при сомнении прочитай его сам (шаг 1). "
+            )
+
+        tail = _POSTING_TAIL
+        if not _want_git_search:
+            # Хвост — та же поверхность, что и шаги: советовать незарегистрированный git_search
+            # нельзя и здесь. safe_grep живой (git/индекс не нужны), но ходит только по BSL.
+            tail = tail.replace(
+                "ищи имя регистра через git_search (он идет по ВСЕМУ дереву и любым типам файлов). ",
+                f"ищи имя регистра через {_register_search_route()}. ",
+            )
+        parts.append(tail)
+        hint = "".join(parts)
+        if profile:
+            hint += _POSTING_PROFILE_TAIL.format(doc=document_name)
+        return hint
+
+    def _live_posting_signal(
+        document_name: str, *, index_prefilter: bool = False
+    ) -> tuple[str, str, list[dict]] | None:
+        """``(rel_path, тело модуля, CFE-перехваты)``, если сигнал подтвержден ЖИВЬЁМ:
+        ОбработкаПроведения объявлена И прямых ``Движения.<Регистр>`` в модуле НЕТ. Иначе None.
+
+        Тело возвращается ВМЕСТЕ с путём (оно уже прочитано — см. ``_live_body``), потому что
+        разбор получателя делает СЕРВЕР: агент прочитать этот модуль может не суметь вовсе —
+        обработчик бывает только в CFE-расширении, а туда песочный ``read_file`` не пускает.
+
+        ЕДИНСТВЕННАЯ точка истины для обоих маршрутов (find_register_movements и секция
+        registers профиля). Держать проверки раздельно уже дважды приводило к тому, что
+        половины конъюнкции разъезжались по источникам и сигнал лгал: сперва «движений нет»
+        брали из индекса, а «обработчик есть» — живьём; потом это починили в хелпере, но
+        забыли в профиле. Обе половины обязаны читаться по ОДНОМУ живому телу — структурно,
+        а не по договорённости.
+
+        Возвращаем ПУТЬ, а не bool: у документа может быть несколько точных ObjectModule
+        (main + CFE-расширение), и тогда ``module_hint='Документ.X'`` резолвится неоднозначно,
+        а find_call_hierarchy уходит в fallback-режим. Точный rel_path — самая сильная форма
+        hint, которую call-hierarchy уже поддерживает.
+
+        **Кандидат ВСЕГДА подтверждается живым кодом** — в ОБОИХ маршрутах, одной и той же
+        проверкой. Верить тут индексу нельзя: общий парсер методов применяет
+        ``BSL_PATTERNS["procedure_def"]`` неякорным ``.search()`` к СЫРОЙ строке, поэтому
+        билдер кладёт в таблицу ``methods`` даже закомментированную
+        ``// Процедура ОбработкаПроведения()``. Доверившись ей, профиль заявил бы обработчик,
+        которого нет, — и разошёлся бы с ``find_register_movements`` НА ОДНОМ И ТОМ ЖЕ свежем
+        индексе. ``extract_procedures``/``_parse_procedures`` тоже не годятся: первый
+        объединяет индекс с live-fill (а live-fill только ДОБАВЛЯЕТ методы и не убирает
+        исчезнувшие → «помнит» уже удалённую процедуру), второй наследует ту же неякорность.
+        Матчим анкорным ``_POSTING_HANDLER_DECL_RE`` (ключевые слова — как в BSL_PATTERNS,
+        включая английские Procedure/Function; якорь ``^\\s*`` отсекает и комментарий, и текст
+        внутри строкового литерала: в 1С строка-продолжение всегда начинается с ``|``).
+
+        ``index_prefilter`` — ТОЛЬКО про то, скольких кандидатов мы открываем В ПОИСКЕ
+        ОБРАБОТЧИКА (фаза 1), а не про строгость проверки (она одна и та же):
+          * ``False`` (find_register_movements): открываем КАЖДОГО точного кандидата →
+            self-healing, обработчик, дописанный после сборки индекса, будет найден;
+          * ``True`` (get_object_profile): сперва дешёвый отсев по индексу
+            (``get_methods_by_path``) — модуль, на который индекс не указал, в фазе 1 не
+            открываем. Плата: на устаревшем индексе профиль может ПРОМОЛЧАТЬ (метода ещё нет
+            в ``methods``) — это безопасное направление; соврать он не может.
+
+        **ВНИМАНИЕ про стоимость:** index-отсев действует ТОЛЬКО в фазе 1. Фаза 2 (движений
+        нет) открывает ВСЕ точные ObjectModule документа, включая index-negative, — иначе
+        движения, дописанные в НЕ-индексный модуль, остались бы незамеченными и конъюнкция
+        снова собралась бы из разных источников. Но фаза 2 запускается ТОЛЬКО когда обработчик
+        уже подтверждён, то есть на общем пути (у документа есть движения / индекс не знает
+        обработчика) не открывается НИ ОДИН файл. Тело каждого модуля читается однократно
+        за вызов (см. ``_live_body``).
+
+        find_by_type здесь НЕ годится: он матчит имя ПОДСТРОКОЙ и режет выдачу на 50
+        элементах — то есть даёт не только ложного омонима (это лечится post-фильтром), но и
+        FALSE-NEGATIVE: нужный документ может не попасть в первые 50 подстрочных кандидатов.
+        Для identity-sensitive кода main-кандидаты берутся из текущего CF/EDT-дерева, а
+        точные CFE-кандидаты — из live side-load расширений в _index_state.
+        """
+        target = (document_name or "").casefold()
+        if not target:
+            return None
+        _ensure_index()
+        main_candidates = _live_main_object_module_paths(document_name)
+        extension_candidates = sorted(
+            rel_path
+            for rel_path, info in _index_state
+            if rel_path in _extension_paths_set
+            and (info.category or "") == "Documents"
+            and info.module_type == "ObjectModule"
+            and (info.object_name or "").casefold() == target  # ТОЧНО: без подстроки и без cap-50
+        )
+        candidates = [*main_candidates, *extension_candidates]
+        if not candidates:
+            return None
+
+        bodies: dict[str, str] = {}
+
+        def _live_body(rel_path: str) -> str | None:
+            """Тело модуля, прочитанное РОВНО ОДИН раз за вызов (обе половины смотрят на него)."""
+            if rel_path in bodies:
+                return bodies[rel_path]
+            if rel_path in _extension_paths_set:
+                try:
+                    body = _ext_read_file(rel_path)
+                except Exception:
+                    return None
+            else:
+                body = _live_main_object_module_body(rel_path)
+                if body is None:
+                    return None
+            bodies[rel_path] = body
+            return body
+
+        # --- Половина 1: где ЖИВЬЁМ объявлен обработчик ---
+        # Анкорный матч по СЫРОМУ телу: якорь ^\s* сам отсекает и `// Процедура ...`, и текст
+        # внутри строкового литерала (строка-продолжение в 1С всегда начинается с `|`), а стоит
+        # это ~1 мс против ~85 мс полного вырезания комментариев.
+        handler_path: str | None = None
+        for rel_path in candidates:
+            if index_prefilter:
+                # Дешёвый отсев: без подсказки индекса модуль даже не открываем.
+                if idx_reader is None:
+                    continue
+                try:
+                    procs = idx_reader.get_methods_by_path(rel_path) or []
+                except Exception:
+                    continue
+                if not any((p.get("name") or "").casefold() == "обработкапроведения" for p in procs):
+                    continue
+            body = _live_body(rel_path)
+            if body is None:
+                continue
+            if _POSTING_HANDLER_DECL_RE.search(body):
+                handler_path = rel_path
+                break  # обработчик мог уехать в CFE — поэтому перебор, а не ранний выход
+        if handler_path is None:
+            return None
+
+        # --- Половина 2: прямых ВЫПОЛНЯЕМЫХ Движения.X нет НИ В ОДНОМ модуле документа ---
+        # Именно НИ В ОДНОМ, а не только в модуле обработчика: у документа бывает несколько
+        # точных ObjectModule (main + CFE), и движения могли остаться в ДРУГОМ. Проверять
+        # только модуль обработчика — значит снова собрать конъюнкцию из разных источников
+        # (индекс про остальные модули + живой файл про этот) и снова соврать на устаревшем
+        # индексе. Читаем всех кандидатов — но ТОЛЬКО когда уже собрались выставить сигнал,
+        # то есть на общем пути лишних чтений нет, а модули эти уже в кеше.
+        # Комментарии/строки тут вырезаем: у `Движения.X` якоря нет, и `// Движения.X` (или тот
+        # же текст в запросе) иначе сошёл бы за обращение и отнял бы у агента верный сигнал.
+        for rel_path in candidates:
+            body = _live_body(rel_path)
+            if body is None:
+                return None  # не смогли прочитать модуль документа — молчим, а не гадаем
+
+        interceptors: list[dict] = []
+        seen_interceptors: set[tuple[str, str, str]] = set()
+        for rel_path in candidates:
+            for interceptor in _posting_interceptors_for_module(rel_path, bodies.get(rel_path) or ""):
+                key = (
+                    interceptor["path"].casefold(),
+                    interceptor["method"].casefold(),
+                    interceptor["annotation"].casefold(),
+                )
+                if key not in seen_interceptors:
+                    seen_interceptors.add(key)
+                    interceptors.append(interceptor)
+
+        # A CFE replacement without a visible ProceedWithCall suppresses the main handler.
+        # Therefore a live ``Движения.X`` in main is not an active movement and must not
+        # veto the replacement-aware hint.  CFE movements always remain active; with a
+        # visible continuation main rows keep the ordinary possible-execution semantics.
+        _active, _suppressed, replacement_meta = _apply_cfe_posting_replacement([], interceptors)
+        ignore_main_movements = bool(replacement_meta and not replacement_meta["main_handler_continuation_visible"])
+        suppressible_main_rows = (
+            _main_handler_only_movement_keys(document_name, bodies) if ignore_main_movements else set()
+        )
+        for rel_path in candidates:
+            for movement in _MOVEMENTS_LIVE_RE.finditer(_live_code_only(bodies.get(rel_path) or "")):
+                if movement.group(1).lower() in _MOVEMENT_METHOD_NOISE:
+                    continue
+                movement_key = (
+                    rel_path.replace("\\", "/").casefold(),
+                    movement.group(1).casefold(),
+                )
+                if ignore_main_movements and movement_key in suppressible_main_rows:
+                    continue
+                return None  # выполняемое движение ЕСТЬ живьём → handler-сигнала быть не должно
+        return handler_path, (bodies.get(handler_path) or ""), interceptors
+
+    def _maybe_add_posting_handler_hint(result: dict, document_name: str, posting_calls_offset: int = 0) -> None:
+        """find_register_movements: обработчик есть, `Движения.X` нет → ФАКТ + условный hint.
+
+        ПРИОРИТЕТ Posting=Deny. Полагаться на то, что его уже выставил
+        _maybe_add_postability_hint, НЕЛЬЗЯ: тот гейтится ПОЛНОЙ пустотой результата
+        (code_registers И erp_mechanisms И manager_tables И adapted_registers). Проверка здесь
+        выполняется ДО раннего выхода и по code_registers: Deny обязан пометить статические
+        ссылки недостижимыми, а не только подавить handler-сигнал на пустом результате.
+        Поэтому постановку проверяем ЗДЕСЬ явно (live-XML — find_register_movements и так
+        читает файлы; _check_document_postable мемоизирован, XML не парсится дважды).
+        """
+        if result.get("hint"):
+            return
+        info = _check_document_postable(document_name)
+        if info.get("is_postable") is False:
+            # Preserve provenance-bearing static rows, but mark them unreachable: the
+            # platform will not invoke posting for a Deny document.
+            result.setdefault("posting", info.get("posting"))
+            result["is_postable"] = False
+            result["hint"] = (
+                "Документ непроводимый (Posting=Deny) — движений регистров при проведении нет. "
+                "Непустые code_registers/manager_tables в этом ответе — только статические ссылки "
+                "из недостижимого обработчика или снимка, а не выполняемые движения. "
+                "Связь с регистрами ищите через find_event_subscriptions / "
+                "регистры сведений с типом источника = документ."
+            )
+            return
+        suppressed_main = result.get("suppressed_main_code_registers") or []
+        if result.get("code_registers"):
+            if suppressed_main:
+                result["hint"] = _replacement_hint(suppressed_main)
+            return
+        # ОБЕ половины конъюнкции проверяет _live_posting_signal — по ОДНОМУ живому телу и той
+        # же проверкой, что и профиль. Отдельной перепроверки движений здесь БОЛЬШЕ НЕТ: пока
+        # половины жили в разных местах, они дважды успели разъехаться по источникам.
+        found = _live_posting_signal(document_name, index_prefilter=False)
+        if not found:
+            if suppressed_main:
+                # Live analysis may be unavailable/partial, but the exact CFE annotation
+                # and the absence of a direct continuation were already established while
+                # reading the same module for movement extraction.  Preserve that narrower
+                # fact rather than silently re-promoting suppressed main rows.
+                result["hint"] = _replacement_hint(suppressed_main)
+            return
+        handler_path, module_body, interceptors = found
+        result["posting_handler_present"] = True
+        result["hint"] = _build_posting_hint(
+            document_name,
+            handler_path,
+            module_body,
+            profile=False,
+            interceptors=interceptors,
+            posting_calls_offset=posting_calls_offset,
+        )
+
     def find_register_writers(register_name: str) -> dict:
-        """Find all documents that write to a specific register.
-        Searches all document ObjectModules for 'Движения.RegisterName'.
+        """Find static document references to a specific register.
+        Searches all document ObjectModules for 'Движения.RegisterName'. CFE
+        replacement reachability and Posting=Deny are intentionally not applied.
+        ``find_register_movements(document)`` applies those filters, but main code
+        rows there still come from the index snapshot.
 
         Args:
             register_name: Register name to search for.
 
-        Returns: dict with register, writers, total_documents_scanned, total_writers."""
+        Returns: dict with register, writers, total_documents_scanned, total_writers,
+                 runtime_filtered=False, and an interpretation hint."""
         register_name = _strip_meta_prefix(register_name)
+        runtime_hint = (
+            "Статические ссылки из кода/индекса: CFE-замены и Posting=Deny здесь не применяются. "
+            "find_register_movements(document) применяет эти фильтры, но main-строки там остаются "
+            "снимком индекса; после изменения main-кода проверь живой файл кандидата."
+        )
 
         # Fast path: SQLite index
         if idx_reader is not None:
@@ -4816,6 +7678,8 @@ def make_bsl_helpers(
                     ],
                     "total_documents_scanned": 0,
                     "total_writers": len(idx_writers),
+                    "runtime_filtered": False,
+                    "hint": runtime_hint,
                 }
 
         _ensure_index()
@@ -4856,6 +7720,8 @@ def make_bsl_helpers(
             "writers": writers,
             "total_documents_scanned": len(doc_modules),
             "total_writers": len(writers),
+            "runtime_filtered": False,
+            "hint": runtime_hint,
         }
 
     def analyze_document_flow(document_name: str) -> dict:
@@ -4913,7 +7779,8 @@ def make_bsl_helpers(
         if isinstance(movements, dict) and movements.get("is_postable") is False:
             result["is_postable"] = False
             result["hint"] = (
-                "Документ непроводимый (Posting=Deny). register_movements ожидаемо пустой. "
+                "Документ непроводимый (Posting=Deny). Строки в register_movements, если они есть, "
+                "являются статическими ссылками из недостижимого обработчика, а не runtime-движениями. "
                 "Связь с регистрами — через event_subscriptions, based_on "
                 "или регистры сведений с типом-источником = документ."
             )
@@ -4938,15 +7805,62 @@ def make_bsl_helpers(
         наш `document_name` есть в этой процедуре. Записи помечаются
         `"via": "back_scan"`.
 
-        Returns: dict with document, can_create_from_here, can_be_created_from."""
-        document_name = _strip_meta_prefix(document_name)
+        Вход category-aware: bare-имя и `Документ./Document.` → полный обход (FS + метаданные);
+        типизированный НЕ-документ (`Справочник.X`) → только метаданные, document-specific
+        сканы пропускаются (иначе при омонимичном Document.X подмешались бы связи документа).
+
+        Returns: dict with document, can_create_from_here, can_be_created_from.
+        Для прямых code-derived записей ``via`` отсутствует (backcompat; отсутствие означает
+        direct); back_scan/metadata помечены явно. Metadata несет также category + canonical
+        ref — Catalog-основания и омонимы."""
+        # Canonical category is resolved BEFORE the FS walk (#3, code-review): every scan
+        # below is document-specific (Documents/<name>/Ext/*, ДокументСсылка.<name>), so a
+        # typed non-document input (``Справочник.X``) must not run them — with a homonymous
+        # Document.X in the config they would silently attach the DOCUMENT's bases to the
+        # CATALOG's answer, i.e. break exactly the homonym case this change exists for.
+        canon, _forms = _normalize_object_ref((document_name or "").strip())
+        if canon and "." not in canon:
+            canon = f"Document.{canon}"  # bare name → document (this helper is document-centric)
+        is_document_input = (not canon) or canon.startswith("Document.")
+        # Короткое имя — из canonical suffix, а НЕ из регистрозависимого _strip_meta_prefix:
+        # "документ.X" канонизируется (casefold), но _strip_meta_prefix оставил бы префикс
+        # на месте и FS-поиск ушёл бы искать объект "документ.X".
+        document_name = canon.split(".", 1)[1] if canon and "." in canon else _strip_meta_prefix(document_name)
         result: dict = {
             "document": document_name,
             "can_create_from_here": [],
             "can_be_created_from": [],
         }
+        metadata_complete = False
+        metadata_incomplete_at_cap = False
 
-        modules = find_by_type("Documents", document_name)
+        modules: list[dict] = []
+        if is_document_input:
+            # Полное имя документа задаёт identity, а не substring-запрос. Иначе обычная
+            # пара ``Заказ``/``ЗаказКлиента`` смешивает процедуры двух объектов; чужой
+            # direct-hit вдобавок отключает корректный back_scan для точного документа.
+            # Если точного объекта нет, сохраняем исторический fragment-fallback.
+            _ensure_index()
+            exact_name = document_name.casefold()
+            exact_modules = [
+                _info_to_dict(relative_path, info)
+                for relative_path, info in _index_state
+                if (info.category or "").casefold() == "documents" and (info.object_name or "").casefold() == exact_name
+            ]
+            exact_document_exists = bool(exact_modules)
+            if not exact_document_exists:
+                # У документа законно может не быть НИ ОДНОГО BSL-модуля. Проверяем его
+                # identity по точному live XML/MDO-пути; иначе пустой точный объект снова
+                # провалился бы в fuzzy-ветку и получил модули префиксного соседа. Общий
+                # glob здесь не используем: index-backed glob имеет диагностические строки
+                # для некоторых нулевых запросов, которые не являются найденными файлами.
+                try:
+                    _resolve_object_xml(f"Documents/{document_name}")
+                except Exception:
+                    exact_document_exists = False
+                else:
+                    exact_document_exists = True
+            modules = exact_modules if exact_document_exists else find_by_type("Documents", document_name)
 
         # --- ManagerModule: ДобавитьКомандыСозданияНаОсновании ---
         mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
@@ -4980,7 +7894,9 @@ def make_bsl_helpers(
 
         # --- Reverse scan для can_create_from_here ---
         # Только если прямой обход ничего не нашёл — иначе дёшево пропускаем.
-        if not result["can_create_from_here"]:
+        # Ищется `ДокументСсылка.<name>` → осмысленно только для документо-входа
+        # (для `Справочник.X` это ссылка на ОМОНИМИЧНЫЙ документ, а не на наш справочник).
+        if is_document_input and not result["can_create_from_here"]:
             try:
                 obj_paths = glob_files_fn("Documents/*/Ext/ObjectModule.bsl") or []
             except Exception:
@@ -5013,6 +7929,95 @@ def make_bsl_helpers(
                         "file": raw_path,
                         "via": "back_scan",
                     }
+                )
+
+        # --- Metadata union: declarative <BasedOn> (#3, v1.28.0) ---
+        # The FS scan above only walks Documents/* → it misses Catalog (and other)
+        # objects that declare our document as their <BasedOn> basis. Those live in the
+        # index (metadata_references, kind='based_on'). Run STRICTLY AFTER direct+back_scan
+        # (purely additive) — back_scan is gated on an empty can_create_from_here, so
+        # injecting metadata earlier would suppress a real code-declared basis.
+        if idx_reader is not None:
+            # ``canon`` — canonical ref of the INPUT object, resolved up-front (see above):
+            # an explicit Справочник./Catalog. keeps its category, a bare name is a Document.
+            if canon:
+                try:
+                    # find_metadata_references (NOT find_references_to_object, which drops
+                    # source_object) → each row's source_* is an object creatable from us.
+                    # ЛИМИТ — ПО ФАКТИЧЕСКОМУ СЧЁТУ. Дефолтный limit=1000 у ридера предназначен
+                    # для agent-facing выдачи, а здесь union ВНУТРЕННИЙ и обязан быть ПОЛНЫМ:
+                    # на дефолте хвост оснований молча исчез бы из can_create_from_here (тихое
+                    # усечение читается как «это всё» — ровно то, что мы чиним в get_overrides).
+                    # Если счетчик недоступен (нет таблицы / транзиентный сбой), резервная
+                    # выборка остается ограниченной. Ответ короче лимита полный; ровно лимит
+                    # строк означает неизвестный хвост и явно помечается как partial ниже.
+                    cnt = idx_reader.count_metadata_references(canon, kinds=["based_on"])
+                    count_available = isinstance(cnt, dict) and cnt.get("total") is not None
+                    total_based_on = int(cnt["total"]) if count_available else 0
+                    metadata_limit = max(total_based_on, 1000)
+                    raw_mrows = idx_reader.find_metadata_references(canon, kinds=["based_on"], limit=metadata_limit)
+                    if raw_mrows is not None:
+                        if count_available:
+                            metadata_complete = len(raw_mrows) >= total_based_on
+                            metadata_incomplete_at_cap = not metadata_complete
+                        else:
+                            metadata_complete = len(raw_mrows) < metadata_limit
+                            metadata_incomplete_at_cap = not metadata_complete
+                    mrows = raw_mrows or []
+                except Exception:
+                    mrows = []
+                # Folder-category → singular canonical for the ``ref`` field. Reuse the
+                # shared _CATEGORY_TO_TYPE_PREFIX (complete over ALL metadata_references
+                # trigger categories — Tasks/BusinessProcesses/Reports/… also support Ввод
+                # на основании), NOT a local subset that would emit non-canonical "Tasks.X".
+                # Same map the index uses to build canonical refs from these very rows.
+                from rlm_tools_bsl.bsl_index import _CATEGORY_TO_TYPE_PREFIX
+
+                # Dedup by canonical source (category, object) — NOT bare name — so a
+                # Document.X and a Catalog.X basis don't collapse. Seed from what direct+
+                # back_scan already found (all Documents → default category "Documents",
+                # matching the plural folder category stored in metadata_references).
+                seen_keys: set[tuple[str, str]] = set()
+                for e in result["can_create_from_here"]:
+                    cat = (e.get("category") or "Documents").lower()
+                    seen_keys.add((cat, str(e.get("document", "")).lower()))
+                for r in mrows:
+                    src_obj = r.get("source_object")
+                    if not src_obj:
+                        continue
+                    src_cat = r.get("source_category") or ""
+                    key = (src_cat.lower(), str(src_obj).lower())
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    canon_cat = _CATEGORY_TO_TYPE_PREFIX.get(src_cat, src_cat)
+                    result["can_create_from_here"].append(
+                        {
+                            "document": src_obj,
+                            "category": src_cat,
+                            "via": "metadata",
+                            "ref": f"{canon_cat}.{src_obj}" if canon_cat else src_obj,
+                        }
+                    )
+
+        # Для типизированного не-документа metadata_references — единственный применимый
+        # источник. Для любого входа достижение резервного лимита при неизвестном счете
+        # означает возможный хвост metadata-union. В обоих случаях ответ честно partial.
+        if canon and (metadata_incomplete_at_cap or (not is_document_input and not metadata_complete)):
+            result["partial"] = True
+            if metadata_incomplete_at_cap:
+                result.setdefault("_meta", {})["reason"] = "metadata_references_incomplete"
+                result["hint"] = (
+                    "Счет BasedOn недоступен или расходится с выборкой, а выборка достигла "
+                    "резервного лимита. В can_create_from_here может быть не весь хвост; "
+                    "проверь индекс и повтори вызов."
+                )
+            else:
+                result.setdefault("_meta", {})["reason"] = "metadata_references_unavailable"
+                result["hint"] = (
+                    "Связи BasedOn для типизированного не-документа читаются из metadata_references. "
+                    "Таблица недоступна или индекс не подключен, поэтому пустые списки здесь неполны; "
+                    "пересобери индекс и повтори вызов."
                 )
 
         return result
@@ -5960,7 +8965,7 @@ def make_bsl_helpers(
     def _ensure_functional_options() -> list[dict]:
         return _fo_lazy.ensure(_build_functional_options)
 
-    def find_functional_options(object_name: str, include_code: bool = True) -> dict:
+    def find_functional_options(object_name: str, include_code: bool = True, limit: int | None = None) -> dict:
         """Find functional options that affect a given object.
         Also greps BSL modules for ПолучитьФункциональнуюОпцию("X") pattern.
         Uses SQLite index for XML options when available.
@@ -5972,8 +8977,18 @@ def make_bsl_helpers(
                 ``False`` — XML-only (index/live FO definitions), без code-скана; так
                 зовёт compact ``get_object_profile`` (тяжёлый grep — только под
                 ``include_code_usages``).
+            limit: ``None`` (default, backcompat) — вернуть все опции без пагинации.
+                Иначе **per-bucket cap** (v1.28.0, #6): ``xml_options`` и ``code_options``
+                режутся КАЖДЫЙ независимо до ``limit`` (``limit=10`` → до 10+10, НЕ 10
+                суммарно) — зеркало ``find_event_subscriptions``. Защита от обрыва по
+                ``max_output_chars`` на объектах с сотнями опций.
 
-        Returns: dict with object, xml_options, code_options (empty when not include_code)."""
+        Returns: dict with object, xml_options, code_options (empty when not
+        include_code). При ``limit`` != None — плюс ``total`` (полный xt+ct для
+        непустого object_name), ``returned`` (len(xp)+len(cp)), ``has_more``
+        (per-bucket). Пустой code-обзор сохраняет бюджет 20 модулей; если каталог
+        больше, пагинированный ответ помечен ``partial=True`` и ``total`` считается
+        только по проверенному code-срезу."""
         object_name = _strip_meta_prefix(object_name)
 
         # --- Fast path for xml_options: SQLite index ---
@@ -5992,13 +9007,23 @@ def make_bsl_helpers(
 
         # Grep for ПолучитьФункциональнуюОпцию in BSL code (skipped when XML-only).
         code_options: list[dict] = []
+        code_scope_partial = False
+        code_modules_scanned = 0
+        code_modules_total = 0
         if include_code:
             try:
-                grep_results = safe_grep("ПолучитьФункциональнуюОпцию", name_hint=object_name)
+                live_catalog = _ensure_live_bsl_catalog()
+                code_modules_total = len(live_catalog)
+                # Непустой объект получает полный live-каталог. Пустой обзор сохраняет
+                # прежний безопасный бюджет safe_grep — первые 20 модулей, а не весь dump.
+                grep_kwargs = {"max_files": len(live_catalog)} if object_name else {}
+                code_modules_scanned = len(live_catalog) if object_name else min(20, len(live_catalog))
+                code_scope_partial = not object_name and code_modules_total > code_modules_scanned
+                grep_results = safe_grep("(?i)ПолучитьФункциональнуюОпцию", name_hint=object_name, **grep_kwargs)
                 for r in grep_results:
                     text = r.get("text", "") or r.get("content", "")
                     # Extract option name from ПолучитьФункциональнуюОпцию("OptionName")
-                    m = re.search(r'ПолучитьФункциональнуюОпцию\(\s*"([^"]+)"', text)
+                    m = re.search(r'ПолучитьФункциональнуюОпцию\(\s*"([^"]+)"', text, re.IGNORECASE)
                     if m:
                         code_options.append(
                             {
@@ -6010,11 +9035,34 @@ def make_bsl_helpers(
             except Exception:
                 pass
 
-        return {
+        if limit is None:
+            return {
+                "object": object_name,
+                "xml_options": xml_options,
+                "code_options": code_options,
+            }
+        # Per-bucket cap (#6): each list truncated independently to ``limit``.
+        xt, ct = len(xml_options), len(code_options)
+        n = max(0, int(limit))
+        xp, cp = xml_options[:n], code_options[:n]
+        page = {
             "object": object_name,
-            "xml_options": xml_options,
-            "code_options": code_options,
+            "xml_options": xp,
+            "code_options": cp,
+            "total": xt + ct,
+            "returned": len(xp) + len(cp),
+            "has_more": xt > len(xp) or ct > len(cp),
         }
+        if code_scope_partial:
+            page["partial"] = True
+            page["_meta"] = {
+                "reason": "code_scan_budget",
+                "code_modules_scanned": code_modules_scanned,
+                "code_modules_total": code_modules_total,
+                "total_scope": "all_xml_plus_scanned_code",
+                "hint": "Пустой обзор проверяет первые 20 BSL-модулей; укажи object_name для полного code-скана.",
+            }
+        return page
 
     def find_roles(object_name: str) -> dict:
         """Find roles that grant rights to a given object.
@@ -6921,26 +9969,134 @@ def make_bsl_helpers(
         object_name — имя объекта для прицельного поиска ('' = все)."""
         from rlm_tools_bsl.extension_detector import find_extension_overrides as _feo
 
-        overrides = _feo(extension_path, object_name or None)
-        return {
+        diagnostics: dict = {}
+        overrides = _feo(extension_path, object_name or None, diagnostics=diagnostics)
+        result = {
             "extension_path": extension_path,
             "object_filter": object_name or "(all)",
             "overrides": overrides[:200],
             "total": len(overrides),
             "truncated": len(overrides) > 200,
+            "partial": not diagnostics.get("complete", True),
         }
+        if result["partial"]:
+            result["_meta"] = {"scan_diagnostics": diagnostics}
+        return result
+
+    _OVERRIDES_CAP = 200
+    _OVERRIDES_TOP_N = 20
+
+    def _overrides_payload(
+        rows: list[dict],
+        source: str,
+        *,
+        partial: bool = False,
+        failed_extension_roots: list[dict] | None = None,
+    ) -> dict:
+        """Ответ get_overrides: агрегаты по прочитанному набору + детерминированный срез.
+
+        Срез в cap=200 шёл в порядке вставки (SELECT без ORDER BY), то есть сгруппированным
+        по расширениям: на конфигурации с сотнями перехватов весь срез забивало ОДНО крупное
+        расширение, и группировка по видимым строкам давала неверный топ-объект. Счётчики
+        считаем ДО обрезки (полный список и так в памяти), срез сортируем — чтобы он был
+        воспроизводим. Один и тот же shape отдают ВСЕ ветки (index/live/unavailable), иначе
+        код агента, читающий by_object_top, падает на конфигурации без расширений.
+        """
+
+        # Агрегация CASE-INSENSITIVE: имена объектов/расширений в 1С регистронезависимы, и
+        # фильтры reader'а (get_extension_overrides) сравнивают через .lower(). Если
+        # группировать по исходному написанию, «Объект» и «объект» дадут ДВА элемента
+        # by_object_top и unique_objects=2 — то есть агрегат разошёлся бы с семантикой
+        # фильтров ТОГО ЖЕ API.
+        # НОРМАЛИЗАЦИЯ ИМЕННО .lower(), НЕ .casefold(): цель — БУКВАЛЬНО повторить семантику
+        # фильтра reader'а (bsl_index.py, get_extension_overrides). На русских именах они
+        # совпадают, но в общем Unicode — нет, и casefold склеил бы значения, которые фильтр
+        # того же API считает РАЗНЫМИ. Вторую семантику не изобретаем; если когда-то
+        # переводить на casefold — то ОБА места одним изменением.
+        # display-name выбирается ДЕТЕРМИНИРОВАННО — минимальное написание в группе.
+        # «Первое встреченное» зависело бы от порядка выдачи SQLite (SELECT без ORDER BY), и
+        # ключ by_object_top у пары «Номенклатура»/«номенклатура» скакал бы между прогонами,
+        # хотя счётчик уже регистронезависим.
+        def _bump(counter: dict[str, list], display: str) -> None:
+            key = display.lower()
+            slot = counter.get(key)
+            if slot is None:
+                counter[key] = [display, 1]
+            else:
+                slot[1] += 1
+                if display < slot[0]:
+                    slot[0] = display  # min() по исходному написанию — стабильно
+
+        def _top(counter: dict[str, list], n: int) -> dict[str, int]:
+            items = [(disp, cnt) for disp, cnt in counter.values()]
+            return dict(sorted(items, key=lambda kv: (-kv[1], kv[0]))[:n])
+
+        by_object: dict[str, list] = {}
+        by_extension: dict[str, list] = {}
+        by_annotation: dict[str, list] = {}
+        methods: set[str] = set()
+        for r in rows:
+            obj = r.get("object_name") or ""
+            ext = r.get("extension_name") or ""
+            ann = r.get("annotation") or ""
+            if obj:
+                _bump(by_object, obj)
+            if ext:
+                _bump(by_extension, ext)
+            if ann:
+                _bump(by_annotation, ann)
+            if r.get("target_method"):
+                methods.add(str(r["target_method"]).lower())  # та же нормализация, что у фильтра
+
+        # Детерминизм ПОЛНЫЙ: бизнес-ключи задают осмысленный порядок, а финальный
+        # tie-breaker — стабильная сериализация ВСЕЙ строки, чтобы различимые записи не
+        # зависели от порядка выдачи SQLite (SELECT * несёт и extension_root, и
+        # target_method_line, и прочие поля, которых нет в ключе).
+        def _sort_key(r: dict) -> tuple:
+            return (
+                (r.get("object_name") or "").lower(),
+                (r.get("target_method") or "").lower(),
+                (r.get("extension_name") or "").lower(),
+                (r.get("annotation") or "").lower(),
+                (r.get("extension_method") or "").lower(),
+                (r.get("source_path") or "").lower(),
+                json.dumps(r, sort_keys=True, ensure_ascii=False, default=str),
+            )
+
+        ordered = sorted(rows, key=_sort_key)
+        total = len(rows)
+        payload = {
+            "overrides": ordered[:_OVERRIDES_CAP],
+            "total": total,
+            "truncated": total > _OVERRIDES_CAP,
+            "source": source,
+            "partial": partial,
+            "by_annotation": _top(by_annotation, len(by_annotation)),  # аннотаций мало — все
+            "by_object_top": _top(by_object, _OVERRIDES_TOP_N),
+            "by_extension_top": _top(by_extension, _OVERRIDES_TOP_N),
+            "unique_objects": len(by_object),  # lower()-ключи → регистр не двоит
+            "unique_methods": len(methods),  # тот же lower()
+            "unique_extensions": len(by_extension),
+        }
+        if failed_extension_roots:
+            payload["_meta"] = {"failed_extension_roots": failed_extension_roots}
+        return payload
 
     def get_overrides(object_name: str = "", method_name: str = "") -> dict:
         """Перехваченные методы из индекса (мгновенно).
         object_name/method_name — фильтры ('' = все).
-        Возвращает: {overrides: [...], total: N, truncated: bool,
-                     source: "index"|"live"|"unavailable"}.
-        Без фильтра отдаются ПЕРВЫЕ 200 перехватов (cap=200; порядок НЕ
-        гарантирован — index-источник делает SELECT без ORDER BY). ``total`` —
-        полное число перехватов; ``truncated`` сигналит обрезку (total>200). Для
-        более прицельного среза фильтруй по объекту/методу или вызывай
-        find_ext_overrides по конкретному расширению — но cap=200 действует и там,
-        ``truncated`` всё равно проверяй.
+        Возвращает: {overrides: [...], total: N, truncated: bool, partial: bool,
+                     source: "index"|"live"|"unavailable",
+                     by_annotation, by_object_top, by_extension_top,
+                     unique_objects, unique_methods, unique_extensions}.
+        Без фильтра ``overrides`` отдает ПЕРВЫЕ 200 перехватов (cap=200), детерминированно
+        ОТСОРТИРОВАННЫХ. ``total`` — полное число перехватов; ``truncated`` сигналит обрезку.
+        **СТАТИСТИКУ бери из агрегатов** (``by_annotation`` — все аннотации; ``by_object_top``
+        / ``by_extension_top`` — топ-20; ``unique_*``): при ``partial=false`` они посчитаны по
+        ПОЛНОМУ выбранному источнику, а при ``partial=true`` — только по успешно прочитанной
+        части (см. ``_meta.failed_extension_roots``). Группировать усеченный ``overrides``
+        вручную НЕЛЬЗЯ — срез не репрезентативен. Shape одинаков во всех ветках
+        (index/live/unavailable).
         Каждый перехват ГАРАНТИРОВАННО несёт ключ ``extension_name`` (имя расширения)
         во всех ветках источника — index, live из main-сессии и live из сессии,
         открытой прямо на расширении (нормализуется из идентичности текущего
@@ -6949,12 +10105,7 @@ def make_bsl_helpers(
         if idx_reader is not None:
             result = idx_reader.get_extension_overrides(object_name, method_name)
             if result is not None:
-                return {
-                    "overrides": result[:200],
-                    "total": len(result),
-                    "truncated": len(result) > 200,
-                    "source": "index",
-                }
+                return _overrides_payload(result, source="index")
         # Live fallback
         from rlm_tools_bsl.extension_detector import (
             detect_extension_context as _det,
@@ -6963,14 +10114,60 @@ def make_bsl_helpers(
 
         try:
             ctx = _det(base_path)
-        except Exception:
-            return {"overrides": [], "total": 0, "truncated": False, "source": "unavailable"}
+        except Exception as exc:
+            return _overrides_payload(
+                [],
+                source="unavailable",
+                partial=True,
+                failed_extension_roots=[
+                    {
+                        "extension_name": "",
+                        "extension_root": base_path,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                ],
+            )  # ← единый shape
 
         from rlm_tools_bsl.extension_detector import ConfigRole
 
         all_overrides: list[dict] = []
+        failed_extension_roots: list[dict] = []
+        successful_scans = 0
+
+        def _scan_live_extension(extension_path: str, extension_name: str) -> list[dict]:
+            nonlocal successful_scans
+            diagnostics: dict = {}
+            try:
+                rows = _feo(extension_path, object_name or None, diagnostics=diagnostics)
+            except Exception as exc:
+                failed_extension_roots.append(
+                    {
+                        "extension_name": extension_name,
+                        "extension_root": extension_path,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
+                return []
+
+            # A complete empty root is a successful scan.  An incomplete scan counts as
+            # successful only if at least one candidate file was actually read; a missing
+            # root / top-level walk failure must not make an all-failed aggregate look live.
+            if diagnostics.get("complete", True) or diagnostics.get("files_scanned", 0) > 0:
+                successful_scans += 1
+            if not diagnostics.get("complete", True):
+                failed_extension_roots.append(
+                    {
+                        "extension_name": extension_name,
+                        "extension_root": extension_path,
+                        "diagnostics": diagnostics,
+                    }
+                )
+            return rows
+
         if ctx.current.role == ConfigRole.EXTENSION:
-            all_overrides = _feo(base_path, object_name or None)
+            all_overrides = _scan_live_extension(base_path, ctx.current.name or "")
             # Contract normalization: raw _feo rows lack extension_name/extension_root
             # (unlike index rows and the MAIN-session branch below). Fill them from
             # the current extension's own identity so EVERY override carries
@@ -6980,24 +10177,46 @@ def make_bsl_helpers(
                 ov.setdefault("extension_root", ctx.current.path or base_path)
         elif ctx.current.role == ConfigRole.MAIN and ctx.nearby_extensions:
             for ext in ctx.nearby_extensions:
-                try:
-                    ovs = _feo(ext.path, object_name or None)
-                    for ov in ovs:
-                        ov["extension_name"] = ext.name
-                        ov["extension_root"] = ext.path
-                    all_overrides.extend(ovs)
-                except Exception:
-                    pass
+                ovs = _scan_live_extension(ext.path, ext.name)
+                for ov in ovs:
+                    ov["extension_name"] = ext.name
+                    ov["extension_root"] = ext.path
+                all_overrides.extend(ovs)
+        elif ctx.current.role == ConfigRole.UNKNOWN:
+            # The current root cannot be classified as MAIN or EXTENSION, so even a
+            # successful scan of detected sibling CFE roots is only a lower bound.
+            failed_extension_roots.append(
+                {
+                    "extension_name": ctx.current.name or "",
+                    "extension_root": ctx.current.path or base_path,
+                    "error": "UnknownConfigRole",
+                    "message": "Current configuration root could not be classified as main or extension",
+                }
+            )
+            for ext in ctx.nearby_extensions:
+                ovs = _scan_live_extension(ext.path, ext.name)
+                for ov in ovs:
+                    ov["extension_name"] = ext.name
+                    ov["extension_root"] = ext.path
+                all_overrides.extend(ovs)
 
         if method_name:
             all_overrides = [ov for ov in all_overrides if ov.get("target_method", "").lower() == method_name.lower()]
 
-        return {
-            "overrides": all_overrides[:200],
-            "total": len(all_overrides),
-            "truncated": len(all_overrides) > 200,
-            "source": "live",
-        }
+        failed_extension_roots.sort(
+            key=lambda row: (
+                (row.get("extension_name") or "").lower(),
+                (row.get("extension_root") or "").lower(),
+                row.get("error") or "",
+            )
+        )
+        source = "unavailable" if failed_extension_roots and successful_scans == 0 else "live"
+        return _overrides_payload(
+            all_overrides,
+            source=source,
+            partial=bool(failed_extension_roots),
+            failed_extension_roots=failed_extension_roots,
+        )
 
     # ── v1.9.0: find_references_to_object + find_defined_types ───────
     # Russian → English metadata prefix map (canonical singular form)
@@ -7024,6 +10243,18 @@ def make_bsl_helpers(
         "ОбщаяКоманда.": "CommonCommand.",
         "ФункциональнаяОпция.": "FunctionalOption.",
         "ПодпискаНаСобытие.": "EventSubscription.",
+        # Русские RUNTIME-формы (v1.28.0): английские (DocumentRef./DocumentObject./…)
+        # канонизирует canonicalize_type_ref, а их русские двойники — нет. Без этих строк
+        # "ДокументСсылка.X" оставался неканоничным ref'ом (запрос к индексу по нему заведомо
+        # пуст, а category-aware ветвление считало его НЕ-документом). Четыре документ/
+        # справочник-формы _META_TYPE_PREFIXES принимал и раньше (_strip_meta_prefix их срезал);
+        # "ПеречислениеСсылка." там НЕТ — её поддержка новая (симметрии ради). Точка в ключе
+        # обязательна: она не даёт более короткому "Документ." перехватить "ДокументСсылка.".
+        "ДокументСсылка.": "Document.",
+        "ДокументОбъект.": "Document.",
+        "СправочникСсылка.": "Catalog.",
+        "СправочникОбъект.": "Catalog.",
+        "ПеречислениеСсылка.": "Enum.",
     }
 
     def _normalize_object_ref(s: str) -> tuple[str, list[str]]:
@@ -7887,7 +11118,7 @@ def make_bsl_helpers(
         "read_procedure",
         read_procedure,
         "read_procedure(path, proc_name(str|list), include_overrides=False) -> str | None  "
-        "# list имён → {proc_name: str|None|{error}} (модуль парсится один раз; {error} на упавшем элементе); numbered in MCP session",
+        "# list имен → {proc_name: str|None|{error}} (модуль парсится один раз; {error} на упавшем элементе); numbered in MCP session",
         "code",
         ["read", "чтени", "читать", "содержим", "content", "тело", "body"],
         "READ PROCEDURE BODY:\n"
@@ -7963,8 +11194,18 @@ def make_bsl_helpers(
             "транзитивный",
         ],
         "BUILD CALL HIERARCHY (multi-level callers tree):\n"
+        "  # ВНИМАНИЕ — ОБРАБОТЧИКИ СОБЫТИЙ МОДУЛЯ ОБЪЕКТА (ОбработкаПроведения, ПередЗаписью,\n"
+        "  #   ПриЗаписи, ОбработкаЗаполнения, ПриКопировании...): вызов от ПЛАТФОРМЫ в граф\n"
+        "  #   ВЫЗОВОВ не попадает, поэтому callers=0 — ЭТО НОРМА, а НЕ мертвый код.\n"
+        "  #   По имени хелпер их НЕ исключает: если BSL-код где-то ЯВНО зовет обработчик,\n"
+        "  #     такое ребро в индексе ЕСТЬ и оно придет обычным caller'ом — не игнорируй.\n"
+        "  #   Но ЧЕМ обработчик пишет движения, так не узнать: трассируй ДЕЛЕГАТА из его тела:\n"
+        "  #     read_procedure(path, 'ОбработкаПроведения') -> имя делегата -> хелпер НА ДЕЛЕГАТЕ.\n"
+        "  #   direction='callees' («куда уходит метод») НЕ поддержан — только читать тело.\n"
+        "  #   include_triggers ребра «его зовет платформа» НЕ добавит (такого edge_type нет), но\n"
+        "  #     ПОКАЖЕТ CFE-перехват самого обработчика (&Перед/&После/&Вместо) — это полезно.\n"
         "  # depth=1..3 (по умолчанию 2). Только direction='callers'.\n"
-        "  res = find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2)\n"
+        "  res = find_call_hierarchy('ОтразитьВУчете', direction='callers', depth=2)  # метод, который РЕАЛЬНО зовут из кода\n"
         "  if 'error' in res:\n"
         "      print(res['hint'])  # callees/both пока не поддержаны\n"
         "  else:\n"
@@ -7974,10 +11215,12 @@ def make_bsl_helpers(
         "      for t in res['truncated_targets']:  # callers>200 на узле — дерево неполное\n"
         "          print(f\"  TRUNCATED: {t['name']} (L{t['level']}): {t['returned']}/{t['total']}\")\n"
         "          # полный список callers метода — find_callers_context(t['name'], '', offset=200, limit=200)\n"
-        "  # ТОЧНОСТЬ (exact-режим): для ОДНОИМЁННЫХ объектных методов (ОбработкаПроведения,\n"
-        "  #   ПередЗаписью в сотнях документов) передай module_hint — привяжет КОРЕНЬ к одному\n"
-        "  #   модулю и уберёт ложные звенья от однофамильцев:\n"
-        "  res = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.РеализацияТоваровУслуг', depth=2)\n"
+        "  # ТОЧНОСТЬ (exact-режим): для ОДНОИМЕННЫХ методов (один и тот же метод в сотнях объектов)\n"
+        "  #   передай module_hint — привяжет КОРЕНЬ к одному модулю и уберет ложные звенья от\n"
+        "  #   однофамильцев. NB: у платформенных обработчиков (см. выше) hint не добавит\n"
+        "  #   отсутствующий ПЛАТФОРМЕННЫЙ вход; для ЯВНЫХ BSL-вызовов их обычные рёбра остаются.\n"
+        "  #   Hint нужен для одноименных методов, которые РЕАЛЬНО зовут из кода:\n"
+        "  res = find_call_hierarchy('ЗаполнитьДокумент', module_hint='Документ.РеализацияТоваровУслуг', depth=2)\n"
         "  #   формы hint: rel_path | 'Документ.X'/'Document.X' | голый object_name.\n"
         "  #   Экспортному методу общего модуля hint НЕ нужен, ЕСЛИ его имя уникально во всей БД\n"
         "  #   (exact включится сам); если root_exact=False — имя неуникально, передай module_hint.\n"
@@ -7992,7 +11235,10 @@ def make_bsl_helpers(
         "  #     (по уровням): передай module_hint, чтобы и сузить, и ускорить обход.\n"
         "  # Для глубины 1 эффективнее обычный find_callers_context().\n"
         "  # ТРИГГЕРЫ (include_triggers=True): метод вызывается не только из кода. Подмешивает на\n"
-        "  #   КАЖДЫЙ узел node['triggers'] — не-call рёбра (подписки/события форм/рег.задания/CFE):\n"
+        "  #   КАЖДЫЙ узел node['triggers'] — не-call ребра (подписки/события форм/рег.задания/CFE).\n"
+        "  #   Для ОбработкаПроведения из ТРИГГЕРОВ придет разве что CFE-перехват обработчика\n"
+        "  #   расширением: ребра «его зовет платформа» не существует. (Явные BSL-вызовы, если\n"
+        "  #   они есть, приходят обычными callers — триггеры к ним отношения не имеют.)\n"
         "  res = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.X', include_triggers=True)\n"
         "  for node in res['tree']:\n"
         "      for t in node.get('triggers', []):\n"
@@ -8067,7 +11313,9 @@ def make_bsl_helpers(
         "  #   сузь module_hint (rel_path | 'Документ.X' | имя объекта) → _meta.unique=True:\n"
         "  d = find_definition('ОбработкаПроведения', 'Документ.РеализацияТоваровУслуг')\n"
         "  # дальше: read_procedure(d['definitions'][0]['file'], 'ОбработкаПроведения')  # тело\n"
-        "  #         find_callers_context('ОбработкаПроведения', 'Документ.РеализацияТоваровУслуг')  # обратные ссылки\n"
+        "  #   NB: у платформенного обработчика вызов от ПЛАТФОРМЫ в граф не попадает, поэтому ПУСТЫЕ\n"
+        "  #   обратные ссылки — это НОРМА, а не мертвый код (ЯВНЫЙ вызов из BSL, если он есть, найдется).\n"
+        "  #   Но ЧЕМ он пишет движения, так не узнать: читай тело и трассируй ДЕЛЕГАТА (rlm_help('проведение')).\n"
         "  # _meta.hint_applied — фильтр по hint применён к запросу (НЕ «hint изменил счёт»);\n"
         "  #   total/truncated — потолок limit; _meta.slow_fallback=True — был кириллический py_lower-rescan\n"
         "  #   (имя передано в нижнем регистре). Пустой результат → definitions:[], total:0 (не ошибка).",
@@ -8173,7 +11421,7 @@ def make_bsl_helpers(
     _reg(
         "parse_form",
         parse_form,
-        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers, commands, attributes:[{name, types, main, main_table, query_text}]}]  # атрибуты формы используют ключ types (list типов), НЕ attr_type (это поле find_attributes)",
+        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers, commands, attributes:[{name, types, main, main_table, query_text}]}]  # у атрибута формы ключ types — СТРОКА 'Тип1, Тип2' (не list: для списка используй types.split(', ') if types else []), НЕ attr_type (это поле find_attributes)",
         "xml",
         kw=["parse_form", "события формы", "обработчики формы", "элементы формы", "form handler", "form event"],
         recipe=(
@@ -8439,7 +11687,10 @@ def make_bsl_helpers(
     _reg(
         "find_event_subscriptions",
         find_event_subscriptions,
-        "find_event_subscriptions(obj, custom_only=False, event_filter=None, limit=None) -> list[dict] (default) | {subscriptions, total, returned, has_more} (when limit set)",
+        "find_event_subscriptions(obj, custom_only=False, event_filter=None, limit=None) -> list[dict]"
+        " | {subscriptions, total, returned, has_more} (limit)"
+        "  # при непустом obj строки несут scope=exact|partial|universal; полное имя — ТОЧНОЕ совпадение"
+        " (омонимы-подстроки не протекают), фрагмент — подстрока; 'Документ.X' -> category-aware",
         "business",
         ["подписк", "subscription", "событи", "event", "BeforeWrite", "OnWrite", "ПриЗаписи", "ПередЗаписью"],
         "FIND EVENT SUBSCRIPTIONS:\n"
@@ -8469,20 +11720,50 @@ def make_bsl_helpers(
     _reg(
         "find_register_movements",
         find_register_movements,
-        "find_register_movements(doc_name) -> {code_registers:[{name, source, file}], erp_mechanisms:[str], manager_tables:[str], adapted_registers:[str]}  # ВНИМАНИЕ: только code_registers — список словарей; erp_mechanisms/manager_tables/adapted_registers — списки ИМЁН-строк",
+        "find_register_movements(doc_name, posting_calls_offset=0) -> {code_registers:[dict], suppressed_main_code_registers?:[dict],"
+        " erp_mechanisms/manager_tables/adapted_registers:[str], is_postable?, posting_handler_present?,"
+        " hint?, partial?, _meta?}"
+        "  # code_registers — словари, остальные три — списки ИМЕН-строк;"
+        " partial=True означает неполное чтение CFE, modules_scanned содержит только успешно прочитанные модули;"
+        " сначала смотри is_postable; при пустом code_registers — posting_handler_present + hint",
         "business",
         ["движени", "movement", "регистр", "register", "проведен", "posting"],
         "TRACE DOCUMENT REGISTER MOVEMENTS:\n"
         "  result = find_register_movements('ПриобретениеТоваровУслуг')\n"
-        "  for r in result['code_registers']:\n"
-        "      detail = r.get('lines') or r.get('source', '')\n"
-        "      print(f\"  Движения.{r['name']} ({detail})\")\n"
+        "  suppressed = result.get('suppressed_main_code_registers', [])  # main-handler, отсеченный CFE-заменой\n"
+        "  if result.get('is_postable') is not False:\n"
+        "      for r in result['code_registers']:\n"
+        "          detail = r.get('lines') or r.get('source', '')\n"
+        "          print(f\"  Движения.{r['name']} ({detail})\")\n"
         "  # Если документ непроводимый — результат содержит is_postable=False + hint:\n"
         "  if result.get('is_postable') is False:\n"
-        "      print(result['hint'])  # подсказка про подписки/регистры сведений\n"
+        "      print('Непроводимый (Posting=Deny) — движений нет:', result['hint'])\n"
+        "  if result.get('is_postable') is not False and result.get('posting_handler_present'):\n"
+        "      # ОбработкаПроведения есть без прямых Движения.X: запись может быть делегирована или отсутствовать.\n"
+        "      # ЧИТАЙ result['hint'] И ИДИ ПО НЕМУ: тело обработчика УЖЕ РАЗОБРАНО СЕРВЕРОМ, и в hint\n"
+        "      #   лежат ФАКТЫ, а не догадки:\n"
+        "      #   * наборы/менеджеры записи прямо в обработчике -> регистры НАЗВАНЫ поименно;\n"
+        "      #   * делегат ИмяМодуля.Метод(...) -> получатель РАЗРЕШЕН: сервер отличил ОБЩИЙ МОДУЛЬ от\n"
+        "      #     ПЕРЕМЕННОЙ/параметра и от РЕКВИЗИТА документа. ФАКТ «общий модуль» разрешен ТОЛЬКО\n"
+        "      #     ПОЛНОМУ live-источнику реквизитов: хелпер сверяет по живому XML, включая метаданные\n"
+        "      #     расширений всех диалектов (нечитаемый файл расширения = проверка НЕПОЛНАЯ = развилка);\n"
+        "      #     профиль видит snapshot: при index_used=True И наличие, И отсутствие реквизита ничего\n"
+        "      #     не доказывают о live XML. Не классифицируй по ним: точная live-проверка —\n"
+        "      #     find_register_movements; иначе следуй tree-search маршруту из hint.\n"
+        "      #     Неразрешенный получатель -> маршрут из hint: точный live safe_grep по всему BSL-каталогу\n"
+        "      #     либо find_definition без module-hint; одноименный модуль иначе отдал бы ЧУЖОЕ тело.\n"
+        "      #   * вызов без точки -> hint скажет, локальный он или из ГЛОБАЛЬНОГО общего модуля.\n"
+        "      #   Шаги в hint — ИСПОЛНИМЫЙ Python с уже подставленными путем и именами: копируй как есть.\n"
+        "      # НЕ ПОДТВЕРЖДАЙ делегата проверкой category == 'CommonModules': module_hint 'ОбщийМодуль.X'\n"
+        "      #   уже фильтрует запрос по этой категории в SQL -> проверка ВСЕГДА истинна (тавтология).\n"
+        "      # Движения через find_call_hierarchy на обработчике не ищи: вызов от ПЛАТФОРМЫ в граф\n"
+        "      #   не попадает (callers=0 — норма, а не мертвый код; ЯВНЫЙ BSL-вызов он все же покажет).\n"
+        "      print('Обработчик есть, прямых Движения.X нет — разбор тела в hint:')\n"
+        "      print(result['hint'])\n"
         "\n"
-        "FIND WHO WRITES TO REGISTER:\n"
+        "FIND STATIC WRITER CANDIDATES:\n"
         "  result = find_register_writers('ТоварыНаСкладах')\n"
+        "  # CFE/Posting проверь через find_register_movements(document); свежесть main-строки — по живому файлу\n"
         "  for w in result['writers']:\n"
         "      detail = w.get('lines') or w.get('source', '')\n"
         "      print(f\"  {w['document']} ({detail})\")",
@@ -8490,15 +11771,15 @@ def make_bsl_helpers(
     _reg(
         "find_register_writers",
         find_register_writers,
-        "find_register_writers(reg_name) -> {writers: [{document, source|lines, file}]}",
+        "find_register_writers(reg_name) -> {writers:[{document,source|lines,file}],runtime_filtered:false,hint}",
         "business",
         ["писатели регистра", "кто пишет", "register writer", "writer"],
-        "FIND WHO WRITES TO REGISTER (обратное к find_register_movements):\n"
+        "FIND STATIC WRITER CANDIDATES:\n"
         "  result = find_register_writers('ТоварыНаСкладах')\n"
+        "  # runtime_filtered=False: CFE/Posting проверь через forward; свежесть main-строки — по живому файлу\n"
         "  for w in result['writers']:\n"
         "      detail = w.get('lines') or w.get('source', '')\n"
-        "      print(f\"  {w['document']} ({detail})\")\n"
-        "  # Связка: find_register_movements(doc) ↔ find_register_writers(reg) — двусторонний поиск.",
+        "      print(f\"  {w['document']} ({detail})\")",
     )
     _reg(
         "find_based_on_documents",
@@ -8510,15 +11791,18 @@ def make_bsl_helpers(
         "  result = find_based_on_documents('ПриобретениеТоваровУслуг')\n"
         "  print('Можно создать из этого документа:')\n"
         "  for d in result['can_create_from_here']:\n"
-        "      via = d.get('via', 'direct')  # 'direct' или 'back_scan' (обратный обход)\n"
-        "      print(f\"  -> {d['document']} ({via})\")\n"
+        "      via = d.get('via', 'direct')  # 'direct' / 'back_scan' / 'metadata'\n"
+        "      ref = d.get('ref') or d['document']  # metadata: canonical Catalog.X/Document.X\n"
+        '      print(f"  -> {ref} ({via})")\n'
         "  print('Этот документ создается на основании:')\n"
         "  for d in result['can_be_created_from']:\n"
         "      print(f\"  <- {d['type']}\")\n"
         "  # Если у документа нет ДобавитьКомандыСозданияНаОсновании (типичный кейс — Письма в ДО3),\n"
         "  # хелпер автоматически делает back_scan по ОбработкаЗаполнения других Documents и находит\n"
         "  # документы, у которых наш doc_name упомянут как ДокументСсылка.<doc_name>.\n"
-        "  # Записи из back_scan помечены via='back_scan'.",
+        "  # Записи back_scan помечены via='back_scan'; декларативные <BasedOn> из индекса\n"
+        "  # (в т.ч. Catalog-основания, невидимые для FS-скана Documents/*) — via='metadata'\n"
+        "  # (несут d['category'] и canonical d['ref']).",
     )
     _reg(
         "find_print_forms",
@@ -8534,7 +11818,10 @@ def make_bsl_helpers(
     _reg(
         "find_functional_options",
         find_functional_options,
-        "find_functional_options(obj_name) -> {xml_options, code_options}",
+        "find_functional_options(obj_name, include_code=True, limit=None) -> {xml_options, code_options}"
+        " | {…, total, returned, has_more, partial?, _meta?}  # limit — per-bucket cap;"
+        " empty obj сканирует 20 BSL-модулей и при большем каталоге ставит partial=True;"
+        " вызывать limit= ИМЕНОВАННО (2-й позиционный — include_code)",
         "business",
         ["функциональн", "опци", "functional", "option", "включен", "выключен"],
         "FIND FUNCTIONAL OPTIONS:\n"
@@ -8543,7 +11830,10 @@ def make_bsl_helpers(
         "  for fo in result['xml_options']:\n"
         "      print(f\"  {fo['name']}: {fo['synonym']}\")\n"
         "  for co in result['code_options']:\n"
-        "      print(f\"  В коде: {co['option_name']} (стр.{co['line']})\")",
+        "      print(f\"  В коде: {co['option_name']} (стр.{co['line']})\")\n"
+        "  # Опций сотни? — пагинация per-bucket (xml и code режутся КАЖДЫЙ до N):\n"
+        "  page = find_functional_options('РеализацияТоваровУслуг', limit=10)  # limit= ИМЕНОВАННО\n"
+        "  # page: {..., total, returned, has_more}",
     )
     _reg(
         "find_roles",
@@ -8753,7 +12043,11 @@ def make_bsl_helpers(
         "  # Metadata refs + in-code usages in one call:\n"
         "  full = find_references_to_object('Документ.X', include_code=True)\n"
         "  print(f\"meta={full['total']} code={full['code_total']} {full['code_by_kind']}\")\n"
-        "  # On v11 indexes (no metadata_references table) — partial=True via live scan",
+        "  # On v11 indexes (no metadata_references table) — partial=True via live scan\n"
+        "  # NB: line у attribute_type — best-effort строка первого по файлу\n"
+        "  #   <Name>Имя</Name> (CF) / <name>Имя</name> (EDT), а не строка тега типа\n"
+        "  #   (<v8:Type> в CF / <types> в EDT);\n"
+        "  #   при одноимённых элементах якорь может относиться к более раннему блоку",
     )
 
     _reg(
@@ -8839,7 +12133,7 @@ def make_bsl_helpers(
     _reg(
         "find_ext_overrides",
         find_ext_overrides,
-        "find_ext_overrides(extension_path, object_name='') -> {extension_path, object_filter, overrides:[{annotation, target_method, extension_method, ...}] (первые 200), total, truncated}",
+        "find_ext_overrides(extension_path, object_name='') -> {overrides[:200], total, truncated, partial, _meta?}",
         "extension",
         ["перехваты расширения", "ext_overrides", "live overrides", "перехваты live"],
         "FIND OVERRIDES IN EXTENSION (live, без индекса):\n"
@@ -8847,7 +12141,7 @@ def make_bsl_helpers(
         "  for e in ctx.get('nearby_extensions', []):\n"
         "      print(f\"  {e.get('name')} -> {e.get('path')}\")\n"
         "      ovr = find_ext_overrides(e['path'])  # перехваты расширения (первые 200; см. total/truncated)\n"
-        "      print(f\"    total={ovr['total']} truncated={ovr['truncated']}\")\n"
+        "      print(f\"    total={ovr['total']} truncated={ovr['truncated']} partial={ovr['partial']}\")\n"
         "      for o in ovr['overrides'][:5]:\n"
         "          print(f\"      &{o['annotation']} {o['target_method']}\")\n"
         "  # Прицельный поиск по объекту (если расширения есть):\n"
@@ -8860,7 +12154,8 @@ def make_bsl_helpers(
     _reg(
         "get_overrides",
         get_overrides,
-        "get_overrides(object_name='', method_name='') -> {overrides: [...] (первые 200, порядок не гарантирован), total, truncated, source}",
+        "get_overrides(object_name='', method_name='') -> {overrides[:200], total, truncated, partial, source,"
+        " by_annotation, by_object_top, by_extension_top, unique_*}  # stats full iff partial=False",
         "extension",
         ["перехват", "override", "расширен", "extension", "вместо", "после", "перед"],
         "GET OVERRIDES:\n"
@@ -8917,7 +12212,7 @@ def make_bsl_helpers(
             "  # Anti-noise on common tokens: start with mode='files' or a narrow file_types/path, then drill down.\n"
             "  # Mind max_results / the {'_truncated': True} sentinel; regex=True is POSIX ERE\n"
             "  #   (end-of-line anchor on CRLF files needs '[[:space:]]*$', not '$').\n"
-            "  # On failure returns [{'error': ...}] (NOT []). For a known module use safe_grep instead.",
+            "  # Failure -> [{'error': ..., 'hint': ...}] (NOT []): follow hint for safe_grep/grep pattern semantics.",
         )
 
     # ── Return all helpers (auto-generated from registry) ────────

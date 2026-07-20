@@ -341,6 +341,7 @@ class TestGetOverridesTruncated:
         bsl = _make_bsl_with_reader(_FakeOverridesReader(rows))
         res = bsl["get_overrides"]()
         assert res["source"] == "index"
+        assert res["partial"] is False
         assert res["total"] == 250
         assert len(res["overrides"]) == 200
         assert res["truncated"] is True
@@ -364,6 +365,7 @@ class TestGetOverridesTruncated:
         bsl = _make_bsl_with_reader(None)
         res = bsl["get_overrides"]()
         assert res["source"] == "unavailable"
+        assert res["partial"] is True
         assert res["truncated"] is False
 
     def test_live_branch_truncated_over_200(self, monkeypatch):
@@ -382,34 +384,205 @@ class TestGetOverridesTruncated:
             nearby_extensions = []
 
         monkeypatch.setattr(ed, "detect_extension_context", lambda _p: _Ctx())
-        monkeypatch.setattr(ed, "find_extension_overrides", lambda _p, _o=None: list(big))
+
+        def _find(_p, _o=None, diagnostics=None):
+            if diagnostics is not None:
+                diagnostics.update({"complete": True})
+            return list(big)
+
+        monkeypatch.setattr(ed, "find_extension_overrides", _find)
         bsl = _make_bsl_with_reader(None)
         res = bsl["get_overrides"]()
         assert res["source"] == "live"
         assert res["total"] == 250
         assert len(res["overrides"]) == 200
         assert res["truncated"] is True
+        assert res["partial"] is False
+
+    def test_live_main_scan_failure_is_explicitly_partial(self, monkeypatch):
+        import rlm_tools_bsl.extension_detector as ed
+        from rlm_tools_bsl.extension_detector import ConfigRole
+
+        class _Cur:
+            role = ConfigRole.MAIN
+
+        class _Ext:
+            def __init__(self, name, path):
+                self.name = name
+                self.path = path
+
+        class _Ctx:
+            current = _Cur()
+            nearby_extensions = [_Ext("РасшA", "/ext/a"), _Ext("РасшB", "/ext/b")]
+
+        def _find(path, _object=None, diagnostics=None):
+            if path == "/ext/b":
+                raise PermissionError("denied")
+            diagnostics.update(
+                {
+                    "root": path,
+                    "root_available": True,
+                    "complete": True,
+                    "candidate_files": 1,
+                    "files_scanned": 1,
+                    "unreadable_files": [],
+                    "walk_errors": [],
+                }
+            )
+            return [{"object_name": "Док", "target_method": "ПриЗаписи", "annotation": "После"}]
+
+        monkeypatch.setattr(ed, "detect_extension_context", lambda _p: _Ctx())
+        monkeypatch.setattr(ed, "find_extension_overrides", _find)
+        res = _make_bsl_with_reader(None)["get_overrides"]()
+
+        assert res["source"] == "live", res
+        assert res["partial"] is True, res
+        assert res["total"] == 1, res
+        assert res["unique_extensions"] == 1, res
+        assert res["by_extension_top"] == {"РасшA": 1}, res
+        assert res["_meta"]["failed_extension_roots"] == [
+            {
+                "extension_name": "РасшB",
+                "extension_root": "/ext/b",
+                "error": "PermissionError",
+                "message": "denied",
+            }
+        ], res
+
+    def test_live_main_all_missing_roots_is_unavailable(self, monkeypatch):
+        import rlm_tools_bsl.extension_detector as ed
+        from rlm_tools_bsl.extension_detector import ConfigRole
+
+        class _Cur:
+            role = ConfigRole.MAIN
+
+        class _Ext:
+            name = "ИсчезнувшееРасширение"
+            path = "/ext/missing"
+
+        class _Ctx:
+            current = _Cur()
+            nearby_extensions = [_Ext()]
+
+        def _find(path, _object=None, diagnostics=None):
+            diagnostics.update(
+                {
+                    "root": path,
+                    "root_available": False,
+                    "complete": False,
+                    "candidate_files": 0,
+                    "files_scanned": 0,
+                    "unreadable_files": [],
+                    "walk_errors": [],
+                }
+            )
+            return []
+
+        monkeypatch.setattr(ed, "detect_extension_context", lambda _p: _Ctx())
+        monkeypatch.setattr(ed, "find_extension_overrides", _find)
+        res = _make_bsl_with_reader(None)["get_overrides"]()
+
+        assert res["source"] == "unavailable", res
+        assert res["partial"] is True, res
+        assert res["total"] == 0, res
+        assert res["_meta"]["failed_extension_roots"][0]["diagnostics"]["root_available"] is False
+
+    def test_live_unknown_context_without_extensions_is_unavailable(self, monkeypatch):
+        import rlm_tools_bsl.extension_detector as ed
+        from rlm_tools_bsl.extension_detector import ConfigRole
+
+        class _Cur:
+            role = ConfigRole.UNKNOWN
+            name = ""
+            path = "/incomplete/current"
+
+        class _Ctx:
+            current = _Cur()
+            nearby_extensions = []
+
+        monkeypatch.setattr(ed, "detect_extension_context", lambda _p: _Ctx())
+        res = _make_bsl_with_reader(None)["get_overrides"]()
+
+        assert res["source"] == "unavailable", res
+        assert res["partial"] is True, res
+        assert res["total"] == 0, res
+        assert res["_meta"]["failed_extension_roots"] == [
+            {
+                "extension_name": "",
+                "extension_root": "/incomplete/current",
+                "error": "UnknownConfigRole",
+                "message": "Current configuration root could not be classified as main or extension",
+            }
+        ], res
+
+    def test_live_unknown_context_scans_known_extensions_as_partial_lower_bound(self, monkeypatch):
+        import rlm_tools_bsl.extension_detector as ed
+        from rlm_tools_bsl.extension_detector import ConfigRole
+
+        class _Cur:
+            role = ConfigRole.UNKNOWN
+            name = ""
+            path = "/incomplete/current"
+
+        class _Ext:
+            name = "РаспознанноеРасширение"
+            path = "/ext/known"
+
+        class _Ctx:
+            current = _Cur()
+            nearby_extensions = [_Ext()]
+
+        def _find(path, _object=None, diagnostics=None):
+            assert path == "/ext/known"
+            diagnostics.update({"complete": True, "files_scanned": 1})
+            return [{"object_name": "Док", "target_method": "ПриЗаписи", "annotation": "После"}]
+
+        monkeypatch.setattr(ed, "detect_extension_context", lambda _p: _Ctx())
+        monkeypatch.setattr(ed, "find_extension_overrides", _find)
+        res = _make_bsl_with_reader(None)["get_overrides"]()
+
+        assert res["source"] == "live", res
+        assert res["partial"] is True, res
+        assert res["total"] == 1, res
+        assert res["overrides"][0]["extension_name"] == "РаспознанноеРасширение", res
+        assert res["overrides"][0]["extension_root"] == "/ext/known", res
+        assert res["_meta"]["failed_extension_roots"][0]["error"] == "UnknownConfigRole", res
 
     def test_find_ext_overrides_truncated(self, monkeypatch):
         import rlm_tools_bsl.extension_detector as ed
 
         big = [{"target_method": f"M{i}", "annotation": "Перед"} for i in range(250)]
-        monkeypatch.setattr(ed, "find_extension_overrides", lambda _p, _o=None: list(big))
+
+        def _find(_p, _o=None, diagnostics=None):
+            if diagnostics is not None:
+                diagnostics.update({"complete": True})
+            return list(big)
+
+        monkeypatch.setattr(ed, "find_extension_overrides", _find)
         bsl = _make_bsl_with_reader(None)
         res = bsl["find_ext_overrides"]("/ext/path")
         assert res["total"] == 250
         assert len(res["overrides"]) == 200
         assert res["truncated"] is True
+        assert res["partial"] is False
 
     def test_find_ext_overrides_not_truncated(self, monkeypatch):
         import rlm_tools_bsl.extension_detector as ed
 
         small = [{"target_method": f"M{i}", "annotation": "Перед"} for i in range(5)]
-        monkeypatch.setattr(ed, "find_extension_overrides", lambda _p, _o=None: list(small))
+
+        def _find(_p, _o=None, diagnostics=None):
+            if diagnostics is not None:
+                diagnostics.update({"complete": False, "unreadable_files": ["Module.bsl"]})
+            return list(small)
+
+        monkeypatch.setattr(ed, "find_extension_overrides", _find)
         bsl = _make_bsl_with_reader(None)
         res = bsl["find_ext_overrides"]("/ext/path")
         assert res["total"] == 5
         assert res["truncated"] is False
+        assert res["partial"] is True
+        assert res["_meta"]["scan_diagnostics"]["unreadable_files"] == ["Module.bsl"]
 
 
 # ---------------------------------------------------------------------------
@@ -834,3 +1007,128 @@ class TestEarlyExitMeta:
         assert has[0] == "0"
         assert count is not None, "extension_overrides_count must be in meta"
         assert count[0] == "0"
+
+
+# ===========================================================================
+# v1.28.0 — агрегаты get_overrides по ПОЛНОМУ набору + единый shape
+# ===========================================================================
+
+
+def _make_overrides_env(tmp_path, rows):
+    """rows: list[(object_name, target_method, annotation, extension_name)] → (bsl, reader)."""
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+    from rlm_tools_bsl.format_detector import detect_format
+    from rlm_tools_bsl.helpers import make_helpers
+
+    tmp_path.mkdir(parents=True, exist_ok=True)  # фикстуру зовут и с подкаталогом (tmp_path/"reversed")
+    (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+    db = IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=True)
+    conn = sqlite3.connect(str(db))
+    # ext_module_path — NOT NULL без DEFAULT (см. схему), пропуск дал бы IntegrityError.
+    conn.executemany(
+        "INSERT INTO extension_overrides (object_name, target_method, annotation, "
+        "extension_name, extension_method, extension_root, source_path, ext_module_path) "
+        "VALUES (?, ?, ?, ?, 'ext_' || ?, 'root', 'p.bsl', 'ext.bsl')",
+        [(o, m, a, e, m) for o, m, a, e in rows],
+    )
+    conn.commit()
+    conn.close()
+    reader = IndexReader(str(db))
+    helpers, resolve_safe = make_helpers(str(tmp_path))
+    bsl = make_bsl_helpers(
+        base_path=str(tmp_path),
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=detect_format(str(tmp_path)),
+        idx_reader=reader,
+    )
+    return bsl, reader
+
+
+def test_get_overrides_aggregates_cover_rows_invisible_in_the_slice(tmp_path):
+    """Агрегаты обязаны видеть строку, которой НЕТ в срезе 200.
+
+    Имя 'ЯРедкийОбъект' выбрано намеренно: после сортировки среза по (object, ...) он
+    лексикографически ПОСЛЕДНИЙ (Я > Ш) и в первые 200 не попадает. Если бы агрегаты
+    считались по срезу (старое поведение) — его бы для агента не существовало.
+    """
+    rows = [("ШумныйОбъект", f"Метод{i:03d}", "После", "ExtA") for i in range(210)]
+    rows += [("ЯРедкийОбъект", f"Метод{i:03d}", "Вместо", "ExtB") for i in range(5)]
+    bsl, reader = _make_overrides_env(tmp_path, rows)
+    try:
+        res = bsl["get_overrides"]()
+        assert res["total"] == 215
+        assert res["truncated"] is True
+        assert len(res["overrides"]) == 200
+        # Ключевое: строки НЕТ в срезе, но она ЕСТЬ в агрегате
+        assert "ЯРедкийОбъект" not in {o["object_name"] for o in res["overrides"]}
+        assert res["by_object_top"]["ЯРедкийОбъект"] == 5
+        assert res["by_object_top"]["ШумныйОбъект"] == 210
+        assert res["by_annotation"] == {"После": 210, "Вместо": 5}
+        assert res["by_extension_top"] == {"ExtA": 210, "ExtB": 5}
+        assert res["unique_objects"] == 2
+        assert res["unique_extensions"] == 2
+        # unique_methods имеет ЗАЯВЛЕННУЮ семантику (уникальные target_method,
+        # case-insensitive). Метод000..Метод209 у ШумныйОбъект + Метод000..Метод004 у
+        # ЯРедкийОбъект (имена ПЕРЕСЕКАЮТСЯ) → ровно 210.
+        assert res["unique_methods"] == 210, res["unique_methods"]
+        # Срез детерминирован между вызовами
+        again = bsl["get_overrides"]()
+        assert [(o["object_name"], o["target_method"]) for o in res["overrides"]] == [
+            (o["object_name"], o["target_method"]) for o in again["overrides"]
+        ]
+    finally:
+        reader.close()
+
+
+def test_get_overrides_aggregates_are_case_insensitive(tmp_path):
+    """Имена объектов/расширений в 1С регистронезависимы, и фильтры reader'а сравнивают
+    через .lower(). Агрегаты обязаны следовать той же семантике, иначе «Объект» и «объект»
+    дадут два элемента by_object_top и unique_objects=2 — агрегат разойдётся с фильтрами
+    того же API."""
+    rows = [
+        ("Номенклатура", "ПередЗаписью", "После", "ExtA"),
+        ("номенклатура", "ПриЗаписи", "После", "extA"),
+    ]
+    bsl, reader = _make_overrides_env(tmp_path, rows)
+    try:
+        res = bsl["get_overrides"]()
+        assert res["unique_objects"] == 1, res["by_object_top"]
+        assert res["unique_extensions"] == 1, res["by_extension_top"]
+        assert sum(res["by_object_top"].values()) == 2
+        assert len(res["by_object_top"]) == 1  # одна запись, а не две
+        # Сверка с фильтром того же API: он тоже регистронезависим
+        assert bsl["get_overrides"]("НОМЕНКЛАТУРА")["total"] == 2
+    finally:
+        reader.close()
+
+    # display-name ДЕТЕРМИНИРОВАН: обратный порядок вставки даёт тот же ключ.
+    bsl2, reader2 = _make_overrides_env(tmp_path / "reversed", list(reversed(rows)))
+    try:
+        assert list(bsl2["get_overrides"]()["by_object_top"]) == list(res["by_object_top"]), (
+            "ключ by_object_top зависит от порядка выдачи SQLite"
+        )
+    finally:
+        reader2.close()
+
+
+def test_get_overrides_unavailable_has_same_shape(tmp_path, monkeypatch):
+    """Три ветки (index/live/unavailable) — ОДИН shape, иначе агент, написавший
+    res['by_object_top'], падает на конфигурации без расширений."""
+    import rlm_tools_bsl.extension_detector as ed
+
+    def _boom(_path):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ed, "detect_extension_context", _boom)
+    bsl = _make_bsl_with_reader(None)  # без idx_reader → live-ветка → _det падает
+    res = bsl["get_overrides"]()
+    assert res["source"] == "unavailable"
+    assert res["partial"] is True
+    for key in ("by_annotation", "by_object_top", "by_extension_top"):
+        assert res[key] == {}, key
+    for key in ("unique_objects", "unique_methods", "unique_extensions", "total"):
+        assert res[key] == 0, key
+    assert res["overrides"] == [] and res["truncated"] is False

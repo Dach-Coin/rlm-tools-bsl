@@ -218,15 +218,16 @@ def test_strategy_main_truncates_to_top_n(monkeypatch):
     ovr = _overrides_by_index(ctx)  # Ext0=0 … Ext24=24 overrides
     text = _extension_strategy(ctx, ovr)
 
+    # #1 (v1.28.0): по умолчанию (budget==0) заголовок — счётчик total + указатель на
+    # nearby_extensions (с маркерами усечения), БЕЗ перечня префиксов, БЕЗ построчных
+    # счётчиков и БЕЗ прозы hidden-summary (усечение несёт структурный nearby_extensions).
     assert "EXTENSIONS DETECTED" in text
-    assert "Расш24 (prefix: р24_)" in text  # топ по overrides — в заголовке
-    assert "+5 more (detect_extensions())" in text  # 25-20=5 скрыто
-    # Счётчики только для shown (top-20 = Ext5..Ext24).
-    assert _shown_count_headers(text) == {f"Расш{i}" for i in range(5, 25)}
-    # Сводная строка по скрытым: hidden=5, hidden_overrides=0+1+2+3+4=10.
-    assert "+5 more extensions" in text
-    assert "10 overrides total" in text
-    assert "detect_extensions()" in text
+    assert "25 EXTENSIONS DETECTED" in text  # total (не top-N) в заголовке
+    assert "nearby_extensions" in text
+    assert "(prefix:" not in text
+    assert _shown_count_headers(text) == set()  # без построчных счётчиков
+    assert "more extensions" not in text  # без прозы hidden-summary
+    assert "get_overrides(" in text
 
 
 def test_strategy_main_no_truncation_at_cap(monkeypatch):
@@ -239,7 +240,10 @@ def test_strategy_main_no_truncation_at_cap(monkeypatch):
     assert "more (detect_extensions())" not in text
     assert "more extensions" not in text
     assert "detect_extensions()" not in text  # не-усечённая стратегия не зовёт detect_extensions
-    assert _shown_count_headers(text) == {f"Расш{i}" for i in range(20)}
+    # #1: budget==0 → без построчных счётчиков; total=20 в заголовке.
+    assert _shown_count_headers(text) == set()
+    assert "20 EXTENSIONS DETECTED" in text
+    assert "get_overrides(" in text
 
 
 def test_strategy_main_cap_plus_one(monkeypatch):
@@ -249,9 +253,12 @@ def test_strategy_main_cap_plus_one(monkeypatch):
     monkeypatch.setenv("RLM_EXT_LIST_CAP", "20")
     ctx = _ctx_main(21)
     text = _extension_strategy(ctx, _overrides_for(ctx, per_ext=2))
-    assert "+1 more (detect_extensions())" in text
-    assert "+1 more extensions" in text
-    assert len(_shown_count_headers(text)) == 20
+    # #1: budget==0 → усечение отражено total-счётчиком (21) + структурным nearby_extensions,
+    # без прозы "+1 more" и без построчных счётчиков.
+    assert "21 EXTENSIONS DETECTED" in text
+    assert "more extensions" not in text
+    assert _shown_count_headers(text) == set()
+    assert "nearby_extensions" in text
 
 
 def test_strategy_main_disabled_cap_keeps_full(monkeypatch):
@@ -262,7 +269,9 @@ def test_strategy_main_disabled_cap_keeps_full(monkeypatch):
     ctx = _ctx_main(30)
     text = _extension_strategy(ctx, _overrides_for(ctx, per_ext=2))
     assert "more (detect_extensions())" not in text
-    assert _shown_count_headers(text) == {f"Расш{i}" for i in range(30)}
+    # #1: budget==0 → без построчных счётчиков; cap отключён → total=30 (все) в заголовке.
+    assert _shown_count_headers(text) == set()
+    assert "30 EXTENSIONS DETECTED" in text
 
 
 def test_strategy_main_critical_block_preserved_when_truncated(monkeypatch):
@@ -373,8 +382,10 @@ def test_response_disabled_cap_keeps_full(tmp_path, monkeypatch, cap_value):
         # Site 1: warning со всеми именами (без короткой сводки).
         assert any("Расш29" in w for w in resp["warnings"])
         assert not any("call detect_extensions() for the complete list" in w for w in resp["warnings"])
-        # Site 3: strategy со всеми расширениями, без +more.
-        assert "Расш29" in resp["strategy"]
+        # Site 3: strategy — счётчик total (все 30) + указатель на nearby_extensions,
+        # без +more и без перечня имён/префиксов (#1, v1.28.0).
+        assert "30 EXTENSIONS DETECTED" in resp["strategy"]
+        assert "nearby_extensions" in resp["strategy"]
         assert "more (detect_extensions())" not in resp["strategy"]
     finally:
         _rlm_end(sid)

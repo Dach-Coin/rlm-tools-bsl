@@ -207,6 +207,12 @@ def test_recipe_aliases_consistency():
         assert dom in _BUSINESS_RECIPES, f"alias '{alias}' points to missing domain '{dom}'"
 
 
+def test_based_on_recipe_prints_canonical_metadata_ref():
+    full_text = "\n".join(_BUSINESS_RECIPES["ввод на основании"]["full"])
+    assert 'd.get("ref") or d["document"]' in full_text
+    assert 'd.get("category","")+"."' not in full_text
+
+
 def test_references_recipe_has_subsystem_membership_hint():
     """v1.24.0 #3 — рецепт 'ссылки' должен подсказывать членство в подсистемах через
     kinds=['subsystem_content'] + предупреждать про устаревший индекс (live-проверку)."""
@@ -381,3 +387,135 @@ def test_integration_strategy_code_hint_injected():
 def test_integration_strategy_via_alias():
     text = get_strategy("high", None, query="обмен данными с сайтом")
     assert "BUSINESS RECIPE: интеграция" in text
+
+
+# --- v1.28.0: рецепты и стратегии обязаны вести к агрегатам get_overrides ---
+
+
+def test_overrides_recipe_uses_aggregates_not_the_truncated_slice():
+    """Рецепт «расширения» учил строить сводку по усечённым 200 строкам — ровно то, что
+    чинит v1.28.0. Рецепт обязан направлять на агрегаты."""
+    import json
+
+    from rlm_tools_bsl.bsl_knowledge import _get_topic_recipe
+
+    for fmt in ("compact", "full"):
+        rec = _get_topic_recipe("расширения", format=fmt)
+        text = json.dumps(rec, ensure_ascii=False)
+        assert "by_object_top" in text, (fmt, text)
+        assert "by_annotation" in text, (fmt, text)
+        # старая формулировка, толкавшая к ручной группировке среза, должна уйти
+        assert "сводка group-by неполная" not in text, (fmt, text)
+
+
+def test_both_strategy_copies_carry_overrides_aggregates(monkeypatch):
+    """full-стратегия — ОТДЕЛЬНАЯ, встроенная копия (bsl_knowledge), а не bsl_strategy_data.
+    При RLM_STRATEGY_MODE=full агент получает ЕЁ, поэтому обновлять надо ОБЕ копии, иначе
+    половина пользователей продолжит получать старые инструкции.
+
+    Источники проверяются РАЗДЕЛЬНО и с ПУСТЫМ query: с непустым query в стратегию
+    инжектится рецепт «расширения», и by_object_top попал бы в текст ИЗ РЕЦЕПТА — тест был
+    бы зелёным даже при старой встроенной full-копии.
+    """
+    from rlm_tools_bsl.bsl_strategy_data import STRATEGY_SECTIONS
+
+    # 1) slim-источник (bsl_strategy_data) — без всякого рецепта
+    slim_text = "\n".join(str(v) for v in STRATEGY_SECTIONS.values())
+    assert "by_object_top" in slim_text, "slim-стратегия не упоминает агрегаты get_overrides"
+
+    # 2) встроенная full-копия (bsl_knowledge) — ПУСТОЙ query, чтобы рецепт не инжектился
+    monkeypatch.setenv("RLM_STRATEGY_MODE", "full")
+    full_text = get_strategy("medium", None, query="")
+    assert "by_object_top" in full_text, "встроенная full-стратегия осталась старой (get_overrides)"
+
+
+def test_posting_recipe_does_not_claim_unpostable_on_zero_code_registers():
+    """Рецепт утверждал «code_registers=0 → документ непроводим». Это ЛОЖЬ для документов
+    с делегированным проведением. Рецепт обязан вести к проверке posting_handler_present /
+    is_postable, а не к выводу о непроводимости."""
+    import json
+
+    from rlm_tools_bsl.bsl_knowledge import _get_topic_recipe
+
+    for fmt in ("compact", "full"):
+        text = json.dumps(_get_topic_recipe("проведение", format=fmt), ensure_ascii=False)
+        assert "posting_handler_present" in text, (fmt, text)
+
+
+def test_both_strategy_copies_carry_posting_handler_signal(monkeypatch):
+    """Парный к test_both_strategy_copies_carry_overrides_aggregates. Проверяем обе
+    физические копии стратегии, ПУСТОЙ query."""
+    from rlm_tools_bsl.bsl_strategy_data import STRATEGY_SECTIONS
+
+    slim_text = "\n".join(str(v) for v in STRATEGY_SECTIONS.values())
+    assert "posting_handler_present" in slim_text, "slim-стратегия не упоминает posting_handler_present"
+
+    monkeypatch.setenv("RLM_STRATEGY_MODE", "full")
+    full_text = get_strategy("medium", None, query="")
+    assert "posting_handler_present" in full_text, "встроенная full-стратегия осталась старой (движения)"
+
+
+def test_no_strategy_copy_names_the_platform_handler_without_the_warning(monkeypatch):
+    """Инвариант вместо дублирования текста: копия стратегии ВПРАВЕ не упоминать
+    ОбработкаПроведения вовсе (slim так и делает — и платит за это 0 токенов), но если упомянула,
+    то обязана сказать, что его зовёт ПЛАТФОРМА и callers=0 — это норма.
+
+    Встроенная full-стратегия приводила ОбработкаПроведения как КАНОНИЧЕСКИЙ пример module_hint
+    для find_call_hierarchy, то есть учила приёму, который ВСЕГДА возвращает пусто, и прямо
+    противоречила рецепту «проведение». Стратегия — самая горячая agent-facing поверхность (её
+    видят на КАЖДОМ старте, в отличие от рецептов по запросу), поэтому дефект тут дороже всего.
+
+    Инвариант, а не «обе копии обязаны нести текст»: заставлять slim нести предупреждение о
+    том, чего slim не упоминает, — это чистый расход бюджета старта.
+
+    Проверяем ОТРЕНДЕРЕННУЮ стратегию (get_strategy), а не сырые STRATEGY_SECTIONS, и ОБЯЗАТЕЛЬНО
+    с idx_stats. Обе оговорки — про грабли, на которые тест уже наступил, пока писался:
+      1) первая версия читала для slim сырые STRATEGY_SECTIONS и ПРОПУСТИЛА дефект: блок INDEX TIPS
+         живёт в bsl_knowledge и подмешивается в ОБА режима, а в сырых секциях его нет;
+      2) вторая версия звала get_strategy БЕЗ idx_stats — а INDEX TIPS рендерятся ТОЛЬКО при
+         наличии индекса, поэтому проверка выполнялась вхолостую (в тексте не было ни обработчика,
+         ни предупреждения — «зелено» ни о чём). Агент же всегда работает С индексом.
+    Пинить надо ровно то, что реально уходит агенту."""
+    idx_stats = {"methods": 100, "calls": 200, "has_fts": True}
+    for mode in ("slim", "full"):
+        monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
+        for stats in (None, idx_stats):
+            text = get_strategy("medium", None, idx_stats=stats, query="")
+            if "ОбработкаПроведения" in text:
+                # Корень «ПЛАТФОРМ», а не словоформа: текст говорит «вызов от ПЛАТФОРМЫ».
+                assert "ПЛАТФОРМ" in text, (
+                    f"{mode}-стратегия (idx_stats={'да' if stats else 'нет'}) называет "
+                    "ОбработкаПроведения, но не предупреждает, что его зовёт ПЛАТФОРМА (callers=0 — "
+                    "норма, а не мёртвый код). Пример module_hint на платформенном обработчике всегда "
+                    "вернёт пусто и противоречит рецепту «проведение»."
+                )
+
+
+def test_functional_options_recipe_mentions_limit_in_both_formats():
+    """Алиас «функциональные опции» → топик «права». limit= обязан быть и в compact (дефолт
+    rlm_help), и в full — иначе агент упрётся в обрыв по max_output_chars и о параметре не
+    узнает (наблюдалось в e2e v1.28.0).
+
+    Ассерт на find_roles — гейт против «лечения» правкой не той строки: compact-строка
+    ОБЪЕДИНЁННАЯ («детальнее: find_roles(...) по ролям; find_functional_options(...) по
+    опциям»), и подмена её строкой только про ФО выкинула бы маршрут детализации ролей."""
+    import json
+
+    from rlm_tools_bsl.bsl_knowledge import _get_topic_recipe
+
+    for fmt in ("compact", "full"):
+        text = json.dumps(_get_topic_recipe("функциональные опции", format=fmt), ensure_ascii=False)
+        assert "find_functional_options" in text, (fmt, text)
+        assert "limit=" in text, (fmt, text)
+        assert "find_roles" in text, (fmt, "маршрут по ролям потерян при правке рецепта")
+
+
+def test_functional_options_limit_visible_in_both_performance_copies(monkeypatch):
+    """performance-секция существует в ДВУХ копиях (slim: STRATEGY_SECTIONS, full: встроенная
+    в bsl_knowledge). Пропустив одну, мы бы рассказывали про limit= только половине
+    пользователей."""
+    from rlm_tools_bsl.bsl_strategy_data import STRATEGY_SECTIONS
+
+    assert "limit=" in STRATEGY_SECTIONS["performance"], "slim performance-секция без limit="
+    monkeypatch.setenv("RLM_STRATEGY_MODE", "full")
+    assert "limit=10" in get_strategy("medium", None, query=""), "full-стратегия без limit="

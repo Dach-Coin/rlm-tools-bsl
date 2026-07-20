@@ -63,12 +63,12 @@ Step 4 — ANALYZE: get the full picture
   analyze_object(name) → metadata + all modules + procedures
   analyze_document_flow(doc_name) → subscriptions + register movements + jobs
   find_custom_modifications(object_name) → find non-standard code by prefix
-  find_register_movements(doc_name) → which registers a document writes to (is_postable hint при пустом результате)
+  find_register_movements(doc_name) → Posting/CFE-фильтрованные кандидаты (main — снимок индекса; сначала is_postable; при пустом code_registers смотри posting_handler_present + hint)
   CAUTION: analyze_document_flow and analyze_object scan many files — on large configs (10K+)
   they may be slow (>60s). Prefer calling individual helpers separately if timeout occurs.
 
 Step 5 — EXTENSIONS: check if behavior is modified
-  get_overrides('ObjectName') → indexed overrides (instant); без фильтра первые 200 (порядок не гарантирован), total/truncated в ответе сигналят обрезку
+  get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top/unique_* полны iff partial=False; иначе lower bound, см. _meta
   read_procedure(path, name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
   NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.
@@ -79,8 +79,8 @@ Step 5 — EXTENSIONS: check if behavior is modified
 == STEP 4 EXTENDED (по перформансу) ==
 
 INSTANT (индексный путь, OK для batch 5-10 в одном rlm_execute):
-  find_register_writers(reg_name)        → документы-писатели регистра
-  find_register_movements(doc_name)      → регистры, в которые пишет документ
+  find_register_writers(reg_name)        → статические reverse-кандидаты
+  find_register_movements(doc_name)      → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса
   find_event_subscriptions(obj)          → подписки на события (event_filter + limit опционально)
   find_scheduled_jobs(name='')           → регламентные задания
   find_roles(obj_name)                   → роли с правами на объект
@@ -89,7 +89,7 @@ INSTANT (индексный путь, OK для batch 5-10 в одном rlm_exe
   get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
 
 HYBRID (часть из индекса, часть live — ОДИН вызов в batch, не больше 2-3):
-  find_functional_options(obj_name)      → xml_options из индекса; code_options через safe_grep (live, всегда)
+  find_functional_options(obj_name[, limit=10]) → xml_options из индекса; code_options через safe_grep (live, всегда); limit= — per-bucket cap, спасает от обрыва по max_output_chars
 
 LIVE (читают тела процедур / parse XML — медленно, особенно без индекса):
   find_based_on_documents(doc_name)      → read_procedure(ОбработкаЗаполнения, ДобавитьКомандыСозданияНаОсновании) — НЕ batch массово
@@ -183,10 +183,10 @@ DISAMBIGUATION_PAIRS: list[dict] = [
     },
     {
         "pair": ("find_register_movements", "find_register_writers"),
-        "summary": "document → registers vs register → documents",
+        "summary": "document → Posting/CFE-filtered candidates vs register → static candidates",
         "when_a": "документ → какие регистры пишет (есть is_postable).",
-        "when_b": "регистр → какие документы пишут.",
-        "rule": "Двунаправленный поиск; запрашивай оба только если нужны обе стороны.",
+        "when_b": "регистр → статические ссылки документов (runtime_filtered=False).",
+        "rule": "find_register_movements применяет Posting/CFE; main-строка остается снимком и после изменения кода требует проверки живого модуля.",
         "tags": ["registers", "document"],
     },
     {

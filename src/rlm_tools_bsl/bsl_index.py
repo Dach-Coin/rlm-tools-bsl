@@ -1538,7 +1538,7 @@ _PATH_GLOB_CHARS = frozenset("*?[]")
 
 
 def _sanitize_grep_path(path: str | None) -> str | None:
-    """Normalise a user-supplied ``path`` filter into a safe git pathspec base.
+    r"""Normalise a user-supplied ``path`` filter into a safe git pathspec base.
 
     Returns:
       * ``""`` — input was empty/unset → no path filter (search whole config).
@@ -1548,22 +1548,51 @@ def _sanitize_grep_path(path: str | None) -> str | None:
         surface an error rather than silently widening the search to the whole
         config (or, worse, escaping ``base_path`` to the repo root).
 
-    Rejected (→ ``None``): backslashes, pathspec magic (``:/``, ``:(...)``,
-    leading ``:``), Windows drive prefixes, ``..``/``.`` segments, internal
-    empty segments (``a//b``), glob metacharacters (``* ? [ ]`` — ``path`` is a
-    **literal** subtree/file filter, so a glob would silently widen it past the
-    documented contract), and inputs that collapse to empty after stripping
-    surrounding slashes (``"/"``, ``"///"``) — the latter being non-empty intent
-    that we refuse to reinterpret as "whole config".
+    Internal backslashes are **normalised to ``/``** up-front (so
+    ``CommonModules\Foo`` is accepted as ``CommonModules/Foo``), then the same
+    checks apply as for POSIX input. A *leading* slash or backslash is rejected
+    before normalisation: on Windows either roots the path at the current drive,
+    and POSIX ``/x`` is absolute as well. None may be silently re-read as a
+    relative config subtree. Rejected (→ ``None``):
+    pathspec magic (``:/``, ``:(...)``, leading ``:``), rooted / UNC /
+    network-absolute paths (``/CommonModules``, ``\CommonModules`` or
+    ``\\server\share\X``), drive prefixes
+    (``C:\...`` → ``C:/...`` → caught), ``..``/``.``
+    segments (``a\..\b`` too), internal empty segments (``a//b``), glob
+    NUL (не может быть частью пути ОС и отклоняется ``subprocess``), glob-
+    metacharacters (``* ? [ ]`` — ``path`` is a **literal** subtree/file filter, so
+    a glob would silently widen it past the documented contract), and inputs that
+    collapse to empty after stripping surrounding slashes (``"/"``, ``"///"``) —
+    the latter being non-empty intent that we refuse to reinterpret as "whole
+    config".
     """
-    raw = path or ""
-    if not raw.strip():
+    raw = (path or "").strip()
+    if not raw:
         return ""  # unset → no filter
-    if "\\" in raw:
+    if "\x00" in raw:
+        return None  # subprocess rejects embedded NUL; classify it as a bad filter, not a git failure
+    if raw.startswith(("\\", "/")):
+        # Both ``\CommonModules`` and ``/CommonModules`` express rooted input on
+        # Windows. Normalising/stripping first would reinterpret either as the relative
+        # subtree ``CommonModules``. This also rejects UNC and POSIX-absolute input;
+        # the post-normalisation ``//`` guard remains as defence in depth.
+        return None
+    # Normalise Windows separators BEFORE the magic/drive/glob/'..' checks (#4).
+    # A literal ``path=`` is often copied from a Windows path (``CommonModules\Foo``);
+    # hard-rejecting any ``\`` made the adjacent replace dead code and surfaced an
+    # error instead of filtering. ``C:\...`` still collapses to ``C:/...`` and is
+    # caught by ``_DRIVE_RE``; ``a\..\b`` still trips the ``..`` segment guard.
+    raw = raw.replace("\\", "/")
+    if raw.startswith("//"):
+        # UNC / network-absolute input (``\\server\share\X`` → ``//server/share/X``).
+        # The strip('/') below would erase the absolute marker and silently re-read it
+        # as the relative subtree ``server/share/X`` — a misleading empty search instead
+        # of an error. Reject explicitly (checked AFTER the backslash normalisation so
+        # ``\\``, ``//`` and mixed ``/\`` all collapse into this one guard).
         return None
     if raw.startswith(_PATHSPEC_MAGIC_PREFIXES) or raw.startswith(":"):
         return None
-    cleaned = raw.strip().replace("\\", "/").strip("/")
+    cleaned = raw.strip("/")
     if not cleaned:
         return None  # non-empty input that was all slashes ("/", "///")
     if _DRIVE_RE.match(cleaned):
@@ -1619,9 +1648,10 @@ def _sanitize_grep_excludes(exclude_path) -> list[str] | None:
         could widen the result set past what the caller asked to exclude.
 
     Each element runs through :func:`_sanitize_grep_path` (same safety rules:
-    backslashes, pathspec magic, drive prefixes, ``..``/``.``, glob metachars are
-    all rejected). The input stays **literal** — glob is used only internally, by
-    :func:`_git_grep`, to expand each name into an "at any depth" exclusion.
+    backslashes are normalised to ``/``; pathspec magic, drive prefixes,
+    ``..``/``.``, glob metachars are all rejected). The input stays **literal** —
+    glob is used only internally, by :func:`_git_grep`, to expand each name into
+    an "at any depth" exclusion.
     """
     raw = exclude_path or ""
     if isinstance(raw, str):
@@ -1655,6 +1685,7 @@ def _git_grep(
     max_per_file: int = 50,
     include_truncation_sentinel: bool = False,
     timeout: int | None = None,
+    err: dict | None = None,
 ) -> list[dict] | None:
     """Run a single ``git grep`` over the work tree at *base_path*.
 
@@ -1693,19 +1724,37 @@ def _git_grep(
     Returns a list of dicts, or **``None``** on a real failure (git unavailable,
     rc≥2, timeout, or a malformed filter). ``None`` is distinct from ``[]`` (zero
     matches) so the caller can report "search failed" rather than "nothing found".
+
+      * *err* — optional out-channel: on failure it is filled with the REASON
+        (``{"kind": ...}``, plus ``rc``/``stderr`` for ``kind="rc"``). Without it a
+        bare ``None`` collapses "git is down" and "git rejected YOUR pattern" into
+        one outcome, and the caller can only GUESS which — that guess is exactly how
+        a malformed regex ended up reported as a git failure. Guessing is also why a
+        Python-side pre-check cannot close the gap: ``git grep -E`` speaks POSIX ERE,
+        so ``(?=a)``/``(?P<x>a)`` compile fine in Python yet git exits 128 with
+        "Invalid preceding regular expression". Let git say what is wrong — its own
+        message names both the pattern and the reason. Populating *err* changes no
+        return value, so existing callers are unaffected.
     """
+
+    def _fail(kind: str, **extra) -> None:
+        if err is not None:
+            err.clear()
+            err.update(kind=kind, **extra)
+        return None
+
     if mode not in ("lines", "files"):
-        return None
+        return _fail("bad_mode", mode=mode)
     if not isinstance(pattern, str) or pattern == "":
-        return None
+        return _fail("bad_pattern", reason="empty")
     # Multi-pattern guard: a NL/NUL in the pattern makes git treat it as several
     # ``-e`` patterns (unexpected OR-search). Not supported in v1 → error.
     if "\n" in pattern or "\x00" in pattern:
-        return None
+        return _fail("bad_pattern", reason="newline_or_nul")
 
     cmd = _git_base_cmd(base_path)
     if cmd is None:
-        return None
+        return _fail("no_git")
 
     # Build pathspecs.
     if literal_files is not None:
@@ -1717,13 +1766,14 @@ def _git_grep(
     else:
         san_path = _sanitize_grep_path(path)
         if san_path is None:
-            return None  # malformed path filter
+            return _fail("bad_pathspec", arg="path")  # malformed path filter
         exts = _sanitize_grep_file_types(file_types)
         if exts is None:
-            return None  # malformed file_types
+            return _fail("bad_pathspec", arg="file_types")  # malformed file_types
         exclude_specs = _sanitize_grep_excludes(exclude_path)
         if exclude_specs is None:
-            return None  # malformed exclude filter → error, not silent widening
+            # malformed exclude filter → error, not silent widening
+            return _fail("bad_pathspec", arg="exclude_path")
         if san_path and exts:
             pathspecs = [f"{san_path}/*.{ext}" for ext in exts]
         elif exts:
@@ -1758,14 +1808,18 @@ def _git_grep(
         r = subprocess.run(grep_cmd, **_GIT_SUBPROCESS_KW, timeout=t)
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
         logger.info("_git_grep: %s: %s", type(exc).__name__, exc)
-        return None
+        kind = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "spawn_failed"
+        return _fail(kind, detail=f"{type(exc).__name__}: {exc}")
 
     rc = r.returncode
     if rc == 1:
         return []  # no matches — not an error
     if rc != 0:
+        # git ЗАПУСТИЛСЯ и сам объяснил, что не так (битый ERE → rc=128 + "Invalid preceding
+        # regular expression" / "unmatched ( for expression group"). Его вердикт точнее любой
+        # эвристики на нашей стороне: он называет и pattern, и причину.
         logger.info("_git_grep: rc=%d stderr=%r", rc, (r.stderr or "")[:200])
-        return None
+        return _fail("rc", rc=rc, stderr=(r.stderr or "")[:500])
 
     stdout = r.stdout or ""
     results: list[dict] = []
@@ -2304,7 +2358,10 @@ def _extract_code_usages(
                 if query_canon:
                     out.append((query_canon + g2, g3 or None, "query", lineno))
                     continue
-                en_ref = canonicalize_type_ref(f"{g1}.{g2}")
+                # BUILD keeps the pre-1.28 case-sensitive extraction contract.  Public
+                # lookup canonicalization is intentionally case-insensitive, but widening
+                # persisted code usages requires its own builder-version migration.
+                en_ref = canonicalize_type_ref(f"{g1}.{g2}", fold_case=False)
                 if en_ref:
                     out.append((en_ref, None, "ref_type", lineno))
     return out
@@ -9769,62 +9826,56 @@ class IndexReader:
         object_name: str = "",
         custom_only: bool = False,
         event_filter: list[str] | str | None = None,
+        object_ref: str = "",
     ) -> list[dict] | None:
         """Get event subscriptions from the index, optionally filtered.
 
         Args:
-            object_name: Filter by source type (case-insensitive substring).
+            object_name: Имя объекта БЕЗ префикса. Матчинг exact-с-фолбэком (v1.28.0):
+                         точное совпадение по ИМЕННОЙ части типа-источника; подстрока —
+                         только если точных нет (вход = фрагмент имени). Category-blind.
             custom_only: Not applied here (requires prefix detection from helpers).
-            event_filter: List of event substrings (case-insensitive) — match on
-                          event column. Server-side SQL filter, applied in addition
-                          to object_name filter (which runs on JSON source_types).
-                          Accepts a single string too — it will be wrapped in a
-                          one-element list. Без этого Python итерирует строку
-                          по символам и каждый символ становится substring-матчем.
+            object_ref:  Canonical ref ("Document.X"). Если задан — сравнение идет по
+                         canonicalize_type_ref, то есть category-AWARE, и partial-фолбэка
+                         НЕТ (явный ref = точное намерение).
+            event_filter: Фильтр по событию (case-insensitive substring). Применяется
+                          ПОСЛЕ классификации exact/partial — иначе отсутствие события у
+                          точного источника воскрешало бы подстрочного омонима. Допустима
+                          одна строка — она оборачивается в список: без этого Python
+                          итерирует строку по символам и каждый символ становится
+                          substring-матчем.
 
         Returns:
             List of dicts matching find_event_subscriptions format, or None
-            if the table is empty / missing.
+            if the table is empty / missing. При непустом object_name/object_ref каждая
+            строка несет ``scope``: "exact" | "partial" | "universal"; без фильтра объекта
+            возвращается прежний компактный список (без scope и без source_types).
         """
         # Normalize a bare string to a one-element list (see docstring).
         if isinstance(event_filter, str):
             event_filter = [event_filter] if event_filter else None
         with self._lock:
             try:
-                sql = (
+                # NB: НЕТ WHERE по событию (v1.28.0). Фильтр уехал в Python и применяется
+                # ПОСЛЕ классификации exact/partial — см. развёрнутый комментарий ниже.
+                # Таблица мала (сотни строк), полное чтение дешево.
+                rows = self._conn.execute(
                     "SELECT name, synonym, event, handler_module, handler_procedure, "
                     "source_types, source_count, file FROM event_subscriptions"
-                )
-                params: list = []
-                if event_filter:
-                    clauses = []
-                    for ev in event_filter:
-                        clauses.append("py_lower(event) LIKE '%' || py_lower(?) || '%'")
-                        params.append(ev)
-                    sql += " WHERE " + " OR ".join(clauses)
-                rows = self._conn.execute(sql, params).fetchall()
+                ).fetchall()
             except sqlite3.OperationalError:
                 return None
 
             if not rows:
-                # Distinguish three cases:
-                #   (1) table missing                       → None (handled above by OperationalError)
-                #   (2) table empty / stale                 → None (caller should fall back live)
-                #   (3) table non-empty, filter matched 0   → []   (authoritative)
-                if event_filter:
-                    # Дополнительно проверяем что таблица в принципе непустая,
-                    # чтобы НЕ заглушить live fallback на stale/empty index.
-                    try:
-                        cnt_row = self._conn.execute("SELECT COUNT(*) AS cnt FROM event_subscriptions").fetchone()
-                    except sqlite3.OperationalError:
-                        return None
-                    if cnt_row is None or cnt_row["cnt"] == 0:
-                        return None  # table is empty → caller should try live XML
-                    return []  # table has rows, filter matched nothing — authoritative
+                # Таблица пуста/отсутствует → None (caller падает в live-фолбэк).
+                # Случай «таблица непуста, а фильтр не совпал → [] (authoritative)»
+                # теперь получается сам собой: rows непусты → возвращаем (возможно
+                # пустой) отфильтрованный список.
                 return None
 
-            result: list[dict] = []
             name_lower = object_name.lower() if object_name else ""
+            ref_lower = object_ref.lower() if object_ref else ""
+            entries: list[tuple[dict, list[str]]] = []
 
             for r in rows:
                 source_types: list[str] = []
@@ -9837,28 +9888,65 @@ class IndexReader:
                 handler_procedure = r["handler_procedure"] or ""
                 handler = f"CommonModule.{handler_module}.{handler_procedure}" if handler_module else handler_procedure
 
-                entry = {
-                    "name": r["name"],
-                    "synonym": r["synonym"] or "",
-                    "source_types": source_types,
-                    "source_count": r["source_count"] or 0,
-                    "event": r["event"] or "",
-                    "handler": handler,
-                    "handler_module": handler_module,
-                    "handler_procedure": handler_procedure,
-                    "file": r["file"] or "",
-                }
+                entries.append(
+                    (
+                        {
+                            "name": r["name"],
+                            "synonym": r["synonym"] or "",
+                            "source_types": source_types,
+                            "source_count": r["source_count"] or 0,
+                            "event": r["event"] or "",
+                            "handler": handler,
+                            "handler_module": handler_module,
+                            "handler_procedure": handler_procedure,
+                            "file": r["file"] or "",
+                        },
+                        source_types,
+                    )
+                )
 
-                if name_lower:
-                    if not source_types:
-                        result.append(entry)
-                    elif any(name_lower in t.lower() for t in source_types):
-                        result.append(entry)
-                else:
-                    stripped = {k: v for k, v in entry.items() if k != "source_types"}
-                    result.append(stripped)
+            def _apply_event_filter(items: list[dict]) -> list[dict]:
+                if not event_filter:
+                    return items
+                evs = [e.lower() for e in event_filter]
+                return [s for s in items if any(ev in (s.get("event") or "").lower() for ev in evs)]
 
-            return result
+            if not name_lower and not ref_lower:
+                compact = [{k: v for k, v in e.items() if k != "source_types"} for e, _ in entries]
+                return _apply_event_filter(compact)
+
+            # v1.28.0: EXACT-С-ФОЛБЭКОМ.
+            # Раньше искомое имя сравнивалось с ПОЛНОЙ формой типа подстрокой
+            # (`name in "CatalogObject.XПрисоединенныеФайлы"`), из-за чего полное имя
+            # объекта цепляло более длинный омоним — ДРУГОЙ объект.
+            #   1) сравниваем с ИМЕННОЙ частью типа (или canonical ref при object_ref);
+            #   2) есть точные → отдаём только их (подстрочные не подмешиваем);
+            #   3) точных нет → фолбэк на подстроку (вход был ФРАГМЕНТОМ имени).
+            # ПОРЯДОК КРИТИЧЕН: классификация идёт по ПОЛНОМУ набору подписок, а
+            # event_filter применяется ПОСЛЕ. Если фильтровать по событию в SQL (как было),
+            # точная подписка без нужного события выпадает ДО классификации, exact-набор
+            # пустеет и partial-фолбэк воскрешает омонима.
+            # Universal (пустой source_types) — catch-all, включается ВСЕГДА.
+            exact_hits: list[dict] = []
+            partial_hits: list[dict] = []
+            universal: list[dict] = []
+
+            for entry, source_types in entries:
+                if not source_types:
+                    universal.append({**entry, "scope": "universal"})
+                    continue
+                if ref_lower:
+                    if any(t and canonicalize_type_ref(t).lower() == ref_lower for t in source_types):
+                        exact_hits.append({**entry, "scope": "exact"})
+                    continue  # типизированный вход — без partial-фолбэка
+                names = [(t.split(".", 1)[1] if "." in t else t).lower() for t in source_types if t]
+                if any(n == name_lower for n in names):
+                    exact_hits.append({**entry, "scope": "exact"})
+                elif any(name_lower in n for n in names):
+                    partial_hits.append({**entry, "scope": "partial"})
+
+            matched = exact_hits if exact_hits else partial_hits
+            return _apply_event_filter(matched + universal)
 
     @_transient_safe(lambda: None)
     def get_event_subscriptions_exact(self, object_ref: str) -> list[dict] | None:
@@ -9868,15 +9956,19 @@ class IndexReader:
         ``CatalogManager.X`` …). Each element is normalized via ``canonicalize_type_ref``
         → ``Document.X`` and compared to ``object_ref`` exactly, so ``Document.X`` will
         NOT pull in ``Document.XYZ`` (the substring trap of ``get_event_subscriptions``).
-        Read-only; no schema/builder bump.
+        Subscriptions with an EMPTY ``source_types`` are **universal** catch-alls (they
+        fire for any source) and are included too — ``scope`` marks each row ``"exact"``
+        or ``"universal"``, and the list is sorted exact-first (v1.28.0, #2). Read-only;
+        no schema/builder bump.
 
         Args:
             object_ref: canonical English ``Type.Name`` ref.
 
         Returns:
-            ``list[dict]`` (``find_event_subscriptions`` shape, with ``source_types``)
-            of subscriptions whose source is exactly this object, or ``None`` if the
-            table is empty/missing. ``[]`` when present but nothing matches.
+            ``list[dict]`` (``find_event_subscriptions`` shape, with ``source_types`` and
+            a ``scope`` field) of subscriptions whose source is exactly this object OR
+            universal, or ``None`` if the table is empty/missing. ``[]`` when present but
+            nothing matches (and no universal subscriptions exist).
         """
         ref_lower = object_ref.lower()
         with self._lock:
@@ -9896,8 +9988,16 @@ class IndexReader:
                     source_types = json.loads(r["source_types"]) if r["source_types"] else []
                 except (ValueError, TypeError):
                     pass
-                if not any(t and canonicalize_type_ref(t).lower() == ref_lower for t in source_types):
+                # #2 (v1.28.0): a subscription with EMPTY source_types is a *universal*
+                # catch-all — it fires for ANY source, so it applies to this object too.
+                # Silently dropping it (the old ``if not any(...)``) undercounted the
+                # section vs ``find_event_subscriptions`` (on configs with many shared
+                # catch-all subscriptions the count was off by a large factor).
+                # A NON-empty source_types still needs an EXACT canonical match (no
+                # substring re-introduction); ``scope`` marks the two apart for the caller.
+                if source_types and not any(t and canonicalize_type_ref(t).lower() == ref_lower for t in source_types):
                     continue
+                scope = "exact" if source_types else "universal"
                 handler_module = r["handler_module"] or ""
                 handler_procedure = r["handler_procedure"] or ""
                 handler = f"CommonModule.{handler_module}.{handler_procedure}" if handler_module else handler_procedure
@@ -9911,9 +10011,13 @@ class IndexReader:
                         "handler": handler,
                         "handler_module": handler_module,
                         "handler_procedure": handler_procedure,
+                        "scope": scope,
                         "file": r["file"] or "",
                     }
                 )
+            # Stable: exact before universal so a limited preview always shows the
+            # explicit-source subscriptions first (universal is the long catch-all tail).
+            result.sort(key=lambda d: 0 if d["scope"] == "exact" else 1)
             return result
 
     @_transient_safe(lambda: None)

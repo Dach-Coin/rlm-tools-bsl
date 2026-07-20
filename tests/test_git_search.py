@@ -9,6 +9,7 @@ registration gating, and the cwd/git-independent doc snapshot).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -124,10 +125,15 @@ def repo(tmp_path):
 def test_sanitize_path_valid():
     assert _sanitize_grep_path("CommonModules") == "CommonModules"
     assert _sanitize_grep_path("CommonModules/") == "CommonModules"
-    assert _sanitize_grep_path("/CommonModules/") == "CommonModules"
     assert _sanitize_grep_path("a/b/c") == "a/b/c"
     assert _sanitize_grep_path("") == ""  # unset → no filter
     assert _sanitize_grep_path(None) == ""
+    # v1.28.0 (#4): Windows backslash separators are normalised to POSIX ``/``
+    # instead of hard-rejected, so a literal ``path=`` copied from a Windows path
+    # (e.g. ``CommonModules\Foo``) actually filters instead of erroring.
+    assert _sanitize_grep_path("a\\b") == "a/b"
+    assert _sanitize_grep_path("CommonModules\\Foo") == "CommonModules/Foo"
+    assert _sanitize_grep_path("CommonModules\\Foo\\") == "CommonModules/Foo"
 
 
 def test_sanitize_path_rejected():
@@ -140,13 +146,27 @@ def test_sanitize_path_rejected():
         "a/../b",
         "a//b",
         "C:/Windows",
+        "C:\\Windows",  # backslash drive still caught (normalised → C:/Windows → _DRIVE_RE)
+        "\\CommonModules",  # rooted at current drive; must not become relative after normalisation
+        "\\CommonModules\\Foo",
+        "/CommonModules",  # forward slash is also rooted at the current drive on Windows
+        "/CommonModules/Foo",
+        "a\\..\\b",  # parent escape survives backslash normalisation
         "/",
         "///",
-        "a\\b",
         "*",
         "CommonModules*",
         "Doc[a-z]",
         "a?b",
+        # v1.28.0 (code-review): UNC / network-absolute input must be REJECTED, not
+        # silently re-read as a relative filter. Backslash normalisation turns
+        # ``\\server\share\X`` into ``//server/share/X``; a bare strip('/') would
+        # leave ``server/share/X`` — an absolute path masquerading as a subtree.
+        "\\\\server\\share\\CommonModules",
+        "//server/share/CommonModules",
+        "\\\\server",
+        "/\\server/share",  # mixed separators collapse to '//server/...' too
+        "Common\x00Modules",  # subprocess cannot represent NUL in argv
     ):
         assert _sanitize_grep_path(bad) is None, bad
 
@@ -210,14 +230,17 @@ def test_git_grep_path_as_file(repo):
     target = "CommonModules/МойМодуль/Ext/Module.bsl"
     hits = _git_grep(str(repo), TOK, path=target, mode="files")
     assert [h["file"] for h in hits] == [target]
-    # Leading/trailing slash is normalised to the same result.
-    hits2 = _git_grep(str(repo), TOK, path="/" + target + "/", mode="files")
+    # A trailing slash is harmless; a leading slash is rooted and rejected.
+    hits2 = _git_grep(str(repo), TOK, path=target + "/", mode="files")
     assert [h["file"] for h in hits2] == [target]
+    assert _git_grep(str(repo), TOK, path="/" + target, mode="files") is None
 
 
 def test_git_grep_malformed_filters_return_none(repo):
     assert _git_grep(str(repo), TOK, path=":/") is None
     assert _git_grep(str(repo), TOK, path="../escape") is None
+    assert _git_grep(str(repo), TOK, path="\\CommonModules") is None
+    assert _git_grep(str(repo), TOK, path="/CommonModules") is None
     assert _git_grep(str(repo), TOK, path="/") is None  # all-slashes → error
     assert _git_grep(str(repo), TOK, path="*") is None  # glob → no silent widening
     assert _git_grep(str(repo), TOK, path="CommonModules*", file_types="bsl") is None
@@ -225,7 +248,7 @@ def test_git_grep_malformed_filters_return_none(repo):
 
 
 def test_git_grep_path_empty_is_whole_config(repo):
-    """Empty path = whole config (valid); only non-empty all-slash collapses."""
+    """Empty path = whole config (valid); non-empty rooted input is rejected."""
     hits = _git_grep(str(repo), TOK, path="", mode="files")
     assert len(hits) >= 3  # bsl + xml + other doc bsl
 
@@ -367,15 +390,233 @@ def test_git_search_registered_and_finds_xml(repo):
 
 
 def test_git_search_error_dict_on_failure(repo, monkeypatch):
+    """Настоящий сбой git — и ТОЛЬКО он — даёт «git grep failed or timed out».
+
+    Форма ошибки ЕДИНАЯ — {error, hint} — и у аргументных причин, и у отказа git. Докстринг
+    обещает `hint`, поэтому потребитель вправе читать `result[0]["hint"]` НА ЛЮБОМ ошибочном
+    пути; раньше на аварийном он получал бы KeyError — то есть ровно там, где хуже всего.
+    Содержательно hint отказа git обязан СНЯТЬ подозрение с аргументов (они уже проверены выше)
+    и дать замену, работающую без git."""
     bsl = _make_bsl(repo)
     monkeypatch.setattr(bsl_index_mod, "_git_grep", lambda *a, **k: None)
     out = bsl["git_search"](TOK)
-    assert out == [{"error": "git grep failed or timed out"}]
+    assert len(out) == 1
+    assert out[0]["error"] == "git grep failed or timed out"
+    assert set(out[0]) == {"error", "hint"}, f"форма ошибки разъехалась с аргументными: {out[0]}"
+    assert "safe_grep" in out[0]["hint"], f"hint отказа git не дает замену: {out[0]['hint']}"
 
 
-def test_git_search_error_dict_on_bad_filter(repo):
+def test_git_search_fallback_hint_does_not_oversell_safe_grep(repo, monkeypatch):
+    """safe_grep — НЕ равноценная замена git_search, и hint обязан это сказать.
+
+    git_search идёт по ВСЕМУ дереву и любым типам файлов; safe_grep ищет ТОЛЬКО по BSL и без
+    name_hint ограничен первыми max_files кандидатами. Отправить агента с `git_search(tok,
+    file_types="xml")` в safe_grep — значит послать его туда, где XML не ищется В ПРИНЦИПЕ: он
+    получит пусто и решит, что токена нет. Поэтому hint обязан назвать границы safe_grep и дать
+    отдельный маршрут для не-BSL/широкого поиска."""
     bsl = _make_bsl(repo)
-    assert bsl["git_search"](TOK, path=":/") == [{"error": "git grep failed or timed out"}]
+    monkeypatch.setattr(bsl_index_mod, "_git_grep", lambda *a, **k: None)
+    hint = bsl["git_search"](TOK, file_types="xml")[0]["hint"]
+    assert "BSL" in hint, f"hint не говорит, что safe_grep ограничен BSL: {hint}"
+    assert "max_files" in hint, f"hint не говорит про потолок кандидатов у safe_grep: {hint}"
+    assert "grep(" in hint, f"hint не даёт маршрут для не-BSL/широкого поиска: {hint}"
+
+
+def test_git_search_names_broken_regex_instead_of_blaming_git(repo):
+    """git зовётся с `-E` (POSIX ERE, см. bsl_index._git_grep). Битое выражение — git_search("(",
+    regex=True) — проходит guard'ы _git_grep, а падает УЖЕ в git (rc>=2), который отдаёт None.
+
+    Без предварительной компиляции хелпер снова свалил бы вину на git — то есть ИСХОДНЫЙ класс
+    дефекта (агент чинит не своё) выживал бы для malformed regex. Хуже того: новый hint отказа
+    git прямо утверждает, что аргументы провалидированы, — и это утверждение было бы ЛОЖНЫМ."""
+    bsl = _make_bsl(repo)
+    for pat in ("(", "a[b", "*x", "a{2,1}"):
+        out = bsl["git_search"](pat, regex=True)
+        assert len(out) == 1 and "error" in out[0], (pat, out)
+        assert "pattern" in out[0]["error"], out[0]["error"]
+        assert "git grep failed" not in out[0]["error"], f"снова валим на git: {out[0]['error']}"
+        assert out[0].get("hint"), out[0]
+
+    # Контроль: валидное выражение НЕ отвергается, поиск идёт как обычно.
+    ok = bsl["git_search"](TOK, regex=True)
+    assert not (ok and "error" in ok[0]), ok
+    # И в fixed-string режиме (git grep -F) «битый» regex — обычная подстрока, не ошибка.
+    fixed = bsl["git_search"]("(", regex=False)
+    assert not (fixed and "error" in fixed[0]), fixed
+
+
+def test_git_search_classifies_python_only_regex_by_gits_own_verdict(repo):
+    """Python-проверка ПРИНЦИПИАЛЬНО не закрывает POSIX ERE, и это не лечится ещё одной эвристикой.
+
+    `re` — НАДМНОЖЕСТВО ERE: lookahead `(?=a)` и именованные группы `(?P<x>a)` компилируются в
+    Python, а `git grep -E` их отвергает — rc=128, «Invalid preceding regular expression». Значит
+    предварительный re.compile их ПРОПУСКАЕТ, и раньше они уезжали в «git grep failed or timed
+    out»: исходный дефект (агент чинит не своё) выживал, а hint при этом ещё и уверял, что
+    аргументы проверены.
+
+    Правильный источник истины — САМ git: он называет и pattern, и причину. `_git_grep` отдаёт
+    rc+stderr через `err`, и хелпер эту причину доносит, а не угадывает. Тест пинит и это:
+    сообщение git обязано долетать до агента."""
+    bsl = _make_bsl(repo)
+    for pat in ("(?=a)", "(?P<x>a)", "(?<=a)b"):
+        out = bsl["git_search"](pat, regex=True)
+        assert len(out) == 1 and "error" in out[0], (pat, out)
+        assert "pattern" in out[0]["error"], f"{pat!r}: причина снова не названа: {out[0]['error']}"
+        assert "git grep failed" not in out[0]["error"], f"{pat!r}: снова валим на git: {out[0]['error']}"
+        # Подлинное сообщение git долетает до агента — оно точнее любой нашей формулировки.
+        assert "regular expression" in out[0]["error"].lower() or "unmatched" in out[0]["error"].lower(), out[0]
+        assert "POSIX ERE" in out[0]["hint"], out[0]["hint"]
+        assert "regex=False" in out[0]["hint"], out[0]["hint"]
+
+    # Контроль: те же конструкции как ЛИТЕРАЛЬНАЯ подстрока (-F) — не ошибка, просто нет совпадений.
+    assert bsl["git_search"]("(?=a)", regex=False) == []
+
+
+def test_git_search_names_the_broken_filter_instead_of_blaming_git(repo):
+    """Найдено в e2e v1.28.0: битый фильтр и сбой git схлопывались в ОДНО сообщение
+    («git grep failed or timed out»), потому что _git_grep на обе причины отдаёт None.
+    Агент, передавший неверный path=, читал это как «git сломался» и шёл чинить не то.
+
+    Теперь причина НАЗВАНА: сообщение указывает на виновный аргумент и несёт hint, а
+    «git grep failed or timed out» означает РОВНО сбой git (см. тест выше)."""
+    bsl = _make_bsl(repo)
+    for kwargs, culprit in (
+        ({"path": ":/"}, "path"),
+        ({"path": "C:\\Windows"}, "path"),
+        ({"path": "a\\..\\b"}, "path"),
+        ({"path": "Common\x00Modules"}, "path"),
+        ({"exclude_path": "../etc"}, "exclude_path"),
+        ({"exclude_path": "Forms\x00/Bad"}, "exclude_path"),
+        ({"file_types": "b*sl"}, "file_types"),
+        # _git_grep отдаёт None ещё и на эти две причины — если их не классифицировать здесь,
+        # они снова уедут в "git grep failed or timed out" и утверждение об эксклюзивности
+        # этого сообщения станет ложным (ровно так и было в первой версии правки).
+        ({"mode": "bogus"}, "mode"),
+    ):
+        out = bsl["git_search"](TOK, **kwargs)
+        assert len(out) == 1 and "error" in out[0], (kwargs, out)
+        err = out[0]["error"]
+        assert culprit in err, f"ошибка не называет виновный аргумент {culprit!r}: {err}"
+        assert "git grep failed" not in err, f"снова валим на git: {err}"
+        assert out[0].get("hint"), f"нет actionable-подсказки: {out[0]}"
+
+    # NL/NUL в pattern — git трактовал бы их как несколько -e паттернов; тоже НЕ вина git.
+    for pat in ("a\nb", "a\x00b"):
+        out = bsl["git_search"](pat)
+        assert len(out) == 1 and "error" in out[0], (pat, out)
+        assert "pattern" in out[0]["error"], out[0]["error"]
+        assert "git grep failed" not in out[0]["error"], out[0]["error"]
+        assert out[0].get("hint"), out[0]
+
+
+def test_git_search_does_not_blame_the_pattern_for_a_real_git_failure(repo, monkeypatch):
+    """rc>=2 НЕ означает «git отверг твой pattern»: тем же rc=128 git отвечает и на настоящий
+    отказ (повреждённый индекс, не-репозиторий, отсутствующий объект). Классифицировать отказ по
+    флагу `regex` — значит снова обвинять не того: с regex=True корректное ERE-выражение
+    объявлялось бы битым («перепиши выражение»), а с regex=False реальный отказ уезжал бы в
+    «git grep отверг команду» — то есть обещание, что «git grep failed or timed out» остаётся
+    РОВНО за отказом git, было бы ложным (и докстринг вместе с ним).
+
+    Разводить причины обязан stderr: при ошибке компиляции выражения git ЭХОМ печатает сам
+    паттерн (`fatal: -e option, '(': Unmatched (`), при отказе — нет."""
+    bsl = _make_bsl(repo)
+    fatal = "fatal: not a git repository (or any of the parent directories): .git\n"
+
+    def _fake(*_a, err=None, **_k):
+        if err is not None:
+            err.clear()
+            err.update(kind="rc", rc=128, stderr=fatal)
+        return None
+
+    monkeypatch.setattr(bsl_index_mod, "_git_grep", _fake)
+    for regex in (True, False):
+        out = bsl["git_search"]("валидный.*ERE", regex=regex)
+        assert len(out) == 1 and "error" in out[0], (regex, out)
+        err = out[0]["error"]
+        assert "pattern" not in err.lower(), f"regex={regex}: обвиняем корректный pattern: {err}"
+        assert err == "git grep failed or timed out", f"regex={regex}: настоящий отказ git назван иначе: {err}"
+        assert out[0].get("hint"), out[0]
+
+
+def test_git_search_fallback_hint_warns_that_pattern_semantics_change(repo, monkeypatch):
+    """Аварийный fallback МЕНЯЕТ семантику паттерна, и молчать об этом нельзя.
+
+    git_search по умолчанию литеральный (`git grep -F`), а обе замены из hint — регексные:
+    `grep()` и `safe_grep()` компилируют аргумент через Python `re`. Значит для литерального
+    `git_search("(")` подсказка `safe_grep("(")` не просто «неравноценна» — она ПАДАЕТ
+    (`re.error`/ValueError), а литеральная точка тихо превращается в «любой символ». Для
+    regex=True расходятся ещё и диалекты: POSIX ERE у git vs Python `re` у замен.
+
+    Hint обязан назвать смену семантики и дать маршрут, ИСПОЛНИМЫЙ ДОСЛОВНО. В свежей песочнице
+    нет ни переменной `pattern`, ни предзагруженного модуля `re` (он лишь разрешён к import через
+    sandbox.ALLOWED_MODULES), поэтому совет вида `safe_grep(re.escape(pattern), ...)` после
+    настоящего отказа git давал бы NameError — второй отказ подряд (Codex MED, v1.28). Экранирует
+    СЕРВЕР и вставляет готовый литерал; тест исполняет ОБЕ замены (`safe_grep` и `grep`) в
+    namespace БЕЗ `re` и `pattern`."""
+    bsl = _make_bsl(repo)
+    monkeypatch.setattr(bsl_index_mod, "_git_grep", lambda *a, **k: None)
+    hint = bsl["git_search"]("(", regex=False)[0]["hint"]
+    assert "re.escape" in hint, f"hint не называет применённое экранирование: {hint}"
+    frags = re.findall(r"safe_grep\([^)]*\)", hint)
+    assert frags, f"hint не даёт исполнимого safe_grep-эквивалента: {hint}"
+    ns = dict(bsl)  # ни 're', ни 'pattern' — ровно как в свежей песочнице
+    for frag in frags:
+        res = eval(compile(frag, "<fallback-hint>", "eval"), {"__builtins__": {}}, ns)  # noqa: S307
+        assert isinstance(res, list), (frag, res)
+    assert "'\\\\('" in hint, f"экранированный сервером литерал не вставлен: {hint}"
+
+    grep_frags = re.findall(r"(?<!safe_)grep\([^)]*\)", hint)
+    assert grep_frags, f"hint не дает исполнимого grep-эквивалента для не-BSL: {hint}"
+    helpers, _ = make_helpers(str(repo))
+    grep_ns = {**dict(bsl), **helpers}
+    for frag in grep_frags:
+        # Hint честно требует подставить путь из glob_files/find_module; меняем только его,
+        # сам подготовленный сервером pattern исполняется дословно.
+        executable = frag.replace("'конкретный/путь'", "'Documents/ТестовыйДокумент/Ext/Form.xml'")
+        res = eval(compile(executable, "<fallback-hint:grep>", "eval"), {"__builtins__": {}}, grep_ns)  # noqa: S307
+        assert isinstance(res, list), (executable, res)
+        assert "\\\\(" in executable, f"grep получил сырой некомпилируемый литерал: {executable}"
+
+    hint_re = bsl["git_search"]("a.*b", regex=True)[0]["hint"]
+    assert "ERE" in hint_re and "re" in hint_re, f"hint не разводит диалекты ERE и Python re: {hint_re}"
+    assert "'a.*b'" in hint_re, f"regex-вариант не вставлен как готовый литерал: {hint_re}"
+    for frag in re.findall(r"safe_grep\([^)]*\)", hint_re):
+        res = eval(compile(frag, "<fallback-hint>", "eval"), {"__builtins__": {}}, dict(bsl))  # noqa: S307
+        assert isinstance(res, list), (frag, res)
+
+
+def test_git_search_long_pattern_fallback_respects_the_regex_flag(repo, monkeypatch):
+    """Длинный (>300) паттерн не интерполируется в hint готовым литералом — но общий маршрут
+    «собери с re.escape» для regex=True был бы СМЕНОЙ СМЫСЛА (выражение превратилось бы в
+    литерал) и противоречил бы соседней фразе «при regex=True экранировать не надо» в том же
+    hint (Codex LOW, v1.28). Длинная ветка обязана ветвиться по флагу."""
+    bsl = _make_bsl(repo)
+    monkeypatch.setattr(bsl_index_mod, "_git_grep", lambda *a, **k: None)
+    long_pattern = "a" * 301
+
+    hint_re = bsl["git_search"](long_pattern, regex=True)[0]["hint"]
+    assert "re.escape(" not in hint_re, f"длинному regex советуют экранирование: {hint_re}"
+    assert "БЕЗ re.escape" in hint_re, f"нет явного запрета экранирования для regex: {hint_re}"
+
+    hint_lit = bsl["git_search"](long_pattern, regex=False)[0]["hint"]
+    assert "import re" in hint_lit and "re.escape(" in hint_lit, (
+        f"длинный литерал потерял маршрут с явным import re: {hint_lit}"
+    )
+    assert long_pattern not in hint_lit, "гигантский паттерн интерполирован в hint целиком"
+
+
+def test_helpers_doc_git_fallback_example_executes_without_hidden_names(repo):
+    """HELPERS.md раньше советовал `safe_grep(re.escape(pattern), ...)`, но в свежей песочнице
+    нет ни `re`, ни переменной `pattern`. Документный пример обязан сам импортировать модуль,
+    определить паттерн и одинаково подготовить его для BSL (`safe_grep`) и не-BSL (`grep`)."""
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "HELPERS.md").read_text(encoding="utf-8")
+    match = re.search(r"исполнимый пример без скрытых переменных: `([^`]+)`", doc)
+    assert match, "в HELPERS.md пропал исполнимый fallback-пример git_search"
+
+    helpers, _ = make_helpers(str(repo))
+    namespace = {**_make_bsl(repo), **helpers}
+    exec(compile(match.group(1), "<HELPERS.md:git-fallback>", "exec"), namespace)  # noqa: S102
+    assert namespace["p"] == r"\(", f"документный пример не экранировал литерал: {namespace['p']!r}"
 
 
 def test_git_search_truncation_contract(repo):
@@ -412,6 +653,64 @@ def test_safe_grep_git_parity_literal(repo, monkeypatch):
         return sorted((r["file"], r["line"], r["text"]) for r in rs)
 
     assert _key(with_git) == _key(without_git)
+    # #7 (v1.28.0): обе ветки отдают POSIX '/'-разделитель (строгий паритет, без '\').
+    assert all("\\" not in r["file"] for r in with_git)
+    assert all("\\" not in r["file"] for r in without_git)
+
+
+def test_safe_grep_normalizes_file_separators_to_posix(repo):
+    """#7 (v1.28.0): safe_grep приводит `file` каждого результата к POSIX '/' на
+    единой точке сборки — даже если нижележащая ветка/``grep_fn`` вернула Windows
+    '\\' (эмуляция ``helpers.grep`` directory-walk: ``str(relative_to)`` на Windows).
+    Гетерогенность '\\' vs '/' внутри одной выдачи ломала бы сортировку по `file`."""
+    helpers, resolve_safe = make_helpers(str(repo))
+    format_info = detect_format(str(repo))
+
+    def _backslash_grep(pattern, path):
+        return [{"file": "CommonModules\\МойМодуль\\Ext\\Module.bsl", "line": 1, "text": "hit"}]
+
+    bsl = make_bsl_helpers(
+        base_path=str(repo),
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=_backslash_grep,
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+    )
+    # regex-паттерн (метасимвол '.') → git-литерал fast-path пропущен → Python grep_fn.
+    results = bsl["safe_grep"]("hi.")
+    assert results, "ожидались результаты из Python-ветки (grep_fn)"
+    assert all("\\" not in r["file"] for r in results), [r["file"] for r in results]
+    assert all(r["file"] == "CommonModules/МойМодуль/Ext/Module.bsl" for r in results)
+
+
+def test_safe_grep_does_not_mutate_grep_fn_results(repo):
+    """#7 (code-review): нормализация `file` НЕ мутирует словари, отданные ``grep_fn``.
+
+    Реальный ``helpers.grep`` кладёт СВОЙ список словарей в ``_grep_cache`` и при
+    cache-hit возвращает его БЕЗ копирования. In-place ``m["file"] = ...`` в safe_grep
+    навсегда переписывал бы `file` в кеше → последующий прямой ``grep()`` в этой же
+    сессии отдавал бы уже нормализованные пути (тихая смена контракта низкоуровневого
+    grep, которую мы решили не трогать). Собираем новые словари."""
+    helpers, resolve_safe = make_helpers(str(repo))
+    format_info = detect_format(str(repo))
+    backend_rows = [{"file": "CommonModules\\МойМодуль\\Ext\\Module.bsl", "line": 1, "text": "hit"}]
+
+    def _cached_backslash_grep(pattern, path):
+        return backend_rows  # тот же объект, как при cache-hit у helpers.grep
+
+    bsl = make_bsl_helpers(
+        base_path=str(repo),
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=_cached_backslash_grep,
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+    )
+    results = bsl["safe_grep"]("hi.")
+    assert all(r["file"] == "CommonModules/МойМодуль/Ext/Module.bsl" for r in results)
+    # Backend-строки остались нетронутыми (safe_grep вернул КОПИИ).
+    assert backend_rows[0]["file"] == "CommonModules\\МойМодуль\\Ext\\Module.bsl"
 
 
 def test_safe_grep_regex_stays_on_python(repo):
@@ -506,8 +805,17 @@ def test_sanitize_excludes():
         "ConfigDumpInfo.xml",
     ]
     # Any malformed element rejects the whole call (no silent narrowing-away).
-    for bad in ("../x", "a*", "Forms,a*", ":(top)", "C:/Win", "a\\b", "/"):
+    for bad in ("../x", "a*", "Forms,a*", ":(top)", "C:/Win", "\\Forms", "/Forms", "/"):
         assert _sanitize_grep_excludes(bad) is None, bad
+    # v1.28.0 (#4): backslash separators are normalised (shared with ``path``),
+    # not rejected — an ``exclude_path`` copied from a Windows path still works.
+    assert _sanitize_grep_excludes("a\\b") == ["a/b"]
+    assert _sanitize_grep_excludes("Forms\\Sub,Templates") == ["Forms/Sub", "Templates"]
+    # …but a UNC/network-absolute element is still rejected (shared guard with ``path``):
+    # it must not be silently re-read as the relative subtree ``server/share/Forms``.
+    assert _sanitize_grep_excludes("\\\\server\\share\\Forms") is None
+    assert _sanitize_grep_excludes("//server/share/Forms") is None
+    assert _sanitize_grep_excludes("Forms,\\\\server\\share") is None
 
 
 def test_git_grep_exclude_nested_forms(repo):
@@ -600,8 +908,13 @@ def test_git_search_exclude_path_helper(repo):
 
 
 def test_git_search_exclude_malformed_error(repo):
+    """Битый exclude_path — ошибка, а не молча расширенный поиск. Причина НАЗВАНА
+    (раньше валили на git: «git grep failed or timed out»)."""
     bsl = _make_bsl(repo)
-    assert bsl["git_search"](TOK, exclude_path="a*") == [{"error": "git grep failed or timed out"}]
+    out = bsl["git_search"](TOK, exclude_path="a*")
+    assert len(out) == 1 and "error" in out[0], out
+    assert "exclude_path" in out[0]["error"], out[0]["error"]
+    assert "git grep failed" not in out[0]["error"], out[0]["error"]
 
 
 def test_git_search_positional_compat_unchanged(repo):

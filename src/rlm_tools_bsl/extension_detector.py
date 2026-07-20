@@ -530,6 +530,7 @@ def _build_warnings(
 def find_extension_overrides(
     extension_path: str,
     object_name: str | None = None,
+    diagnostics: dict | None = None,
 ) -> list[dict]:
     """Find method interception annotations in BSL files of an extension.
 
@@ -537,22 +538,49 @@ def find_extension_overrides(
         extension_path: Root directory of the extension.
         object_name: If specified, only scan modules belonging to this object
             (case-insensitive match on object_name from path parsing).
+        diagnostics: Optional mutable mapping populated with scan completeness,
+            counters, unreadable files, and directory traversal errors.
 
     Returns:
         List of dicts with keys: annotation, target_method, extension_method,
         module_path, object_name, module_type, line.
     """
     ext_base = Path(extension_path)
+    scan_diagnostics = {
+        "root": str(ext_base),
+        "root_available": ext_base.is_dir(),
+        "complete": True,
+        "candidate_files": 0,
+        "files_scanned": 0,
+        "unreadable_files": [],
+        "walk_errors": [],
+    }
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(scan_diagnostics)
     if not ext_base.is_dir():
+        scan_diagnostics["complete"] = False
+        if diagnostics is not None:
+            diagnostics.update(scan_diagnostics)
         return []
 
     object_filter = object_name.lower() if object_name else None
     results: list[dict] = []
 
-    for dirpath, dirnames, filenames in os.walk(ext_base):
+    def _record_walk_error(error: OSError) -> None:
+        scan_diagnostics["complete"] = False
+        scan_diagnostics["walk_errors"].append(
+            {
+                "path": str(getattr(error, "filename", "") or ext_base),
+                "error": type(error).__name__,
+                "message": str(error),
+            }
+        )
+
+    for dirpath, dirnames, filenames in os.walk(ext_base, onerror=_record_walk_error):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
         for fname in filenames:
-            if not fname.endswith(".bsl"):
+            if not fname.casefold().endswith(".bsl"):
                 continue
 
             fpath = os.path.join(dirpath, fname)
@@ -566,8 +594,17 @@ def find_extension_overrides(
                 if bsl_info.object_name.lower() != object_filter:
                     continue
 
-            _scan_bsl_for_annotations(fpath, rel_path, str(ext_base), results)
+            scan_diagnostics["candidate_files"] += 1
+            if _scan_bsl_for_annotations(fpath, rel_path, str(ext_base), results):
+                scan_diagnostics["files_scanned"] += 1
+            else:
+                scan_diagnostics["complete"] = False
+                scan_diagnostics["unreadable_files"].append(rel_path)
 
+    scan_diagnostics["unreadable_files"].sort()
+    scan_diagnostics["walk_errors"].sort(key=lambda row: (row["path"], row["error"], row["message"]))
+    if diagnostics is not None:
+        diagnostics.update(scan_diagnostics)
     return results
 
 
@@ -576,13 +613,13 @@ def _scan_bsl_for_annotations(
     rel_path: str,
     ext_base: str,
     results: list[dict],
-) -> None:
+) -> bool:
     """Scan a single BSL file for interception annotations."""
     try:
         with open(fpath, encoding="utf-8-sig", errors="replace") as f:
             lines = f.readlines()
     except OSError:
-        return
+        return False
 
     bsl_info = parse_bsl_path(fpath, ext_base)
 
@@ -613,3 +650,4 @@ def _scan_bsl_for_annotations(
                 "line": i + 1,
             }
         )
+    return True

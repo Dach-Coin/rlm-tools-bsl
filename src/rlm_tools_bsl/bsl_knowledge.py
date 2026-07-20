@@ -340,15 +340,15 @@ Step 4 — ANALYZE: get the full picture
   analyze_object(name) → metadata + all modules + procedures
   analyze_document_flow(doc_name) → subscriptions + register movements + jobs
   find_custom_modifications(object_name) → find non-standard code by prefix
-  find_register_movements(doc_name) → which registers a document writes to (is_postable hint при пустом результате)
+  find_register_movements(doc_name) → Posting/CFE-фильтрованные кандидаты (main — снимок индекса; сначала is_postable; при пустом code_registers смотри posting_handler_present + hint)
   CAUTION: analyze_document_flow and analyze_object scan many files — on large configs (10K+)
   they may be slow (>60s). Prefer calling individual helpers separately if timeout occurs.
 
 == STEP 4 EXTENDED (по перформансу) ==
 
 INSTANT (индексный путь, OK для batch 5-10 в одном rlm_execute):
-  find_register_writers(reg_name)        → документы-писатели регистра
-  find_register_movements(doc_name)      → регистры, в которые пишет документ
+  find_register_writers(reg_name)        → статические reverse-кандидаты
+  find_register_movements(doc_name)      → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса
   find_event_subscriptions(obj)          → подписки на события (event_filter + limit опционально)
   find_scheduled_jobs(name='')           → регламентные задания
   find_roles(obj_name)                   → роли с правами на объект
@@ -357,7 +357,7 @@ INSTANT (индексный путь, OK для batch 5-10 в одном rlm_exe
   get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
 
 HYBRID (часть из индекса, часть live — ОДИН вызов в batch, не больше 2-3):
-  find_functional_options(obj_name)      → xml_options из индекса; code_options через safe_grep (live, всегда)
+  find_functional_options(obj_name[, limit=10]) → xml_options из индекса; code_options через safe_grep (live, всегда); limit= — per-bucket cap, спасает от обрыва по max_output_chars
 
 LIVE (читают тела процедур / parse XML — медленно, особенно без индекса):
   find_based_on_documents(doc_name)      → read_procedure(ОбработкаЗаполнения, ДобавитьКомандыСозданияНаОсновании) — НЕ batch массово
@@ -368,7 +368,7 @@ LIVE (читают тела процедур / parse XML — медленно, �
 CAUTION: на конфигах 10K+ файлов analyze_* могут быть >60с. Батчь LIVE-хелперы по одному; INSTANT — по 5-10.
 
 Step 5 — EXTENSIONS: check if behavior is modified
-  get_overrides('ObjectName') → indexed overrides (instant); без фильтра первые 200 (порядок не гарантирован), total/truncated в ответе сигналят обрезку
+  get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top/unique_* полны iff partial=False; иначе lower bound, см. _meta
   read_procedure(path, name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
   NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.
@@ -385,9 +385,14 @@ get_object_full_structure(name) vs analyze_object(name):
 find_call_hierarchy(name, depth=N, module_hint=...) vs find_callers_context(name):
   - find_callers_context → 1 уровень callers + контекст вызова (line/text). Быстрее.
   - find_call_hierarchy → N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации.
-    + module_hint у hierarchy: для ОДНОИМЁННЫХ объектных методов (ОбработкаПроведения и т.п.)
-      привязывает корень к одному модулю → exact-режим (точные рёбра по callee_key, без однофамильцев).
-      Глубже exact распространяется сам. Доверие к рёбрам — в _meta (root_exact/exact_rows/fallback_rows).
+    + module_hint у hierarchy: для ОДНОИМЕННЫХ объектных методов, которые РЕАЛЬНО зовут из BSL
+      (ЗаполнитьДокумент и т.п.), привязывает корень к одному модулю → exact-режим (точные ребра
+      по callee_key, без однофамильцев).
+      Глубже exact распространяется сам. Доверие к ребрам — в _meta (root_exact/exact_rows/fallback_rows).
+    + ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью, ПриЗаписи): вызов от ПЛАТФОРМЫ
+      в граф ВЫЗОВОВ не попадает → callers=0 это НОРМА, а не мертвый код (module_hint это не лечит).
+      По имени хелпер их НЕ исключает: ЯВНЫЙ вызов обработчика из BSL, если он есть, он ПОКАЖЕТ.
+      Но ЧЕМ пишутся движения, так не найти: читай тело и трассируй ДЕЛЕГАТА (rlm_help(topic='проведение')).
   Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy
   (с module_hint, если корень — неуникальный объектный метод).
 
@@ -447,11 +452,14 @@ find_based_on_documents(doc_name) — прямой обход + back_scan:
     ОбработкаЗаполнения других Documents и собираются те, кто упомянул ДокументСсылка.<doc_name>.
   - Записи из back_scan помечены via='back_scan' (типичный кейс — Письма в ДО3:
     у них нет ДобавитьКомандыСозданияНаОсновании, но Задача/Поручение могут заполняться от них).
+  - Декларативный BasedOn из metadata_references добавляет документы и другие категории.
+    Для типизированного не-документа это единственный источник; без доступной таблицы ответ partial=True.
 
 find_register_movements(doc) vs find_register_writers(reg):
   - find_register_movements: документ → какие регистры пишет (есть is_postable).
-  - find_register_writers: регистр → какие документы пишут.
-  Двунаправленный поиск; запрашивай оба только если нужны обе стороны.
+  - find_register_writers: регистр → статические ссылки документов (runtime_filtered=False).
+  find_register_movements применяет Posting/CFE, но main-строки берет из снимка индекса;
+  после изменения main-кода проверь живое тело файла кандидата.
 
 search(q, scope='X') vs search_X(q):
   - search() — broad-first, отдаёт unified [{source_type, text, path, path_kind, detail}].
@@ -507,13 +515,13 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('себестоимость') → объекты по синониму",
             "get_object_profile('ДокИмя') → за 1 вызов: регистры + подписки + структура + модули (вместо find_register_movements/analyze_document_flow по отдельности)",
-            "find_register_writers('РегистрСебестоимости') → какие документы пишут в регистр",
+            "find_register_writers('РегистрСебестоимости') → статические reverse-кандидаты; Posting/CFE проверь через forward, свежесть main-кода — по живому файлу",
             "детали потока → get_object_profile('ДокИмя', include_flow=True)",
         ],
         "full": [
             "search_objects('себестоимость') → документы, регистры, модули по синониму",
             "find_by_type('AccumulationRegisters', 'Себестоимость') → регистры себестоимости",
-            "find_register_writers('РегистрИмя') → какие документы пишут в регистр",
+            "find_register_writers('РегистрИмя') → статические reverse-кандидаты; Posting/CFE проверь через forward, свежесть main-кода — по живому файлу",
             "analyze_document_flow('ДокИмя') → проводки + подписки + задания",
             "search_methods('Себестоимость') → методы расчёта по всей кодовой базе",
             "find_callers_context('РассчитатьСебестоимость') → цепочка вызовов",
@@ -525,32 +533,33 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
             "get_object_profile('ДокИмя') → за 1 вызов: регистры (registers) + подписки (subscriptions) + структура + модули + роли",
-            "registers.summary: если code_registers=0 и движений нет — документ непроводим, смотри subscriptions, не ищи ОбработкуПроведения",
-            "поток целиком → get_object_profile('ДокИмя', include_flow=True); код проведения → read_procedure(path, 'ОбработкаПроведения')",
+            "registers.summary: main_code_registers_suppressed_by_cfe>0 — handler-only main не active; code_registers=0 ≠ непроводимый: смотри posting_handler_present. Posting=Deny определяет только find_register_movements.is_postable. Исполняй hint: сервер назвал регистры и классифицировал получателя (МОДУЛЬ/ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН); неподтвержденный МОДУЛЬ молча даст ЧУЖОЕ тело, для НЕ ОПОЗНАН дал tree-search. Проверка category=='CommonModules' — ТАВТОЛОГИЯ: module_hint уже применил этот фильтр. find_call_hierarchy движений не найдет: обработчик зовет ПЛАТФОРМА",
+            "поток целиком → get_object_profile('ДокИмя', include_flow=True)",
         ],
         "full": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
-            "find_register_movements('ДокИмя') → регистры, в которые пишет документ",
-            "проверить is_postable: если find_register_movements вернул is_postable=False — переходить к find_event_subscriptions, не искать ОбработкаПроведения",
-            "analyze_document_flow('ДокИмя') → проводки + подписки + рег.задания",
-            "find_event_subscriptions('ДокИмя', event_filter=['BeforeWrite','OnWrite','Posting','Проведение','ПередЗаписью','ПриЗаписи']) → подписки на ключевые события документа",
-            "read_procedure(path, 'ОбработкаПроведения') → код проведения",
-            "find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.ДокИмя', depth=2) → транзитивные вызывающие. module_hint ОБЯЗАТЕЛЕН: ОбработкаПроведения одноимённа в сотнях документов → без hint root_exact=False и в дерево попадут ложные звенья от однофамильцев (hint у тебя уже есть — это path из read_procedure)",
-            "find_callers_context('ОбработкаПроведения', module_hint='Документ.ДокИмя') → 1 уровень callers + контекст вызова (тоже с hint — точные рёбра)",
-            "ALT: search_methods('Проведение') если имя процедуры нестандартное",
+            "find_register_movements('ДокИмя') → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса",
+            "сигналы: is_postable=False -> нет движений; suppressed_main_code_registers -> handler-only main не active; posting_handler_present при code_registers=0 -> прямых Движения.X нет, возможны делегаты",
+            "ТРАССИРОВКА: исполняй result['hint']: сервер вернул регистр, делегата (получатель может быть НЕ РАЗРЕШЕН), dotless local-global или «не пишет»; CFE через read_file недоступен",
+            "ЛОВУШКИ: (1) точка НЕ доказывает модуль: слева бывает ПЕРЕМЕННАЯ/РЕКВИЗИТ; одноименный модуль молча отдаст ЧУЖОЕ тело — верь метке hint. (2) category=='CommonModules' при 'ОбщийМодуль.' — ТАВТОЛОГИЯ: это фильтр module_hint. (3) проверяй d.get('definitions'): пусто = definitions=[], без индекса ключа нет. (4) ПУСТО — исполни live safe_grep-маршрут из hint; _truncated = остановка на 50 кандидатах, без него каталог пройден",
+            "НАШЕЛ Движения.X: find_register_writers('Регистр') даст static-кандидатов; Posting/CFE проверь forward, измененный после build main-файл — живьем. Набор записей helper не найдет — ищи регистр через git_search, иначе safe_grep",
+            "ОбработкаПроведения зовет ПЛАТФОРМА: callers=0 норма, но ЯВНЫЙ BSL-вызов хелперы покажут. Движения ищи через hint, call-хелперами трассируй ДЕЛЕГАТА; include_triggers — лишь CFE-перехват",
+            "analyze_document_flow('ДокИмя') → проводки + подписки + регзадания",
+            "find_event_subscriptions('ДокИмя', event_filter=['BeforeWrite','OnWrite','Posting','Проведение','ПередЗаписью','ПриЗаписи']) → подписки документа",
+            "ALT: search_methods('Проведение') при нестандартном имени",
         ],
     },
     "распределение": {
         "compact": [
             "search_objects('распределение') → объекты по синониму",
             "get_object_profile('ДокИмя') → за 1 вызов: регистры + подписки + структура + модули",
-            "find_register_writers('РегистрИмя') → документы-источники; методы → search_methods('Распредел')",
+            "find_register_writers('РегистрИмя') → статические кандидаты; методы → search_methods('Распредел')",
         ],
         "full": [
             "search_objects('распределение') → объекты по синониму",
             "search_methods('Распредел') → все методы распределения",
             "find_by_type('AccumulationRegisters', 'Распредел') → регистры распределения",
-            "find_register_writers('РегистрИмя') → какие документы пишут в регистр",
+            "find_register_writers('РегистрИмя') → статические reverse-кандидаты; Posting/CFE проверь через forward, свежесть main-кода — по живому файлу",
             "analyze_document_flow('ДокИмя') → полный flow документа распределения",
             "analyze_subsystem('РаспределениеЗатрат') → все объекты домена",
             "find_callers_context('Распределить') → цепочка вызовов",
@@ -578,13 +587,13 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('ОбъектИмя') → найти объект по бизнес-имени",
             "get_object_profile('ОбъектИмя') → за 1 вызов: роли (roles) + функц.опции (functional_options) + структура",
-            "детальнее: find_roles('ОбъектИмя') по ролям; find_functional_options('ОбъектИмя') по опциям",
+            "детальнее: find_roles('ОбъектИмя') по ролям; find_functional_options('ОбъектИмя', limit=10) по опциям (limit= ИМЕНОВАННО — per-bucket cap + total/returned/has_more; без него на «жирных» объектах обрыв по max_output_chars)",
         ],
         "full": [
             "search_objects('ОбъектИмя') → найти объект по бизнес-имени",
             "find_roles('ОбъектИмя') → роли с правами на объект (чтение, запись, и т.д.)",
             "find_by_type('Roles') → полный список ролей конфигурации",
-            "find_functional_options('ОбъектИмя') → функциональные опции объекта",
+            "find_functional_options('ОбъектИмя', limit=10) → функциональные опции; limit= (именованно!) режет xml_options и code_options КАЖДЫЙ до N + total/returned/has_more — без него обрыв по max_output_chars",
             "search_methods('ПравоДоступа') → проверки прав в коде",
             "search_methods('РольДоступна') → программные проверки ролей",
             "analyze_subsystem('УправлениеДоступом') → все объекты подсистемы прав",
@@ -705,7 +714,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         ],
         "full": [
             "rel = find_based_on_documents('ПриобретениеТоваровУслуг')",
-            "for d in rel['can_create_from_here']: print(f'  -> {d[\"document\"]}')",
+            'for d in rel[\'can_create_from_here\']: print(f\'  -> {d.get("ref") or d["document"]} (via={d.get("via","direct")})\')  # metadata ref канонический: Catalog.X/Document.X',
             "for d in rel['can_be_created_from']: print(f'  <- {d[\"type\"]}')",
             "search_methods('Заполнить') → процедуры заполнения шапки/ТЧ при вводе на основании",
             "find_event_subscriptions('ДокИмя', event_filter=['Filling','ОбработкаЗаполнения']) → подписки на заполнение",
@@ -760,13 +769,15 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     "иерархия вызовов": {
         "compact": [
             "find_call_hierarchy('ПроцИмя', direction='callers', depth=2) → транзитивные вызывающие на 2 уровня",
-            "Одноимённый ОБЪЕКТНЫЙ метод (ОбработкаПроведения) → добавь module_hint='Документ.X' для точности (exact-режим)",
+            "Одноименный ОБЪЕКТНЫЙ метод, который РЕАЛЬНО зовут из кода (ЗаполнитьДокумент, ОтразитьВУчете) → добавь module_hint='Документ.X' для точности (exact-режим)",
+            "ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 это НОРМА, а не мертвый код. По имени хелпер их НЕ исключает — ЯВНЫЙ вызов из BSL он ПОКАЖЕТ; но движения так не найти: читай тело и трассируй ДЕЛЕГАТА → рецепт «проведение»",
             "Экспортный метод общего модуля с уникальным во всей БД именем → hint не нужен (exact сам); если root_exact=False — имя неуникально, передай module_hint",
             "Для одного уровня + контекст строк используй find_callers_context('ПроцИмя')",
             "direction='callees' пока не поддерживается (возвращает error-dict с hint)",
         ],
         "full": [
-            "tree = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.РеализацияТоваровУслуг', depth=2)",
+            "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint='Документ.РеализацияТоваровУслуг', depth=2) → одноименный ОБЪЕКТНЫЙ метод, который РЕАЛЬНО зовут из кода",
+            "ПЛАТФОРМЕННЫЕ обработчики модуля объекта (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф ВЫЗОВОВ не попадает → callers=0 это НОРМА, а не мертвый код, и module_hint этого не лечит. НО по имени хелпер обработчики НЕ исключает: если BSL-код где-то ЯВНО зовет ОбработкаПроведения(...), такое ребро в индексе ЕСТЬ и хелпер его ПОКАЖЕТ — не игнорируй его. Просто ЧЕМ пишутся движения, так не найти: трассируй ДЕЛЕГАТА из тела обработчика → рецепт «проведение». include_triggers ребра «зовет платформа» не добавит (такого edge_type нет), но CFE-перехват самого обработчика ПОКАЖЕТ",
             "module_hint привязывает КОРЕНЬ к одному модулю → exact-режим убирает ложные звенья от однофамильцев",
             "Формы hint: rel_path | 'Документ.X'/'Document.X' | голый object_name; глубже обход exact идёт сам (по rel_path caller'а)",
             "Доверие: _meta.root_exact (включился ли exact на корне), _meta.exact_rows/fallback_rows, node['meta'].target_exact, node['target_key']=rel_path::метод",
@@ -779,7 +790,9 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "ALT: find_callers_context('ПроцИмя', module_hint='ОбщегоНазначения') для disambig'а омонимов",
         ],
         "code_hint": (
-            "tree = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.РеализацияТоваровУслуг', depth=2)\n"
+            "# NB: корень — метод, который РЕАЛЬНО зовут из BSL. На платформенном обработчике\n"
+            "# (ОбработкаПроведения и др.) этот пример вернет callers=0 — его зовет ПЛАТФОРМА.\n"
+            "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint='Документ.РеализацияТоваровУслуг', depth=2)\n"
             "m = tree.get('_meta', {})\n"
             "print(f\"root_exact={m.get('root_exact')} exact_rows={m.get('exact_rows')} fallback_rows={m.get('fallback_rows')}\")\n"
             "for node in tree.get('tree', []):\n"
@@ -791,13 +804,14 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     },
     "расширения": {
         "compact": [
-            "get_overrides('ИмяОбъекта') → перехваты из индекса (source='index')",
+            "get_overrides('ИмяОбъекта') → перехваты объекта из индекса (source='index')",
+            "get_overrides() → вся конфигурация: сначала partial. False → агрегаты по ВСЕМ перехватам; True → нижняя оценка, причины в _meta.failed_extension_roots. НЕ группируй overrides — это срез 200",
             "extract_procedures(path) → поле overridden_by у перехваченных методов",
             "read_procedure(path, name, include_overrides=True) → оригинал + тело расширения с аннотацией",
             "find_module/find_attributes/parse_object_xml/search видят объекты ext конфигов; пути начинаются на '../' — передавай их в read_procedure/extract_procedures напрямую",
         ],
         "full": [
-            "get_overrides() → перехваты конфигурации (ПЕРВЫЕ 200; total/truncated в ответе — при truncated сводка group-by неполная, сужай get_overrides('Объект'))",
+            "get_overrides() → перехваты конфигурации. СНАЧАЛА partial: False — total/агрегаты по полному выбранному источнику; True — только по прочитанной части, причины в _meta.failed_extension_roots. overrides = отсортированный срез 200, total/truncated сигналят обрезку; сводку по срезу не строй",
             "get_overrides('ИмяОбъекта') → перехваты одного объекта (метод, аннотация, файл расширения)",
             "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
@@ -808,20 +822,20 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "read_file/grep/glob_files на путях с '../' дадут PermissionError (sandbox base-only)",
         ],
         "code_hint": (
-            "res = get_overrides()  # -> {overrides:[...] (первые 200), total, truncated, source}; перехваты в res['overrides']\n"
-            "all_ov = res['overrides']\n"
-            "if res['truncated']:  # total>200 — выборка усечена, агрегаты по объектам/расширениям НЕПОЛНЫЕ\n"
-            "    print(f\"ВНИМАНИЕ: показаны {len(all_ov)} из {res['total']} — фильтруй get_overrides('Объект') или find_ext_overrides(ext_path)\")\n"
-            "from collections import Counter\n"
-            "print(f\"total={res['total']} source={res['source']} from {len({o['extension_name'] for o in all_ov})} extensions\")\n"
-            "# Группировка по аннотациям (ключ перехвата — extension_name, НЕ extension):\n"
-            "print(Counter(o['annotation'] for o in all_ov))\n"
-            "# Топ-объект:\n"
-            "top = Counter(o['object_name'] for o in all_ov).most_common(1)[0]\n"
-            'print(f"top object: {top[0]} ({top[1]} overrides)")\n'
-            "obj_ov = get_overrides(top[0])['overrides']\n"
-            "for o in obj_ov[:5]:\n"
-            "    print(f\"  {o['annotation']} {o['target_method']} ← {o['extension_name']}\")"
+            "res = get_overrides()\n"
+            "print(f\"total={res['total']} truncated={res['truncated']} partial={res['partial']} source={res['source']}\")\n"
+            "if res['partial']:\n"
+            "    print('НИЖНЯЯ ОЦЕНКА; недочитанные roots:', res.get('_meta', {}))\n"
+            "print('по аннотациям:', res['by_annotation'])\n"
+            "print('топ объектов:', list(res['by_object_top'].items())[:5])\n"
+            "print('топ расширений:', list(res['by_extension_top'].items())[:5])\n"
+            "print(f\"объектов={res['unique_objects']} методов={res['unique_methods']} расширений={res['unique_extensions']}\")\n"
+            "# Не группируй res['overrides'] — это срез; агрегаты полны только при partial=False\n"
+            "# Детализация топ-объекта (имя берем из АГРЕГАТА, а не из среза):\n"
+            "top_obj = next(iter(res['by_object_top']), None)\n"
+            "if top_obj:\n"
+            "    for o in get_overrides(top_obj)['overrides'][:5]:\n"
+            "        print(f\"  {o['annotation']} {o['target_method']} ← {o['extension_name']}\")"
         ),
     },
     "достижимость": {
@@ -1242,7 +1256,8 @@ def _build_full_strategy(
         tips = [
             "INDEX TIPS:",
             "  - find_callers_context() returns instantly — для СКОРОСТИ scope-hint не нужен, ищи по всей кодовой базе.",
-            "  - НО module_hint у find_call_hierarchy/find_callers_context — это ТОЧНОСТЬ, не скорость: для одноимённых объектных методов (ОбработкаПроведения, ПередЗаписью) hint включает exact-режим (точные рёбра по callee_key, без однофамильцев из других модулей); экспортному методу общего модуля hint не нужен, ЕСЛИ его имя уникально во всей БД — иначе (root_exact=False) передай module_hint.",
+            "  - НО module_hint у find_call_hierarchy/find_callers_context — это ТОЧНОСТЬ, не скорость: для одноименных объектных методов, которые РЕАЛЬНО зовут из BSL (ЗаполнитьДокумент, ОтразитьВУчете), hint включает exact-режим (точные ребра по callee_key, без однофамильцев из других модулей); экспортному методу общего модуля hint не нужен, ЕСЛИ его имя уникально во всей БД — иначе (root_exact=False) передай module_hint.",
+            "  - ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 норма, не мертвый код (ЯВНЫЙ BSL-вызов хелпер покажет). Движения ищи не тут: rlm_help(topic='проведение').",
             "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
             "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",
             "  - find_attributes() and find_predefined() are INSTANT from index — use for attribute/subconto type questions.",
@@ -1577,7 +1592,8 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
     tips = [
         "INDEX TIPS:",
         "  - find_callers_context() returns instantly — для СКОРОСТИ scope-hint не нужен, ищи по всей кодовой базе.",
-        "  - НО module_hint у find_call_hierarchy/find_callers_context — это ТОЧНОСТЬ, не скорость: для одноимённых объектных методов (ОбработкаПроведения, ПередЗаписью) hint включает exact-режим (точные рёбра по callee_key, без однофамильцев из других модулей); экспортному методу общего модуля hint не нужен, ЕСЛИ его имя уникально во всей БД — иначе (root_exact=False) передай module_hint.",
+        "  - НО module_hint у find_call_hierarchy/find_callers_context — это ТОЧНОСТЬ, не скорость: для одноименных объектных методов, которые РЕАЛЬНО зовут из BSL (ЗаполнитьДокумент, ОтразитьВУчете), hint включает exact-режим (точные ребра по callee_key, без однофамильцев из других модулей); экспортному методу общего модуля hint не нужен, ЕСЛИ его имя уникально во всей БД — иначе (root_exact=False) передай module_hint.",
+        "  - ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 норма, не мертвый код (ЯВНЫЙ BSL-вызов хелпер покажет). Движения ищи не тут: rlm_help(topic='проведение').",
         "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
         "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",
         "  - find_attributes() and find_predefined() are INSTANT from index — use for attribute/subconto type questions.",
@@ -1718,8 +1734,11 @@ def list_categories() -> list[str]:
 
 def _ext_override_detail_budget() -> int:
     """Сколько строк поимённых перехватов расширений включать в стратегию
-    СУММАРНО по всем расширениям. 0 (по умолчанию) — только счётчики +
-    указатель на get_overrides(). Регулируется env RLM_EXT_OVERRIDE_DETAIL."""
+    СУММАРНО по всем расширениям. 0 (по умолчанию, #1 v1.28.0) — НИ поимённого
+    дампа, НИ построчных счётчиков: только указатель на структурный
+    nearby_extensions + get_overrides() (счётчики зеркалят
+    nearby_extensions[].overrides_count). >0 — включить per-extension счётчики и
+    до N detail-строк. Регулируется env RLM_EXT_OVERRIDE_DETAIL."""
     raw = os.environ.get("RLM_EXT_OVERRIDE_DETAIL", "").strip()
     if not raw:
         return 0
@@ -1745,11 +1764,16 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
             ext_context.nearby_extensions, ext_overrides, _ext_list_cap()
         )
         truncated = n_shown < total
-        ext_names = ", ".join(f"{e.name or '?'} (prefix: {e.name_prefix or '—'})" for e in shown)
-        if truncated:
-            ext_names += f", … +{total - n_shown} more (detect_extensions())"
+        budget = _ext_override_detail_budget()
+        # Header: total COUNT + a pointer to the authoritative machine-readable list, NOT
+        # a prose enumeration of names/prefixes (#1, v1.28.0). The top-N names, prefixes and
+        # overrides_count already live in extension_context.nearby_extensions (with its own
+        # truncation markers — nearby_extensions_truncated/total/shown + extensions_hint);
+        # serializing them a 2nd time here (prose header) and a 3rd (per-extension counters
+        # below) cost ~600 tok on EVERY rlm_start. The behavioral block is preserved VERBATIM.
         lines.append(
-            f"\nCRITICAL — EXTENSIONS DETECTED: {ext_names}\n"
+            f"\nCRITICAL — {total} EXTENSIONS DETECTED "
+            "(name/prefix/overrides_count в extension_context.nearby_extensions)\n"
             "Extensions OVERRIDE methods in this config via annotations:\n"
             "  &Перед (Before), &После (After), &Вместо (Instead), &ИзменениеИКонтроль (ChangeAndValidate)\n"
             "YOU MUST mention overridden methods in your response.\n"
@@ -1758,50 +1782,49 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
             "to high-level BSL helpers (read_procedure, extract_procedures, parse_object_xml, find_attributes,\n"
             "find_predefined, search). They read extensions internally. For overrides use get_overrides/find_ext_overrides."
         )
-        # Per-extension COUNTS only by default. The full per-method dump used to be
-        # inlined here (max_lines=30 PER extension, no global cap) — on extension-heavy
-        # configs (УТ 11.5: 14 ext / 1258 overrides) it ballooned the strategy to ~64K
-        # chars / ~37K tokens and was re-paid on EVERY rlm_start, in BOTH slim and full.
-        # Mirror the nearby_extensions count-only decision (server.py). Detail is opt-in
-        # via RLM_EXT_OVERRIDE_DETAIL: a SINGLE loop with a GLOBAL `detail_used` budget
-        # (not per-extension); detail rows stay grouped UNDER each extension's count line
-        # (provenance). Omission is tracked GLOBALLY and signalled by ONE pointer at the
-        # end (round-4) — the per-extension "... and more" marker is stripped so later
-        # extensions whose detail was dropped aren't silently count-only.
-        budget = _ext_override_detail_budget()
-        detail_used = 0
+        # Per-extension override COUNTS mirror nearby_extensions[].overrides_count, so by
+        # default (budget==0) we DON'T re-emit them — a single pointer to get_overrides()
+        # suffices (the ~600-tok dedup of #1). Detail is opt-in via RLM_EXT_OVERRIDE_DETAIL:
+        # a SINGLE loop with a GLOBAL `detail_used` budget (not per-extension); detail rows
+        # stay grouped UNDER each extension's count line (provenance). Omission is tracked
+        # GLOBALLY and signalled by ONE pointer at the end — the per-extension "... and more"
+        # marker is stripped so later extensions whose detail was dropped aren't silently
+        # count-only. The hidden-extensions summary (top-N truncation) rides the same opt-in
+        # path — at budget==0 the structured nearby_extensions markers already convey it.
         omitted_detail = False
-        for e in shown:
-            overrides = ext_overrides.get(e.path, [])
-            if not overrides:
-                continue
-            lines.append(f"\n{e.name or '?'}: {len(overrides)} overrides")
-            if not budget:
-                continue
-            remaining = budget - detail_used
-            if remaining <= 0:
-                omitted_detail = True  # later extension's detail dropped entirely
-                continue
-            detail = _format_overrides_summary(overrides, max_lines=remaining)
-            # Strip the helper's LOCAL truncation marker — a single GLOBAL pointer is
-            # emitted at the end instead (so omission is unambiguous across all exts).
-            if detail and "... and more" in detail[-1]:
-                detail = detail[:-1]
-                omitted_detail = True
-            lines.extend(detail)
-            detail_used += len(detail)
-        if truncated:
-            # Расширения вне top-N не получили строку-счётчик — одна сводка про скрытые
-            # (их число + суммарные overrides) с указателем на полный список.
-            shown_paths = {e.path for e in shown}
-            hidden = total - n_shown
-            hidden_overrides = sum(
-                len(ext_overrides.get(e.path, [])) for e in ext_context.nearby_extensions if e.path not in shown_paths
-            )
-            lines.append(
-                f"\n… +{hidden} more extensions, {hidden_overrides} overrides total "
-                "— get_overrides('ИмяОбъекта') / detect_extensions()."
-            )
+        if budget:
+            detail_used = 0
+            for e in shown:
+                overrides = ext_overrides.get(e.path, [])
+                if not overrides:
+                    continue
+                lines.append(f"\n{e.name or '?'}: {len(overrides)} overrides")
+                remaining = budget - detail_used
+                if remaining <= 0:
+                    omitted_detail = True  # later extension's detail dropped entirely
+                    continue
+                detail = _format_overrides_summary(overrides, max_lines=remaining)
+                # Strip the helper's LOCAL truncation marker — a single GLOBAL pointer is
+                # emitted at the end instead (so omission is unambiguous across all exts).
+                if detail and "... and more" in detail[-1]:
+                    detail = detail[:-1]
+                    omitted_detail = True
+                lines.extend(detail)
+                detail_used += len(detail)
+            if truncated:
+                # Расширения вне top-N не получили строку-счётчик — одна сводка про скрытые
+                # (их число + суммарные overrides) с указателем на полный список.
+                shown_paths = {e.path for e in shown}
+                hidden = total - n_shown
+                hidden_overrides = sum(
+                    len(ext_overrides.get(e.path, []))
+                    for e in ext_context.nearby_extensions
+                    if e.path not in shown_paths
+                )
+                lines.append(
+                    f"\n… +{hidden} more extensions, {hidden_overrides} overrides total "
+                    "— get_overrides('ИмяОбъекта') / detect_extensions()."
+                )
         if not budget or omitted_detail:
             lines.append(
                 "\nFull per-object override detail on demand: get_overrides('ИмяОбъекта') or find_ext_overrides()."

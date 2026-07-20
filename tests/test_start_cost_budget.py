@@ -23,12 +23,31 @@ from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 from rlm_tools_bsl.bsl_knowledge import get_strategy
 from rlm_tools_bsl.format_detector import detect_format
 
-# v1.23.0 baselines (chars), measured with the frozen snapshot registry.
+# Baselines (chars), measured with the frozen snapshot registry.
+#
+# v1.28.0 re-baseline (INTENTIONAL — per this test's own guidance). The v1.23.0 numbers had
+# been eaten to 99.2–99.7% of ceiling by v1.28.0 release A, i.e. the +5% guard was already
+# exhausted BEFORE this change and could no longer absorb any new contract text. The growth
+# here is the agent-facing contract of the v1.28.0 fixes — without it the fixes are invisible
+# to the agent (aggregate keys nobody reads == the bug we just fixed):
+#   * find_event_subscriptions  → scope=exact|partial|universal, category-aware 'Документ.X'
+#   * get_overrides             → by_annotation / by_object_top / by_extension_top / unique_*
+#   * find_register_movements   → posting_handler_present + hint
+#   * find_functional_options   → limit= (per-bucket cap)
+# The prose was trimmed first (helper `sig` strings shrank 388/319/568 → 328/256/320 chars, and
+# the long explanations moved from the BUDGETED `sig` into the unbudgeted `recipe`, which
+# rlm_help serves on demand). What remains is irreducible without deleting the key names.
+#
+# NB the DEFAULT start path did not grow at all: slim/"" is byte-for-byte what release A
+# emitted (7146) — Step 4/5 + performance strategy lines live in sections that slim serves via
+# rlm_help, not inline. Growth is confined to full mode and to a query-matched recipe, i.e. it
+# is paid only when the agent actually asked about that topic.
+# Re-baselining to the measured values restores a real +5% margin for the next edit.
 _BASELINES = {
-    ("slim", ""): 6837,
-    ("slim", "проведение"): 7402,
-    ("full", ""): 28244,
-    ("full", "проведение"): 29420,
+    ("slim", ""): 7146,
+    ("slim", "проведение"): 7990,
+    ("full", ""): 30063,
+    ("full", "проведение"): 31555,
 }
 # Whole rlm_start payload baselines (strategy + available_functions + index +
 # extension_context) for a fixed minimal INDEXED config — the plan's real target.
@@ -37,7 +56,11 @@ _BASELINES = {
 # index-hit, else FS-fallback" hint update. Restores the +5% margin (the v1.23.0
 # baseline sat at ~99% of ceiling, so the documented order-dependent extension-leak
 # flakiness could tip it once the margin shrank).
-_PAYLOAD_BASELINES = {"slim": 19832, "full": 42125}
+# v1.28.0 re-baseline, same reasoning as _BASELINES above (see there). This payload also
+# carries available_functions, i.e. every helper `sig` — after the sig trim it was back under
+# the old ceiling on its own, but at 98–99% of it; re-baselining restores the +5% margin so the
+# next edit trips the guard on its own merits rather than on inherited saturation.
+_PAYLOAD_BASELINES = {"slim": 20691, "full": 43482}
 _DRIFT = 1.05  # allow ≤5% growth before failing
 
 _IDX_STATS = {

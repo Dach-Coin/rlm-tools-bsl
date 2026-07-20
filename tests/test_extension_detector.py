@@ -1,5 +1,6 @@
 """Tests for extension_detector module."""
 
+import builtins
 import os
 import tempfile
 import textwrap
@@ -327,6 +328,20 @@ def test_find_overrides_all():
         assert "мр_ПередЗаписью" in ext_methods
 
 
+def test_find_overrides_accepts_case_insensitive_bsl_suffix(tmp_path):
+    bsl_path = tmp_path / "Documents" / "Док" / "Ext" / "ObjectModule.BSL"
+    _write(str(bsl_path), '&Вместо("ОбработкаПроведения")\nПроцедура Замена()\nКонецПроцедуры\n')
+    diagnostics = {}
+
+    overrides = find_extension_overrides(str(tmp_path), diagnostics=diagnostics)
+
+    assert [row["target_method"] for row in overrides] == ["ОбработкаПроведения"]
+    assert overrides[0]["module_type"] == "ObjectModule"
+    assert diagnostics["complete"] is True
+    assert diagnostics["candidate_files"] == 1
+    assert diagnostics["files_scanned"] == 1
+
+
 def test_find_overrides_by_object():
     """Filtering by object_name works."""
     with tempfile.TemporaryDirectory() as d:
@@ -346,6 +361,32 @@ def test_find_overrides_by_object():
         doc2_overrides = find_extension_overrides(d, object_name="Док2")
         assert len(doc2_overrides) == 1
         assert doc2_overrides[0]["target_method"] == "Метод2"
+
+
+def test_find_overrides_reports_unreadable_module(monkeypatch, tmp_path):
+    """Rows from readable modules remain useful, but a failed BSL read must make
+    scan completeness observable to aggregate callers."""
+    readable = tmp_path / "Documents" / "Док1" / "Ext" / "ObjectModule.bsl"
+    unreadable = tmp_path / "Documents" / "Док2" / "Ext" / "ObjectModule.bsl"
+    _write(str(readable), '&Перед("Метод1")\nПроцедура р_Метод1()\nКонецПроцедуры\n')
+    _write(str(unreadable), '&После("Метод2")\nПроцедура р_Метод2()\nКонецПроцедуры\n')
+
+    real_open = builtins.open
+
+    def _selective_open(path, *args, **kwargs):
+        if os.path.normcase(os.fspath(path)) == os.path.normcase(str(unreadable)):
+            raise PermissionError("module became unreadable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _selective_open)
+    diagnostics = {}
+    overrides = find_extension_overrides(str(tmp_path), diagnostics=diagnostics)
+
+    assert [row["target_method"] for row in overrides] == ["Метод1"], overrides
+    assert diagnostics["complete"] is False, diagnostics
+    assert diagnostics["candidate_files"] == 2, diagnostics
+    assert diagnostics["files_scanned"] == 1, diagnostics
+    assert diagnostics["unreadable_files"] == ["Documents/Док2/Ext/ObjectModule.bsl"], diagnostics
 
 
 def test_all_purposes():
