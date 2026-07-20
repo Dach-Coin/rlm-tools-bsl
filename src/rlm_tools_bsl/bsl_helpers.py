@@ -903,7 +903,11 @@ def make_bsl_helpers(
                         continue
                     full = Path(dirpath) / fname
                     try:
-                        rel = os.path.relpath(str(full), base_path).replace("\\", "/")
+                        # База — РАЗРЕШЁННАЯ: числитель построен от resolved ext_root, и relpath
+                        # от сырого base_path с 8.3-короткой компонентой (C:\Users\RUNNER~1\...)
+                        # не совпал бы префиксом с длинной формой — вместо '../cfe/...' рождался
+                        # бы '../../…'-монстр (single point истины: _base_path_resolved).
+                        rel = os.path.relpath(str(full), str(_base_path_resolved)).replace("\\", "/")
                     except ValueError:
                         continue
                     info_ext = parse_bsl_path(str(full), ext_root_str)
@@ -924,7 +928,10 @@ def make_bsl_helpers(
                     _ext_metadata_scan_failed[0] = True
                 for cat, obj_name, rel_to_ext in locators:
                     try:
-                        rel_to_base = os.path.relpath(str(ext_root / rel_to_ext), base_path).replace("\\", "/")
+                        # resolved ext_root → resolved база (см. BSL pass выше).
+                        rel_to_base = os.path.relpath(str(ext_root / rel_to_ext), str(_base_path_resolved)).replace(
+                            "\\", "/"
+                        )
                     except ValueError:
                         # Кросс-дисковое расширение (Windows: база на D:, расширение на E:) —
                         # relpath невыразим. «Не смогли выразить путь» = «не смогли посмотреть»:
@@ -945,7 +952,10 @@ def make_bsl_helpers(
                     syn_rows = []
                 for obj_name, cat, prefixed_synonym, rel_to_ext in syn_rows:
                     try:
-                        rel_to_base = os.path.relpath(str(ext_root / rel_to_ext), base_path).replace("\\", "/")
+                        # resolved ext_root → resolved база (см. BSL pass выше).
+                        rel_to_base = os.path.relpath(str(ext_root / rel_to_ext), str(_base_path_resolved)).replace(
+                            "\\", "/"
+                        )
                     except ValueError:
                         continue
                     _extension_synonyms.append((obj_name, cat, prefixed_synonym, rel_to_base))
@@ -5680,7 +5690,11 @@ def make_bsl_helpers(
                     full_path = full_path.resolve()
                     if not full_path.is_file():
                         continue
-                    rel_path = os.path.relpath(str(full_path), base_path).replace("\\", "/")
+                    # relpath от РАЗРЕШЁННОЙ базы: full_path уже .resolve(), и relpath от сырого
+                    # base_path на Windows с 8.3-короткой компонентой (C:\Users\RUNNER~1\...)
+                    # не совпадает префиксом с длинной формой — рождался «../../…»-путь, дедуп
+                    # его не узнавал, и тот же модуль попадал в кандидаты вторым экземпляром.
+                    rel_path = os.path.relpath(str(full_path), str(_base_path_resolved)).replace("\\", "/")
                 except (OSError, PermissionError, ValueError):
                     continue
                 rel_key = rel_path.casefold()
@@ -6405,7 +6419,9 @@ def make_bsl_helpers(
                                 full_key = os.path.normcase(os.path.abspath(str(full_path)))
                                 if full_key in candidate_keys or not full_path.is_file():
                                     continue
-                                rel_path = os.path.relpath(str(full_path), base_path).replace("\\", "/")
+                                # resolved-путь → relpath от resolved-базы (см. _live_main_object_module_paths):
+                                # сырая база с 8.3-компонентой давала «../../…»-кандидата.
+                                rel_path = os.path.relpath(str(full_path), str(_base_path_resolved)).replace("\\", "/")
                             except (OSError, PermissionError, ValueError):
                                 continue
                             candidates.append(rel_path)
@@ -6491,7 +6507,8 @@ def make_bsl_helpers(
                         if full_key in candidate_keys or not full_path.is_file():
                             continue
                         try:
-                            rel_path = os.path.relpath(str(full_path), base_path).replace("\\", "/")
+                            # resolved-путь → relpath от resolved-базы (см. _live_main_object_module_paths).
+                            rel_path = os.path.relpath(str(full_path), str(_base_path_resolved)).replace("\\", "/")
                         except ValueError:
                             # Штатная топология — соседние исходники на одном диске. Не изобретаем
                             # для manager-probe отдельную абсолютную адресацию: необычный root
