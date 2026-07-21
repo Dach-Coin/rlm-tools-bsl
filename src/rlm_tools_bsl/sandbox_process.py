@@ -1,4 +1,4 @@
-"""ProcessSandboxBackend (v1.29.0): процесс-на-сессию, авторитетный parent deadline.
+"""ProcessSandboxBackend: процесс-на-сессию, авторитетный parent deadline.
 
 Родительская сторона процессной изоляции песочницы:
 
@@ -27,6 +27,7 @@ import logging
 import math
 import multiprocessing
 import os
+import queue
 import sys
 import threading
 import time
@@ -66,6 +67,183 @@ _POLL_SLICE_SECONDS = 0.25
 
 class _IpcSendTimeout(TimeoutError):
     """Parent-side IPC send did not complete before the operation deadline."""
+
+
+class _SpawnStartTimeout(TimeoutError):
+    """Linux spawn-broker did not complete Process.start() before startup deadline."""
+
+
+class _SpawnBrokerRetired(RuntimeError):
+    """Broker stopped accepting requests after a timed-out spawn."""
+
+
+@dataclass
+class _SpawnRequest:
+    """Синхронный запрос долгоживущему Linux spawn-broker."""
+
+    process: object
+    child_conn: object
+    completed: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    error: BaseException | None = None
+    abandoned: bool = False
+
+
+class _LinuxSpawnBroker:
+    """Запускает все Linux workers из одного thread, живущего до смерти сервера.
+
+    ``PR_SET_PDEATHSIG`` привязан не к TGID процесса-родителя, а к конкретному
+    thread, вызвавшему fork/clone. Поэтому прямой ``Process.start()`` из AnyIO
+    worker-thread убивал sandbox при ретайре этого thread. Broker сериализует
+    только короткий spawn; тяжёлая инициализация workers по-прежнему параллельна.
+    """
+
+    def __init__(self) -> None:
+        self.owner_pid = os.getpid()
+        self._requests: queue.Queue[_SpawnRequest | None] = queue.Queue()
+        self._state_lock = threading.Lock()
+        self._accepting = True
+        self._thread = threading.Thread(
+            target=self._run,
+            name="rlm-linux-spawn-broker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    @property
+    def can_accept(self) -> bool:
+        with self._state_lock:
+            return self._accepting and self._thread.is_alive()
+
+    def start(self, process, child_conn, timeout: float) -> None:
+        request = _SpawnRequest(process=process, child_conn=child_conn)
+        with self._state_lock:
+            if not self._accepting or not self._thread.is_alive():
+                raise _SpawnBrokerRetired
+            self._requests.put(request)
+
+        if not request.completed.wait(max(0.0, timeout)):
+            # Атомарно относительно новых submit: после первого timeout broker
+            # больше не принимает сессии. Уже созданные им workers не страдают —
+            # его thread остаётся жив и сохраняет их PDEATHSIG parent.
+            with self._state_lock, request.lock:
+                if not request.completed.is_set():
+                    request.abandoned = True
+                    self._accepting = False
+                    raise _SpawnStartTimeout("Linux Process.start() exceeded sandbox startup deadline")
+        if request.error is not None:
+            raise request.error
+
+    def _run(self) -> None:
+        while True:
+            request = self._requests.get()
+            if request is None:  # только для изолированных unit-тестов broker-а
+                self._requests.task_done()
+                return
+            with request.lock:
+                abandoned_before_start = request.abandoned
+            if abandoned_before_start:
+                self._finish_abandoned_request(request)
+                continue
+
+            error = None
+            try:
+                request.process.start()
+            except BaseException as exc:  # noqa: BLE001 — исключение обязано вернуться caller-у
+                error = exc
+
+            with request.lock:
+                abandoned = request.abandoned
+                if not abandoned:
+                    request.error = error
+                    if error is not None:
+                        self._close_child_connection(request)
+                    request.completed.set()
+            if abandoned:
+                self._finish_abandoned_request(request)
+            else:
+                self._requests.task_done()
+                del request
+
+    @staticmethod
+    def _close_child_connection(request: _SpawnRequest) -> None:
+        try:
+            request.child_conn.close()
+        except Exception:
+            pass
+
+    def _finish_abandoned_request(self, request: _SpawnRequest) -> None:
+        """Поздний spawn не имеет caller-а: закрыть IPC и гарантированно добить root."""
+        self._close_child_connection(request)
+        process = request.process
+        if getattr(process, "pid", None) is not None:
+            try:
+                # Закрытый bootstrap peer обычно завершает worker через EOF ещё до init.
+                process.join(0.25)
+            except Exception:
+                logger.warning("late abandoned sandbox spawn join failed", exc_info=True)
+        try:
+            root_alive = process.is_alive()
+        except Exception:
+            root_alive = getattr(process, "pid", None) is not None
+        if root_alive:
+            try:
+                process.kill()
+            except Exception:
+                logger.warning("late abandoned sandbox spawn kill failed", exc_info=True)
+            try:
+                process.join(1.0)
+            except Exception:
+                logger.warning("late abandoned sandbox spawn final join failed", exc_info=True)
+        with request.lock:
+            request.completed.set()
+        self._requests.task_done()
+        del request
+
+
+_linux_spawn_broker: _LinuxSpawnBroker | None = None
+_linux_spawn_broker_lock = threading.Lock()
+
+
+def _reset_linux_spawn_broker_after_fork() -> None:
+    """В fork-child threads не наследуются: отбросить broker и потенциально locked mutex."""
+    global _linux_spawn_broker, _linux_spawn_broker_lock
+    _linux_spawn_broker = None
+    _linux_spawn_broker_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_linux_spawn_broker_after_fork)
+
+
+def _start_process(proc, child_conn, deadline: float) -> None:
+    """Linux: spawn из стабильного broker-thread; другие ОС — прямой start.
+
+    Ленивая инициализация не создаёт лишний thread в spawned worker, который при
+    импорте main-модуля тоже может импортировать ``sandbox_process``. Проверка PID
+    защищает embedding-сценарий с fork: в новом процессе нужен собственный broker.
+    """
+    if not sys.platform.startswith("linux"):
+        proc.start()
+        return
+
+    global _linux_spawn_broker
+    while True:
+        with _linux_spawn_broker_lock:
+            broker = _linux_spawn_broker
+            if broker is None or broker.owner_pid != os.getpid() or not broker.is_alive or not broker.can_accept:
+                broker = _LinuxSpawnBroker()
+                _linux_spawn_broker = broker
+        try:
+            broker.start(proc, child_conn, deadline - time.monotonic())
+            return
+        except _SpawnBrokerRetired:
+            # Broker мог стать retired между снятием global-lock и submit.
+            continue
 
 
 # Разумный потолок seq в helper_calls: JSON-integer не ограничен по длине, а
@@ -488,7 +666,11 @@ class ProcessSandboxBackend:
                 out_lock,
                 quota_value,
                 quota_lock,
-                {"ipc_max_bytes": cfg.ipc_max_bytes, "generation": gen},
+                {
+                    "ipc_max_bytes": cfg.ipc_max_bytes,
+                    "generation": gen,
+                    "expected_parent_pid": os.getpid(),
+                },
             ),
             # daemon — только страховочный пояс к явному shutdown-циклу (§13.6);
             # mp-daemon не мешает subprocess-детям вроде git.
@@ -497,7 +679,7 @@ class ProcessSandboxBackend:
         )
         job = None
         try:
-            proc.start()
+            _start_process(proc, child_conn, deadline)
             child_conn.close()
             # Make the starting runtime visible before any potentially slow
             # init work. request_close()/shutdown can now kill it immediately.
@@ -548,6 +730,15 @@ class ProcessSandboxBackend:
             init_frame = encode_frame(make_message("init", request_id, gen, init_payload), cfg.ipc_max_bytes)
             self._send_bytes_with_deadline(parent_conn, init_frame, deadline)
             payload = self._wait_init_response(parent_conn, proc, deadline, request_id, gen)
+        except _SpawnStartTimeout as exc:
+            # Process.start() всё ещё может исполняться в retired broker-thread.
+            # Parent IPC закрываем здесь, а child_conn и возможный поздний worker
+            # принадлежат broker-у: обычный cleanup гонялся бы с Process.start().
+            try:
+                parent_conn.close()
+            except Exception:
+                pass
+            raise SandboxStartupError(str(exc)) from None
         except SandboxClosedError:
             self._cleanup_failed_start(proc, parent_conn, job)
             self._discard_failed_start_runtime(proc, parent_conn, job)

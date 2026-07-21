@@ -1,14 +1,18 @@
 """v1.29.0 этапы 4-6: worker lifecycle, ProcessSandboxBackend execute, hard timeout,
 kill tree, crash/restart, LLM shared quota. Реальные spawn-процессы (Win/Linux)."""
 
+import multiprocessing
 import os
+import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from _process_test_utils import make_cf_project, pid_alive, wait_until
+from rlm_tools_bsl import sandbox_process as sandbox_process_module
 from rlm_tools_bsl.format_detector import detect_format
 from rlm_tools_bsl._sandbox_protocol import SandboxProtocolError
 from rlm_tools_bsl.sandbox import TRUNCATION_MARKER
@@ -63,6 +67,55 @@ def backend(cf_project):
 def _close(b):
     b.request_close("test_done")
     b.finish_close(time.monotonic() + 10)
+
+
+def _linux_process_running(pid: int) -> bool:
+    """``kill(pid, 0)`` видит zombie живым; /proc state нужен orphan-тесту."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return True
+    tail = stat.rsplit(")", 1)[-1].lstrip()
+    return bool(tail) and tail[0] != "Z"
+
+
+def _busy_worker_parent(project_path: str, control_conn) -> None:
+    """Test helper: сервер-процесс с worker, застрявшим в C-коде с GIL."""
+    backend = None
+    ready_sent = False
+    try:
+        backend = ProcessSandboxBackend(_make_config(project_path, execution_timeout_seconds=120))
+        outcome = {}
+
+        def execute_redos():
+            outcome["result"] = backend.execute(
+                "import re\nprint('orphan-guard-entered')\nre.match(r'(a+)+$', 'a'*40 + 'b')"
+            )
+
+        runner = threading.Thread(target=execute_redos, daemon=True)
+        runner.start()
+        if not wait_until(lambda: "orphan-guard-entered" in backend._read_shared_stdout()[0], timeout=30):
+            control_conn.send(("error", f"worker did not enter execute; outcome={outcome!r}"))
+            return
+        control_conn.send(("ready", backend.worker_pid))
+        ready_sent = True
+        # EOF при аварии pytest-parent тоже освобождает helper и его worker.
+        try:
+            control_conn.recv()
+        except EOFError:
+            pass
+    except BaseException as exc:  # noqa: BLE001 — диагностика должна дойти в parent-test
+        if not ready_sent:
+            try:
+                control_conn.send(("error", f"{type(exc).__name__}: {exc}"))
+            except (EOFError, OSError):
+                pass
+    finally:
+        control_conn.close()
+        if backend is not None:
+            _close(backend)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +343,170 @@ def test_graceful_close_removes_pid(cf_project):
     assert b.finish_close(time.monotonic() + 10).closed
     with pytest.raises(SandboxClosedError):
         b.execute("print(1)")
+
+
+def test_worker_survives_spawning_thread_exit(cf_project):
+    """Linux-регресс: воркер обязан пережить смерть ТРЕДА, запросившего его запуск —
+    rlm_execute приходит позже, возможно на другом треде (пул тредов сервера).
+    Ранее Linux PR_SET_PDEATHSIG был привязан к короткоживущему вызывающему треду.
+    Теперь worker запускается из стабильного spawn-broker thread процесса сервера."""
+    holder = {}
+
+    def make():
+        try:
+            holder["backend"] = ProcessSandboxBackend(_make_config(cf_project))
+        except BaseException as exc:  # noqa: BLE001 — пробросить ошибку из test-thread
+            holder["error"] = exc
+
+    spawner = threading.Thread(target=make)
+    spawner.start()
+    spawner.join()  # тред-создатель МЁРТВ, воркер обязан жить дальше
+    if "error" in holder:
+        raise holder["error"]
+    b = holder["backend"]
+    try:
+        # join() reaps SIGKILLed child, в отличие от zombie-blind kill(pid, 0).
+        b._proc.join(timeout=0.5)
+        assert b._proc.is_alive(), "воркер убит завершением вызывающего треда"
+        r = b.execute("print('alive after spawner exit')")
+        assert r.error is None and r.stdout == "alive after spawner exit\n"
+    finally:
+        _close(b)
+
+
+def test_linux_spawn_broker_timeout_rotates_and_cleans_late_worker(monkeypatch):
+    """Зависший spawn bounded, не блокирует новые сессии и не рождает позднюю сироту."""
+
+    class FakeConnection:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self, release=None):
+            self.release = release
+            self.entered = threading.Event()
+            self.killed = threading.Event()
+            self.alive = False
+            self.start_thread = None
+
+        def start(self):
+            self.start_thread = threading.get_ident()
+            self.entered.set()
+            if self.release is not None:
+                self.release.wait(5)
+            self.alive = True
+
+        def join(self, _timeout):
+            pass
+
+        def is_alive(self):
+            return self.alive
+
+        def kill(self):
+            self.alive = False
+            self.killed.set()
+
+    release = threading.Event()
+    blocked_proc = FakeProcess(release)
+    blocked_conn = FakeConnection()
+    outcome = {}
+    retired_broker = None
+    active_broker = None
+
+    monkeypatch.setattr(sandbox_process_module.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox_process_module, "_linux_spawn_broker", None)
+
+    def start_blocked():
+        try:
+            sandbox_process_module._start_process(
+                blocked_proc,
+                blocked_conn,
+                time.monotonic() + 0.2,
+            )
+        except BaseException as exc:  # noqa: BLE001 — результат test-thread
+            outcome["error"] = exc
+
+    caller = threading.Thread(target=start_blocked)
+    caller.start()
+    assert blocked_proc.entered.wait(1), "broker не вошёл в Process.start"
+    caller.join(2)
+    assert not caller.is_alive(), "ожидание broker-а не ограничено startup deadline"
+    assert isinstance(outcome.get("error"), sandbox_process_module._SpawnStartTimeout)
+
+    try:
+        retired_broker = sandbox_process_module._linux_spawn_broker
+        assert retired_broker is not None and not retired_broker.can_accept
+
+        quick_proc = FakeProcess()
+        quick_conn = FakeConnection()
+        sandbox_process_module._start_process(quick_proc, quick_conn, time.monotonic() + 1.0)
+        active_broker = sandbox_process_module._linux_spawn_broker
+        assert active_broker is not retired_broker
+        assert quick_proc.alive and quick_proc.start_thread != blocked_proc.start_thread
+        quick_conn.close()  # normal _start_worker делает это сразу после успешного start
+
+        release.set()
+        assert blocked_proc.killed.wait(2), "retired broker не очистил поздно запущенный worker"
+        assert blocked_conn.closed
+        quick_proc.alive = False
+    finally:
+        release.set()
+        for broker in (retired_broker, active_broker):
+            if broker is not None:
+                broker._requests.put(None)
+                broker._thread.join(2)
+
+
+def test_spawn_broker_timeout_is_controlled_startup_error(cf_project, monkeypatch):
+    def fail_start(_proc, _child_conn, _deadline):
+        raise sandbox_process_module._SpawnStartTimeout("synthetic broker timeout")
+
+    monkeypatch.setattr(sandbox_process_module, "_start_process", fail_start)
+    with pytest.raises(SandboxStartupError, match="synthetic broker timeout"):
+        ProcessSandboxBackend(_make_config(cf_project))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux PDEATHSIG orphan-guard")
+def test_worker_dies_with_parent_during_gil_holding_execute(cf_project):
+    """Смерть сервера убивает worker kernel-level, даже если Python-watchdog не получил бы GIL."""
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=True)
+    helper = ctx.Process(target=_busy_worker_parent, args=(cf_project, child_conn), name="orphan-guard-test-parent")
+    worker_pid = None
+    try:
+        helper.start()
+        child_conn.close()
+        assert parent_conn.poll(60), "helper не сообщил о готовности worker"
+        status, payload = parent_conn.recv()
+        assert status == "ready", payload
+        worker_pid = int(payload)
+        assert _linux_process_running(worker_pid)
+
+        # После stdout-marker worker успевает войти в catastrophic regex, удерживающий GIL.
+        time.sleep(0.5)
+        helper.terminate()
+        helper.join(10)
+        assert not helper.is_alive(), "тестовый server-parent не завершился"
+        assert wait_until(lambda: not _linux_process_running(worker_pid), timeout=10), (
+            "worker пережил смерть server-parent во время GIL-holding execute"
+        )
+    finally:
+        parent_conn.close()
+        child_conn.close()
+        if helper.is_alive():
+            helper.kill()
+            helper.join(5)
+        if worker_pid is not None and _linux_process_running(worker_pid):
+            import signal
+
+            try:
+                os.killpg(worker_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            wait_until(lambda: not _linux_process_running(worker_pid), timeout=5)
 
 
 def test_external_kill_gives_controlled_crash_then_restart(cf_project):

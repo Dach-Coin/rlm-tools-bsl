@@ -1,4 +1,4 @@
-"""Entry-point sandbox worker-процесса (v1.29.0, spawn target).
+"""Entry-point sandbox worker-процесса (spawn target).
 
 Намеренно МАЛЕНЬКИЙ top-level модуль без импорта ``server.py``: Windows spawn
 импортирует его в дочернем процессе, и он не должен тянуть MCP main или
@@ -6,7 +6,8 @@
 импортируются лениво после отвязки stdio и применения resource limits.
 
 Порядок запуска (§8.1): detach stdin/stdout/stderr → отдельная process
-group/session (POSIX) + PDEATHSIG (Linux) → RLIMIT_AS (POSIX) → recv init →
+group/session + orphan-guard (Linux PDEATHSIG через стабильный spawn-broker;
+остальной POSIX — getppid-watchdog) → RLIMIT_AS (POSIX) → recv init →
 FormatInfo → собственный read-only IndexReader → Sandbox (timeout=0 — deadline
 авторитетен только у родителя) → lazy LLM probe → init_ok → command loop.
 
@@ -147,51 +148,91 @@ def _detach_stdio() -> tuple[bool, str]:
     return True, "raw fd 0/1/2 redirected to null"
 
 
-def _isolate_process_group() -> tuple[bool, str]:
+def _isolate_process_group(expected_parent_pid: int) -> tuple[bool, str]:
     """POSIX: собственная session/process group (kill tree убивает и descendants);
-    Linux: PDEATHSIG=SIGKILL с проверкой parent до/после (§10.2). Windows —
-    Job Object на стороне родителя.
+    Linux: PDEATHSIG от стабильного parent spawn-broker (§10.2); остальной POSIX:
+    best-effort getppid-watchdog. Windows — Job Object на стороне родителя.
 
-    Возвращает ``(process_group_isolated, detail)``. Провал ``setsid()`` НЕ
-    глушится: без своей группы ``killpg`` перестаёт гарантировать уничтожение
-    descendants, то есть заявленная граница отключилась бы молча. Родитель
-    превращает это в controlled ошибку старта на обязательных gate-платформах —
-    симметрично поведению Job Object на Windows (§23.9).
+    Возвращает ``(isolation_ready, detail)``. Провал ``setsid()`` или обязательного
+    Linux orphan-guard НЕ глушится: заявленная граница отключилась бы молча.
+    Родитель превращает это в controlled ошибку старта на обязательных gate-
+    платформах — симметрично поведению Job Object на Windows (§23.9).
     """
     if os.name != "posix":
         return True, "windows: job object (parent-side)"
+    if expected_parent_pid <= 0:
+        return False, "expected parent PID is unavailable"
     try:
         os.setsid()
     except OSError as exc:
         return False, f"setsid failed: {type(exc).__name__}: {exc}"
     detail = "posix: own session/process group"
     if sys.platform.startswith("linux"):
-        try:
-            import ctypes
-            import signal as _signal
+        parent_guarded, guard_detail = _set_linux_parent_death_signal(expected_parent_pid)
+        if not parent_guarded:
+            return False, f"{detail}; {guard_detail}"
+        return True, f"{detail} + {guard_detail}"
 
-            parent_before = os.getppid()
-            libc = ctypes.CDLL(None, use_errno=True)
-            # prctl(2) сигнализирует об ошибке возвратом -1 и errno, а НЕ
-            # исключением: без явной проверки мы рапортовали бы «+ PDEATHSIG»
-            # даже когда сигнал смерти родителя не установлен.
-            libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
-            libc.prctl.restype = ctypes.c_int
-            PR_SET_PDEATHSIG = 1
-            ctypes.set_errno(0)
-            rc = libc.prctl(PR_SET_PDEATHSIG, _signal.SIGKILL, 0, 0, 0)
-            if rc != 0:
-                err = ctypes.get_errno()
-                detail += f" (PDEATHSIG unavailable: prctl rc={rc} errno={err} {os.strerror(err) if err else ''})"
-            else:
-                # Race-check: родитель мог умереть между spawn и prctl — тогда
-                # сигнал уже не придёт и сирота обязана уйти сама.
-                if os.getppid() != parent_before or os.getppid() == 1:
-                    os._exit(1)
-                detail += " + PDEATHSIG"
-        except Exception as exc:  # noqa: BLE001 — PDEATHSIG documented best effort
-            detail += f" (PDEATHSIG unavailable: {type(exc).__name__})"
+    # На macOS/прочем POSIX нет PR_SET_PDEATHSIG. Ожидаемый PID передан сервером,
+    # а не захвачен уже после spawn: это закрывает стартовую гонку с init/subreaper.
+    if os.getppid() != expected_parent_pid:
+        os._exit(1)
+    if _start_parent_death_watchdog(expected_parent_pid):
+        detail += " + parent-death watchdog (best effort)"
+    else:
+        detail += " (parent-death watchdog unavailable)"
     return True, detail
+
+
+def _set_linux_parent_death_signal(expected_parent_pid: int) -> tuple[bool, str]:
+    """Kernel-level orphan-guard, привязанный к долгоживущему spawn-broker thread."""
+    try:
+        import ctypes
+        import signal as _signal
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        libc.prctl.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        rc = libc.prctl(1, _signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG = 1
+        if rc != 0:
+            err = ctypes.get_errno()
+            suffix = f": {os.strerror(err)}" if err else ""
+            return False, f"PDEATHSIG unavailable (prctl rc={rc}, errno={err}{suffix})"
+    except Exception as exc:  # noqa: BLE001 — превращаем в controlled startup error
+        return False, f"PDEATHSIG unavailable ({type(exc).__name__}: {exc})"
+
+    # Сервер мог умереть до prctl. Сравнение с PID, захваченным в сервере ДО spawn,
+    # работает и при reparent на non-PID1 subreaper, и когда сам сервер имеет PID 1.
+    if os.getppid() != expected_parent_pid:
+        os._exit(1)
+    return True, "PDEATHSIG (stable spawn broker)"
+
+
+def _start_parent_death_watchdog(expected_parent_pid: int, interval: float = 0.5) -> bool:
+    """Best-effort orphan-guard для POSIX без Linux ``PR_SET_PDEATHSIG``.
+
+    Отдельный Python-thread не блокируется command-loop ``recv`` и обычным Python-
+    кодом, но не является hard-гарантией при native-коде, удерживающем GIL. Поэтому
+    Linux использует kernel-level guard выше; этот fallback нужен для macOS и других
+    best-effort платформ.
+    """
+    import time as _time
+
+    def _watch() -> None:
+        while True:
+            try:
+                _time.sleep(interval)
+                if os.getppid() != expected_parent_pid:
+                    os._exit(1)
+            except Exception:
+                os._exit(1)
+
+    try:
+        threading.Thread(target=_watch, name="rlm-parent-death-watchdog", daemon=True).start()
+        return True
+    except Exception:
+        return False
 
 
 def _apply_memory_limit(memory_mb: int) -> tuple[bool, str]:
@@ -381,7 +422,8 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
     """Top-level spawn target. ``boot`` — только примитивы (trusted bootstrap);
     вся конфигурация сессии приходит первым ``init``-frame по JSON IPC."""
     stdio_detached, stdio_detail = _detach_stdio()
-    group_isolated, group_detail = _isolate_process_group()
+    expected_parent_pid = int(boot.get("expected_parent_pid", 0))
+    isolation_ready, group_detail = _isolate_process_group(expected_parent_pid)
     ipc_max_bytes = int(boot.get("ipc_max_bytes", 4 * 1024 * 1024))
     generation = int(boot.get("generation", 1))
     idx_reader = None
@@ -409,16 +451,16 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
             )
             return
 
-        if not group_isolated:
-            # Без своей process group parent не может гарантировать kill дерева —
-            # заявленная граница отключилась бы молча. Fail-fast, как Job Object.
+        if not isolation_ready:
+            # Без своей process group / обязательного Linux orphan-guard parent не
+            # может гарантировать заявленную границу. Fail-fast, как Job Object.
             _send(
                 conn,
                 make_message(
                     "init_error",
                     request_id,
                     generation,
-                    {"error": f"process group isolation unavailable ({group_detail})"},
+                    {"error": f"process isolation unavailable ({group_detail})"},
                 ),
                 ipc_max_bytes,
             )
