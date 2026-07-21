@@ -205,6 +205,12 @@ def test_failed_start_cleanup_kills_process_group(monkeypatch):
     monkeypatch.setattr("rlm_tools_bsl.sandbox_process.os.killpg", kill_group)
     backend = ProcessSandboxBackend.__new__(ProcessSandboxBackend)
     backend._cfg = SimpleNamespace(kill_grace_seconds=0)
+    # __new__ минует __init__, поэтому tree-cleanup-состояние выставляем вручную,
+    # как и соседний test_failed_start_job_confirms_matching_close_race: успешный
+    # killpg доводит _cleanup_failed_start до чтения self._tree_cleanup_target.
+    backend._tree_cleanup_unconfirmed = False
+    backend._tree_cleanup_target = None
+    backend._tree_cleanup_confirmed_target = None
     backend._cleanup_failed_start(proc, FakeConnection(), None)
 
     assert killed_groups == [proc.pid]

@@ -15,11 +15,22 @@ from rlm_tools_bsl.server import _rlm_end, _rlm_execute, _rlm_start
 from rlm_tools_bsl.session import Session, SessionManager
 
 
+# Server-level тесты идут через реальный _rlm_start → ProcessBackendConfig.from_env,
+# т.е. с дефолтным RLM_SANDBOX_MEMORY_MB=1024 (RLIMIT_AS на POSIX). Под coverage-
+# инструментацией + glibc multi-arena адресное пространство (не RSS) исчерпывается,
+# и воркер под concurrency гибнет (BrokenPipeError) — флейки, не связанные с тем, что
+# тест проверяет (маршрутизация/изоляция/teardown). Поведение самого лимита проверяет
+# test_sandbox_process_limits.py, поэтому здесь потолок памяти отключаем.
+def _disable_worker_memory_limit(monkeypatch):
+    monkeypatch.setenv("RLM_SANDBOX_MEMORY_MB", "0")
+
+
 @pytest.fixture
 def process_mode(monkeypatch):
     """Только для сценариев, которые по смыслу существуют лишь в process mode
     (worker PID, hard-kill таймаута, kill дерева, Job Object)."""
     monkeypatch.setenv("RLM_SANDBOX_MODE", "process")
+    _disable_worker_memory_limit(monkeypatch)
 
 
 @pytest.fixture(params=["inline", "process"])
@@ -31,6 +42,7 @@ def any_mode(request, monkeypatch):
     которым оператор реально будет пользоваться) осталась бы без server-level
     покрытия."""
     monkeypatch.setenv("RLM_SANDBOX_MODE", request.param)
+    _disable_worker_memory_limit(monkeypatch)
     return request.param
 
 

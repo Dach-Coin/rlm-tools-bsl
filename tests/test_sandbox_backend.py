@@ -315,10 +315,15 @@ def test_reaper_survives_raising_backend():
         def finish_close(self, deadline):
             raise RuntimeError("boom")
 
-    reaper.enqueue(Boom())
-    ok = _FakeBackend()
-    reaper.enqueue(ok)
-    assert _wait(lambda: ok.closed_event.is_set())
+    try:
+        reaper.enqueue(Boom())
+        ok = _FakeBackend()
+        reaper.enqueue(ok)
+        assert _wait(lambda: ok.closed_event.is_set())
+    finally:
+        # Boom вечно бросает → без stop() daemon-поток reaper-а крутит ретраи и
+        # спамит лог до конца pytest-сессии (жёг CPU на CI). Как в соседних reaper-тестах.
+        reaper.stop()
 
 
 def test_reaper_retries_after_finish_close_raises():
