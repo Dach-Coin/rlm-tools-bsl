@@ -535,6 +535,30 @@ rlm-bsl-index index build <path-to-1c-sources>
 
 Подробности: [INDEXING.md](INDEXING.md)
 
+## 5.1. OS hardening — ответственность оператора
+
+С v1.29.0 код агента выполняется в отдельном sandbox-worker-процессе на сессию (`RLM_SANDBOX_MODE=process`): это application-level containment (изоляция stdout/памяти сессий, hard-kill по таймауту, resource limits), **но не OS security boundary**. Worker работает с правами пользователя сервиса: файлы, сеть и environment (включая LLM-credentials), доступные этому пользователю, потенциально доступны и коду после Python-escape. Никакая настройка приложения эти меры не заменяет — сильная изоляция строится средствами ОС.
+
+**Docker (рекомендации):**
+
+- запускать контейнер non-root;
+- монтировать репозитории read-only (`:ro`);
+- минимизировать writable-тома (только cache/config/logs);
+- `read_only: true` для root filesystem, где совместимо;
+- `security_opt: [no-new-privileges:true]`, `cap_drop: [ALL]`;
+- `mem_limit`/`pids_limit` на контейнер;
+- сетевую политику по необходимости (например, только LLM-endpoint);
+- не хранить лишние секреты в файлах, доступных контейнеру.
+
+**Windows native/служба:**
+
+- отдельная сервисная учётная запись (не личная и не LocalSystem без нужды);
+- read-only ACL на каталоги исходников 1С;
+- запись — только в каталоги cache/config/logs сервиса;
+- ограничить доступ учётной записи к прочим пользовательским каталогам;
+- firewall-политика для исходящих соединений процесса;
+- отдельные/минимально-привилегированные LLM-credentials (worker их наследует).
+
 ## 6. Проверить работоспособность
 
 Откройте проект с исходниками 1С в Claude Code и спросите:

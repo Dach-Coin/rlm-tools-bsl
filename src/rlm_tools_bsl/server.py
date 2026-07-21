@@ -18,7 +18,20 @@ from pydantic import Field
 
 from rlm_tools_bsl.session import SessionManager, build_session_manager_from_env
 from rlm_tools_bsl.sandbox import Sandbox
-from rlm_tools_bsl.llm_bridge import get_llm_query_fn, make_llm_query_batched, warmup_openai_import
+from rlm_tools_bsl.sandbox_backend import (
+    InlineSandboxBackend,
+    SandboxBackendReaper,
+    SandboxClosedError,
+    SandboxStartupError,
+)
+from rlm_tools_bsl._sandbox_config import (
+    SandboxConfigError,
+    get_sandbox_mode,
+    kill_grace_seconds,
+    shutdown_deadline_seconds,
+    validate_sandbox_env,
+)
+from rlm_tools_bsl.llm_bridge import warmup_openai_import
 from rlm_tools_bsl.format_detector import FormatInfo, SourceFormat, detect_format
 from rlm_tools_bsl.extension_detector import (
     ConfigRole,
@@ -82,9 +95,33 @@ mcp = FastMCP(
 
 session_manager = SessionManager()  # defaults for tests/import
 
-_sandboxes: dict[str, Sandbox] = {}
-_idx_readers: dict[str, IndexReader] = {}
+# v1.29.0: значения — backend-объекты (InlineSandboxBackend | ProcessSandboxBackend),
+# не голые Sandbox. Имя сохранено для минимального diff. Замок защищает ТОЛЬКО
+# словарь — его нельзя держать на время execute (§9.1).
+_sandboxes: dict = {}
 _sandboxes_lock = threading.Lock()
+# A start captures this before slow initialization and may publish its backend
+# only if shutdown has not crossed that operation.
+_sandbox_registry_epoch = 0
+# Once shutdown starts, registration remains closed for this server lifecycle.
+# Tests that exercise several synthetic lifecycles reset the flag explicitly.
+_sandbox_registry_accepting = True
+# Process backends that already own (or are about to own) a worker, but have not
+# yet been published in ``_sandboxes``.  Shutdown must be able to revoke them
+# during a slow init instead of waiting for the 60s startup timeout.
+_starting_sandbox_backends: dict[int, object] = {}
+
+# Единственный владелец завершающей фазы lifecycle backend-ов (§9.4): teardown-пути
+# только снимают backend из registry + request_close + enqueue сюда.
+_reaper = SandboxBackendReaper()
+
+
+def _begin_sandbox_backend_lifecycle() -> None:
+    """Allow registrations for a new invocation without reviving an old epoch."""
+    global _sandbox_registry_accepting
+
+    with _sandboxes_lock:
+        _sandbox_registry_accepting = True
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -167,20 +204,130 @@ def _scan_metadata(path: str) -> dict:
     }
 
 
-def _release_session_resources(session_id: str) -> None:
-    """Идемпотентный teardown ресурсов сессии (sandbox + idx_reader)."""
+def _release_session_resources(session_id: str, reason: str = "ttl_eviction") -> None:
+    """Идемпотентный bounded teardown ресурсов сессии (двухфазная схема §9.3-9.4):
+    detach из registry → неблокирующий request_close → enqueue в reaper.
+    НИКОГДА не берёт session execution lock и не ждёт join/kill_grace."""
     with _sandboxes_lock:
-        _sandboxes.pop(session_id, None)
-        reader = _idx_readers.pop(session_id, None)
-    if reader is not None:
+        backend = _sandboxes.pop(session_id, None)
+        if backend is not None and getattr(backend, "mode", None) == "process":
+            try:
+                backend.request_close(reason)
+            except Exception:
+                logger.warning("request_close failed for session %s", session_id, exc_info=True)
+            finally:
+                # Keep lifecycle ownership continuous: shutdown takes the same
+                # registry lock before inspecting the reaper, so it cannot pass
+                # between detaching a live worker and making it reaper-visible.
+                _reaper.enqueue(backend)
+            return
+    if backend is not None:
         try:
-            reader.close()
+            backend.request_close(reason)
         except Exception:
-            pass
+            logger.warning("request_close failed for session %s", session_id, exc_info=True)
+        # Inline: процесса нет, единственный ресурс — IndexReader, его закрытие
+        # мгновенно. Закрываем СИНХРОННО, потому что асинхронная сдача в reaper
+        # ломала внешний инвариант: на Windows открытый handle bsl_index.db не
+        # даёт сразу после rlm_end пересобрать/удалить индекс (WinError 32).
+        # Deadline здесь НЕ ожидание, а маркер «не форсировать под работающим
+        # кодом»: если execute в полёте, finish_close вернёт residual и доводит
+        # уже reaper. Для process-backend путь остаётся асинхронным — там ждать
+        # пришлось бы kill_grace/join, что запрещено (§9.3).
+        finished = False
+        if getattr(backend, "mode", None) == "inline":
+            try:
+                finished = backend.finish_close(time.monotonic() + 1.0).closed
+            except Exception:
+                logger.warning("inline finish_close failed for session %s", session_id, exc_info=True)
+        if not finished:
+            _reaper.enqueue(backend)
 
 
 def _cleanup_expired_resources() -> None:
     session_manager.cleanup_expired()  # on_evict → _release_session_resources
+
+
+def _track_starting_backend(backend, expected_epoch: int) -> bool:
+    """Publish an initializing process backend only to lifecycle management."""
+    with _sandboxes_lock:
+        if not _sandbox_registry_accepting or expected_epoch != _sandbox_registry_epoch:
+            return False
+        _starting_sandbox_backends[id(backend)] = backend
+        return True
+
+
+def _untrack_starting_backend(backend) -> None:
+    with _sandboxes_lock:
+        _starting_sandbox_backends.pop(id(backend), None)
+
+
+def _reap_failed_starting_backend(backend) -> bool:
+    """Detach a failed constructor while retaining ownership of any residual.
+
+    Return whether this call transferred the backend.  ``False`` normally means
+    shutdown already removed it from the startup registry and owns cleanup.
+    """
+    with _sandboxes_lock:
+        if _starting_sandbox_backends.pop(id(backend), None) is None:
+            # Shutdown already claimed this backend and owns its finalization.
+            return False
+        try:
+            backend.request_close("start_failure")
+        except Exception:
+            logger.warning("failed-start backend revoke failed", exc_info=True)
+        finally:
+            # Transfer ownership before releasing the registry lock, so shutdown
+            # cannot pass between detach and visibility in the reaper.
+            _reaper.enqueue(backend)
+        return True
+
+
+def _failed_process_backend_has_lifecycle_owner(backend) -> bool:
+    """Transfer a failed process backend, or recognize shutdown ownership."""
+    if getattr(backend, "mode", None) != "process":
+        return False
+    if _reap_failed_starting_backend(backend):
+        return True
+    with _sandboxes_lock:
+        # The production process factory always registers before spawning.  If
+        # its entry is gone during shutdown, the shutdown snapshot owns it;
+        # running a second finish_close here could block shutdown on _close_lock
+        # beyond its single global deadline.
+        return not _sandbox_registry_accepting
+
+
+def _publish_session_backend(session_id: str, session, backend, expected_epoch: int) -> bool:
+    """Publish *backend* only for the still-current session and server epoch.
+
+    Lock order is SessionManager → backend registry.  Eviction callbacks run
+    outside the manager lock, while registry holders never enter the manager.
+    """
+
+    def publish() -> bool:
+        with _sandboxes_lock:
+            _starting_sandbox_backends.pop(id(backend), None)
+            if not _sandbox_registry_accepting or expected_epoch != _sandbox_registry_epoch:
+                return False
+            _sandboxes[session_id] = backend
+            return True
+
+    published = session_manager._run_if_current(session_id, session, publish)
+    # If the Session disappeared, ``publish`` was not called at all.  Keep the
+    # lifecycle-only entry until the caller's failure path can transfer it
+    # atomically to the reaper; detaching it here would open an ownership gap in
+    # which concurrent shutdown cannot see the live worker.
+    return published
+
+
+def _session_backend_is_current(session_id: str, session, backend) -> bool:
+    """Identity recheck after waiting for the per-session execution lock."""
+
+    def check_backend() -> bool:
+        with _sandboxes_lock:
+            return _sandboxes.get(session_id) is backend
+
+    return session_manager._run_if_current(session_id, session, check_backend)
 
 
 session_manager.on_evict = _release_session_resources
@@ -323,41 +470,69 @@ _build_jobs_lock = threading.Lock()
 _build_jobs: dict[str, dict] = {}
 
 
-def _install_session_llm_tools(session, sandbox: Sandbox) -> bool:
-    try:
-        base_llm_query = get_llm_query_fn()
-        if base_llm_query is None:
-            logger.info("llm_query not available (no LLM provider configured)")
-            return False
-        base_llm_query_batched = make_llm_query_batched(base_llm_query)
-        lock = threading.Lock()
+def _create_session_backend(
+    *,
+    sandbox_mode: str,
+    resolved: str,
+    session,
+    max_output_chars: int,
+    execution_timeout_seconds: int,
+    format_info,
+    idx_reader,
+    db_path,
+    callers_authoritative: bool,
+    ext_paths_for_sandbox: list[str],
+    registry_epoch: int,
+):
+    """Фабрика backend по режиму (§5.2): выбор делается один раз при rlm_start,
+    дальше server не ветвится по типу backend.
 
-        def _reserve_llm_calls(count: int) -> None:
-            if count < 1:
-                raise ValueError("count must be >= 1")
-            with lock:
-                if session.llm_calls_used + count > session.max_llm_calls:
-                    raise RuntimeError(
-                        f"LLM call limit exceeded: {session.llm_calls_used} + {count} > {session.max_llm_calls}"
-                    )
-                session.llm_calls_used += count
+    Возвращает ``(backend, parent_reader_still_owned)``: в inline режиме reader
+    переходит во владение backend (закрывается его finish_close); в process
+    режиме reader остаётся временным parent-объектом и его закрывает вызывающий
+    сразу после успешного init (§8.3)."""
+    if sandbox_mode == "process":
+        from rlm_tools_bsl.sandbox_process import (
+            ProcessBackendConfig,
+            ProcessSandboxBackend,
+            format_info_to_payload,
+        )
 
-        def llm_query(prompt: str, context: str = "") -> str:
-            _reserve_llm_calls(1)
-            return base_llm_query(prompt, context)
+        config = ProcessBackendConfig.from_env(
+            base_path=resolved,
+            max_output_chars=max_output_chars,
+            execution_timeout_seconds=execution_timeout_seconds,
+            format_info_payload=format_info_to_payload(format_info),
+            db_path=str(db_path) if idx_reader is not None else None,
+            index_expected=idx_reader is not None,
+            idx_zero_callers_authoritative=callers_authoritative,
+            extension_paths=ext_paths_for_sandbox,
+            max_llm_calls=session.max_llm_calls,
+            llm_calls_used=session.llm_calls_used,
+        )
+        backend = ProcessSandboxBackend(
+            config,
+            startup_register=lambda candidate: _track_starting_backend(candidate, registry_epoch),
+            startup_unregister=_reap_failed_starting_backend,
+        )
+        return backend, True
 
-        def llm_query_batched(prompts: list[str], context: str = "") -> list[str]:
-            if not prompts:
-                return []
-            _reserve_llm_calls(len(prompts))
-            return base_llm_query_batched(prompts, context)
-
-        sandbox._namespace["llm_query"] = llm_query
-        sandbox._namespace["llm_query_batched"] = llm_query_batched
-        return True
-    except Exception as e:
-        logger.warning(f"Could not initialize llm_query: {e}")
-        return False
+    sandbox = Sandbox(
+        base_path=resolved,
+        max_output_chars=max_output_chars,
+        execution_timeout_seconds=execution_timeout_seconds,
+        format_info=format_info,
+        idx_reader=idx_reader,
+        idx_zero_callers_authoritative=callers_authoritative,
+        extension_paths=ext_paths_for_sandbox,
+    )
+    backend = InlineSandboxBackend(
+        sandbox,
+        idx_reader,
+        max_llm_calls=session.max_llm_calls,
+        llm_calls_used=session.llm_calls_used,
+    )
+    return backend, False
 
 
 def _rlm_start(
@@ -372,6 +547,10 @@ def _rlm_start(
     project: str | None = None,
 ) -> str:
     t0 = time.monotonic()
+    with _sandboxes_lock:
+        if not _sandbox_registry_accepting:
+            return json.dumps({"error": "Server is shutting down; new sandbox sessions are not accepted"})
+        registry_epoch = _sandbox_registry_epoch
     _cleanup_expired_resources()
 
     # --- Resolve project name to path ---
@@ -444,6 +623,14 @@ def _rlm_start(
 
     logger.info("rlm_start: path=%s effort=%s include_metadata=%s", path, effort, include_metadata)
 
+    # Fail-fast режим песочницы (§11.1): невалидный RLM_SANDBOX_MODE не имеет
+    # права молча превратиться в inline. main() валидирует на старте сервера;
+    # эта проверка закрывает прямые вызовы _rlm_start (тесты/embedding).
+    try:
+        sandbox_mode = get_sandbox_mode()
+    except SandboxConfigError as e:
+        return json.dumps({"error": f"Sandbox configuration error: {e}"}, ensure_ascii=False)
+
     effort, max_llm_calls, max_execute_calls = resolve_session_limits(effort, query, max_llm_calls, max_execute_calls)
     # effort_config нужен дальше (safe_grep_max_files / guidance) — от ИТОГОВОГО effort
     # (после auto-эвристики/RLM_FORCE_EFFORT он всегда валиден, но .get безопаснее).
@@ -477,6 +664,7 @@ def _rlm_start(
     # оставит idx_reader несвязанным и outer-except упадёт UnboundLocalError,
     # замаскировав исходную ошибку.
     idx_reader = None
+    backend = None
 
     try:
         metadata = _scan_metadata(resolved) if include_metadata else {}
@@ -622,8 +810,9 @@ def _rlm_start(
             sum(len(v) for v in ext_overrides.values()),
         )
 
-        # Pre-import openai in background while Sandbox builds (~13s on slow PCs)
-        if os.environ.get("RLM_LLM_BASE_URL"):
+        # Pre-import openai в фоне — только для inline: spawn-worker процесс
+        # родительский прогрев всё равно не увидит (§12.1).
+        if sandbox_mode == "inline" and os.environ.get("RLM_LLM_BASE_URL"):
             threading.Thread(target=warmup_openai_import, daemon=True).start()
 
         # Determine if index is authoritative for zero-callers results
@@ -633,47 +822,63 @@ def _rlm_start(
         ext_paths_for_sandbox = (
             [e.path for e in ext_context.nearby_extensions] if ext_context.current.role == ConfigRole.MAIN else []
         )
-        sandbox = Sandbox(
-            base_path=resolved,
+        backend, parent_owns_reader = _create_session_backend(
+            sandbox_mode=sandbox_mode,
+            resolved=resolved,
+            session=session,
             max_output_chars=max_output_chars,
             execution_timeout_seconds=execution_timeout_seconds,
             format_info=format_info,
             idx_reader=idx_reader,
-            idx_zero_callers_authoritative=_callers_authoritative,
-            extension_paths=ext_paths_for_sandbox,
+            db_path=db_path,
+            callers_authoritative=_callers_authoritative,
+            ext_paths_for_sandbox=ext_paths_for_sandbox,
+            registry_epoch=registry_epoch,
         )
-        has_llm_tools = _install_session_llm_tools(session, sandbox)
-        t_sandbox = time.monotonic() - t_step
-        logger.info(
-            "rlm_start: session=%s sandbox ready, llm_tools=%s index=%s",
-            session_id,
-            has_llm_tools,
-            idx_reader is not None,
-        )
-
-        # Auto-detect custom prefixes — fast path from index, fallback to glob scan
-        t_step = time.monotonic()
-        detected_prefixes: list[str] = []
-        src_prefixes = "none"
-        if idx_reader is not None:
+        if not parent_owns_reader:
+            # inline: reader теперь во владении backend — не закрывать вторично.
+            idx_reader = None
+        elif idx_reader is not None:
+            # process: worker открыл собственный read-only reader; временный
+            # parent reader больше не нужен и закрывается сразу (§8.3).
             try:
-                detected_prefixes = idx_reader.get_detected_prefixes()
-                if detected_prefixes:
-                    src_prefixes = "index"
+                idx_reader.close()
             except Exception:
                 pass
-        if not detected_prefixes:
-            _prefix_fn = sandbox._namespace.get("_detected_prefixes")
-            if callable(_prefix_fn):
-                try:
-                    detected_prefixes = _prefix_fn()
-                    if detected_prefixes:
-                        src_prefixes = "fallback"
-                except Exception:
-                    pass
+            idx_reader = None
+
+        index_loaded = backend.index_loaded
+        if sandbox_mode == "process" and idx_stats and not index_loaded:
+            # Race parent-check → worker-open (§8.3): не заявлять loaded=true,
+            # если worker сообщил обратное; index_block уйдёт в no-stats ветку
+            # со статусом "incomplete" + retry warning.
+            idx_stats = None
+            idx_load_failed = True
+            idx_warnings.append(
+                backend.index_warning
+                or "Index became unavailable during sandbox start — session continues in live/no-index mode"
+            )
+
+        has_llm_tools = backend.has_llm_tools
+        t_sandbox = time.monotonic() - t_step
+        logger.info(
+            "rlm_start: session=%s sandbox ready, mode=%s gen=%d pid=%s llm_tools=%s index=%s",
+            session_id,
+            backend.mode,
+            backend.generation,
+            backend.worker_pid,
+            has_llm_tools,
+            index_loaded,
+        )
+
+        # Auto-detect custom prefixes — вычислены backend-ом (index fast path +
+        # fallback-скан живут теперь рядом с namespace, §13.2).
+        t_step = time.monotonic()
+        detected_prefixes: list[str] = backend.detected_prefixes
+        src_prefixes = backend.prefixes_source
         t_prefixes = time.monotonic() - t_step
 
-        bsl_registry = sandbox._namespace.get("_registry") or {}
+        bsl_registry = backend.registry_snapshot
         t_step = time.monotonic()
         strategy = get_strategy(
             effort,
@@ -699,15 +904,31 @@ def _rlm_start(
                 f"(These override the '{effort}' preset defaults shown in the EFFORT block below.)\n\n" + strategy
             )
 
-        with _sandboxes_lock:
-            _sandboxes[session_id] = sandbox
-            if idx_reader is not None:
-                _idx_readers[session_id] = idx_reader
+        # Публикация атомарна с проверкой владельца: TTL-эвикция и shutdown не
+        # могут оставить backend без соответствующей живой Session (§13.3).
+        if not _publish_session_backend(session_id, session, backend, registry_epoch):
+            raise SandboxClosedError("session was revoked during initialization")
     except Exception as e:
         logger.error("rlm_start: session=%s failed: %s", session_id, e, exc_info=True)
         session_manager.end(session_id)
-        # idx_reader создан (405), но мог НЕ успеть зарегистрироваться в _idx_readers
-        # (исключение между созданием и 581) → on_evict его не увидит, end() callback не зовёт.
+        if backend is not None:
+            lifecycle_owns_backend = _failed_process_backend_has_lifecycle_owner(backend)
+            # Pre-registration init failure — разрешённое исключение из
+            # reaper-only правила (§13.3): execution lock ещё не задействован,
+            # пользовательский код не выполнялся → bounded finish_close inline,
+            # незавершённый residual уходит в reaper.
+            if not lifecycle_owns_backend:
+                _untrack_starting_backend(backend)
+                try:
+                    backend.request_close("start_failure")
+                    report = backend.finish_close(time.monotonic() + kill_grace_seconds() + 2.0)
+                    if report.residual:
+                        _reaper.enqueue(backend)
+                except Exception:
+                    logger.warning("rlm_start: backend cleanup failed", exc_info=True)
+                    _reaper.enqueue(backend)
+        # idx_reader: жив только если backend его не принял (inline передаёт
+        # владение backend-у и обнуляет ссылку; process закрывает сразу).
         if idx_reader is not None:
             try:
                 idx_reader.close()
@@ -760,7 +981,7 @@ def _rlm_start(
         _bv = int(idx_stats.get("builder_version") or 0)
         _has_meta = bool(idx_stats.get("has_metadata"))
         index_block: dict = {
-            "loaded": idx_reader is not None,
+            "loaded": index_loaded,
             "index_check": "quick",
             "builder_version": _bv,
             "methods": idx_stats.get("methods"),
@@ -790,7 +1011,7 @@ def _rlm_start(
         # (strategy/docs tell the agent to read these from rlm_start.index; a missing key
         # would break that or push agents back to a get_index_info() call).
         index_block = {
-            "loaded": idx_reader is not None,
+            "loaded": index_loaded,
             "index_check": "quick",
             "builder_version": 0,
             "methods": None,
@@ -862,6 +1083,9 @@ def _rlm_start(
             "max_llm_calls": session.max_llm_calls,
             "max_execute_calls": session.max_execute_calls,
             "execution_timeout_seconds": execution_timeout_seconds,
+            # §16.2: агент/оператор обязаны видеть, включена ли процессная
+            # изоляция — в inline hard-kill таймаута не гарантируется.
+            "sandbox_mode": backend.mode,
         },
         "available_functions": available_functions,
         "strategy": strategy,
@@ -1034,24 +1258,69 @@ def _rlm_execute(
     t0 = time.monotonic()
     logger.info("rlm_execute: session=%s code_len=%d", session_id, len(code))
     _cleanup_expired_resources()
+    # Сильные локальные ссылки на session/backend до конца ответа (§9.1.2):
+    # после снятия из registries активный execute завершает controlled response
+    # на этих же объектах и не ищет их повторно.
     session = session_manager.get(session_id)
     if not session:
         return json.dumps({"error": f"Session '{session_id}' not found or expired"}, ensure_ascii=False)
 
     with _sandboxes_lock:
-        sandbox = _sandboxes.get(session_id)
-    if not sandbox:
+        backend = _sandboxes.get(session_id)
+    if not backend:
         return json.dumps({"error": f"Sandbox not found for session '{session_id}'"}, ensure_ascii=False)
 
-    if session.execute_calls >= session.max_execute_calls:
-        return json.dumps(
-            {"error": (f"Execution call limit exceeded: {session.execute_calls} >= {session.max_execute_calls}")},
-            ensure_ascii=False,
-        )
+    # §9.1: два execute одной сессии строго последовательны. Глобальный
+    # _sandboxes_lock на время выполнения НЕ держится (§3.5).
+    with session.execution_lock:
+        if not _session_backend_is_current(session_id, session, backend):
+            return json.dumps(
+                {"error": f"Session '{session_id}' was closed before execution (rlm_end/eviction/shutdown)"},
+                ensure_ascii=False,
+            )
+        if session.execute_calls >= session.max_execute_calls:
+            return json.dumps(
+                {"error": (f"Execution call limit exceeded: {session.execute_calls} >= {session.max_execute_calls}")},
+                ensure_ascii=False,
+            )
 
-    session.execute_calls += 1
-    result = sandbox.execute(code)
+        session.execute_calls += 1
+        try:
+            result = backend.execute(code)
+        except SandboxClosedError:
+            return json.dumps(
+                {"error": f"Session '{session_id}' was closed during execution (rlm_end/eviction/shutdown)"},
+                ensure_ascii=False,
+            )
+        except SandboxStartupError as e:
+            # lazy restart не удался; backend остаётся dead — следующий execute
+            # попробует новое поколение снова.
+            logger.error("rlm_execute: session=%s sandbox restart failed: %s", session_id, e)
+            return json.dumps(
+                {
+                    "error": f"Sandbox restart failed: {e}",
+                    "sandbox_state": {"status": "dead", "restart": "on_next_execute"},
+                },
+                ensure_ascii=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            # Прежний Sandbox.execute() не бросал НИКОГДА (ловил всё внутри).
+            # Backend добавил IPC/процессные пути, поэтому непредвиденная ошибка
+            # инфраструктуры не должна превращаться в исключение уровня MCP —
+            # сессия обязана получить controlled JSON-ошибку.
+            logger.error("rlm_execute: session=%s backend failure", session_id, exc_info=True)
+            return json.dumps(
+                {"error": f"Sandbox backend failure: {type(e).__name__}: {e}"},
+                ensure_ascii=False,
+            )
+        # Монотонная синхронизация LLM usage из backend (shared counter переживает
+        # kill; accounting никогда не уменьшается по данным worker — §12.2.5).
+        session.llm_calls_used = max(session.llm_calls_used, backend.llm_calls_used)
+        return _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0)
 
+
+def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0) -> str:
+    session_id = session.session_id
     elapsed = time.monotonic() - t0
     # Log helper calls with timing (grouped by name)
     helpers_summary = ""
@@ -1090,6 +1359,16 @@ def _rlm_execute(
     if result.efficiency_hints:
         response["efficiency_hints"] = result.efficiency_hints
 
+    # Machine-readable маркер terminated/restarted (§10.6): только при аварии/
+    # первом ответе нового поколения; обычные compact-ответы поле не несут.
+    if result.sandbox_state:
+        response["sandbox_state"] = result.sandbox_state
+        # Namespace нового поколения начинается с нуля независимо от detail_level
+        # аварийного ответа. Иначе compact/usage timeout оставлял snapshot старого
+        # worker-а, и одноимённая переменная нового worker-а не считалась новой.
+        if result.sandbox_state.get("state_lost"):
+            session._last_reported_vars = set()
+
     if detail_level in {"usage", "full"}:
         response["usage"] = {
             "execute_calls_used": session.execute_calls,
@@ -1100,9 +1379,9 @@ def _rlm_execute(
     if detail_level == "full":
         current_vars = set(result.variables)
         previous_vars = getattr(session, "_last_reported_vars", set())
-        # Build excluded_vars from registry + static helpers
-        bsl_reg = sandbox._namespace.get("_registry") or {}
-        excluded_vars = set(bsl_reg.keys()) | {
+        # Build excluded_vars from registry + static helpers. registry_names —
+        # вычисляемое представление snapshot backend-а, не прямой _namespace (§13.2).
+        excluded_vars = set(backend.registry_names) | {
             "_detected_prefixes",
             "_registry",
             "read_file",
@@ -1131,8 +1410,16 @@ def _rlm_execute(
     hints_log = ""
     if result.efficiency_hints:
         hints_log = " hints=" + ",".join(h["id"] for h in result.efficiency_hints)
+    # Bounded process-metadata (§13.4): PID/generation/reset — только server log,
+    # payload IPC целиком не логируется.
+    sandbox_log = f" mode={backend.mode} gen={result.generation}"
+    state = result.sandbox_state
+    if state:
+        sandbox_log += f" sandbox_state={state.get('status')}:{state.get('reason')} hard_timeout={state.get('reason') == 'timeout'}"
+    if backend.worker_pid is not None:
+        sandbox_log += f" pid={backend.worker_pid}"
     logger.info(
-        "rlm_execute: session=%s call=%d/%d error=%s elapsed=%.2fs out_chars=%d out_tokens~%d%s%s%s",
+        "rlm_execute: session=%s call=%d/%d error=%s elapsed=%.2fs out_chars=%d out_tokens~%d%s%s%s%s",
         session_id,
         session.execute_calls,
         session.max_execute_calls,
@@ -1142,6 +1429,7 @@ def _rlm_execute(
         int(out_chars / 1.75),
         helpers_summary,
         hints_log,
+        sandbox_log,
         _execute_code_log_field(code),
     )
     return result_json
@@ -1162,15 +1450,11 @@ def _rlm_end(session_id: str) -> str:
         )
     else:
         logger.info("rlm_end: session=%s (not found)", session_id)
+    # Двухфазный идемпотентный teardown (§9.3): detach → неблокирующий
+    # request_close → reaper. Session execution lock НЕ берётся; success
+    # возвращается, не дожидаясь kill_grace/join/освобождения SQLite handle.
     session_manager.end(session_id)
-    with _sandboxes_lock:
-        _sandboxes.pop(session_id, None)
-        reader = _idx_readers.pop(session_id, None)
-    if reader is not None:
-        try:
-            reader.close()
-        except Exception:
-            pass
+    _release_session_resources(session_id, reason="rlm_end")
     return json.dumps({"success": True}, ensure_ascii=False)
 
 
@@ -2395,6 +2679,112 @@ def _setup_file_logging():
         )
 
 
+def _shutdown_all_sandbox_backends() -> None:
+    """Bounded остановка всех sandbox workers при server shutdown (§13.6).
+
+    Один общий deadline ``RLM_SANDBOX_SHUTDOWN_DEADLINE_SECONDS`` на ВСЮ
+    последовательность (не per-worker); после его истечения остатки получают
+    немедленный force-kill без нового окна ожидания. Идемпотентна и не падает
+    из-за одного проблемного worker.
+    """
+    global _sandbox_registry_accepting, _sandbox_registry_epoch
+
+    # Общий deadline отсчитывается от НАЧАЛА всей последовательности, включая
+    # revoke всех backend-ов, а не только последующий graceful/force проход.
+    deadline = time.monotonic() + shutdown_deadline_seconds()
+    with _sandboxes_lock:
+        _sandbox_registry_accepting = False
+        _sandbox_registry_epoch += 1
+        backends = list(_sandboxes.items())
+        backends.extend((f"starting-{key}", backend) for key, backend in _starting_sandbox_backends.items())
+        _sandboxes.clear()
+        _starting_sandbox_backends.clear()
+    # Раннего выхода на пустом registry НЕТ: в очереди reaper-а могут лежать
+    # backends, снятые эвикцией прямо перед остановкой, и их деревья тоже обязаны
+    # быть добиты здесь, а не оставлены на семантику daemon-процессов.
+    for sid, backend in backends:
+        try:
+            backend.request_close("server_shutdown")
+        except Exception:
+            logger.warning("shutdown: request_close failed for session %s", sid, exc_info=True)
+    closed = forced = errors = 0
+    unfinished: list[tuple[str, object]] = []
+    for index, (sid, backend) in enumerate(backends):
+        if time.monotonic() >= deadline:
+            # Обычный finish_close даже с истёкшим deadline не должен вызываться
+            # N раз: оставшиеся сразу идут в zero-wait force phase.
+            unfinished.extend(backends[index:])
+            break
+        try:
+            report = backend.finish_close(deadline)
+        except Exception:
+            errors += 1
+            unfinished.append((sid, backend))
+            logger.warning("shutdown: finish_close failed for session %s", sid, exc_info=True)
+            continue
+        if report.closed:
+            closed += 1
+        else:
+            unfinished.append((sid, backend))
+        if report.forced:
+            forced += 1
+        if report.errors:
+            errors += 1
+    drained = _reaper.drain(deadline)
+    # Остатки получают НЕМЕДЛЕННЫЙ force-kill без нового окна ожидания (§13.6):
+    # kill дерева для process, detached close reader для inline.
+    # force_abort — НЕблокирующий: finish_close здесь встал бы в очередь за
+    # _close_lock, которым может владеть reaper со своим собственным deadline.
+    for sid, backend in unfinished:
+        try:
+            if backend.force_abort():
+                forced += 1
+            else:
+                errors += 1
+                logger.warning("shutdown: session %s не удалось добить (возможная утечка процесса)", sid)
+                _reaper.enqueue(backend)
+        except Exception:
+            errors += 1
+            logger.warning("shutdown: force_abort failed for session %s", sid, exc_info=True)
+            _reaper.enqueue(backend)
+    reaper_forced, reaper_left = _reaper.force_abort_pending()
+    logger.info(
+        "shutdown: sandbox backends total=%d closed=%d forced=%d errors=%d "
+        "reaper_drained=%s reaper_forced=%d reaper_left=%d",
+        len(backends),
+        closed,
+        forced,
+        errors,
+        drained,
+        reaper_forced,
+        reaper_left,
+    )
+
+
+def sandbox_diagnostics() -> dict:
+    """Счётчики состояний sandbox-backend для тестов/health-метрик (§20).
+
+    Только counts/states: ни путей, ни секретов, ни PID. Не является sandbox
+    helper и агенту не доступна.
+    """
+    with _sandboxes_lock:
+        backends = list(_sandboxes.values())
+    states: dict[str, int] = {}
+    modes: dict[str, int] = {}
+    for backend in backends:
+        try:
+            states[backend.state] = states.get(backend.state, 0) + 1
+            modes[backend.mode] = modes.get(backend.mode, 0) + 1
+        except Exception:  # noqa: BLE001 — диагностика не имеет права падать
+            states["unknown"] = states.get("unknown", 0) + 1
+    return {
+        "sessions_with_backend": len(backends),
+        "states": states,
+        "modes": modes,
+        "reaper_pending": _reaper.pending_count(),
+    }
+
+
 def _warmup_imports():
     """Pre-import heavy modules so first rlm_start is fast. Best-effort."""
     _t0 = time.monotonic()
@@ -2404,7 +2794,13 @@ def _warmup_imports():
         import rlm_tools_bsl.bsl_index  # noqa: F401
         import rlm_tools_bsl.helpers  # noqa: F401
 
-        warmup_openai_import()
+        # openai греем только для inline: при spawn дочерний worker родительский
+        # прогрев не наследует, а parent в process mode client не создаёт (§12.1).
+        try:
+            if get_sandbox_mode() == "inline":
+                warmup_openai_import()
+        except SandboxConfigError:
+            pass  # невалидный режим уже отверг старт в main()
     except Exception:
         logger.debug("warmup: import error (non-critical)", exc_info=True)
     logger.info("warmup: completed in %.1fs", time.monotonic() - _t0)
@@ -2436,9 +2832,6 @@ def main():
             pass
 
     load_project_env()
-
-    session_manager = build_session_manager_from_env()
-    session_manager.on_evict = _release_session_resources
 
     parser = argparse.ArgumentParser(description="rlm-tools-bsl MCP server")
     parser.add_argument(
@@ -2484,6 +2877,30 @@ def main():
 
         handle_service_command(args)
         return
+
+    # Validate only on the MCP-server path.  argparse's --version and service
+    # management are independent utilities and must not require a usable sandbox.
+    try:
+        sandbox_env = validate_sandbox_env()
+    except SandboxConfigError as e:
+        logger.error("Invalid sandbox configuration: %s", e)
+        raise SystemExit(f"rlm-tools-bsl: invalid sandbox configuration: {e}") from None
+    logger.info("sandbox config: %s", sandbox_env)
+    if sandbox_env["mode"] == "process" and sandbox_env["memory_mb"] == 0:
+        logger.warning(
+            "RLM_SANDBOX_MEMORY_MB=0: потолок памяти sandbox-worker ОТКЛЮЧЁН — "
+            "один сеанс может исчерпать память хоста. Значение 0 предназначено "
+            "для платформ/сценариев, где лимит мешает; иначе задайте >= 16."
+        )
+    if sandbox_env["mode"] == "inline":
+        logger.warning(
+            "RLM_SANDBOX_MODE=inline задан ЯВНО: hard process isolation ОТКЛЮЧЕНА — "
+            "код агента выполняется в основном MCP-процессе; timeout не является hard-kill. "
+            "Inline предназначен только для диагностики/аварийного восстановления."
+        )
+
+    session_manager = build_session_manager_from_env()
+    session_manager.on_evict = _release_session_resources
 
     if args.transport != "stdio":
         _setup_file_logging()
@@ -2548,5 +2965,11 @@ def main():
     except Exception as exc:
         logger.warning("cleanup_stale_cache failed: %s", exc)
 
-    threading.Thread(target=_warmup_imports, daemon=True).start()
-    mcp.run(transport=args.transport)
+    _begin_sandbox_backend_lifecycle()
+    try:
+        threading.Thread(target=_warmup_imports, daemon=True).start()
+        mcp.run(transport=args.transport)
+    finally:
+        # Не полагаться на daemon-семантику процессов: явный bounded shutdown
+        # всех sandbox workers с единым deadline (§13.6).
+        _shutdown_all_sandbox_backends()

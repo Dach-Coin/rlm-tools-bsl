@@ -142,6 +142,58 @@ class HelperCall:
     duplicate_of: int | None = None
 
 
+# Один exec + redirect_stdout за раз на ВЕСЬ процесс: contextlib.redirect_stdout
+# подменяет глобальный sys.stdout, поэтому два перекрывшихся inline-execute разных
+# Sandbox смешивали вывод (доказанная stdout-гонка v1.28). В process mode на
+# worker один Sandbox — конкуренции за замок нет, потеря параллельности касается
+# только явного inline fallback (§6.2 плана v1.29.0).
+_INLINE_STDOUT_LOCK = threading.Lock()
+
+# Маркер усечения — публичный контракт, байт-в-байт как до v1.29.0.
+TRUNCATION_MARKER = "\n... [output truncated]"
+
+
+class BoundedTextCapture(io.TextIOBase):
+    """Текстовый capture с лимитом в СИМВОЛАХ (контракт max_output_chars).
+
+    В отличие от прежнего StringIO + post-hoc среза, перестаёт накапливать
+    данные сразу по достижении лимита — огромный print() больше не занимает
+    память процесса до обрезки (§3.4 плана). Маркер усечения добавляет
+    вызывающий код по флагу ``truncated``.
+    """
+
+    def __init__(self, max_chars: int):
+        self._max_chars = max_chars
+        self._parts: list[str] = []
+        self._used_chars = 0
+        self.truncated = False
+
+    def writable(self) -> bool:  # pragma: no cover - io.TextIOBase contract
+        return True
+
+    def write(self, s: str) -> int:
+        if not isinstance(s, str):
+            s = str(s)
+        if not s:
+            return 0
+        remaining = self._max_chars - self._used_chars
+        if remaining <= 0:
+            self.truncated = True
+            return len(s)
+        chunk = s[:remaining]
+        self._parts.append(chunk)
+        self._used_chars += len(chunk)
+        if len(chunk) < len(s):
+            self.truncated = True
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+    def getvalue(self) -> str:
+        return "".join(self._parts)
+
+
 @dataclass
 class ExecutionResult:
     stdout: str
@@ -186,6 +238,7 @@ class Sandbox:
         idx_reader=None,
         idx_zero_callers_authoritative: bool = False,
         extension_paths: list[str] | None = None,
+        output_capture_factory=None,
     ):
         self._base_path = base_path
         self._max_output_chars = max_output_chars
@@ -194,6 +247,14 @@ class Sandbox:
         self._idx_reader = idx_reader
         self._idx_zero_callers_authoritative = idx_zero_callers_authoritative
         self._extension_paths = list(extension_paths or [])
+        # Process mode подставляет фабрику writer-а в shared-buffer; None → bounded
+        # in-memory capture. Возвращаемый объект обязан поддерживать write/flush,
+        # getvalue() и атрибут truncated (см. BoundedTextCapture).
+        self._output_capture_factory = output_capture_factory
+        # Defense-in-depth: сериализация execute ОДНОГО Sandbox (parent сериализует
+        # сессию своим session execution lock, но прямые пользователи класса/tests
+        # не обязаны об этом знать — §14.3 плана).
+        self._execute_lock = threading.RLock()
         self._namespace: dict = {}
         self._resolve_safe = None
         self._helper_calls: list[HelperCall] = []
@@ -546,6 +607,12 @@ class Sandbox:
         return None
 
     def execute(self, code: str) -> ExecutionResult:
+        # Порядок замков единый (§14.3): instance execute lock → global inline
+        # stdout lock → redirect/capture → timeout → exec.
+        with self._execute_lock:
+            return self._execute_locked(code)
+
+    def _execute_locked(self, code: str) -> ExecutionResult:
         self._helper_calls.clear()
         blocked = self._validate_readonly(code)
         if blocked is not None:
@@ -556,13 +623,23 @@ class Sandbox:
                 helper_calls=[],
                 efficiency_hints=None,
             )
-        stdout_capture = io.StringIO()
+        if self._output_capture_factory is not None:
+            stdout_capture = self._output_capture_factory()
+        else:
+            stdout_capture = BoundedTextCapture(self._max_output_chars)
         error = None
 
         try:
-            with contextlib.redirect_stdout(stdout_capture):
-                with self._execution_timeout():
-                    exec(code, self._namespace)
+            with _INLINE_STDOUT_LOCK:
+                with contextlib.redirect_stdout(stdout_capture):
+                    with self._execution_timeout():
+                        # Явное имя вместо дефолтного "<string>": в process-режиме worker
+                        # спавнится через multiprocessing `python -c "...spawn_main(...)"`, и у
+                        # его bootstrap co_filename тоже "<string>". Тогда traceback-кадр кода
+                        # агента (File "<string>", line 1) эхо-строкой показывал bootstrap
+                        # worker-а вместо кода агента (косметика, не утечка). Отдельное имя
+                        # убирает коллизию. Compile внутри try — SyntaxError ловится как и раньше.
+                        exec(compile(code, "<rlm-sandbox>", "exec"), self._namespace)
         except Exception:
             error = traceback.format_exc()
             # generic-IO хелперы (grep/read_file/…) не входят в BSL _registry —
@@ -572,8 +649,12 @@ class Sandbox:
             error = self._add_error_hints(error, code, available_names=available, registry=reg)
 
         stdout = stdout_capture.getvalue()
-        if len(stdout) > self._max_output_chars:
-            stdout = stdout[: self._max_output_chars] + "\n... [output truncated]"
+        if getattr(stdout_capture, "truncated", False):
+            stdout = stdout + TRUNCATION_MARKER
+        elif len(stdout) > self._max_output_chars:
+            # Последний defensive-рубеж для нестандартных capture-объектов;
+            # с BoundedTextCapture недостижимо.
+            stdout = stdout[: self._max_output_chars] + TRUNCATION_MARKER
 
         return ExecutionResult(
             stdout=stdout,
@@ -582,6 +663,36 @@ class Sandbox:
             helper_calls=list(self._helper_calls),
             efficiency_hints=self._compute_efficiency_hints() or None,
         )
+
+    def registry_metadata_snapshot(self) -> dict[str, dict]:
+        """JSON-safe снимок metadata реестра хелперов ЭТОЙ сессии, без ``fn``.
+
+        Не вторая независимая проекция registry: каталогом служит существующий
+        ``build_helper_metadata_snapshot()`` (bsl_helpers), из которого берутся
+        только ключи фактического session ``_registry`` — так условное наличие
+        ``git_search`` (auto-режим) отражается честно, а каталог с ``force``
+        остаётся только документацией (§14.4 плана). Хелпер сессии, которого нет
+        в каталоге, — ошибка инициализации, не повод молча собрать другую схему.
+        Возвращаемые структуры — копии: мутация снапшота не трогает registry.
+        """
+        registry = self._namespace.get("_registry") or {}
+        if not registry:
+            return {}
+        from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+        catalog = build_helper_metadata_snapshot()
+        missing = sorted(name for name in registry if name not in catalog)
+        if missing:
+            raise RuntimeError(f"session helpers missing from metadata catalog: {missing}")
+        return {
+            name: {
+                "sig": catalog[name]["sig"],
+                "cat": catalog[name]["cat"],
+                "kw": list(catalog[name]["kw"]),
+                "recipe": catalog[name]["recipe"],
+            }
+            for name in registry
+        }
 
     @staticmethod
     def _add_error_hints(

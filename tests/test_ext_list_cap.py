@@ -355,8 +355,8 @@ def test_sandbox_gets_all_extension_paths_above_cap(tmp_path, monkeypatch):
     assert "error" not in resp, resp
     sid = resp["session_id"]
     try:
-        sandbox = _sandboxes[sid]
-        assert len(sandbox._extension_paths) == 25  # песочница полна
+        backend = _sandboxes[sid]
+        assert backend.extension_paths_count == 25  # песочница полна
         assert len(resp["extension_context"]["nearby_extensions"]) == 20  # response усечён
     finally:
         _rlm_end(sid)

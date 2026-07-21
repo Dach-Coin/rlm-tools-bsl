@@ -23,6 +23,11 @@ class Session:
     execute_calls: int = 0
     total_in_chars: int = 0
     total_out_chars: int = 0
+    # v1.29.0 §9.1: сериализация двух rlm_execute ОДНОЙ сессии. Держится только
+    # исполняющим путём _rlm_execute; rlm_end/TTL-eviction/shutdown его НИКОГДА
+    # не берут (иначе teardown ждал бы пользовательский timeout до 300с).
+    # Никогда не сериализуется в sandbox worker.
+    execution_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
 
 class SessionManager:
@@ -91,6 +96,18 @@ class SessionManager:
                 session.last_used = time.time()
         self._fire_on_evict(evicted)
         return session
+
+    def _run_if_current(self, session_id: str, expected: Session, callback) -> bool:
+        """Run a short callback only while *expected* is still registered.
+
+        The callback runs under the manager lock so eviction cannot complete in
+        the gap between the identity check and publication of a related resource.
+        It must remain non-blocking and return a truthy value on success.
+        """
+        with self._lock:
+            if self._sessions.get(session_id) is not expected:
+                return False
+            return bool(callback())
 
     def end(self, session_id: str) -> None:
         with self._lock:

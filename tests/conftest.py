@@ -35,6 +35,17 @@ def _strategy_mode_default(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _sandbox_mode_default(monkeypatch):
+    """Pin RLM_SANDBOX_MODE=inline для существующей suite (§16.3 плана v1.29.0).
+
+    Многие тесты monkeypatch-ят объекты процесса, которые spawn-child не увидит.
+    Process-mode integration-тесты ставят RLM_SANDBOX_MODE=process локальным
+    monkeypatch.setenv ПОВЕРХ этой autouse-фикстуры.
+    """
+    monkeypatch.setenv("RLM_SANDBOX_MODE", "inline")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ext_display_env(monkeypatch):
     """Снять переменные, управляющие агент-facing представлением расширений.
 
@@ -64,14 +75,19 @@ def _isolate_real_home(tmp_path_factory, monkeypatch):
     Found in v1.9.2 smoke test: a single ``pytest -q`` run accumulated 19
     stale ``bsl_index.db`` and 87 stale ``file_index.json`` in real home.
 
-    Two-layer isolation:
+    Three-layer isolation:
     1. Set ``RLM_INDEX_DIR`` → indexes go to a session-shared tmp dir.
-    2. Patch ``pathlib.Path.home`` → any code that falls back to
-       ``Path.home()/.cache/...`` (cache module, migration helper) sees a
-       fake home instead of the developer's real one.
+    2. Set ``RLM_CONFIG_FILE`` → ``_cache_base()`` resolves to
+       ``dirname/cache`` WITHOUT touching ``Path.home()``. Layers 1 and 2 are
+       env vars, so they are the only ones that survive ``spawn``: v1.29.0
+       process-mode workers are separate processes and do NOT inherit the
+       ``Path.home`` patch below. Without this layer every no-index process
+       test wrote ``file_index.json`` into the developer's real ``~/.cache``.
+    3. Patch ``pathlib.Path.home`` → in-process code that still falls back to
+       ``Path.home()/.cache/...`` (migration helper) sees a fake home.
 
     Tests that explicitly verify fallback behavior (migration tests, cache
-    tests) can still override either layer — monkeypatch applies later
+    tests) can still override any layer — monkeypatch applies later
     changes on top of this autouse setup.
     """
     import pathlib
@@ -79,7 +95,24 @@ def _isolate_real_home(tmp_path_factory, monkeypatch):
     isolated_root = tmp_path_factory.mktemp("rlm_index_root")
     fake_home = tmp_path_factory.mktemp("rlm_fake_home")
     monkeypatch.setenv("RLM_INDEX_DIR", str(isolated_root))
+    # Файл намеренно не создаётся: нужен только его dirname. load_config()
+    # на отсутствующем пути — no-op.
+    monkeypatch.setenv("RLM_CONFIG_FILE", str(fake_home / "service.json"))
     monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_env(monkeypatch):
+    """Снять LLM-переменные окружения перед каждым тестом (§18.10.1 плана v1.29.0).
+
+    Критично именно для process mode: worker пробует провайдера по env, а env
+    наследуется spawn-ребёнком. Без снятия ``has_llm_tools`` зависел бы от
+    того, экспортирован ли ключ в шелле разработчика, и parity-тесты падали бы
+    по причине, не связанной с паритетом. Тесты, которым нужен провайдер,
+    ставят переменные локальным ``monkeypatch.setenv`` поверх этой фикстуры.
+    """
+    for var in ("ANTHROPIC_API_KEY", "RLM_LLM_BASE_URL", "RLM_LLM_MODEL", "RLM_LLM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture

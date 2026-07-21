@@ -23,6 +23,14 @@ from rlm_tools_bsl.server import (
 from rlm_tools_bsl.sandbox import HelperCall
 
 
+@pytest.fixture(autouse=True)
+def _isolate_sandbox_backend_lifecycle(monkeypatch):
+    """Synthetic main() lifecycles must not leak shutdown state to neighbours."""
+    from rlm_tools_bsl import server
+
+    monkeypatch.setattr(server, "_sandbox_registry_accepting", True)
+
+
 # ---------------------------------------------------------------------------
 # _format_helper_summary tests
 # ---------------------------------------------------------------------------

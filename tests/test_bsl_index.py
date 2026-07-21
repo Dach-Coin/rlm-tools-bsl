@@ -1618,6 +1618,10 @@ class TestPathHelpers:
     def test_index_dir_default(self, monkeypatch):
         """Without RLM_INDEX_DIR, uses ~/.cache/rlm-tools-bsl/."""
         monkeypatch.delenv("RLM_INDEX_DIR", raising=False)
+        # Этот тест про САМЫЙ последний fallback, поэтому снимаем и вторую
+        # ступень precedence, которую conftest выставляет всем тестам ради
+        # изоляции spawn-детей (dirname(RLM_CONFIG_FILE)/index).
+        monkeypatch.delenv("RLM_CONFIG_FILE", raising=False)
 
         from pathlib import Path
 
