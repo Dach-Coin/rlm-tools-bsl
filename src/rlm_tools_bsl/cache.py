@@ -31,7 +31,7 @@ import time
 
 from rlm_tools_bsl.format_detector import BslFileInfo
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 _disk_lock = threading.Lock()
 
 LAST_USED_MARKER = "last_used.txt"

@@ -533,7 +533,7 @@ class TestFormElementsIndex:
         conn.close()
         assert has["value"] == "1"
         assert int(count["value"]) > 0
-        assert int(bv["value"]) == 14
+        assert int(bv["value"]) == 15
 
     def test_index_reader_get_form_elements(self, indexed_db):
         db_path, _ = indexed_db

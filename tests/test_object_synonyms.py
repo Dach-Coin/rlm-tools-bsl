@@ -445,7 +445,7 @@ class TestBuildSynonyms:
         conn = sqlite3.connect(str(db_path))
         row = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()
         conn.close()
-        assert row[0] == "14"
+        assert row[0] == "15"
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +633,7 @@ class TestHelpers:
         info = bsl["get_index_info"]()
         reader.close()
         assert info["status"] == "ok"
-        assert info["builder_version"] == 14
+        assert info["builder_version"] == 15
         assert info["has_synonyms"] is True
 
     def test_get_index_info_no_index(self):
@@ -804,7 +804,7 @@ class TestIncrementalUpdate:
         conn = sqlite3.connect(str(db_path))
         ver = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()[0]
         conn.close()
-        assert ver == "14"
+        assert ver == "15"
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +839,7 @@ class TestV7toV8Migration:
 
         conn = sqlite3.connect(str(db_path))
         ver = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()[0]
-        assert ver == "14"
+        assert ver == "15"
         # regions and module_headers tables must exist (no OperationalError)
         regions_count = conn.execute("SELECT COUNT(*) FROM regions").fetchone()[0]
         headers_count = conn.execute("SELECT COUNT(*) FROM module_headers").fetchone()[0]

@@ -378,7 +378,7 @@ class TestRegionsIntegration:
         conn = sqlite3.connect(str(db_path))
         ver = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()[0]
         conn.close()
-        assert ver == "14"
+        assert ver == "15"
 
 
 class TestRegionsDeltaCleanup:

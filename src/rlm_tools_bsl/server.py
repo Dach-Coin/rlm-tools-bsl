@@ -674,6 +674,7 @@ def _rlm_start(
         idx_warnings: list[str] = []
         idx_stats: dict | None = None
         idx_status = None
+        idx_version_outdated = False
         # True when a reader was opened but its stats came back as a zero/load-failure
         # sentinel (transient read of an EXISTING db mid-rebuild). Lets the no-stats branch
         # report "incomplete" (retry) rather than "missing" even if the marker was already
@@ -726,12 +727,15 @@ def _rlm_start(
                         # Check index builder version
                         idx_version = int(idx_stats.get("builder_version") or 0)
                         if idx_version < BUILDER_VERSION:
+                            idx_version_outdated = True
                             msg = (
                                 f"Index built with v{idx_version}, current v{BUILDER_VERSION} — "
-                                f'new helpers available after rebuild: rlm-bsl-index index build "{resolved}"'
+                                f'run rlm-bsl-index index update "{resolved}" before using indexed coordinates'
                             )
                             idx_warnings.append(msg)
                             logger.warning("rlm_start: session=%s %s", session_id, msg)
+                            idx_reader.close()
+                            idx_reader = None
         except Exception as e:
             if idx_reader is not None:
                 try:
@@ -744,7 +748,11 @@ def _rlm_start(
 
         # --- Format + extension detection (fast path from index or disk) ---
         startup_meta = None
-        if idx_reader is not None and idx_status == IndexStatus.FRESH:
+        if (
+            idx_reader is not None
+            and idx_status == IndexStatus.FRESH
+            and int((idx_stats or {}).get("builder_version") or 0) >= BUILDER_VERSION
+        ):
             startup_meta = idx_reader.get_startup_meta()
 
         if startup_meta is not None:
@@ -1003,7 +1011,9 @@ def _rlm_start(
             "config_version": idx_stats.get("config_version"),
             # Reader loaded → map the freshness status (FRESH→"ok"). The with-stats branch
             # is only reached for FRESH/STALE_AGE/STALE_CONTENT, so .get default is unused.
-            "index_status": _INDEX_STATUS_LABELS.get(idx_status, "ok"),
+            "index_status": (
+                "outdated" if idx_version_outdated else _INDEX_STATUS_LABELS.get(idx_status, "ok")
+            ),
             "warnings": idx_warnings,
         }
     else:

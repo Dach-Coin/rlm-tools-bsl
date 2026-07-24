@@ -35,7 +35,7 @@ from rlm_tools_bsl.bsl_xml_parsers import (
 
 logger = logging.getLogger(__name__)
 
-BUILDER_VERSION = 14
+BUILDER_VERSION = 15
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
@@ -6317,16 +6317,14 @@ class IndexBuilder:
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'has_synonyms'").fetchone()
         has_synonyms = meta_row is None or meta_row["value"] == "1"
 
-        # Schema upgrades that add code-derived tables/columns (regions/
-        # module_headers in v8, metadata_code_usages in v13, calls.callee_key in
-        # v14) cannot be back-filled incrementally — they require a one-time full
-        # rebuild that recreates the schema. Threshold = newest such version.
+        # Schema upgrades and changes to persisted module coordinates cannot be
+        # back-filled incrementally — they require a one-time full rebuild.
         # NB: a plain version bump without this forced rebuild would route v13
         # DBs into the version-mismatch full *scan* below, which INSERTs into the
         # OLD schema (no callee_key column) and fails — so the rebuild is required.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 14:
+        if old_version < BUILDER_VERSION:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -6351,12 +6349,12 @@ class IndexBuilder:
             }
 
         # Self-heal perf indexes (idx_calls_callee_short, idx_meth_module) on EVERY
-        # v14+ update (no-op, metadata-only, git-fast, full-scan all pass this
-        # point). Unconditional — NOT under `if bsl_changed:` — so a v14 DB built
+        # current-version update (no-op, metadata-only, git-fast, full-scan all pass this
+        # point). Unconditional — NOT under `if bsl_changed:` — so a current DB built
         # before an index existed gets it even on a no-op update (Codex round-3).
-        # Build paths already have them via _SCHEMA_SQL. old_version >= 14 is
-        # guaranteed here (the < 14 branch above returned), so the tables have
-        # their final v14 shape.
+        # Build paths already have them via _SCHEMA_SQL. A current version is
+        # guaranteed here (the upgrade branch above returned), so the tables have
+        # their final shape.
         with conn:
             self._ensure_callee_short_index(conn)
             self._ensure_meth_module_index(conn)
@@ -7464,8 +7462,8 @@ class IndexBuilder:
     def _ensure_callee_key_column(conn: sqlite3.Connection) -> None:
         """Defensively add ``calls.callee_key`` if a same-version DB lacks it.
 
-        A v14 index is always created via a full rebuild (old_version < 14 forces
-        it), so the column exists on every real v14 DB. This guard mirrors the
+        A current index is always created via a full rebuild from older versions,
+        so the column exists on every real current DB. This guard mirrors the
         defensive ``CREATE TABLE IF NOT EXISTS`` pattern used elsewhere and keeps
         the incremental INSERT from failing should a malformed DB slip through.
         """

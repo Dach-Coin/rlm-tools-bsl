@@ -208,7 +208,7 @@ def cf_index(tmp_path, monkeypatch):
 
 class TestBuilderReader:
     def test_builder_version_is_14(self):
-        assert BUILDER_VERSION == 14
+        assert BUILDER_VERSION == 15
 
     def test_table_exists(self, cf_index):
         _, _, db_path, _ = cf_index
