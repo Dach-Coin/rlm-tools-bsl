@@ -132,10 +132,13 @@ foreach ($sp in @($globalSitePackages, $userSitePackages)) {
     }
 }
 
-# Force a fresh wheel pull from PyPI.
+# Force a fresh wheel pull from PyPI. `cache clean` drops the cached package but
+# NOT uv's cached index metadata, which has its own TTL -- without --refresh a
+# release published minutes ago can still resolve to the PREVIOUS version, and
+# the two install steps below can then land different versions.
 & uv cache clean rlm-tools-bsl
 
-$uvInstallArgs = @("tool", "install", "rlm-tools-bsl[service]", "--force", "--reinstall", "--upgrade")
+$uvInstallArgs = @("tool", "install", "rlm-tools-bsl[service]", "--force", "--reinstall", "--upgrade", "--refresh")
 if ($NativeTls) { $uvInstallArgs += "--native-tls" }
 & uv @uvInstallArgs
 if ($LASTEXITCODE -ne 0) {
@@ -148,7 +151,12 @@ if ($LASTEXITCODE -ne 0) {
 $globalPython = if ($exePath) { & $exePath -c "import sys; print(sys.executable)" 2>$null } else { "" }
 if ($globalPython -and (Test-Path $globalPython)) {
     Write-Host "Updating global Python package ($globalPython)..." -ForegroundColor Cyan
-    $uvPipArgs = @("pip", "install", "rlm-tools-bsl", "--upgrade", "--python", $globalPython)
+    # --reinstall-package is required, not cosmetic: --upgrade only compares the
+    # version NUMBER, so an install left over from simple-install.ps1 (same
+    # version, but built from the local tree) satisfies the requirement and uv
+    # reports "Audited" without replacing it -- the service would then run the
+    # working tree while this script claims it installed the PyPI release.
+    $uvPipArgs = @("pip", "install", "rlm-tools-bsl", "--upgrade", "--refresh", "--reinstall-package", "rlm-tools-bsl", "--python", $globalPython)
     if ($NativeTls) { $uvPipArgs += "--native-tls" }
     & uv @uvPipArgs
     if ($LASTEXITCODE -ne 0) {

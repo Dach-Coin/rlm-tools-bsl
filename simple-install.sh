@@ -87,9 +87,14 @@ if [ "${UV_NATIVE_TLS:-}" = "true" ]; then
 fi
 
 # Force a fresh build (drop any cached wheel from a previous install).
+# --upgrade and --refresh keep this path symmetric with simple-install-from-pip.sh:
+# without --upgrade an already-installed dependency that still satisfies the
+# constraints is left untouched, so a rebuild from source could leave the service
+# on an outdated dependency. --refresh also drops uv's cached index metadata and
+# the cached local build, which `cache clean` alone does not cover.
 uv cache clean rlm-tools-bsl 2>/dev/null || true
 
-if ! uv tool install "${SCRIPT_DIR}[service]" --force --reinstall "${UV_EXTRA_ARGS[@]}"; then
+if ! uv tool install "${SCRIPT_DIR}[service]" --force --reinstall --upgrade --refresh "${UV_EXTRA_ARGS[@]}"; then
     echo "ERROR: uv tool install failed."
     echo "If you see TLS certificate errors (corporate proxy), retry with:"
     echo "  UV_NATIVE_TLS=true ./simple-install.sh"

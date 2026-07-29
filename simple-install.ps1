@@ -141,8 +141,13 @@ if (Test-Path $distDir) {
     Remove-Item -Recurse -Force $distDir
 }
 
+# --upgrade and --refresh keep this path symmetric with simple-install-from-pip.ps1.
+# Without --upgrade an already-installed dependency that still satisfies the
+# constraints is left untouched, so a rebuild from source could leave the service
+# on an outdated dependency. --refresh also drops uv's cached index metadata and
+# the cached local build, which `cache clean` alone does not cover.
 & uv cache clean rlm-tools-bsl
-$uvInstallArgs = @("tool", "install", "${PSScriptRoot}[service]", "--force", "--reinstall")
+$uvInstallArgs = @("tool", "install", "${PSScriptRoot}[service]", "--force", "--reinstall", "--upgrade", "--refresh")
 if ($NativeTls) { $uvInstallArgs += "--native-tls" }
 & uv @uvInstallArgs
 if ($LASTEXITCODE -ne 0) {
@@ -155,7 +160,11 @@ if ($LASTEXITCODE -ne 0) {
 $globalPython = & $exePath -c "import sys; print(sys.executable)" 2>$null
 if ($globalPython -and (Test-Path $globalPython)) {
     Write-Host "Updating global Python package ($globalPython)..." -ForegroundColor Cyan
-    $uvPipArgs = @("pip", "install", $PSScriptRoot, "--python", $globalPython)
+    # --reinstall-package mirrors simple-install-from-pip.ps1: --upgrade compares
+    # only the version NUMBER, so an install of the same version coming from PyPI
+    # satisfies the requirement and uv skips it, leaving the service on the
+    # published wheel instead of the local build this script is meant to deploy.
+    $uvPipArgs = @("pip", "install", $PSScriptRoot, "--upgrade", "--refresh", "--reinstall-package", "rlm-tools-bsl", "--python", $globalPython)
     if ($NativeTls) { $uvPipArgs += "--native-tls" }
     & uv @uvPipArgs
     if ($LASTEXITCODE -ne 0) {

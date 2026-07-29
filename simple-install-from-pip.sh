@@ -87,10 +87,12 @@ if [ "${UV_NATIVE_TLS:-}" = "true" ]; then
     UV_EXTRA_ARGS+=("--native-tls")
 fi
 
-# Force a fresh wheel pull from PyPI.
+# Force a fresh wheel pull from PyPI. `cache clean` drops the cached package but
+# NOT uv's cached index metadata, which has its own TTL -- without --refresh a
+# release published minutes ago can still resolve to the PREVIOUS version.
 uv cache clean rlm-tools-bsl 2>/dev/null || true
 
-if ! uv tool install "rlm-tools-bsl[service]" --force --reinstall --upgrade "${UV_EXTRA_ARGS[@]}"; then
+if ! uv tool install "rlm-tools-bsl[service]" --force --reinstall --upgrade --refresh "${UV_EXTRA_ARGS[@]}"; then
     echo "ERROR: uv tool install failed."
     echo "If you see TLS certificate errors (corporate proxy), retry with:"
     echo "  UV_NATIVE_TLS=true ./simple-install-from-pip.sh"
