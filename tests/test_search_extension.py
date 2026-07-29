@@ -225,29 +225,107 @@ class TestSearchModuleHeadersLive:
 
 
 class TestCountOnlyExtension:
-    """v1.24.0 #1 — count_only is INDEX-side (main config only); ext rows that the
-    normal path merges live are NOT counted. scope=='main_index' makes that explicit,
-    so агент не примет это за «total mismatch»."""
+    """v1.30.0 — count_only считает в ТОМ ЖЕ scope, что и list.
 
-    def test_count_only_regions_is_index_side(self, helpers_with_ext):
+    До 1.30.0 count отвечал только индексом, и `список=2 при count=1` было штатным
+    (v1.24.0 #1). Агенты рекуррентно читали это как «total mismatch» и уходили за полной
+    выдачей, то есть экономящий токены count_only работал против себя.
+
+    NB: оба теста делают count_only ПЕРВЫМ вызовом на свежей фикстуре — это и есть
+    регресс на то, что признак «расширения настроены» берётся из `_ext_paths_raw`
+    (доступен сразу), а не из `_extension_paths_set` (заполняется только в
+    `_ensure_index`, то есть на первом вызове был бы пуст).
+    """
+
+    def test_count_only_regions_counts_live_extensions(self, helpers_with_ext):
         bsl, _cf, _cfe, reader = helpers_with_ext
         res = bsl["search_regions"]("ext_SearchRegion", count_only=True)
-        assert res["scope"] == "main_index"
-        assert res["source"] == "index"
+        assert res["scope"] == "main_index+live_extensions"
+        assert res["source"] == "index+live"
         assert res["truncated"] is False
-        # Index has no ext_SearchRegion (it lives only in the extension file) →
-        # index-side count is 0, even though the merged list path WOULD find it.
-        assert res["total"] == reader.count_regions("ext_SearchRegion")
-        # The live-merged path does surface the ext region — proving count_only
-        # is intentionally a different (cheaper, main-only) census.
+        # Область живёт только в расширении: main-счёт 0, но census её ВИДИТ.
+        assert res["total_main"] == reader.count_regions("ext_SearchRegion") == 0
+        assert res["total_extensions"] >= 1
         merged = bsl["search_regions"]("ext_SearchRegion")
         assert any(r["module_path"].startswith("../cfe/") for r in merged)
+        assert res["total"] == len(merged)
 
-    def test_count_only_module_headers_is_index_side(self, helpers_with_ext):
+    def test_count_only_module_headers_counts_live_extensions(self, helpers_with_ext):
         bsl, _cf, _cfe, reader = helpers_with_ext
         res = bsl["search_module_headers"]("ext_SearchMarker", count_only=True)
+        assert res["scope"] == "main_index+live_extensions"
+        assert res["total_main"] == reader.count_module_headers("ext_SearchMarker")
+        merged = bsl["search_module_headers"]("ext_SearchMarker")
+        assert res["total"] == len(merged)
+
+    def test_count_only_does_not_depend_on_limit(self, helpers_with_ext):
+        bsl, _cf, _cfe, _reader = helpers_with_ext
+        a = bsl["search_regions"]("ext_SearchRegion", count_only=True)
+        b = bsl["search_regions"]("ext_SearchRegion", limit=1, count_only=True)
+        assert a == b
+
+    @pytest.mark.parametrize("query", ["", "   "])
+    def test_empty_and_whitespace_query_keep_main_only_scope(self, helpers_with_ext, query):
+        """«Пустой» = `not query or not query.strip()` — тот же предикат, что у reader'а.
+
+        Сырой truthiness пустил бы `"   "` в полный live-проход по всем CFE-модулям, хотя
+        main-сторона того же вызова трактует его как «отдай всё». Предохранитель работает
+        в ОБЕИХ ветках: и count, и list.
+        """
+        bsl, _cf, _cfe, _reader = helpers_with_ext
+        res = bsl["search_regions"](query, count_only=True)
         assert res["scope"] == "main_index"
-        assert res["total"] == reader.count_module_headers("ext_SearchMarker")
+        assert set(res) == {"total", "source", "truncated", "scope"}
+
+        headers = bsl["search_module_headers"](query, count_only=True)
+        assert headers["scope"] == "main_index"
+
+        # list при whitespace-query тоже не подмешивает CFE-строки
+        rows = bsl["search_module_headers"](query)
+        assert not any(r["module_path"].startswith("../cfe/") for r in rows)
+
+    def test_main_and_cfe_module_paths_live_in_separate_namespaces(self, helpers_with_ext):
+        """Инвариант, на котором стоит `total = main + len(live)`: ext↔main collision по
+        `(module_path, name)` невозможен, поэтому main-строки грузить не нужно."""
+        bsl, _cf, _cfe, _reader = helpers_with_ext
+        rows = bsl["search_regions"]("Search")
+        main_paths = {r["module_path"] for r in rows if not r["module_path"].startswith("../cfe/")}
+        ext_paths = {r["module_path"] for r in rows if r["module_path"].startswith("../cfe/")}
+        assert not (main_paths & ext_paths)
+
+    def test_duplicate_region_names_in_one_cfe_module_are_two_occurrences(self, tmp_path, monkeypatch):
+        """Merge-хелперы снимают только совпадение с MAIN-строкой и НЕ дедупят ext↔ext.
+        Count обязан повторять это: два одноимённых `#Область` в одном CFE-модуле — две
+        физические записи, а не одна."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+        cf = os.path.join(str(tmp_path), "src", "cf")
+        cfe = os.path.join(str(tmp_path), "src", "cfe", "ExtDup")
+        _write(os.path.join(cf, "Configuration.xml"), _CF_MAIN_XML)
+        _write(os.path.join(cfe, "Configuration.xml"), _ext_xml())
+        _write(
+            os.path.join(cfe, "CommonModules", "ExtDupModule", "Ext", "Module.bsl"),
+            "#Область dup_Region\nПроцедура А() Экспорт\nКонецПроцедуры\n#КонецОбласти\n"
+            "#Область dup_Region\nПроцедура Б() Экспорт\nКонецПроцедуры\n#КонецОбласти\n",
+        )
+        db_path = IndexBuilder().build(cf, build_calls=False, build_metadata=True, build_fts=True)
+        reader = IndexReader(db_path)
+        try:
+            generic, resolve_safe = make_helpers(cf, idx_reader=reader)
+            bsl = make_bsl_helpers(
+                base_path=cf,
+                resolve_safe=resolve_safe,
+                read_file_fn=generic["read_file"],
+                grep_fn=generic["grep"],
+                glob_files_fn=generic["glob_files"],
+                format_info=detect_format(cf),
+                idx_reader=reader,
+                extension_paths=[cfe],
+            )
+            res = bsl["search_regions"]("dup_Region", count_only=True)
+            assert res["total_extensions"] == 2
+            assert res["total"] == len(bsl["search_regions"]("dup_Region"))
+        finally:
+            reader.close()
 
 
 class TestSearchUnified:
@@ -653,3 +731,35 @@ class TestSearchSourceConsistency:
         ext_callers = [c for c in result["callers"] if c["file"].startswith("../cfe/")]
         assert ext_callers, f"extension caller silently skipped: {result}"
         assert ext_callers[0]["caller_name"] == "ext_SearchMethod"
+
+
+def test_count_only_without_index_but_with_extensions_is_live(tmp_path, monkeypatch):
+    """Без индекса, но с настроенными расширениями census остаётся честным: source='live',
+    total_main=0. Раньше такой вызов отдавал {'total': 0, 'source': 'unavailable'} —
+    неотличимо от «ничего нет»."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf = os.path.join(str(tmp_path), "src", "cf")
+    cfe = os.path.join(str(tmp_path), "src", "cfe", "ExtNoIdx")
+    _write(os.path.join(cf, "Configuration.xml"), _CF_MAIN_XML)
+    _write(os.path.join(cfe, "Configuration.xml"), _ext_xml())
+    _write(
+        os.path.join(cfe, "CommonModules", "ExtNoIdxModule", "Ext", "Module.bsl"),
+        "#Область noidx_Region\nПроцедура А() Экспорт\nКонецПроцедуры\n#КонецОбласти\n",
+    )
+    generic, resolve_safe = make_helpers(cf)
+    bsl = make_bsl_helpers(
+        base_path=cf,
+        resolve_safe=resolve_safe,
+        read_file_fn=generic["read_file"],
+        grep_fn=generic["grep"],
+        glob_files_fn=generic["glob_files"],
+        format_info=detect_format(cf),
+        idx_reader=None,
+        extension_paths=[cfe],
+    )
+    res = bsl["search_regions"]("noidx_Region", count_only=True)
+    assert res["source"] == "live"
+    assert res["scope"] == "main_index+live_extensions"
+    assert res["total_main"] == 0
+    assert res["total"] == res["total_extensions"] == 1
+    assert res["total"] == len(bsl["search_regions"]("noidx_Region"))

@@ -177,3 +177,17 @@ def test_index_block_colocates_get_index_info_nudge():
     assert "== INDEX ==" in block
     assert "get_index_info" in block
     assert "rlm_start.index" in block
+
+
+def test_count_only_contract_synced_in_both_strategy_copies():
+    """v1.30.0: count_only стал CFE-aware. Обе копии NOTE (slim STRATEGY_SECTIONS и
+    встроенная full _STRATEGY_HEADER) обязаны описывать НОВЫЙ контракт — иначе код
+    считает расширения, а половина агентов продолжает читать «index-side {total}».
+    """
+    from rlm_tools_bsl.bsl_knowledge import _STRATEGY_HEADER
+
+    for text in (STRATEGY_SECTIONS["workflow"], _STRATEGY_HEADER):
+        assert "count_only=True" in text
+        assert "тот же scope" in text
+        assert "total_extensions" in text
+        assert "index-side {total}" not in text  # старое обещание ушло

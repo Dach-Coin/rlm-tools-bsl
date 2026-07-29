@@ -1132,3 +1132,177 @@ def test_get_overrides_unavailable_has_same_shape(tmp_path, monkeypatch):
     for key in ("unique_objects", "unique_methods", "unique_extensions", "total"):
         assert res[key] == 0, key
     assert res["overrides"] == [] and res["truncated"] is False
+
+
+# ── v1.30.0 (пакет 5): единый additive shape перехватов ───────
+
+_UNIFIED_OVERRIDE_KEYS = {
+    "object_name",
+    "target_method",
+    "annotation",
+    "extension_name",
+    "extension_method",
+    "extension_root",
+    "ext_module_path",
+    "ext_line",
+    "module_path",
+    "module_type",
+    "line",
+    "source_path",
+    "source_module_id",
+    "target_method_line",
+}
+
+
+def test_override_shape_is_unified_across_index_and_find_ext(tmp_path, monkeypatch):
+    """Индексная строка несла ext_module_path/ext_line/source_*, а live-строка
+    find_ext_overrides — module_path/line/module_type. Код агента, переиспользующий одну
+    обработку на обеих ветках, падал. Теперь обязательный набор ключей одинаков, алиасы
+    достроены в ОБЕ стороны, старые поля на месте."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, cfe = _make_main_with_extension(str(tmp_path))
+    db_path = IndexBuilder().build(cf, build_calls=False, build_metadata=True)
+    reader = IndexReader(db_path)
+    try:
+        bsl = _bsl_for(cf, reader)
+        indexed = bsl["get_overrides"]()
+        live = bsl["find_ext_overrides"](cfe)
+        assert indexed["overrides"], indexed
+        assert live["overrides"], live
+
+        for row in indexed["overrides"] + live["overrides"]:
+            missing = _UNIFIED_OVERRIDE_KEYS - set(row)
+            assert not missing, sorted(missing)
+            assert row["module_path"] == row["ext_module_path"]
+            assert row["line"] == row["ext_line"]
+            assert row["module_type"] == "ObjectModule"
+        # исторические индексные поля не потеряны
+        assert "id" in indexed["overrides"][0]
+        assert "extension_purpose" in indexed["overrides"][0]
+    finally:
+        reader.close()
+
+
+class _ManyOverridesReader:
+    """Reader-заглушка: отдаёт заданные СЫРЫЕ строки extension_overrides."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def get_extension_overrides(self, object_name="", method_name=""):
+        return [dict(r) for r in self._rows]
+
+
+def _raw_override(i):
+    return {
+        "id": i,
+        "object_name": "Док%02d" % (i % 7),
+        "source_path": "Documents/Док/Ext/ObjectModule.bsl",
+        "source_module_id": i,
+        "target_method": "Метод%02d" % (i % 5),
+        "target_method_line": None,
+        "annotation": "После",
+        "extension_name": "Расш",
+        "extension_purpose": "Customization",
+        "extension_method": "",
+        "extension_root": "/ext",
+        "ext_module_path": "Documents/Док/Ext/ObjectModule.bsl",
+        "ext_line": i,
+    }
+
+
+def test_cap_200_slice_and_order_survive_additive_normalization(tmp_path):
+    """У `_sort_key` последний элемент — json.dumps ВСЕЙ строки, поэтому новые ключи
+    сдвинули бы tie-break, а с ним и СОСТАВ среза cap=200. Ключ обязан считаться по
+    НЕТРОНУТОЙ строке (до нормализации), иначе часть перехватов молча уезжает из
+    видимых агенту 200."""
+    import json as _json
+
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+    from rlm_tools_bsl.format_detector import detect_format
+    from rlm_tools_bsl.helpers import make_helpers
+
+    rows = [_raw_override(i) for i in range(260)]
+    tmpdir = str(tmp_path)
+    (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+    helpers, resolve_safe = make_helpers(tmpdir)
+    bsl = make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=detect_format(tmpdir),
+        idx_reader=_ManyOverridesReader(rows),
+    )
+    res = bsl["get_overrides"]()
+    assert res["total"] == 260 and res["truncated"] is True
+    assert len(res["overrides"]) == 200
+
+    def legacy_key(r):
+        return (
+            (r.get("object_name") or "").lower(),
+            (r.get("target_method") or "").lower(),
+            (r.get("extension_name") or "").lower(),
+            (r.get("annotation") or "").lower(),
+            (r.get("extension_method") or "").lower(),
+            (r.get("source_path") or "").lower(),
+            _json.dumps(r, sort_keys=True, ensure_ascii=False, default=str),
+        )
+
+    expected_ids = [r["id"] for r in sorted(rows, key=legacy_key)[:200]]
+    assert [r["id"] for r in res["overrides"]] == expected_ids
+    # служебный sort-token наружу не протекает
+    assert all("_sort_token" not in r for r in res["overrides"])
+
+
+def test_find_ext_overrides_keeps_legacy_walk_order_slice(tmp_path):
+    """У find_ext_overrides сортировки среза не было: строки шли в порядке os.walk и
+    резались `[:200]`. Нормализация обязана применяться ПОСЛЕ среза — иначе на
+    расширении с >200 перехватами поменялся бы САМ НАБОР возвращаемых строк."""
+    from rlm_tools_bsl.extension_detector import find_extension_overrides
+
+    cfe = os.path.join(str(tmp_path), "cfe", "БольшоеРасширение")
+    _write(os.path.join(cfe, "Configuration.xml"), _cf_extension_xml(name="БольшоеРасширение"))
+    body = "\n".join('&После("Метод%03d")\nПроцедура мр_П%03d()\nКонецПроцедуры\n' % (i, i) for i in range(210))
+    _write(os.path.join(cfe, "Catalogs", "Номенклатура", "Ext", "ObjectModule.bsl"), body)
+
+    cf = os.path.join(str(tmp_path), "cf")
+    _write(os.path.join(cf, "Configuration.xml"), _CF_MAIN_XML)
+    bsl = _bsl_for(cf, None)
+
+    raw = find_extension_overrides(cfe, None, diagnostics={})
+    res = bsl["find_ext_overrides"](cfe)
+    assert res["total"] == len(raw) > 200
+    assert res["truncated"] is True
+    assert [(r["target_method"], r["line"]) for r in res["overrides"]] == [
+        (r["target_method"], r["line"]) for r in raw[:200]
+    ]
+    assert _UNIFIED_OVERRIDE_KEYS <= set(res["overrides"][0])
+
+
+def test_find_ext_overrides_carries_extension_provenance(tmp_path, monkeypatch):
+    """Единый shape обязан быть совместим СЕМАНТИЧЕСКИ, а не только по набору ключей.
+
+    Сырые live-строки не несут ни `extension_name`, ни `extension_root`. Если просто
+    добить их пустыми значениями, ключ появится, но выдача по нескольким расширениям
+    схлопнется под одним пустым именем — тогда как `get_overrides` для тех же строк даёт
+    настоящее имя из метаданных расширения.
+    """
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, cfe = _make_main_with_extension(str(tmp_path))
+    db_path = IndexBuilder().build(cf, build_calls=False, build_metadata=True)
+    reader = IndexReader(db_path)
+    try:
+        bsl = _bsl_for(cf, reader)
+        live_rows = bsl["find_ext_overrides"](cfe)["overrides"]
+        index_rows = bsl["get_overrides"]()["overrides"]
+        assert live_rows and index_rows
+
+        index_names = {r["extension_name"] for r in index_rows}
+        assert index_names == {"ТестовоеРасширение"}
+        for row in live_rows:
+            assert row["extension_name"] == "ТестовоеРасширение"
+            assert row["extension_root"] == cfe
+    finally:
+        reader.close()

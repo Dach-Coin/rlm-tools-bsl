@@ -1,4 +1,5 @@
 from __future__ import annotations
+import bisect
 import collections
 import concurrent.futures
 import json
@@ -1169,6 +1170,64 @@ def make_bsl_helpers(
             return out
         return fn(arg)
 
+    def _coerce_bound(
+        value,
+        default: int,
+        param: str,
+        sig: str,
+        *,
+        minimum: int = 0,
+        maximum: int | None = None,
+    ) -> tuple[int, str | None]:
+        """Нормализовать limit/offset-подобный параметр на ГРАНИЦЕ хелпера (v1.30.0).
+
+        Возвращает ``(int, warning|None)``. Политика унаследована от int-гарда
+        ``module_hint`` (v1.18.0, см. ``_find_callers_context_one``): НЕ угадывать
+        сдвиг аргументов, НЕ падать — вернуть ДОКУМЕНТИРОВАННЫЙ дефолт и явно
+        назвать сигнатуру.
+
+        Зачем вообще: эти значения уезжают в ``LIMIT ? OFFSET ?`` ридера, а SQLite
+        требует у LIMIT целое — ``None`` там даёт ``IntegrityError: datatype
+        mismatch``, а не «без ограничения». Часть хелперов вдобавок считает
+        ``offset + limit`` и падает раньше SQL. Гард стоит ДО обращения к
+        ``idx_reader``, поэтому ``bsl_index.py`` править не требуется.
+
+        Отрицательные значения ОТСЕКАЮТСЯ намеренно: в SQLite ``LIMIT -1`` — это
+        «без ограничения», и через него сегодня достижим дамп десятков тысяч строк
+        в песочницу с ограниченным ``max_output_chars`` (вплоть до срабатывания
+        таймаута и убийства воркера). ``0`` при этом остаётся валидным.
+
+        ``bool`` отсекается ДО ``int``: он подкласс ``int`` и ``True`` молча прошёл
+        бы как ``1``. ``float`` с дробной частью усекается — согласовано с уже
+        принятым ``int(depth)`` в ``find_call_hierarchy``.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+            return default, (
+                f"{param} ожидался целым, получено {type(value).__name__}={value!r} — "
+                f"использован дефолт {default}. Сигнатура: {sig}."
+            )
+        ivalue = int(value)
+        if ivalue < minimum:
+            return default, (
+                f"{param}={value!r} вне диапазона (минимум {minimum}) — использован дефолт {default}. Сигнатура: {sig}."
+            )
+        if maximum is not None and ivalue > maximum:
+            return maximum, (f"{param}={value!r} превышает максимум {maximum} — усечен. Сигнатура: {sig}.")
+        return ivalue, None
+
+    def _warn_bound(warning: str | None) -> None:
+        """Единая точка логирования для хелперов БЕЗ пригодного ``_meta``.
+
+        Таких большинство: списочные хелперы ``_meta`` не имеют вовсе, а у
+        ``find_references_to_object`` его нет, у ``find_register_movements`` он
+        условный, и отдельно — ``count_only``-payload ``search_regions``/
+        ``search_module_headers``, чей четырёхключевой контракт заморожен
+        byte-for-byte и закреплён тестами. Дописывать туда ключи нельзя, поэтому
+        предупреждение уходит только в лог.
+        """
+        if warning:
+            logger.warning("arg-guard: %s", warning)
+
     def _looks_like_path(s) -> bool:
         """P3-детектор: rel-путь модуля всегда содержит '/' (или '\\'), начинается
         с '..' (extension), либо оканчивается на .bsl/.os/.mdo/.xml; имя объекта 1С
@@ -1533,6 +1592,12 @@ def make_bsl_helpers(
         # поэтому полагаться на guard внутри grep_fn нельзя.
         if has_catastrophic_nesting(pattern):
             raise ValueError(NESTED_QUANTIFIER_ERROR)
+        # Гардим ТОЛЬКО max_files: срез `candidates[:max_files]` / `live_catalog[:max_files]`
+        # ниже при None означает «весь каталог», то есть тихий полный обход вместо
+        # заявленного среза. `_result_cap` НЕ трогаем — там None это намеренное
+        # «без cap» для внутренних исчерпывающих сканов.
+        max_files, _w = _coerce_bound(max_files, 20, "max_files", "safe_grep(pattern, name_hint='', max_files=20)")
+        _warn_bound(_w)
         # Validate the regex up-front too (#5): a syntactically broken pattern (e.g. "(")
         # used to raise a raw ``re.error`` traceback далеко ниже (после прогрева индекса и
         # выбора файлов). Compile ЗДЕСЬ — до _ensure_index/find_module — и переиспользуем
@@ -1715,6 +1780,10 @@ def make_bsl_helpers(
         компилируют аргумент как Python-regex — поэтому hint велит экранировать (``re.escape``) и
         предупреждает про расхождение диалектов POSIX ERE vs Python ``re``.
         """
+        # `max_results` уезжает в сравнение `len(results) > max_results` внутри
+        # ридера — None там даёт TypeError. Гардим на границе, ридер не трогаем.
+        max_results, _w = _coerce_bound(max_results, 200, "max_results", "git_search(pattern, ..., max_results=200)")
+        _warn_bound(_w)
         # v1.18.0 Фикс 4a: пустой/пробельный паттерн -> внятный [{error, hint}]
         # (list-форма, как и любой результат git_search), а не таймаут-заглушка.
         if not pattern or not pattern.strip():
@@ -2050,6 +2119,8 @@ def make_bsl_helpers(
         Delegates to find_callers_context for thorough cross-module search.
 
         Returns: list of dicts {file, line, text}."""
+        max_files, _w = _coerce_bound(max_files, 20, "max_files", "find_callers(proc, module_hint='', max_files=20)")
+        _warn_bound(_w)
         result = find_callers_context(proc_name, module_hint, 0, max_files)
         return [{"file": c["file"], "line": c["line"], "text": c.get("context", "")} for c in result["callers"]]
 
@@ -2116,12 +2187,25 @@ def make_bsl_helpers(
         # AttributeError внутри ридера (`if not hint` ловит лишь 0/пусто). Политика —
         # НЕ угадывать сдвиг аргументов, а не падать и явно назвать сигнатуру.
         arg_warning: str | None = None
+        # v1.30.0: та же политика для offset/limit — они уезжают в `LIMIT ? OFFSET ?`,
+        # где None даёт IntegrityError, а -1 означает «без ограничения» и на частом
+        # имени выдаёт десятки тысяч строк вплоть до таймаута и убийства воркера.
+        _sig = "find_callers_context(proc_name, module_hint, offset, limit)"
+        offset, _w_off = _coerce_bound(offset, 0, "offset", _sig)
+        limit, _w_lim = _coerce_bound(limit, 50, "limit", _sig)
+        # Именно склейка, а не `or`: при `offset=None, limit=None` нормализуются ОБА,
+        # и потребитель должен увидеть оба, а не только первый.
+        _bound_warning = " ".join(w for w in (_w_off, _w_lim) if w) or None
         if not isinstance(module_hint, str):
             arg_warning = (
                 f"module_hint ожидался строкой, получено {type(module_hint).__name__}={module_hint!r} "
                 "— проигнорирован. Сигнатура: find_callers_context(proc_name, module_hint, offset, limit)."
             )
             module_hint = ""
+        if _bound_warning:
+            # Оба гарда пишут в ОДИН ключ _meta.arg_warning: у потребителя не должно
+            # быть двух мест, куда смотреть.
+            arg_warning = f"{arg_warning} {_bound_warning}".strip() if arg_warning else _bound_warning
 
         def _tag(res: dict) -> dict:
             """Прокинуть arg_warning в _meta любого возвращаемого результата."""
@@ -2926,6 +3010,7 @@ def make_bsl_helpers(
             module/object is required (live via extract_procedures); no hint →
             ``{"error": "no index", ...}``.
         """
+        limit, _w = _coerce_bound(limit, 50, "limit", "find_definition(name, module_hint='', limit=50)")
         if not name or not name.strip():
             return {
                 "error": "empty name",
@@ -2988,6 +3073,7 @@ def make_bsl_helpers(
                         "unique": total == 1,
                         "hint_applied": hint_applied,
                         "slow_fallback": res["slow_fallback"],
+                        **({"arg_warning": _w} if _w else {}),
                     },
                 }
             # res is None → corrupt/missing core tables → fall through to live.
@@ -3028,6 +3114,7 @@ def make_bsl_helpers(
                 "unique": len(definitions) == 1,
                 "hint_applied": hint_applied,
                 "slow_fallback": False,
+                **({"arg_warning": _w} if _w else {}),
             },
         }
 
@@ -4540,6 +4627,12 @@ def make_bsl_helpers(
             (публичные get_object_*/find_* НЕ зовутся — никакого glob/live); тяжёлый live —
             только под ``include_flow``/``include_code_usages``.
         """
+        # Дефект здесь ТИХИЙ и оттого худший: `int(limit)` внутри каждой секции
+        # бросает TypeError, посекционный catch пишет status='error', и наружу
+        # уходит внешне валидный профиль, где ВСЕ секции пустые. Агент читает это
+        # как «у объекта нет данных». Гард обязан стоять до сборки секций.
+        limit, _w_limit = _coerce_bound(limit, 20, "limit", "get_object_profile(name, ..., limit=20)")
+
         import time as _time_prof
         from rlm_tools_bsl.bsl_index import (
             _CATEGORY_TO_TYPE_PREFIX as _cat2prefix,
@@ -4584,7 +4677,14 @@ def make_bsl_helpers(
             if not object_name:
                 return {
                     "error": f"Объект '{raw_name}' не найден",
-                    "_meta": {"identity_source": "unresolved", "total_elapsed_ms": _ms(prof_t0)},
+                    "_meta": {
+                        "identity_source": "unresolved",
+                        "total_elapsed_ms": _ms(prof_t0),
+                        # Ранний возврат тоже несёт _meta, поэтому обещание «предупреждение
+                        # там, где есть _meta» обязано выполняться и здесь: сценарий
+                        # «устаревшее имя объекта + limit=None» вполне достижим.
+                        **({"arg_warning": _w_limit} if _w_limit else {}),
+                    },
                 }
         else:
             # NO index → never glob. Identity strictly from the input type-prefix.
@@ -4595,7 +4695,11 @@ def make_bsl_helpers(
                     "error": "no_index_identity_unresolved",
                     "hint": "передай объект с префиксом типа (Документ.X / Справочник.X / Document.X) "
                     "или построй индекс — без индекса bare-имя не резолвится без glob",
-                    "_meta": {"identity_source": "none", "total_elapsed_ms": _ms(prof_t0)},
+                    "_meta": {
+                        "identity_source": "none",
+                        "total_elapsed_ms": _ms(prof_t0),
+                        **({"arg_warning": _w_limit} if _w_limit else {}),
+                    },
                 }
 
         ref = (
@@ -5123,6 +5227,7 @@ def make_bsl_helpers(
                 "extension_visibility": extension_visibility,
                 "total_elapsed_ms": _ms(prof_t0),
                 "sections": meta_sections,
+                **({"arg_warning": _w_limit} if _w_limit else {}),
             },
         }
 
@@ -5953,6 +6058,12 @@ def make_bsl_helpers(
         Returns: dict with document, code_registers, modules_scanned. При Posting=Deny
                  всегда добавляются is_postable=False + hint; найденные статические строки
                  сохраняются с явной пометкой, что при проведении они недостижимы."""
+        # `_meta` здесь условный (ставится setdefault и может отсутствовать), поэтому
+        # предупреждение уходит в лог, а не в ответ.
+        posting_calls_offset, _w = _coerce_bound(
+            posting_calls_offset, 0, "posting_calls_offset", "find_register_movements(doc_name, posting_calls_offset=0)"
+        )
+        _warn_bound(_w)
         document_name = _strip_meta_prefix(document_name)
 
         result: dict
@@ -8605,6 +8716,10 @@ def make_bsl_helpers(
         name: str = "", object_name: str = "", category: str = "", kind: str = "", limit: int = 500
     ) -> list[dict]:
         """Find object attributes/dimensions/resources by name, object, category, or kind."""
+        limit, _w = _coerce_bound(
+            limit, 500, "limit", "find_attributes(name='', object_name='', category='', kind='', limit=500)"
+        )
+        _warn_bound(_w)
         if kind:
             kind = kind.lower()
         if object_name:
@@ -8841,6 +8956,8 @@ def make_bsl_helpers(
 
     def find_predefined(name: str = "", object_name: str = "", limit: int = 500) -> list[dict]:
         """Find predefined items of ChartsOfCharacteristicTypes, Catalogs, ChartsOfAccounts."""
+        limit, _w = _coerce_bound(limit, 500, "limit", "find_predefined(name='', object_name='', limit=500)")
+        _warn_bound(_w)
         if object_name:
             object_name = _strip_meta_prefix(object_name)
         if _ext_roots_resolved:
@@ -8982,6 +9099,72 @@ def make_bsl_helpers(
     def _ensure_functional_options() -> list[dict]:
         return _fo_lazy.ensure(_build_functional_options)
 
+    def _canonical_fo_ref(raw: str) -> str:
+        """Canonical ``Category.Name`` для TYPED-ввода; ``""`` для bare/неизвестного.
+
+        Классификация обязана идти по СЫРОМУ вводу, ДО ``_strip_meta_prefix``: тот
+        режет префикс регистрозависимо, и после него ``Document.X`` уже неотличим от
+        bare ``X``, то есть category теряется и ``Document.X`` начинает матчиться с
+        ``Catalog.X``. Точка сама по себе typed-ом НЕ делает: неизвестная голова
+        (``Foo.Bar``) даёт ``""`` и обрабатывается как bare, а не получает случайную
+        категорию.
+        """
+        from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref as _ctr
+
+        text = (raw or "").strip()
+        if not text or "." not in text:
+            return ""
+        for ru, en in _RU_META_PREFIXES.items():
+            if text[: len(ru)].casefold() == ru.casefold():
+                text = en + text[len(ru) :]
+                break
+        return _ctr(text)
+
+    def _fo_content_matches(content_list, canonical_ref: str, bare_name: str) -> bool:
+        """Точное совпадение FO-``content`` с объектом — helper-side близнец
+        ``IndexReader.get_functional_options_exact``.
+
+        ``content`` хранит канонические английские refs (``Document.X`` и
+        member-scoped ``Document.X.TabularSection.Y.Attribute.Z``).
+
+        * typed (``canonical_ref``) — ref равен или начинается с ``<ref>.``: тот же
+          предикат, что у reader'а, поэтому index и live не расходятся;
+        * bare — точное совпадение ВТОРОГО сегмента (имя объекта) при любой категории:
+          union по омонимам. Именно это чинит подстрочный overcount — глубокий чужой
+          ``...Attribute.ЗаказПоставщику`` больше не выдаётся за документ
+          ``ЗаказПоставщику``, а ``XПрисоединенныеФайлы`` — за ``X``.
+
+        Нормализация через ``.lower()``, а НЕ ``.casefold()`` — буквально повторяем
+        семантику фильтров reader'а (см. ту же оговорку в ``_overrides_payload``).
+
+        Полностью defensive: не-строки, пустые и бесточечные refs пропускаются, а не
+        роняют хелпер и не переводят его в fallback.
+        """
+        if not isinstance(content_list, (list, tuple)):
+            return False
+        if canonical_ref:
+            ref_lower = canonical_ref.lower()
+            member_prefix = ref_lower + "."
+            for c in content_list:
+                if not isinstance(c, str) or not c:
+                    continue
+                c_lower = c.lower()
+                if c_lower == ref_lower or c_lower.startswith(member_prefix):
+                    return True
+            return False
+        bare_lower = (bare_name or "").lower()
+        if not bare_lower:
+            return False
+        for c in content_list:
+            if not isinstance(c, str) or not c:
+                continue
+            parts = c.split(".")
+            if len(parts) < 2:  # dotless/malformed ref — не индексируем [1] вслепую
+                continue
+            if parts[1].lower() == bare_lower:
+                return True
+        return False
+
     def find_functional_options(object_name: str, include_code: bool = True, limit: int | None = None) -> dict:
         """Find functional options that affect a given object.
         Also greps BSL modules for ПолучитьФункциональнуюОпцию("X") pattern.
@@ -9000,27 +9183,60 @@ def make_bsl_helpers(
                 суммарно) — зеркало ``find_event_subscriptions``. Защита от обрыва по
                 ``max_output_chars`` на объектах с сотнями опций.
 
+        **Матчинг ``xml_options`` — ТОЧНЫЙ (v1.30.0)**, а не подстрочный: typed-ввод
+        (``Документ.X``/``Document.X``) матчится по канонической категории и включает
+        member-ссылки (``Document.X.TabularSection.Y.Attribute.Z``), но не смешивается с
+        ``Catalog.X`` и не цепляет ``Document.XExtra``; bare-имя матчится по ТОЧНОМУ
+        имени объекта в любой категории (union омонимов) и больше не выдаёт ФО, где имя
+        встретилось лишь как чужой реквизит. Пустой ``object_name`` — прежний полный
+        обзор. ``code_options`` остаются подстрочными (``safe_grep(name_hint=...)``) —
+        точность двух корзин РАЗНАЯ, это осознанная граница релиза.
+
         Returns: dict with object, xml_options, code_options (empty when not
         include_code). При ``limit`` != None — плюс ``total`` (полный xt+ct для
         непустого object_name), ``returned`` (len(xp)+len(cp)), ``has_more``
         (per-bucket). Пустой code-обзор сохраняет бюджет 20 модулей; если каталог
         больше, пагинированный ответ помечен ``partial=True`` и ``total`` считается
         только по проверенному code-срезу."""
+        # Классификация typed/bare — по СЫРОМУ вводу, до strip (см. _canonical_fo_ref).
+        canonical_ref = _canonical_fo_ref(object_name)
+        # legacy-имя остаётся ЕДИНСТВЕННЫМ публичным/`name_hint` значением: strip
+        # регистрозависим ("Document.X"->"X", но "document.X"/"DOCUMENT.X" — как есть),
+        # и это уже часть контракта (result['object'] + область code-скана). Новая
+        # регистронезависимая классификация живёт ТОЛЬКО в canonical_ref.
         object_name = _strip_meta_prefix(object_name)
 
-        # --- Fast path for xml_options: SQLite index ---
+        # --- xml_options ---
+        # Tri-state reader'а обязателен: None = таблицы нет/пуста/временный сбой
+        # (@_transient_safe) → идём в live XML; [] = таблица есть, совпадений нет →
+        # это ОКОНЧАТЕЛЬНЫЙ ответ, live звать нельзя.
         xml_options: list[dict] | None = None
-        if idx_reader is not None:
-            xml_options = idx_reader.get_functional_options(object_name)
-
-        if xml_options is None:
-            all_fo = _ensure_functional_options()
-            name_lower = object_name.lower()
-            xml_options = []
-            for fo in all_fo:
-                matched = any(name_lower in c.lower() for c in fo.get("content", []))
-                if matched:
-                    xml_options.append(dict(fo))
+        if not object_name:
+            # Пустой ввод — обзор «все ФО». Exact-предикат на пустом имени не совпал бы
+            # ни с чем и молча обнулил бы обзорную ветку, поэтому выходим до фильтра.
+            if idx_reader is not None:
+                xml_options = idx_reader.get_functional_options("")
+            if xml_options is None:
+                xml_options = [dict(fo) for fo in _ensure_functional_options()]
+        else:
+            if idx_reader is not None:
+                if canonical_ref:
+                    # typed + index: тот же reader-метод, что у compact-профиля →
+                    # паритет direct/profile конструктивный, а не воспроизведённый.
+                    xml_options = idx_reader.get_functional_options_exact(canonical_ref)
+                else:
+                    rows = idx_reader.get_functional_options("")
+                    xml_options = (
+                        None
+                        if rows is None
+                        else [r for r in rows if _fo_content_matches(r.get("content"), "", object_name)]
+                    )
+            if xml_options is None:
+                xml_options = [
+                    dict(fo)
+                    for fo in _ensure_functional_options()
+                    if _fo_content_matches(fo.get("content"), canonical_ref, object_name)
+                ]
 
         # Grep for ПолучитьФункциональнуюОпцию in BSL code (skipped when XML-only).
         code_options: list[dict] = []
@@ -9402,6 +9618,8 @@ def make_bsl_helpers(
                  module_path, object_name, rank} ordered by relevance.
                  ``params`` — список имён параметров (list[str], v1.18.0).
                  Empty list if index/FTS not available."""
+        limit, _w = _coerce_bound(limit, 30, "limit", "search_methods(query, limit=30)")
+        _warn_bound(_w)
         result: list[dict] = []
         if idx_reader is not None and idx_reader.has_fts:
             # v1.18.0 Фикс 2: params строкой -> list на helper-границе.
@@ -9429,6 +9647,8 @@ def make_bsl_helpers(
 
         Returns: list of dicts {object_name, category, synonym, file}.
                  Empty list if index not available or no synonyms built."""
+        limit, _w = _coerce_bound(limit, 50, "limit", "search_objects(query, limit=50)")
+        _warn_bound(_w)
         result: list[dict] = []
         if idx_reader is not None:
             indexed = idx_reader.search_objects(query, limit)
@@ -9478,26 +9698,85 @@ def make_bsl_helpers(
                     result = [item[3] for item in ranked]
         return result[:limit]
 
+    def _is_empty_query(query: str) -> bool:
+        """Единый предикат «пустого» запроса для count- и list-ветки search_*.
+
+        Тот же, что у reader'а (``count_regions``/``search_regions`` ветвятся по
+        ``not query or not query.strip()`` и для пустого отдают ВСЕ строки). Сырой
+        truthiness тут не годится: ``"   "`` — truthy, и list-ветка уходила искать
+        литерал из трёх пробелов по всем CFE-модулям, пока main-сторона того же вызова
+        трактовала его как «отдай всё». Для module headers это давало реальный разъезд
+        list↔count (заголовок с тремя подряд пробелами), для regions — лишний полный
+        live-проход.
+        """
+        return not query or not query.strip()
+
+    def _count_only_payload(index_total: int | None, live_rows_fn, empty_query: bool) -> dict:
+        """Ответ ``count_only`` для search_regions/search_module_headers.
+
+        Без настроенных расширений и при пустом query — ПРЕЖНИЙ четырёхключевой dict
+        byte-for-byte. Иначе census идёт в том же scope, что и list-ветка: main index +
+        live-расширения (v1.30.0). Это намеренное изменение смысла ``total``/``source``/
+        ``scope`` в CFE-ветке — раньше count отвечал только индексом, и `список=2 при
+        count=1` был штатным поведением.
+
+        ``_ext_paths_raw`` (сырой аргумент ``extension_paths``), а НЕ
+        ``_extension_paths_set``: последний заполняется только внутри ``_ensure_index()``,
+        то есть на ПЕРВОМ вызове сессии был бы пуст, и count молча вернул бы main-only.
+
+        Дедуп ext↔ext не делается: две одноимённые области в одном CFE-модуле — два
+        физических occurrence, list возвращает оба (merge-хелперы снимают только
+        совпадение с main-строкой). Main и CFE пути лежат в разных namespace, поэтому
+        ext↔main collision не возникает и main-строки грузить не нужно.
+        """
+        if empty_query or not _ext_paths_raw:
+            if index_total is None:
+                return {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
+            return {"total": index_total, "source": "index", "truncated": False, "scope": "main_index"}
+        _ensure_index()  # заполняет _extension_paths_set, без него _live_search_* вернёт []
+        total_extensions = len(live_rows_fn())
+        total_main = index_total or 0
+        return {
+            "total": total_main + total_extensions,
+            "total_main": total_main,
+            "total_extensions": total_extensions,
+            # source перечисляет ПРОСМОТРЕННЫЕ источники, а не только давшие ненулевой вклад
+            "source": "index+live" if index_total is not None else "live",
+            "truncated": False,
+            "scope": "main_index+live_extensions",
+        }
+
     def search_regions(query: str = "", limit: int = 200, count_only: bool = False) -> list[dict] | dict:
         """Search code regions (#Область/#Region) by name substring.
 
         Args:
             query: Search string (e.g. 'Себестоимость', 'Инициализация').
             limit: Max results (default 200).
-            count_only: если True — вернуть само-описательный dict
-                {total, source, truncated, scope:"main_index"} вместо списка.
-                Это INDEX-side счёт по основной конфигурации (расширения НЕ
-                учитываются — для них census обычно не нужен). Для учёта
-                расширений считай по полной выдаче (count_only=False).
+            count_only: если True — вернуть само-описательный dict вместо списка.
+                Census идёт в ТОМ ЖЕ scope, что и обычная выдача (v1.30.0): при
+                настроенных расширениях и непустом query это
+                {total, total_main, total_extensions, source:"index+live"|"live",
+                truncated, scope:"main_index+live_extensions"}. Без расширений либо
+                при пустом query — прежний main-only
+                {total, source:"index"|"unavailable", truncated, scope:"main_index"}.
+                ``limit`` на count не влияет.
 
         Returns: list of dicts {name, line, end_line, module_path, object_name, category};
-                 либо dict {total, source, truncated, scope} при count_only=True.
+                 либо dict (см. count_only).
                  Empty list if index not available or no regions built."""
+        # Гард ДО count_only безопасен: `limit` на census не влияет (у
+        # `_live_search_regions` он лишь в сигнатуре, скан полный), поэтому
+        # четырёхключевой payload остаётся byte-for-byte, а предупреждение уходит
+        # только в лог — дописывать ключи в замороженный контракт нельзя.
+        limit, _w = _coerce_bound(limit, 200, "limit", "search_regions(query, limit=200, count_only=False)")
+        _warn_bound(_w)
+        empty_query = _is_empty_query(query)
         if count_only:
-            total = idx_reader.count_regions(query) if idx_reader is not None else None
-            if total is None:
-                return {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
-            return {"total": total, "source": "index", "truncated": False, "scope": "main_index"}
+            return _count_only_payload(
+                idx_reader.count_regions(query) if idx_reader is not None else None,
+                lambda: _live_search_regions(query, limit),
+                empty_query,
+            )
         result: list[dict] = []
         if idx_reader is not None:
             indexed = idx_reader.search_regions(query, limit)
@@ -9505,7 +9784,7 @@ def make_bsl_helpers(
                 result = list(indexed)
         _ensure_index()
         # Same rank-merge as search_methods — see _rank_merge_ext_into_main.
-        if _extension_paths_set and query:
+        if _extension_paths_set and not empty_query:
             ext_rows = _live_search_regions(query, limit)
             result = _rank_merge_ext_into_main(
                 result, ext_rows, query, name_keys=("name",), dedup_keys=("module_path", "name"), limit=limit
@@ -9518,19 +9797,28 @@ def make_bsl_helpers(
         Args:
             query: Search string (e.g. 'себестоимость', 'доработка').
             limit: Max results (default 200).
-            count_only: если True — вернуть само-описательный dict
-                {total, source, truncated, scope:"main_index"} вместо списка.
-                Это INDEX-side счёт по основной конфигурации (расширения НЕ
-                учитываются). Для учёта расширений считай по полной выдаче.
+            count_only: если True — вернуть само-описательный dict вместо списка.
+                Census идёт в ТОМ ЖЕ scope, что и обычная выдача (v1.30.0): при
+                настроенных расширениях и непустом query это
+                {total, total_main, total_extensions, source:"index+live"|"live",
+                truncated, scope:"main_index+live_extensions"}. Без расширений либо
+                при пустом query — прежний main-only
+                {total, source:"index"|"unavailable", truncated, scope:"main_index"}.
+                ``limit`` на count не влияет.
 
         Returns: list of dicts {module_path, object_name, category, header_comment};
-                 либо dict {total, source, truncated, scope} при count_only=True.
+                 либо dict (см. count_only).
                  Empty list if index not available or no headers built."""
+        # См. комментарий у search_regions: count_only-контракт не затрагивается.
+        limit, _w = _coerce_bound(limit, 200, "limit", "search_module_headers(query, limit=200, count_only=False)")
+        _warn_bound(_w)
+        empty_query = _is_empty_query(query)
         if count_only:
-            total = idx_reader.count_module_headers(query) if idx_reader is not None else None
-            if total is None:
-                return {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
-            return {"total": total, "source": "index", "truncated": False, "scope": "main_index"}
+            return _count_only_payload(
+                idx_reader.count_module_headers(query) if idx_reader is not None else None,
+                lambda: _live_search_module_headers(query, limit),
+                empty_query,
+            )
         result: list[dict] = []
         if idx_reader is not None:
             indexed = idx_reader.search_module_headers(query, limit)
@@ -9539,7 +9827,7 @@ def make_bsl_helpers(
         _ensure_index()
         # No clear name field for rank → reserve a quota for ext rows so a
         # saturated main index does not starve them (codex round 5).
-        if _extension_paths_set and query:
+        if _extension_paths_set and not empty_query:
             ext_rows = _live_search_module_headers(query, limit)
             result = _reserve_merge_ext_into_main(
                 result, ext_rows, dedup_keys=("module_path", "header_comment"), limit=limit
@@ -9561,6 +9849,12 @@ def make_bsl_helpers(
         if scope not in _VALID_SCOPES:
             msg = f"Unknown scope '{scope}'. Valid: {', '.join(sorted(_VALID_SCOPES))}"
             raise ValueError(msg)
+
+        # Гард ОБЯЗАН стоять до `limit // 6` ниже: при scope='all' битое значение
+        # роняет само деление, а при scope != 'all' нетронутым пролетает дальше в
+        # search_methods и падает уже внутри ридера. Оба режима — реальные.
+        limit, _w = _coerce_bound(limit, 30, "limit", "search(query, scope='all', limit=30)")
+        _warn_bound(_w)
 
         query = query.strip() if query else ""
         empty_query = not query
@@ -9796,6 +10090,23 @@ def make_bsl_helpers(
         r'(?:Запрос\.Текст|ТекстЗапроса)\s*=\s*["\']',
         re.IGNORECASE,
     )
+    # Присваивание, у которого литерал перенесён на СЛЕДУЮЩУЮ строку. Построчный скан
+    # `_QUERY_ASSIGN_RE` его не видит: `.search(line)` получает строку уже БЕЗ `\n`, поэтому
+    # `\s*` перенос съесть не может, а кавычки в строке присваивания нет.
+    # Предикат применяется к КОДУ, накопленному перед кавычкой, и разводится с одностроч­ной
+    # формой по `gap`: у неё в зазоре переноса нет, и её целиком обрабатывает legacy-ветка.
+    _QUERY_ASSIGN_NL_RE = re.compile(
+        r"(?:Запрос\.Текст|ТекстЗапроса)\s*=(?P<gap>\s*)$",
+        re.IGNORECASE,
+    )
+    # Конструктор запроса: literal — ПЕРВЫЙ аргумент `Новый Запрос(` / `New Query(`.
+    # Якорь `$` на конце: предикат применяется к КОДУ, накопленному непосредственно перед
+    # открывающей кавычкой, поэтому между `(` и литералом допустимы переносы и комментарии
+    # (в код они не попадают), но никакой посторонний токен — нет.
+    _QUERY_CTOR_RE = re.compile(
+        r"(?<!\w)(?:Новый|New)\s+(?:Запрос|Query)\s*\(\s*$",
+        re.IGNORECASE,
+    )
     _QUERY_TABLE_RE = re.compile(
         r"\b(?:ИЗ|FROM|СОЕДИНЕНИЕ|JOIN)\s+"
         r"((?:РегистрНакопления|РегистрСведений|РегистрБухгалтерии|"
@@ -9805,16 +10116,201 @@ def make_bsl_helpers(
         re.IGNORECASE,
     )
 
+    def _bsl_literal_tokens(text: str) -> tuple[list[tuple], list[tuple[int, int]]]:
+        """Лексический разбор модуля. Возвращает ``(tokens, comment_spans)``, где tokens —
+        чередующиеся куски кода и ЗАКРЫТЫЕ строковые литералы
+        ``[("code", txt), ("str", literal, start_line, start_off, end_off), ...]``, а
+        comment_spans — полуинтервалы ``[start, end)`` от ``//`` до конца строки.
+
+        ``start_off`` — индекс ОТКРЫВАЮЩЕЙ кавычки в исходном тексте, ``end_off`` — индекс
+        сразу ЗА закрывающей. По ним построчная ветка присваивания отличает совпадение в коде
+        от совпадения ВНУТРИ литерала (в тексте запроса запросто встречается собственное
+        `ТекстЗапроса = ""..."."`) и не выходит за конец своего же литерала; по comment_spans
+        она отбрасывает закомментированные присваивания — в модулях 1С регулярно лежат
+        временно отключённые старые запросы.
+
+        Комментарии НЕ попадают в поток токенов отдельными элементами намеренно: код по обе
+        стороны от комментария должен оставаться ОДНИМ куском, иначе предикаты, смотрящие на
+        код непосредственно перед литералом, потеряют привязку.
+
+        Та же лексика, что у ``bsl_index._scan_module`` (``""`` внутри строки — экранированная
+        кавычка, ``//`` вне строки начинает комментарий), но с ДВУМЯ отличиями, без которых
+        конструкторы не извлечь:
+
+        * сохраняется ПОРЯДОК — видно, какой код стоит непосредственно перед литералом и
+          сразу после него (``_scan_module`` отдаёт код с ВЫРЕЗАННЫМИ литералами и эту
+          привязку теряет, поэтому переиспользовать его тут нельзя);
+        * многострочный литерал собирается в ОДИН текст, причём служебный
+          continuation-маркер ``|`` снимается — ровно как это делает legacy-коллектор
+          (``stripped.lstrip("|")``). Иначе служебные символы съедали бы полезную длину
+          200-символьного ``text_preview``.
+
+        Незакрытый литерал НЕ выдаётся: частичной записи из него быть не должно.
+        """
+        tokens: list[tuple] = []
+        comment_spans: list[tuple[int, int]] = []
+        code_buf: list[str] = []
+        lit_buf: list[str] = []
+        in_string = False
+        line = 1
+        lit_line = 1
+        lit_start = 0
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if in_string:
+                if ch == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        lit_buf.append('"')  # экранированная кавычка — строка продолжается
+                        i += 2
+                        continue
+                    tokens.append(("str", "".join(lit_buf), lit_line, lit_start, i + 1))
+                    lit_buf = []
+                    in_string = False
+                    i += 1
+                    continue
+                if ch == "\n":
+                    line += 1
+                    lit_buf.append("\n")
+                    i += 1
+                    j = i
+                    while j < n and text[j] in " \t":
+                        j += 1
+                    if j < n and text[j] == "|":  # continuation-маркер — служебный, не текст
+                        i = j + 1
+                    continue
+                lit_buf.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                tokens.append(("code", "".join(code_buf)))
+                code_buf = []
+                in_string = True
+                lit_line = line
+                lit_start = i
+                i += 1
+                continue
+            if ch == "/" and i + 1 < n and text[i + 1] == "/":
+                c_start = i
+                while i < n and text[i] != "\n":  # комментарий — ни код, ни строка
+                    i += 1
+                comment_spans.append((c_start, i))
+                continue
+            if ch == "\n":
+                line += 1
+            code_buf.append(ch)
+            i += 1
+        tokens.append(("code", "".join(code_buf)))
+        return tokens, comment_spans
+
+    def _extract_lexed_queries(tokens: list[tuple]) -> list[tuple[int, str]]:
+        """``[(line, query_text)]`` для форм, невидимых построчному скану ветки присваивания:
+        конструктор ``Новый Запрос("...")`` / ``New Query("...")`` и присваивание
+        ``Запрос.Текст =`` с литералом на СЛЕДУЮЩЕЙ строке.
+
+        Возвращаются ВСЕ вхождения в порядке источника (две конструкции на одной физической
+        строке дают две записи), только со статически извлекаемым литералом:
+
+        * ``Новый Запрос(НСтр("ru=..."))`` — код перед литералом кончается на ``НСтр(``;
+        * ``Новый Запрос(Переменная)`` — литерала нет;
+        * ``Новый Запрос("A" + "B")`` — после литерала идёт ``+``, а не ``)``: частичный
+          запрос не выдаётся (это же условие разрешает trailing ``// комментарий``, потому
+          что комментарии в код не попадают);
+        * ``Запрос.Текст = Запрос.Текст + "..."`` — между ``=`` и литералом стоит код, а не
+          одни пробелы, поэтому накопительная дописка новым запросом не считается.
+
+        Одностроч­ное ``Запрос.Текст = "..."`` СЮДА НЕ ПОПАДАЕТ: у него в зазоре между ``=``
+        и кавычкой нет перевода строки — по этому признаку случаи и разведены, без него
+        одна и та же строка попала бы в выдачу дважды. Её целиком (вместе с историческим
+        ``text_preview``) обрабатывает legacy-ветка.
+        """
+        out: list[tuple[int, str]] = []
+        for idx, tok in enumerate(tokens):
+            if tok[0] != "str":
+                continue
+            code_before = tokens[idx - 1][1] if idx and tokens[idx - 1][0] == "code" else ""
+            code_after = tokens[idx + 1][1] if idx + 1 < len(tokens) and tokens[idx + 1][0] == "code" else ""
+            m = _QUERY_CTOR_RE.search(code_before)
+            if m is not None:
+                if not code_after.lstrip().startswith(")"):
+                    continue
+            else:
+                m = _QUERY_ASSIGN_NL_RE.search(code_before)
+                if m is None or "\n" not in m.group("gap"):
+                    continue
+                if code_after.lstrip().startswith("+"):
+                    continue
+            # line — строка НАЧАЛА выражения (`Новый` / `Запрос.Текст`), а не строки-литерала:
+            # они расходятся, когда литерал перенесён на следующую строку.
+            expr_line = tok[2] - code_before[m.start() :].count("\n")
+            out.append((expr_line, tok[1]))
+        return out
+
     def extract_queries(path: str) -> list[dict]:
         """Extract embedded 1C queries from a BSL module.
 
-        Finds Запрос.Текст = "..." and ТекстЗапроса = "..." patterns,
-        extracts table names from query text.
+        Находит присваивания ``Запрос.Текст = "..."`` / ``ТекстЗапроса = "..."`` (в том числе
+        с литералом на СЛЕДУЮЩЕЙ строке) И конструкторы ``Новый Запрос("...")`` /
+        ``New Query("...")`` (v1.30.0), извлекает имена таблиц из текста запроса.
+
+        Разбор source-aware: и обе новые формы, и построчная ветка присваивания сверяются со
+        смещениями литералов из лексера, поэтому вхождение внутри комментария или внутри
+        ТЕКСТА САМОГО ЗАПРОСА (``ГДЕ ТекстЗапроса = ""x""``) ложной записи не даёт, а сбор
+        продолжений не выходит за конец своего литерала и не утаскивает следующее
+        присваивание.
+
+        Требование СТАТИЧЕСКОГО литерала относится к КОНСТРУКТОРУ и ПЕРЕНЕСЁННОЙ форме: у них
+        ``Новый Запрос(Переменная)``, ``НСтр(...)``, конкатенация ``"A" + "B"``, накопительное
+        ``Запрос.Текст = Запрос.Текст + "..."`` и незакрытый литерал записи не дают —
+        частичного запроса не бывает.
+
+        Одностроч­ное ``Запрос = Новый Запрос; Запрос.Текст = "..."`` приходит из ветки
+        присваивания и намеренно МЯГЧЕ: оно извлекается и при конкатенации
+        (``Запрос.Текст = "ВЫБРАТЬ ..." + Хвост;``), а ``text_preview`` сохраняет исторический
+        хвост строки — закрывающую кавычку и ``;``. Исторический regex допускает там и
+        одинарную кавычку; лексер её литералом не считает, поэтому source-aware гарды на эту
+        форму не распространяются. Всё это — сохранённая обратная совместимость.
+
+        У перенесённой формы и у конструкторов ``text_preview`` чистый: лексер отдаёт сам
+        литерал, со снятыми continuation-``|``.
 
         Returns: list of dicts {procedure, line, tables: [str], text_preview}."""
         content = _ext_read_file(path)
         lines = content.splitlines()
         procs = extract_procedures(path)
+        tokens, comment_spans = _bsl_literal_tokens(content)
+
+        # Смещения литералов и комментариев делают построчный скан ниже source-aware. Без них
+        # он: (1) видит `ТекстЗапроса = "` В ТЕКСТЕ САМОГО ЗАПРОСА и плодит мусорную запись,
+        # (2) утаскивает коллектором продолжений литерал СЛЕДУЮЩЕГО присваивания,
+        # (3) извлекает ЗАКОММЕНТИРОВАННОЕ присваивание как живой запрос.
+        # Ридеры открывают файл в universal-newlines, поэтому разделитель ровно "\n"; если
+        # раскладка строк вдруг разойдётся (экзотические разделители у splitlines), гарды
+        # отключаются и поведение остаётся ровно прежним.
+        lit_spans = [(t[3], t[4]) for t in tokens if t[0] == "str"]
+        raw_lines = content.split("\n")
+        if raw_lines and raw_lines[-1] == "":
+            raw_lines.pop()  # хвостовой перевод строки: split даёт лишний пустой элемент
+        line_starts: list[int] = []
+        if len(raw_lines) == len(lines):
+            off = 0
+            for rl in raw_lines:
+                line_starts.append(off)
+                off += len(rl) + 1
+
+        def _inside_literal(abs_off: int) -> bool:
+            return any(s < abs_off < e for s, e in lit_spans)
+
+        def _inside_comment(abs_off: int) -> bool:
+            return any(s <= abs_off < e for s, e in comment_spans)
+
+        def _literal_end_line(abs_quote_off: int) -> int | None:
+            """Индекс (0-based) последней строки литерала, ОТКРЫТОГО этой кавычкой."""
+            for s, e in lit_spans:
+                if s == abs_quote_off:
+                    return bisect.bisect_right(line_starts, e - 1) - 1
+            return None
 
         queries: list[dict] = []
         i = 0
@@ -9825,11 +10321,22 @@ def make_bsl_helpers(
                 i += 1
                 continue
 
+            cap = None
+            if line_starts:
+                abs_start = line_starts[i] + m.start()
+                if _inside_literal(abs_start) or _inside_comment(abs_start):
+                    i += 1  # совпадение в тексте запроса или в комментарии, а не в коде
+                    continue
+                # `m.end()-1` — позиция открывающей кавычки: ею и ограничен сбор продолжений
+                cap = _literal_end_line(line_starts[i] + m.end() - 1)
+
             # Collect multiline query text (1C uses | prefix for continuation)
             query_start = i
             query_lines = [line[m.end() :]]
             j = i + 1
             while j < len(lines):
+                if cap is not None and j > cap:
+                    break
                 stripped = lines[j].strip()
                 if stripped.startswith("|") or stripped.startswith('"'):
                     query_lines.append(stripped.lstrip("|").lstrip('"'))
@@ -9864,6 +10371,36 @@ def make_bsl_helpers(
                 }
             )
             i = j
+
+        # Конструкторы и присваивания-с-переносом собираются ОТДЕЛЬНЫМ проходом. У ветки
+        # присваивания выше не изменилось ИЗВЛЕЧЕНИЕ настоящего однострочного присваивания
+        # (regex, склейка `|`-продолжений, `line`, `tables` и исторический `text_preview` с
+        # хвостом строки) — она получила только source-aware отбраковку: совпадения в
+        # комментариях и внутри литералов отбрасываются, а сбор продолжений не выходит за
+        # конец своего литерала. Для модуля без этих патологий результат прежний байт в байт.
+        for expr_line, query_text in _extract_lexed_queries(tokens):
+            tables = list(dict.fromkeys(m2.group(1) for m2 in _QUERY_TABLE_RE.finditer(query_text)))
+            proc_name = ""
+            for p in procs:
+                if p["line"] <= expr_line <= (p["end_line"] or len(lines)):
+                    proc_name = p["name"]
+                    break
+            preview = query_text[:200].strip()
+            if len(query_text) > 200:
+                preview += "..."
+            queries.append(
+                {
+                    "procedure": proc_name,
+                    "line": expr_line,
+                    "tables": tables,
+                    "text_preview": preview,
+                }
+            )
+
+        # Порядок — по источнику. Сортировка стабильная, поэтому при совпадении строк
+        # присваивания идут перед конструкторами, а внутри каждой группы порядок обхода
+        # сохраняется.
+        queries.sort(key=lambda q: q["line"])
         return queries
 
     # ── Code metrics ─────────────────────────────────────────
@@ -9988,10 +10525,32 @@ def make_bsl_helpers(
 
         diagnostics: dict = {}
         overrides = _feo(extension_path, object_name or None, diagnostics=diagnostics)
+        # Provenance: сырые live-строки не несут ни имени расширения, ни его корня, а
+        # ЗДЕСЬ они известны точно — это переданный root. Без явной подстановки единый
+        # shape соблюдался бы формально (ключ есть), но пустым: объединение выдачи по
+        # нескольким расширениям схлопнулось бы под одним пустым именем, чего у
+        # get_overrides не происходит. Имя берём из метаданных самого расширения, как и
+        # get_overrides; session-кэш/basename — best-effort fallback.
+        ext_name = ""
+        try:
+            from rlm_tools_bsl.extension_detector import detect_extension_context as _det
+
+            ext_name = (_det(extension_path).current.name or "").strip()
+        except Exception:
+            ext_name = ""
+        if not ext_name:
+            ext_name = _extension_name_for_root(extension_path) or ""
+        # Срез берётся ПЕРВЫМ, в прежнем порядке обхода (os.walk), и только потом строки
+        # нормализуются — на копиях. Ввести здесь свою сортировку означало бы поменять
+        # СОСТАВ первых 200 строк на конфигурациях с total>200; детерминизм этого среза
+        # относительно ОС/ФС — отдельная задача, не часть выравнивания shape.
         result = {
             "extension_path": extension_path,
             "object_filter": object_name or "(all)",
-            "overrides": overrides[:200],
+            "overrides": [
+                _normalize_override_row(r, extension_name=ext_name, extension_root=extension_path)
+                for r in overrides[:200]
+            ],
             "total": len(overrides),
             "truncated": len(overrides) > 200,
             "partial": not diagnostics.get("complete", True),
@@ -10002,6 +10561,68 @@ def make_bsl_helpers(
 
     _OVERRIDES_CAP = 200
     _OVERRIDES_TOP_N = 20
+
+    # Строковые и «может отсутствовать»-поля единого override-shape (v1.30.0).
+    _OVERRIDE_STR_KEYS = (
+        "object_name",
+        "target_method",
+        "annotation",
+        "extension_name",
+        "extension_method",
+        "extension_root",
+        "ext_module_path",
+        "module_path",
+        "module_type",
+        "source_path",
+    )
+    _OVERRIDE_OPT_KEYS = ("ext_line", "line", "target_method_line", "source_module_id")
+
+    def _normalize_override_row(row: dict, extension_name: str = "", extension_root: str = "") -> dict:
+        """Единый ADDITIVE shape строки перехвата для index / live / find_ext веток.
+
+        Индексная строка (таблица ``extension_overrides``) несёт ``ext_module_path``/
+        ``ext_line``/``source_path``/``source_module_id``, а live-строка
+        (``extension_detector.find_extension_overrides``) — ``module_path``/``line``/
+        ``module_type``. Разный набор ключей у двух публичных API ронял код агента,
+        который переиспользовал одну и ту же обработку.
+
+        Правки только аддитивные: недостающие алиасы достраиваются в ОБЕ стороны, все
+        исторические поля (включая ``id``/``extension_purpose``) сохраняются, значения
+        существующих полей не меняются. Отсутствующая привязка представлена ``""``/
+        ``None``, но КЛЮЧ присутствует всегда — потребителю не нужен ``.get`` с догадкой.
+
+        ``extension_method`` может остаться пустым: read-time self-heal пустых имён —
+        отдельная работа следующего релиза, здесь форма, а не содержимое.
+
+        ``extension_name``/``extension_root`` — provenance расширения, которого в сырой
+        live-строке нет вообще. Их обязан передать вызывающий (он один знает, ЧЕЙ это
+        корень): пустая строка вместо реального имени формально удовлетворяла бы единому
+        shape, но семантически ломала бы совместимость с ``get_overrides`` — объединение
+        выдачи по нескольким расширениям схлопнулось бы под одним пустым именем.
+        Непустое значение в самой строке приоритетнее и никогда не перезаписывается.
+        """
+        out = dict(row)
+        if extension_name and not out.get("extension_name"):
+            out["extension_name"] = extension_name
+        if extension_root and not out.get("extension_root"):
+            out["extension_root"] = extension_root
+        module_path = out.get("module_path") or out.get("ext_module_path") or ""
+        out["module_path"] = module_path
+        out["ext_module_path"] = out.get("ext_module_path") or module_path
+        line = out.get("line") if out.get("line") is not None else out.get("ext_line")
+        out["line"] = line
+        if out.get("ext_line") is None:
+            out["ext_line"] = line
+        if not out.get("module_type"):
+            # module_type у индексных строк не хранится — вычисляем helper-side по пути,
+            # тем же parse_bsl_path, что наполняет live-строки (один словарь имён файлов).
+            out["module_type"] = (parse_bsl_path(module_path, "").module_type or "") if module_path else ""
+        for key in _OVERRIDE_STR_KEYS:
+            if out.get(key) is None:
+                out[key] = ""
+        for key in _OVERRIDE_OPT_KEYS:
+            out.setdefault(key, None)
+        return out
 
     def _overrides_payload(
         rows: list[dict],
@@ -10080,7 +10701,13 @@ def make_bsl_helpers(
                 json.dumps(r, sort_keys=True, ensure_ascii=False, default=str),
             )
 
-        ordered = sorted(rows, key=_sort_key)
+        # Срез cap=200 обязан остаться ПРЕЖНИМ, несмотря на additive-нормализацию: у
+        # _sort_key последний элемент — json.dumps ВСЕЙ строки, поэтому любые новые ключи
+        # сдвинули бы tie-break и состав среза. Поэтому ключ считается по НЕТРОНУТОЙ
+        # строке (до нормализации), нормализация идёт на копии, а служебный токен наружу
+        # не попадает.
+        decorated = sorted(((_sort_key(r), i, r) for i, r in enumerate(rows)), key=lambda t: (t[0], t[1]))
+        ordered = [_normalize_override_row(r) for _key, _i, r in decorated]
         total = len(rows)
         payload = {
             "overrides": ordered[:_OVERRIDES_CAP],
@@ -10348,6 +10975,13 @@ def make_bsl_helpers(
             {object, references, total, truncated, partial, by_kind}
             (+ code_* keys when include_code=True).
         """
+        # Без гарда битый limit роняет индексный запрос, голый `except Exception`
+        # ниже его глушит, и управление уходит в live-скан ВСЕЙ конфигурации —
+        # 45 секунд и жёсткое убийство воркера вместо быстрой ошибки.
+        # `_meta` у этого хелпера нет (ключи: by_kind/object/partial/references/
+        # total/truncated), поэтому предупреждение — только в лог.
+        limit, _w = _coerce_bound(limit, 1000, "limit", "find_references_to_object(object_ref, kinds=None, limit=1000)")
+        _warn_bound(_w)
 
         def _finish(res: dict) -> dict:
             if include_code:
@@ -10645,6 +11279,11 @@ def make_bsl_helpers(
              by_kind, total, truncated, partial, _meta: {scope, extensions_included}}.
             partial=True only when the index lacks the table (rebuild required).
         """
+        # Тот же заглушающий `except Exception` ниже, что и у
+        # find_references_to_object: битый limit роняет индексный запрос, ошибка
+        # глушится, и управление уходит в live-скан. Здесь он ограничен
+        # max_files=40, поэтому не виснет, а падает позже на сравнении с None.
+        limit, _w = _coerce_bound(limit, 1000, "limit", "find_code_usages(object_ref, kind=None, limit=1000)")
         canonical, _ = _normalize_object_ref(object_ref)
         result: dict = {
             "object": canonical,
@@ -10653,7 +11292,11 @@ def make_bsl_helpers(
             "total": 0,
             "truncated": False,
             "partial": False,
-            "_meta": {"scope": "main_config", "extensions_included": False},
+            "_meta": {
+                "scope": "main_config",
+                "extensions_included": False,
+                **({"arg_warning": _w} if _w else {}),
+            },
         }
         if not canonical or "." not in canonical:
             return result
@@ -11390,20 +12033,29 @@ def make_bsl_helpers(
     _reg(
         "safe_grep",
         safe_grep,
-        "safe_grep(pattern, name_hint='', max_files=20) -> [{file, line, text}]",
+        "safe_grep(pattern, name_hint='', max_files=20) -> [{file, line, text}]"
+        "  # ВСЕГДА ≤max_files модулей (с hint — из совпавших) → [] не доказывает отсутствие",
         "code",
         ["search", "grep", "поиск", "искать", "найти", "pattern", "шаблон"],
         "SEARCH FOR CODE:\n"
         "  results = safe_grep('SearchPattern', 'ModuleHint', max_files=20)\n"
         "  for r in results:\n"
         "      print(r['file'], 'line:', r['line'], r['text'])\n"
-        "  # Or find modules by name:\n"
+        "  # ОБЛАСТЬ ПОИСКА: пустой результат НЕ доказывает отсутствие в конфигурации.\n"
+        "  # Срез max_files применяется ВСЕГДА: без name_hint берутся первые max_files\n"
+        "  # модулей КАТАЛОГА, с name_hint — первые max_files СОВПАВШИХ, поэтому широкий\n"
+        "  # hint (общий префикс на десятки модулей) точно так же даёт ложный [].\n"
+        "  # Исчерпывающий поиск по конфигурации — git_search (если исходники под git).\n"
+        "  # Без git: сузь область до конкретных модулей и зови safe_grep прицельно —\n"
         "  modules = find_module('PartOfName')\n"
         "  if not modules:\n"
         "      print('Не найдено')\n"
         "  else:\n"
         "      for m in modules:\n"
-        "          print(m['path'], m['category'], m['object_name'])",
+        "          print(m['path'], m['category'], m['object_name'])\n"
+        "      # кандидатов больше max_files → подними max_files или сузь имя,\n"
+        "      # иначе часть модулей останется непросмотренной\n"
+        "      res = safe_grep('SearchPattern', modules[0]['object_name'], max_files=len(modules))",
     )
 
     _reg(
@@ -11907,7 +12559,7 @@ def make_bsl_helpers(
     _reg(
         "search_objects",
         search_objects,
-        "search_objects(query) -> [{object_name, category, synonym, file}] — find by BUSINESS NAME",
+        "search_objects(query, limit=50) -> [{object_name, category, synonym, file}] — find by BUSINESS NAME",
         "discovery",
         ["synonym", "синоним", "бизнес", "search_objects", "объект", "business"],
         "SEARCH BY BUSINESS NAME (requires index v7+):\n"
@@ -11919,7 +12571,7 @@ def make_bsl_helpers(
         "search_regions",
         search_regions,
         "search_regions(query, limit=200, count_only=False) -> [{name, line, end_line, module_path, object_name, category}] "
-        "| {total, source, truncated, scope:'main_index'}",
+        "| {total, source, truncated, scope} + total_main/total_extensions при CFE",
         "discovery",
         ["область", "region", "search_regions", "#Область"],
         "FIND CODE REGIONS:\n"
@@ -11927,13 +12579,18 @@ def make_bsl_helpers(
         "  for r in regions:\n"
         "      print(r['category'], r['object_name'], r['name'], f'L{r[\"line\"]}-{r[\"end_line\"]}')\n"
         "  # CENSUS (молча усекается по limit без сигнала) — точное число без выдачи:\n"
-        "  n = search_regions('Себестоимость', count_only=True)['total']  # index-side, scope=main_index",
+        "  n = search_regions('Себестоимость', count_only=True)['total']\n"
+        "  # count считает в ТОМ ЖЕ scope, что и выдача (v1.30.0): при настроенных\n"
+        "  # расширениях и непустом query это main index + live-расширения, ответ несёт\n"
+        "  # total_main/total_extensions и scope='main_index+live_extensions'.\n"
+        "  # Без расширений либо при пустом/пробельном query — прежний main-only\n"
+        "  # {total, source, truncated, scope='main_index'}. limit на count не влияет.",
     )
     _reg(
         "search_module_headers",
         search_module_headers,
         "search_module_headers(query, limit=200, count_only=False) -> [{module_path, object_name, category, header_comment}] "
-        "| {total, source, truncated, scope:'main_index'}",
+        "| {total, source, truncated, scope} + total_main/total_extensions при CFE",
         "discovery",
         ["заголовок", "header", "комментарий", "search_module_headers"],
         "FIND MODULES BY HEADER COMMENT:\n"
@@ -11941,7 +12598,9 @@ def make_bsl_helpers(
         "  for h in headers:\n"
         "      print(h['category'], h['object_name'], h['header_comment'][:80])\n"
         "  # CENSUS (молча усекается по limit) — точное число без выдачи:\n"
-        "  n = search_module_headers('доработка', count_only=True)['total']  # index-side, scope=main_index",
+        "  n = search_module_headers('доработка', count_only=True)['total']\n"
+        "  # count = тот же scope, что и выдача (v1.30.0): с расширениями и непустым query\n"
+        "  # ответ несёт total_main/total_extensions и scope='main_index+live_extensions'.",
     )
     _reg(
         "search",
@@ -12172,13 +12831,19 @@ def make_bsl_helpers(
         "get_overrides",
         get_overrides,
         "get_overrides(object_name='', method_name='') -> {overrides[:200], total, truncated, partial, source,"
-        " by_annotation, by_object_top, by_extension_top, unique_*}  # stats full iff partial=False",
+        " by_annotation/by_object_top/by_extension_top=dict{имя:N}, unique_*}  # stats full iff partial=False",
         "extension",
         ["перехват", "override", "расширен", "extension", "вместо", "после", "перед"],
         "GET OVERRIDES:\n"
         "  result = get_overrides('Номенклатура')\n"
         "  for ov in result['overrides']:\n"
         "      print(f\"  {ov['target_method']} <- {ov['annotation']} {ov.get('extension_name', '')}\")\n"
+        "  # by_annotation / by_object_top / by_extension_top — это DICT {имя: количество},\n"
+        "  # НЕ список записей: итерируй .items(), а срезом бери list(d.items())[:5].\n"
+        "  # target_method_line=None — ВАЛИДНОЕ значение, не ошибка индекса: так выглядит\n"
+        "  # перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения\n"
+        "  # и т.п.), у которого в базовом модуле нет текстового объявления, а также\n"
+        "  # строка без source-привязки.\n"
         "  # To read extension method body:\n"
         "  body = read_procedure(path, 'MethodName', include_overrides=True)\n"
         "  # NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths\n"

@@ -8514,3 +8514,689 @@ def test_no_git_register_route_counts_post_index_live_catalog():
             assert any("СвежийПисатель" in row["file"] for row in hits), hits
         finally:
             reader.close()
+
+
+# ── v1.30.0 (пакет 2): exact functional options ───────────────
+
+_FO_CF_XML_TMPL = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable">
+  <FunctionalOption><Properties><Name>{name}</Name>
+    <Location>Constant.{name}</Location>
+    <Content>{content}</Content>
+  </Properties></FunctionalOption>
+</MetaDataObject>
+"""
+
+_FO_MDO_XML_TMPL = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:FunctionalOption xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass">
+  <name>{name}</name>
+  <location>Constant.{name}</location>
+{content}
+</mdclass:FunctionalOption>
+"""
+
+
+def _write_fo(tmpdir, name, refs, edt=False):
+    fo_dir = os.path.join(tmpdir, "FunctionalOptions")
+    os.makedirs(fo_dir, exist_ok=True)
+    if edt:
+        body = "\n".join("  <content>{}</content>".format(r) for r in refs)
+        text = _FO_MDO_XML_TMPL.format(name=name, content=body)
+        path = os.path.join(fo_dir, name + ".mdo")
+    else:
+        body = "".join("<xr:Object>{}</xr:Object>".format(r) for r in refs)
+        text = _FO_CF_XML_TMPL.format(name=name, content=body)
+        path = os.path.join(fo_dir, name + ".xml")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _fo_bsl(tmpdir, idx_reader=None):
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+    helpers, resolve_safe = make_helpers(tmpdir)
+    return make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=detect_format(tmpdir),
+        idx_reader=idx_reader,
+    )
+
+
+def _fo_names(res):
+    return sorted(o["name"] for o in res["xml_options"])
+
+
+def test_fo_exact_typed_matches_object_and_members_not_homonyms(tmp_path):
+    """B9: подстрочный матч давал overcount — имя объекта ловилось внутри ЧУЖОГО
+    глубокого ref'а (`...Attribute.ЗаказПоставщику`) и внутри более длинного имени."""
+    tmpdir = str(tmp_path)
+    _write_fo(tmpdir, "ФО_Объект", ["Document.ЗаказПоставщику"])
+    _write_fo(tmpdir, "ФО_Член", ["Document.ЗаказПоставщику.TabularSection.Товары"])
+    _write_fo(tmpdir, "ФО_Длиннее", ["Document.ЗаказПоставщикуДопы"])
+    _write_fo(tmpdir, "ФО_Чужой", ["Document.ПриобретениеТоваров.TabularSection.Товары.Attribute.ЗаказПоставщику"])
+    _write_fo(tmpdir, "ФО_Справочник", ["Catalog.ЗаказПоставщику"])
+    bsl = _fo_bsl(tmpdir)
+
+    typed = bsl["find_functional_options"]("Документ.ЗаказПоставщику", include_code=False)
+    assert _fo_names(typed) == ["ФО_Объект", "ФО_Член"]
+
+    # bare — union точных омонимов ЛЮБОЙ категории, но по-прежнему без чужого реквизита
+    bare = bsl["find_functional_options"]("ЗаказПоставщику", include_code=False)
+    assert _fo_names(bare) == ["ФО_Объект", "ФО_Справочник", "ФО_Член"]
+
+
+def test_fo_typed_keeps_category_without_index(tmp_path):
+    """typed + live: без индекса маршрут не имеет права схлопнуться в category-blind —
+    иначе typed-семантика держалась бы только при наличии индекса."""
+    tmpdir = str(tmp_path)
+    _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
+    _write_fo(tmpdir, "ФО_Спр", ["Catalog.Заказ"])
+    bsl = _fo_bsl(tmpdir)  # idx_reader=None → live-ветка
+
+    assert _fo_names(bsl["find_functional_options"]("Document.Заказ", include_code=False)) == ["ФО_Док"]
+    assert _fo_names(bsl["find_functional_options"]("Справочник.Заказ", include_code=False)) == ["ФО_Спр"]
+    assert _fo_names(bsl["find_functional_options"]("Заказ", include_code=False)) == ["ФО_Док", "ФО_Спр"]
+
+
+def test_fo_legacy_display_name_is_case_sensitive_as_before(tmp_path):
+    """`_strip_meta_prefix` регистрозависим, и его результат — публичный `object` И
+    `name_hint` code-скана. Новая регистронезависимая классификация не имеет права
+    протечь в это значение."""
+    tmpdir = str(tmp_path)
+    _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
+    bsl = _fo_bsl(tmpdir)
+    assert bsl["find_functional_options"]("Document.Заказ", include_code=False)["object"] == "Заказ"
+    assert bsl["find_functional_options"]("document.Заказ", include_code=False)["object"] == "document.Заказ"
+    assert bsl["find_functional_options"]("DOCUMENT.Заказ", include_code=False)["object"] == "DOCUMENT.Заказ"
+    # ...но xml_options у всех трёх одинаковы — category распознана регистронезависимо
+    for raw in ("Document.Заказ", "document.Заказ", "DOCUMENT.Заказ"):
+        assert _fo_names(bsl["find_functional_options"](raw, include_code=False)) == ["ФО_Док"]
+
+
+def test_fo_empty_object_name_keeps_full_overview(tmp_path):
+    """Пустой ввод = обзор всех ФО. Exact-предикат на пустом имени не совпал бы ни с
+    чем и молча обнулил бы обзорную ветку."""
+    tmpdir = str(tmp_path)
+    _write_fo(tmpdir, "ФО_А", ["Document.А"])
+    _write_fo(tmpdir, "ФО_Б", ["Catalog.Б"])
+    bsl = _fo_bsl(tmpdir)
+    assert _fo_names(bsl["find_functional_options"]("", include_code=False)) == ["ФО_А", "ФО_Б"]
+
+
+class _FakeFoReader:
+    """Reader-заглушка для проверки tri-state (None vs [])."""
+
+    def __init__(self, exact_result, all_result=None):
+        self._exact = exact_result
+        self._all = all_result
+        self.exact_calls = 0
+        self.all_calls = 0
+
+    def get_functional_options_exact(self, ref, include_members=True):
+        self.exact_calls += 1
+        return self._exact
+
+    def get_functional_options(self, object_name=""):
+        self.all_calls += 1
+        return self._all
+
+
+def test_fo_reader_none_falls_back_to_live(tmp_path):
+    """None = таблицы нет/пуста/временный сбой (@_transient_safe) → live XML обязан
+    отработать, иначе живая конфигурация молча отвечает пустотой."""
+    tmpdir = str(tmp_path)
+    _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
+    reader = _FakeFoReader(exact_result=None, all_result=None)
+    bsl = _fo_bsl(tmpdir, idx_reader=reader)
+
+    assert _fo_names(bsl["find_functional_options"]("Документ.Заказ", include_code=False)) == ["ФО_Док"]
+    assert reader.exact_calls == 1
+    assert _fo_names(bsl["find_functional_options"]("Заказ", include_code=False)) == ["ФО_Док"]
+
+
+def test_fo_reader_empty_list_is_final_answer(tmp_path):
+    """[] = таблица есть, совпадений нет → ОКОНЧАТЕЛЬНЫЙ ответ, live звать нельзя."""
+    tmpdir = str(tmp_path)
+    _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
+    reader = _FakeFoReader(exact_result=[], all_result=[])
+    bsl = _fo_bsl(tmpdir, idx_reader=reader)
+
+    assert bsl["find_functional_options"]("Документ.Заказ", include_code=False)["xml_options"] == []
+    assert bsl["find_functional_options"]("Заказ", include_code=False)["xml_options"] == []
+    assert reader.exact_calls == 1 and reader.all_calls == 1
+
+
+def test_fo_malformed_content_is_ignored_safely(tmp_path):
+    """dotless / пустой content не роняет хелпер и не уводит в fallback."""
+    tmpdir = str(tmp_path)
+    _write_fo(tmpdir, "ФО_Битый", ["БезТочки", "Document.Заказ"])
+    bsl = _fo_bsl(tmpdir)
+    assert _fo_names(bsl["find_functional_options"]("Заказ", include_code=False)) == ["ФО_Битый"]
+    assert bsl["find_functional_options"]("БезТочки", include_code=False)["xml_options"] == []
+
+
+def test_fo_cf_and_edt_deep_member_ref_are_equivalent(tmp_path):
+    """CF .xml и EDT .mdo обязаны дать один и тот же канонический глубокий ref и
+    одинаковый exact/bare результат."""
+    cf_dir = tmp_path / "cf"
+    edt_dir = tmp_path / "edt"
+    cf_dir.mkdir()
+    edt_dir.mkdir()
+    deep = "Document.ПриобретениеТоваровУслуг.TabularSection.Товары.Attribute.ЗаказПоставщику"
+    _write_fo(str(cf_dir), "ФО_Глубокий", [deep], edt=False)
+    _write_fo(str(edt_dir), "ФО_Глубокий", [deep], edt=True)
+
+    results = []
+    for d in (cf_dir, edt_dir):
+        bsl = _fo_bsl(str(d))
+        owner = bsl["find_functional_options"]("Документ.ПриобретениеТоваровУслуг", include_code=False)
+        foreign_bare = bsl["find_functional_options"]("ЗаказПоставщику", include_code=False)
+        foreign_typed = bsl["find_functional_options"]("Документ.ЗаказПоставщику", include_code=False)
+        results.append((_fo_names(owner), _fo_names(foreign_bare), _fo_names(foreign_typed)))
+
+    assert results[0] == (["ФО_Глубокий"], [], [])
+    assert results[0] == results[1]
+
+
+# ── v1.30.0 (пакет 3): конструкторы Новый Запрос("...") ───────
+
+
+def _queries_of(tmpdir, body, name="ТестКонструктор"):
+    mod_dir = os.path.join(tmpdir, "Documents", name, "Ext")
+    os.makedirs(mod_dir, exist_ok=True)
+    bsl_path = os.path.join(mod_dir, "ObjectModule.bsl")
+    with open(bsl_path, "w", encoding="utf-8") as f:
+        f.write(body)
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+    helpers, resolve_safe = make_helpers(tmpdir)
+    bsl = make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=detect_format(tmpdir),
+    )
+    rel = os.path.relpath(bsl_path, tmpdir).replace("\\", "/")
+    return bsl["extract_queries"](rel)
+
+
+def test_ctor_query_ru_inline(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    Рез = Новый Запрос("ВЫБРАТЬ * ИЗ Справочник.Номенклатура КАК Н").Выполнить();\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert q[0]["line"] == 2
+    assert q[0]["procedure"] == "Тест"
+    assert q[0]["tables"] == ["Справочник.Номенклатура"]
+    assert q[0]["text_preview"] == "ВЫБРАТЬ * ИЗ Справочник.Номенклатура КАК Н"
+
+
+def test_ctor_query_en_inline(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        'Процедура Тест()\n    Рез = New Query("SELECT * FROM Catalog.Номенклатура AS Н");\nКонецПроцедуры\n',
+    )
+    assert len(q) == 1
+    assert q[0]["tables"] == ["Catalog.Номенклатура"]
+
+
+def test_ctor_query_multiline_strips_continuation_markers(tmp_path):
+    """Служебный `|` физически внутри литерала. Legacy-коллектор его снимает
+    (lstrip('|')), и конструкторная ветка обязана делать то же — иначе служебные
+    символы съедают полезную длину 200-символьного preview."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    Запрос = Новый Запрос("ВЫБРАТЬ\n'
+        "    |    Т.Ссылка\n"
+        "    |ИЗ\n"
+        '    |    РегистрНакопления.ТоварыНаСкладах КАК Т");\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert "|" not in q[0]["text_preview"]
+    assert q[0]["text_preview"] == "ВЫБРАТЬ\n    Т.Ссылка\nИЗ\n    РегистрНакопления.ТоварыНаСкладах КАК Т"
+    assert q[0]["tables"] == ["РегистрНакопления.ТоварыНаСкладах"]
+    # line — строка НАЧАЛА выражения, а не последней строки литерала
+    assert q[0]["line"] == 2
+
+
+def test_ctor_query_argument_on_next_line_keeps_expression_line(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        "    Запрос = Новый Запрос(\n"
+        "        // выбираем всё\n"
+        '        "ВЫБРАТЬ * ИЗ Документ.Заказ КАК З");\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert q[0]["line"] == 2
+    assert q[0]["tables"] == ["Документ.Заказ"]
+
+
+def test_ctor_query_escaped_quotes_decoded(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        'Процедура Тест()\n    Запрос = Новый Запрос("ВЫБРАТЬ ""А"" КАК Поле ИЗ Документ.Заказ");\nКонецПроцедуры\n',
+    )
+    assert len(q) == 1
+    assert '"А"' in q[0]["text_preview"]
+    assert q[0]["tables"] == ["Документ.Заказ"]
+
+
+def test_ctor_query_in_comment_is_ignored(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    // Пример: Новый Запрос("ВЫБРАТЬ * ИЗ Документ.Заказ")\n'
+        '    Текст = "Новый Запрос(""ВЫБРАТЬ * ИЗ Документ.Заказ"")";\n'
+        "КонецПроцедуры\n",
+    )
+    assert q == []
+
+
+def test_ctor_query_two_on_one_line_both_found_in_source_order(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    А = Новый Запрос("ВЫБРАТЬ 1 ИЗ Документ.Первый"); Б = Новый Запрос("ВЫБРАТЬ 2 ИЗ Документ.Второй");\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 2
+    assert q[0]["tables"] == ["Документ.Первый"]
+    assert q[1]["tables"] == ["Документ.Второй"]
+
+
+def test_ctor_query_trailing_comment_does_not_break_extraction(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    Запрос = Новый Запрос("ВЫБРАТЬ * ИЗ Документ.Заказ"); // основной запрос\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert "основной запрос" not in q[0]["text_preview"]
+
+
+def test_ctor_query_non_static_first_argument_is_skipped(tmp_path):
+    """НСтр / переменная / конкатенация / незакрытый литерал — частичного запроса быть
+    не должно."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        "    А = Новый Запрос(НСтр(\"ru='ВЫБРАТЬ * ИЗ Документ.Заказ'\"));\n"
+        "    Б = Новый Запрос(ТекстЗапросаПеременная);\n"
+        '    В = Новый Запрос("ВЫБРАТЬ * ИЗ Документ.Заказ" + Хвост);\n'
+        "КонецПроцедуры\n",
+    )
+    assert q == []
+
+
+def test_assignment_branch_is_byte_for_byte_unchanged(tmp_path):
+    """Регресс на легаси-ветку: `Запрос = Новый Запрос;` + отдельный `.Текст =` даёт
+    РОВНО ОДНУ запись, а её `text_preview` сохраняет исторический хвост строки
+    (закрывающая кавычка и `;`), который старый экстрактор никогда не срезал."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        "    Запрос = Новый Запрос;\n"
+        '    Запрос.Текст = "ВЫБРАТЬ * ИЗ Документ.Заказ КАК З";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert q[0] == {
+        "procedure": "Тест",
+        "line": 3,
+        "tables": ["Документ.Заказ"],
+        "text_preview": 'ВЫБРАТЬ * ИЗ Документ.Заказ КАК З";',
+    }
+
+
+def test_assignment_and_ctor_are_both_returned_in_source_order(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Первая()\n"
+        '    Запрос = Новый Запрос("ВЫБРАТЬ * ИЗ Документ.Первый");\n'
+        "КонецПроцедуры\n"
+        "\n"
+        "Процедура Вторая()\n"
+        "    Запрос = Новый Запрос;\n"
+        '    Запрос.Текст = "ВЫБРАТЬ * ИЗ Документ.Второй";\n'
+        "КонецПроцедуры\n",
+    )
+    assert [x["line"] for x in q] == [2, 7]
+    assert [x["procedure"] for x in q] == ["Первая", "Вторая"]
+
+
+# ── v1.30.0: присваивание с литералом на СЛЕДУЮЩЕЙ строке ─────
+
+
+def test_assignment_literal_on_next_line_is_extracted(tmp_path):
+    """Ядро фикса. Ветка присваивания сканирует ПОСТРОЧНО и требует кавычку в той же
+    строке, поэтому очень частая в 1С форма с перенесённым литералом давала 0 записей."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        "    Запрос = Новый Запрос;\n"
+        "    Запрос.Текст = \n"
+        '        "ВЫБРАТЬ * ИЗ Документ.Заказ КАК З";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    # line — строка ПРИСВАИВАНИЯ, а не строки-литерала
+    assert q[0]["line"] == 3
+    assert q[0]["procedure"] == "Тест"
+    assert q[0]["tables"] == ["Документ.Заказ"]
+    # preview чистый (как у конструкторов): без закрывающей кавычки и `;`
+    assert q[0]["text_preview"] == "ВЫБРАТЬ * ИЗ Документ.Заказ КАК З"
+
+
+def test_assignment_next_line_variable_form_is_extracted(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        'Процедура Тест()\n    ТекстЗапроса =\n        "ВЫБРАТЬ * ИЗ Справочник.Номенклатура КАК Н";\nКонецПроцедуры\n',
+    )
+    assert len(q) == 1
+    assert q[0]["line"] == 2
+    assert q[0]["tables"] == ["Справочник.Номенклатура"]
+
+
+def test_assignment_next_line_strips_continuation_markers(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        "    Запрос.Текст =\n"
+        '        "ВЫБРАТЬ\n'
+        "        |    Т.Ссылка\n"
+        "        |ИЗ\n"
+        '        |    РегистрНакопления.ТоварыНаСкладах КАК Т";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert "|" not in q[0]["text_preview"]
+    assert q[0]["text_preview"] == "ВЫБРАТЬ\n    Т.Ссылка\nИЗ\n    РегистрНакопления.ТоварыНаСкладах КАК Т"
+    assert q[0]["tables"] == ["РегистрНакопления.ТоварыНаСкладах"]
+    assert q[0]["line"] == 2
+
+
+def test_assignment_inline_and_next_line_forms_not_double_counted(tmp_path):
+    """Гейт на разведение случаев. Лексер режет модуль по кавычке, поэтому у ОБЕИХ форм
+    код перед литералом кончается на `Текст = `. Различие — перевод строки в зазоре;
+    без него одностроч­ная форма попала бы и в legacy-ветку, и в лексерный проход."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    Запрос.Текст = "ВЫБРАТЬ * ИЗ Документ.Первый КАК П";\n'
+        "    ТекстЗапроса =\n"
+        '        "ВЫБРАТЬ * ИЗ Документ.Второй КАК В";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 2
+    assert [x["line"] for x in q] == [2, 3]
+    assert [x["tables"] for x in q] == [["Документ.Первый"], ["Документ.Второй"]]
+    # одностроч­ная сохраняет исторический хвост, перенесённая — чистая
+    assert q[0]["text_preview"] == 'ВЫБРАТЬ * ИЗ Документ.Первый КАК П";'
+    assert q[1]["text_preview"] == "ВЫБРАТЬ * ИЗ Документ.Второй КАК В"
+
+
+def test_assignment_next_line_accumulating_concat_is_skipped(tmp_path):
+    """`Запрос.Текст = Запрос.Текст + "..."` — накопительная дописка условия, а не новый
+    запрос: между `=` и литералом стоит код, а не одни пробелы."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    Запрос.Текст = Запрос.Текст + " И Т.Уровень = &Уровень";\n'
+        "    Запрос.Текст = Запрос.Текст +\n"
+        '        " И Т.Дата > &Дата";\n'
+        "    Запрос.Текст =\n"
+        '        Запрос.Текст + " И Т.Код = &Код";\n'
+        "КонецПроцедуры\n",
+    )
+    assert q == []
+
+
+def test_assignment_next_line_concatenation_tail_is_skipped(tmp_path):
+    """После литерала идёт `+` — частичного запроса не выдаём (симметрично конструкторам)."""
+    q = _queries_of(
+        str(tmp_path),
+        'Процедура Тест()\n    Запрос.Текст =\n        "ВЫБРАТЬ * ИЗ Документ.Заказ" + Хвост;\nКонецПроцедуры\n',
+    )
+    assert q == []
+
+
+def test_assignment_next_line_comment_between_equals_and_literal(tmp_path):
+    """Комментарий в код не попадает, поэтому зазор остаётся «пробельным»."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        "    Запрос.Текст = // основной отбор\n"
+        '        "ВЫБРАТЬ * ИЗ Документ.Заказ КАК З";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert q[0]["line"] == 2
+    assert "основной отбор" not in q[0]["text_preview"]
+
+
+def test_assignment_next_line_in_comment_or_string_is_ignored(tmp_path):
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        "    // Запрос.Текст =\n"
+        '    //     "ВЫБРАТЬ * ИЗ Документ.Заказ"\n'
+        '    Шаблон = "Запрос.Текст =\n'
+        '    |    ""ВЫБРАТЬ * ИЗ Документ.Заказ""";\n'
+        "КонецПроцедуры\n",
+    )
+    assert q == []
+
+
+def test_query_text_inside_literal_does_not_produce_second_record(tmp_path):
+    """Построчная ветка присваивания видела `ТекстЗапроса = "` В ТЕКСТЕ САМОГО ЗАПРОСА и
+    делала мусорную запись. Пока перенесённая форма не извлекалась, это была одна неверная
+    запись; после пакета 3b рядом появилась верная — то есть дубль."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        "    Запрос.Текст =\n"
+        '        "ВЫБРАТЬ * ИЗ Документ.Заказ\n'
+        '        |ГДЕ ТекстЗапроса = ""foo""";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert q[0]["line"] == 2
+    assert q[0]["tables"] == ["Документ.Заказ"]
+
+
+def test_same_line_literal_containing_assignment_is_not_extracted(tmp_path):
+    """Тот же класс: совпадение внутри ОДНОСТРОЧНОГО литерала — не код."""
+    q = _queries_of(
+        str(tmp_path),
+        'Процедура Тест()\n    Шаблон = "ТекстЗапроса = ""ВЫБРАТЬ * ИЗ Документ.Заказ""";\nКонецПроцедуры\n',
+    )
+    assert q == []
+
+
+def test_collector_does_not_swallow_next_assignment_literal(tmp_path):
+    """Сбор продолжений ограничен концом СВОЕГО литерала: иначе строка следующего
+    присваивания (она начинается с кавычки) утаскивалась в предыдущий запрос, и его
+    таблицы смешивались с чужими."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    Запрос.Текст = "ВЫБРАТЬ * ИЗ Документ.Первый"; ТекстЗапроса =\n'
+        '        "ВЫБРАТЬ * ИЗ Документ.Второй";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 2
+    assert q[0]["tables"] == ["Документ.Первый"]
+    assert q[1]["tables"] == ["Документ.Второй"]
+
+
+def test_legacy_multiline_query_still_collects_full_continuation(tmp_path):
+    """Гард на сбор продолжений не должен обрезать НОРМАЛЬНЫЙ многострочный legacy-запрос:
+    он весь лежит внутри одного литерала."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    Запрос.Текст = "ВЫБРАТЬ\n'
+        "    |    Т.Ссылка\n"
+        "    |ИЗ\n"
+        "    |    РегистрНакопления.ТоварыНаСкладах КАК Т\n"
+        "    |СОЕДИНЕНИЕ\n"
+        '    |    Справочник.Номенклатура КАК Н";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert q[0]["line"] == 2
+    assert q[0]["tables"] == ["РегистрНакопления.ТоварыНаСкладах", "Справочник.Номенклатура"]
+
+
+def test_commented_out_one_line_assignment_is_not_extracted(tmp_path):
+    """НЕВАКУУМНЫЙ негатив: `//` и присваивание с кавычкой на ОДНОЙ строке — построчный
+    regex тут матчится, и без учёта спанов комментариев запись создавалась."""
+    q = _queries_of(
+        str(tmp_path),
+        'Процедура Тест()\n    // Запрос.Текст = "ВЫБРАТЬ * ИЗ Документ.Заказ";\nКонецПроцедуры\n',
+    )
+    assert q == []
+
+
+def test_commented_out_assignment_next_to_live_one(tmp_path):
+    """Практический кейс: старый запрос временно закомментирован, рядом лежит живой.
+    Извлечься должен ТОЛЬКО живой."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n"
+        '    // ТекстЗапроса = "ВЫБРАТЬ * ИЗ Документ.Старый";\n'
+        '    Запрос.Текст = "ВЫБРАТЬ * ИЗ Документ.Новый";\n'
+        "КонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert q[0]["line"] == 3
+    assert q[0]["tables"] == ["Документ.Новый"]
+
+
+def test_legacy_one_line_concatenation_keeps_tail_by_design(tmp_path):
+    """Запрет конкатенации относится к КОНСТРУКТОРУ и перенесённой форме. Однострочное
+    присваивание с конкатенацией исторически извлекается вместе с хвостом — это
+    сохранённая обратная совместимость, а не недосмотр."""
+    q = _queries_of(
+        str(tmp_path),
+        'Процедура Тест()\n    Запрос.Текст = "ВЫБРАТЬ * ИЗ Документ.Заказ" + ДополнительныйТекст;\nКонецПроцедуры\n',
+    )
+    assert len(q) == 1
+    assert q[0]["tables"] == ["Документ.Заказ"]
+    assert q[0]["text_preview"].endswith('" + ДополнительныйТекст;')
+
+
+def test_legacy_single_quote_form_still_extracted(tmp_path):
+    """Исторический regex допускает и одинарную кавычку. Лексер её литералом не считает,
+    поэтому source-aware гарды на неё не распространяются — фиксируем, чтобы поведение
+    не уехало молча."""
+    q = _queries_of(
+        str(tmp_path),
+        "Процедура Тест()\n    Запрос.Текст = 'ВЫБРАТЬ * ИЗ Документ.Заказ';\nКонецПроцедуры\n",
+    )
+    assert len(q) == 1
+    assert q[0]["tables"] == ["Документ.Заказ"]
+
+
+def test_fo_direct_and_profile_agree_on_indexed_object(tmp_path, monkeypatch):
+    """Гейт исходного расхождения 36 vs 35: прямой хелпер и compact-профиль обязаны дать
+    ОДИН total на однозначном объекте. Профиль всегда сверял точную ссылку, прямой
+    хелпер — подстроку, поэтому лишняя ФО с чужим глубоким реквизитом попадала только в
+    прямую выдачу."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    tmpdir = str(tmp_path)
+    doc_dir = os.path.join(tmpdir, "Documents", "ЗаказПоставщику", "Ext")
+    os.makedirs(doc_dir)
+    with open(os.path.join(doc_dir, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+        f.write("Процедура ОбработкаПроведения(Отказ, Режим)\nКонецПроцедуры\n")
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+    _write_fo(tmpdir, "ФО_Свой", ["Document.ЗаказПоставщику"])
+    _write_fo(tmpdir, "ФО_Член", ["Document.ЗаказПоставщику.TabularSection.Товары"])
+    _write_fo(
+        tmpdir,
+        "ФО_Чужой",
+        ["Document.ПриобретениеТоваров.TabularSection.Товары.Attribute.ЗаказПоставщику"],
+    )
+
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+    db = IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+    reader = IndexReader(str(db))
+    try:
+        helpers, resolve_safe = make_helpers(tmpdir, idx_reader=reader)
+        bsl = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=detect_format(tmpdir),
+            idx_reader=reader,
+        )
+        direct = bsl["find_functional_options"]("Документ.ЗаказПоставщику", include_code=False)
+        profile = bsl["get_object_profile"]("Документ.ЗаказПоставщику", sections=["functional_options"])
+        section = profile["sections"]["functional_options"]
+        assert len(direct["xml_options"]) == section["total"] == 2
+        assert {o["name"] for o in direct["xml_options"]} == {"ФО_Свой", "ФО_Член"}
+    finally:
+        reader.close()
+
+
+def test_ctor_query_unclosed_literal_yields_nothing(tmp_path):
+    """Незакрытый литерал не имеет права дать частичную запись."""
+    q = _queries_of(
+        str(tmp_path),
+        'Процедура Тест()\n    Запрос = Новый Запрос("ВЫБРАТЬ * ИЗ Документ.Заказ\nКонецПроцедуры\n',
+    )
+    assert q == []
+
+
+def test_ctor_query_found_in_extension_module(tmp_path):
+    """Конструктор в модуле расширения читается тем же путём, что и main-модуль
+    (extract_queries идёт через _ext_read_file, а не generic read_file)."""
+    cf = tmp_path / "cf"
+    cfe = tmp_path / "cfe" / "РасшЗапрос"
+    (cf / "Documents" / "ГлавныйДок" / "Ext").mkdir(parents=True)
+    (cf / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+    ext_mod = cfe / "Documents" / "ГлавныйДок" / "Ext"
+    ext_mod.mkdir(parents=True)
+    (cfe / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+    (ext_mod / "ObjectModule.bsl").write_text(
+        'Процедура ext_Тест()\n    З = Новый Запрос("ВЫБРАТЬ * ИЗ Справочник.Номенклатура");\nКонецПроцедуры\n',
+        encoding="utf-8",
+    )
+
+    helpers, resolve_safe = make_helpers(str(cf))
+    bsl = make_bsl_helpers(
+        base_path=str(cf),
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=detect_format(str(cf)),
+        extension_paths=[str(cfe)],
+    )
+    modules = bsl["find_module"]("ГлавныйДок")
+    ext_paths = [m["path"] for m in modules if m["path"].startswith("../")]
+    assert ext_paths, modules
+    q = bsl["extract_queries"](ext_paths[0])
+    assert len(q) == 1
+    assert q[0]["tables"] == ["Справочник.Номенклатура"]
+    assert q[0]["procedure"] == "ext_Тест"

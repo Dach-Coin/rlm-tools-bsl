@@ -82,3 +82,34 @@ def test_help_unknown_falls_back_to_all():
         bsl_help = _get_help(td)
         result = bsl_help("xyzzy_gibberish_12345")
         assert "Available recipes" in result
+
+
+# ── v1.30.0: agent-facing контракты в sig/recipe ──────────────
+
+
+def test_safe_grep_sig_names_max_files_cap_in_both_modes():
+    """RO-5: срез max_files действует и с name_hint — sig обязан говорить это прямо."""
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    sig = build_helper_metadata_snapshot()["safe_grep"]["sig"]
+    assert "max_files" in sig
+    # Оговорка обязана покрывать ОБА режима: срез действует всегда, hint лишь меняет,
+    # что режется. Формулировка "только без name_hint" была бы неполной (широкий hint
+    # точно так же даёт ложный []).
+    assert "ВСЕГДА" in sig and "hint" in sig
+    assert "не доказывает отсутствие" in sig
+
+
+def test_help_safe_grep_gives_full_route_and_denies_proof_of_absence():
+    with tempfile.TemporaryDirectory() as td:
+        result = _get_help(td)("safe_grep")
+        assert "НЕ доказывает отсутствие" in result
+        assert "git_search" in result
+        assert "find_module" in result
+
+
+def test_help_overrides_says_aggregates_are_dicts_and_none_line_is_valid():
+    with tempfile.TemporaryDirectory() as td:
+        result = _get_help(td)("перехват")
+        assert "target_method_line" in result
+        assert ".items()" in result

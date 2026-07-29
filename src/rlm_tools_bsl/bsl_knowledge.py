@@ -315,7 +315,7 @@ Step 1 — DISCOVER: find what you need
   search_methods('substring')            → precise: find METHODS by code name (FTS)
   search_regions('имя')                  → precise: find code regions
   search_module_headers('текст')         → precise: find modules by header
-  NOTE: search_regions/search_module_headers молча усекаются по limit — для census/статистики бери count_only=True (index-side {total})
+  NOTE: search_regions/search_module_headers молча усекаются по limit — для census бери count_only=True: тот же scope, что и выдача (с CFE +total_main/total_extensions)
   NOTE: search() = broad first pass; specialized helpers = precise follow-up when you need specific fields
   parse_object_xml(path) → attributes, tabular sections, dimensions, resources
   find_attributes('ИмяРеквизита')        → INSTANT: attribute name → type(s)
@@ -368,7 +368,7 @@ LIVE (читают тела процедур / parse XML — медленно, �
 CAUTION: на конфигах 10K+ файлов analyze_* могут быть >60с. Батчь LIVE-хелперы по одному; INSTANT — по 5-10.
 
 Step 5 — EXTENSIONS: check if behavior is modified
-  get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top/unique_* полны iff partial=False; иначе lower bound, см. _meta
+  get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top=dict{имя:N}/unique_* полны iff partial=False; иначе lower bound. target_method_line=None валидно
   read_procedure(path, name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
   NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.
@@ -813,6 +813,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "full": [
             "get_overrides() → перехваты конфигурации. СНАЧАЛА partial: False — total/агрегаты по полному выбранному источнику; True — только по прочитанной части, причины в _meta.failed_extension_roots. overrides = отсортированный срез 200, total/truncated сигналят обрезку; сводку по срезу не строй",
             "get_overrides('ИмяОбъекта') → перехваты одного объекта (метод, аннотация, файл расширения)",
+            "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей",
+            "target_method_line=None — валидно: перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения) без текстового объявления в базовом модуле либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
             "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
             "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",
