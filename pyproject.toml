@@ -1,6 +1,6 @@
 [project]
 name = "rlm-tools-bsl"
-version = "1.30.0"
+version = "1.30.1"
 description = "MCP server for token-efficient 1C BSL codebase analysis"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -20,7 +20,11 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
-    "mcp[cli]>=1.2.0",
+    # Верхняя граница обязательна: в mcp 2.0 модуль `mcp.server.fastmcp` переехал
+    # в `mcp.server.mcpserver` (FastMCP → MCPServer), из-за чего установка из PyPI
+    # падала с ModuleNotFoundError. Ветка 1.x продолжает получать патчи.
+    # Снимать `<2` только вместе с миграцией server.py на MCPServer.
+    "mcp[cli]>=1.26.0,<2",
     "anthropic>=0.40.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.venv-constraints/
 .uv-cache/
 .ruff_cache/
 dist/

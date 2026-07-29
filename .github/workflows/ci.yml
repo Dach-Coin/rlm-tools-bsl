@@ -43,3 +43,35 @@ jobs:
         run: uv run python benchmarks/run_benchmark.py
         env:
           PYTHONIOENCODING: utf-8
+
+  # Джоба ловит класс бага из issue #22: джоба `test` выше ставит зависимости по
+  # uv.lock и поэтому структурно НЕ видит, что реально утащит пользователь при
+  # установке из PyPI. Здесь lock игнорируется — резолв идёт по констрейнтам
+  # pyproject, как при `uv tool install rlm-tools-bsl`. Любая незакрытая верхняя
+  # граница зависимости всплывает здесь, а не у пользователя.
+  install-from-constraints:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install from pyproject constraints (uv.lock ignored)
+        run: |
+          uv venv .venv-constraints
+          uv pip install --python .venv-constraints .
+
+      - name: Record resolved dependency versions
+        run: uv pip list --python .venv-constraints
+
+      - name: Assert the mcp upper bound still holds
+        run: |
+          .venv-constraints/bin/python -c "import importlib.metadata as m; v = m.version('mcp'); print('resolved mcp:', v); assert int(v.split('.')[0]) < 2, f'mcp {v} resolved: upper bound in pyproject no longer holds (mcp 2.x moved mcp.server.fastmcp to mcp.server.mcpserver)'"
+
+      - name: Smoke — server imports and CLI entry point responds
+        run: |
+          .venv-constraints/bin/python -c "import rlm_tools_bsl.server; print('server import OK')"
+          .venv-constraints/bin/rlm-bsl-index --help > /dev/null
