@@ -1014,7 +1014,7 @@ File I/O:
   NOTE: For BSL modules prefer find_module()/find_by_type() over glob_files()
   NOTE: tree('.') on large configs produces too much output — use tree('SubDir') or find_files()
 LLM (if available):
-  llm_query(prompt, context='')            → str (keep context <3000 chars, split if empty response)
+  llm_query(prompt, context='')            → str (keep context <3000 chars; '[EMPTY]/[ERROR]' prefix or '[TRUNCATED]' tail = incomplete answer)
   llm_query_batched(prompts, context)      → [str]"""
 
 

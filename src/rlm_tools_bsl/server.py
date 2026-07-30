@@ -31,7 +31,7 @@ from rlm_tools_bsl._sandbox_config import (
     shutdown_deadline_seconds,
     validate_sandbox_env,
 )
-from rlm_tools_bsl.llm_bridge import warmup_openai_import
+from rlm_tools_bsl.llm_bridge import validate_llm_env, warmup_openai_import
 from rlm_tools_bsl.format_detector import FormatInfo, SourceFormat, detect_format
 from rlm_tools_bsl.extension_detector import (
     ConfigRole,
@@ -2922,6 +2922,17 @@ def main():
             getattr(mcp.settings, "host", "?"),
             getattr(mcp.settings, "port", "?"),
         )
+
+    # Проверка env-настроек sub-LLM. Место выбрано намеренно: ПОСЛЕ
+    # _setup_file_logging() (иначе предупреждение при HTTP-запуске не попало бы в
+    # server.log) и после load_project_env() (иначе не увидели бы значения из .env).
+    # Валидируем здесь, а не в провайдере: в дефолтном режиме песочницы провайдер
+    # создаётся лениво в sandbox-воркере, а тот не настраивает logging и пишет
+    # stderr в devnull — предупреждение оттуда не увидел бы никто.
+    # Строго warning + откат к дефолту, НЕ fail-fast: опечатка в одной переменной
+    # не имеет права лишить агента хелпера целиком.
+    for llm_env_warning in validate_llm_env():
+        logger.warning("%s", llm_env_warning)
 
     # One-shot per server start: migrate legacy index directories from the
     # pre-v1.9.2 home-based location into the new RLM_CONFIG_FILE-aware root.

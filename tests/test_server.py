@@ -1437,9 +1437,24 @@ def test_streamable_http_server_starts():
             "id": 1,
         }
 
-        # Retry a few times while server starts up
+        # Ждём старта сервера. Бюджет задан ДЕДЛАЙНОМ, а не числом попыток: цена
+        # одной попытки зависит от того, отказано в соединении сразу (refused —
+        # мгновенно) или сокет ушёл в таймаут. Под нагрузкой это разные величины, и
+        # «20 попыток» означали то ~10 секунд, то почти минуту.
+        #
+        # Ловим весь TransportError, а не только ConnectError: httpx.ConnectTimeout
+        # — НЕ подкласс ConnectError (оба наследуются от TransportError). На
+        # загруженной машине connect упирается в свой таймаут вместо refused, и
+        # раньше первое же такое событие валило тест мимо всех ретраев.
+        #
+        # Досрочный выход по proc.poll(): если сервер умер, ждать дедлайн бессмысленно,
+        # а сообщение с его stderr объясняет причину вместо глухого «не запустился».
         response = None
-        for _ in range(20):
+        last_error = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
             try:
                 response = client.post(
                     mcp_url,
@@ -1448,13 +1463,20 @@ def test_streamable_http_server_starts():
                         "Content-Type": "application/json",
                         "Accept": "application/json, text/event-stream",
                     },
-                    timeout=2,
+                    timeout=5,
                 )
                 break
-            except httpx.ConnectError:
+            except httpx.TransportError as exc:
+                last_error = exc
                 time.sleep(0.5)
 
-        assert response is not None, "Server did not start in time"
+        if response is None and proc.poll() is not None:
+            _out, err = proc.communicate(timeout=5)
+            raise AssertionError(
+                f"server exited with code {proc.returncode} before answering; "
+                f"stderr tail: {err.decode('utf-8', 'replace')[-2000:]}"
+            )
+        assert response is not None, f"Server did not start in time; last error: {last_error!r}"
         assert response.status_code == 200
         assert len(response.content) > 0
     finally:
