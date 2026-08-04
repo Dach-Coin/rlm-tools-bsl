@@ -239,11 +239,18 @@ class Sandbox:
         idx_zero_callers_authoritative: bool = False,
         extension_paths: list[str] | None = None,
         output_capture_factory=None,
+        enable_bsl_helpers: bool = True,
     ):
         self._base_path = base_path
         self._max_output_chars = max_output_chars
         self._execution_timeout_seconds = execution_timeout_seconds
         self._format_info = format_info
+        # Узкий флаг generic-режима (v1.32.0): отключает ТОЛЬКО загрузку
+        # BSL-хелперов. Нумерация строк и остальное поведение песочницы —
+        # по-прежнему от format_info, чтобы один признак не управлял двумя
+        # независимыми вещами. Default True: прямые создания Sandbox
+        # (тесты/встраивание) сохраняют прежнее поведение.
+        self._enable_bsl_helpers = enable_bsl_helpers
         self._idx_reader = idx_reader
         self._idx_zero_callers_authoritative = idx_zero_callers_authoritative
         self._extension_paths = list(extension_paths or [])
@@ -314,7 +321,8 @@ class Sandbox:
         helpers, self._resolve_safe = make_helpers(self._base_path, idx_reader=self._idx_reader)
         self._namespace.update(self._wrap_helpers(helpers))
 
-        if self._format_info is not None:
+        bsl_helpers: dict = {}
+        if self._format_info is not None and self._enable_bsl_helpers:
             bsl_helpers = make_bsl_helpers(
                 base_path=self._base_path,
                 resolve_safe=self._resolve_safe,
@@ -328,6 +336,7 @@ class Sandbox:
             )
             self._namespace.update(self._wrap_helpers(bsl_helpers))
 
+        if self._format_info is not None:
             # --- Agent-facing line numbering (presentation layer) ---
             from rlm_tools_bsl._format import number_lines
 

@@ -276,6 +276,9 @@ class ProcessBackendConfig:
     index_expected: bool = False
     idx_zero_callers_authoritative: bool = False
     extension_paths: list[str] = field(default_factory=list)
+    # Generic-режим (v1.32.0): False отключает загрузку BSL-хелперов в worker.
+    # Default True — прежнее поведение для всех существующих конструкций.
+    enable_bsl_helpers: bool = True
     max_llm_calls: int = 50
     llm_calls_used: int = 0
     # Только для Python test API (dotted "module:factory") — прокладывает fake
@@ -720,6 +723,7 @@ class ProcessSandboxBackend:
                 "index_expected": cfg.index_expected,
                 "idx_zero_callers_authoritative": cfg.idx_zero_callers_authoritative,
                 "extension_paths": list(cfg.extension_paths),
+                "enable_bsl_helpers": cfg.enable_bsl_helpers,
                 "execution_timeout_seconds": 0,
                 "max_llm_calls": cfg.max_llm_calls,
                 "llm_calls_used": self._llm_used,

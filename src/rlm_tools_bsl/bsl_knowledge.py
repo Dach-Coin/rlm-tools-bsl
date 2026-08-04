@@ -1111,6 +1111,53 @@ def get_strategy_mode() -> str:
     return mode if mode in ("slim", "full") else "slim"
 
 
+# --- Generic mode: чужой формат исходников БЕЗ единого .bsl (v1.32.0) ---
+# BSL-хелперы в такой сессии не загружаются, поэтому маршрутная карта не имеет
+# права ссылаться ни на один из них. Строится отдельно от slim/full — те
+# описывают ИМЕННО BSL-инструментарий и остаются нетронутыми.
+
+_GENERIC_LLM_GUIDANCE_SENTENCE = " Use llm_query() for semantic analysis."
+
+_GENERIC_STRATEGY_BODY = """\
+== UNSUPPORTED SOURCE FORMAT - GENERIC MODE ==
+This directory is neither a Configurator dump (cf) nor a 1C:EDT project, and no .bsl file was found.
+1C/BSL helpers are not loaded. Use only generic file exploration.
+
+== WORKFLOW ==
+Write Python in rlm_execute and print() compact results.
+  1. tree('.', max_depth=2) or glob_files('**/*') - inspect the tree
+  2. grep(pattern, path) / grep_summary(pattern, path) - locate text
+  3. read_file(path) / read_files(paths) - read only relevant files
+
+== HELPERS ==
+  read_file(path), read_files(paths)
+  grep(pattern, path), grep_summary(pattern, path)
+  grep_read(pattern, path, max_files=10, context_lines=0)
+  glob_files(pattern), tree(path, max_depth=3), find_files(name)"""
+
+_GENERIC_LLM_HELPERS_LINE = "  llm_query(prompt, context=''), llm_query_batched(prompts, context='')"
+
+
+def build_generic_strategy(effort: str, has_llm_tools: bool = False) -> str:
+    """Маршрутная карта сессии без BSL-хелперов (чужой формат, .bsl нет)."""
+    effort_key = effort if effort in EFFORT_LEVELS else "medium"
+    config = EFFORT_LEVELS[effort_key]
+    guidance = config.guidance
+    body = _GENERIC_STRATEGY_BODY
+    if has_llm_tools:
+        body += "\n" + _GENERIC_LLM_HELPERS_LINE
+    else:
+        guidance = guidance.replace(_GENERIC_LLM_GUIDANCE_SENTENCE, "")
+    return "\n".join(
+        [
+            body,
+            f"\n== EFFORT: {effort_key} ==",
+            guidance,
+            f"Limits: max_execute_calls={config.max_execute_calls}, max_llm_calls={config.max_llm_calls}",
+        ]
+    )
+
+
 def _build_full_strategy(
     effort: str,
     format_info,

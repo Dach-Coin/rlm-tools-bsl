@@ -81,6 +81,19 @@ _BASELINES = {
 _PAYLOAD_BASELINES = {"slim": 20691, "full": 43482}
 _DRIFT = 1.05  # allow ≤5% growth before failing
 
+# v1.32.0: бюджет меряется на ПОДДЕРЖИВАЕМОМ дереве. С гейтом чужих форматов
+# заглушка `<Configuration/>` дала бы source_support=foreign_with_bsl и лишний
+# блок предупреждения в стратегии — то есть бюджет считался бы не для того
+# сценария, который защищает (тест ниже это ещё и ассертит).
+_CF_DESCRIPTOR = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">\n'
+    '  <Configuration uuid="00000000-0000-0000-0000-000000000001">\n'
+    "    <Properties><Name>Тест</Name></Properties>\n"
+    "  </Configuration>\n"
+    "</MetaDataObject>\n"
+)
+
 _IDX_STATS = {
     "methods": 1000,
     "calls": 500,
@@ -138,7 +151,7 @@ def test_full_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
     obj = tmp_path / "Documents" / "БюджетТест" / "Ext"
     obj.mkdir(parents=True)
     (obj / "ObjectModule.bsl").write_text("Процедура П() Экспорт\nКонецПроцедуры\n", encoding="utf-8")
-    (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+    (tmp_path / "Configuration.xml").write_text(_CF_DESCRIPTOR, encoding="utf-8")
     monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
     monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
     IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=True)
@@ -159,6 +172,9 @@ def test_full_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
     data = json.loads(raw)
     try:
         assert not data["extension_context"]["nearby_extensions"], "budget config must be extension-free"
+        # Бюджет обязан меряться на поддерживаемом дереве: на чужом формате
+        # стратегия несёт лишний блок предупреждения, и число было бы не про то.
+        assert data["source_support"] == "supported", "budget config must be a supported cf/edt tree"
         ceiling = int(_PAYLOAD_BASELINES[mode] * _DRIFT)
         assert len(raw) <= ceiling, (
             f"{mode} rlm_start payload {len(raw)} > {ceiling} (+5% of {_PAYLOAD_BASELINES[mode]}). "

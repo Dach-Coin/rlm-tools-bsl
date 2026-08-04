@@ -67,10 +67,18 @@ _PROC_DEF_RE = re.compile(
 
 
 def _parse_config_xml(xml_path: str, directory: str) -> ExtensionInfo | None:
-    """Parse CF-format Configuration.xml and determine role."""
+    """Parse CF-format Configuration.xml and determine role.
+
+    LookupError — незнакомая кодировка в XML-декларации (`encoding="x-invalid"`):
+    ElementTree бросает именно её, а НЕ ParseError. Без перехвата один битый
+    дескриптор в радиусе скана СОСЕДЕЙ убивал весь `rlm_start`
+    (`Session init failed: LookupError`), хотя сама сессия к этому каталогу
+    отношения не имеет. Семантика поиска не меняется: файл, который нельзя
+    разобрать, и раньше означал «здесь конфигурации нет».
+    """
     try:
         tree = ET.parse(xml_path)
-    except (ET.ParseError, OSError):
+    except (ET.ParseError, OSError, LookupError):
         return None
 
     root = tree.getroot()
@@ -125,10 +133,13 @@ def _el_text(parent, tag: str, ns: dict) -> str:
 
 
 def _parse_config_mdo(mdo_path: str, directory: str) -> ExtensionInfo | None:
-    """Parse EDT-format Configuration.mdo and determine role."""
+    """Parse EDT-format Configuration.mdo and determine role.
+
+    Набор перехватываемых исключений — тот же, что у CF (см. `_parse_config_xml`).
+    """
     try:
         tree = ET.parse(mdo_path)
-    except (ET.ParseError, OSError):
+    except (ET.ParseError, OSError, LookupError):
         return None
 
     root = tree.getroot()

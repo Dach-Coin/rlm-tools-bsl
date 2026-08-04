@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 from rlm_tools_bsl.bsl_knowledge import (
     BSL_PATTERNS,
     EFFORT_LEVELS,
@@ -519,3 +521,31 @@ def test_functional_options_limit_visible_in_both_performance_copies(monkeypatch
     assert "limit=" in STRATEGY_SECTIONS["performance"], "slim performance-секция без limit="
     monkeypatch.setenv("RLM_STRATEGY_MODE", "full")
     assert "limit=10" in get_strategy("medium", None, query=""), "full-стратегия без limit="
+
+
+# --- build_generic_strategy (v1.32.0): сессия без BSL-хелперов ---
+
+
+def test_generic_strategy_has_only_available_helpers():
+    from rlm_tools_bsl.bsl_knowledge import build_generic_strategy
+
+    text = build_generic_strategy("medium")
+    assert "read_file" in text and "glob_files" in text
+    for absent in ("find_module", "find_by_type", "safe_grep", "rlm_help"):
+        assert absent not in text
+
+
+def test_generic_strategy_unknown_effort_is_medium():
+    from rlm_tools_bsl.bsl_knowledge import build_generic_strategy
+
+    text = build_generic_strategy("bogus")
+    assert "== EFFORT: medium ==" in text
+    assert "bogus" not in text
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+def test_generic_strategy_does_not_advertise_missing_llm(effort):
+    from rlm_tools_bsl.bsl_knowledge import build_generic_strategy
+
+    assert "llm_query" not in build_generic_strategy(effort, has_llm_tools=False)
+    assert "llm_query" in build_generic_strategy(effort, has_llm_tools=True)

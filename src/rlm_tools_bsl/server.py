@@ -32,7 +32,15 @@ from rlm_tools_bsl._sandbox_config import (
     validate_sandbox_env,
 )
 from rlm_tools_bsl.llm_bridge import validate_llm_env, warmup_openai_import
-from rlm_tools_bsl.format_detector import FormatInfo, SourceFormat, detect_format
+from rlm_tools_bsl.format_detector import (
+    GENERIC_MODE_SESSION_WARNING,
+    UNSUPPORTED_FORMAT_SESSION_WARNING,
+    FormatInfo,
+    SourceFormat,
+    SourceSupport,
+    classify_source,
+    detect_format,
+)
 from rlm_tools_bsl.extension_detector import (
     ConfigRole,
     _ext_list_cap,
@@ -43,6 +51,7 @@ from rlm_tools_bsl.extension_detector import (
 from rlm_tools_bsl.bsl_knowledge import (
     EFFORT_LEVELS,
     _auto_effort,
+    build_generic_strategy,
     _fuzzy_suggest,
     _get_category_helpers,
     _get_disambiguation,
@@ -470,6 +479,52 @@ _build_jobs_lock = threading.Lock()
 _build_jobs: dict[str, dict] = {}
 
 
+def _unsupported_format_build_error(resolved: str) -> str | None:
+    """Гейт нового построения индекса на чужом формате (v1.32.0).
+
+    None — build разрешен; строка — готовый JSON-отказ.
+
+    ``classify_source`` здесь НЕ используется намеренно: он сам зовёт
+    ``probe_bsl``, и на чужом дереве без ``.bsl`` обход был бы двойным.
+    Маппинг ``probe`` → ``source_support`` совпадает с ``classify_source``.
+    """
+    from rlm_tools_bsl.format_detector import (
+        NO_BSL_INDEX_REFUSAL,
+        UNSUPPORTED_FORMAT_INDEX_WARNING,
+        has_our_format_descriptor,
+        probe_bsl,
+    )
+
+    if has_our_format_descriptor(resolved):
+        return None
+
+    probe = probe_bsl(resolved)
+    if probe != "found":
+        # probe == "unknown" (нечитаемое дерево) тоже отказ: build требует
+        # доказанный found. Текст NO_BSL_INDEX_REFUSAL покрывает оба случая.
+        return json.dumps(
+            {
+                "error": NO_BSL_INDEX_REFUSAL,
+                "path": resolved,
+                "source_support": "foreign_no_bsl" if probe == "none" else "foreign_with_bsl",
+            },
+            ensure_ascii=False,
+        )
+
+    return json.dumps(
+        {
+            "error": (
+                UNSUPPORTED_FORMAT_INDEX_WARNING
+                + " Подтвердить сборку может только человек в терминале: "
+                + f'rlm-bsl-index index build "{resolved}" --allow-unsupported-format'
+            ),
+            "path": resolved,
+            "source_support": "foreign_with_bsl",
+        },
+        ensure_ascii=False,
+    )
+
+
 def _create_session_backend(
     *,
     sandbox_mode: str,
@@ -483,6 +538,7 @@ def _create_session_backend(
     callers_authoritative: bool,
     ext_paths_for_sandbox: list[str],
     registry_epoch: int,
+    enable_bsl_helpers: bool = True,
 ):
     """Фабрика backend по режиму (§5.2): выбор делается один раз при rlm_start,
     дальше server не ветвится по типу backend.
@@ -507,6 +563,7 @@ def _create_session_backend(
             index_expected=idx_reader is not None,
             idx_zero_callers_authoritative=callers_authoritative,
             extension_paths=ext_paths_for_sandbox,
+            enable_bsl_helpers=enable_bsl_helpers,
             max_llm_calls=session.max_llm_calls,
             llm_calls_used=session.llm_calls_used,
         )
@@ -525,6 +582,7 @@ def _create_session_backend(
         idx_reader=idx_reader,
         idx_zero_callers_authoritative=callers_authoritative,
         extension_paths=ext_paths_for_sandbox,
+        enable_bsl_helpers=enable_bsl_helpers,
     )
     backend = InlineSandboxBackend(
         sandbox,
@@ -533,6 +591,17 @@ def _create_session_backend(
         llm_calls_used=session.llm_calls_used,
     )
     return backend, False
+
+
+def _session_warnings(source_support: SourceSupport, ext_warnings: list[str]) -> list[str]:
+    """Предупреждение о неподдерживаемом формате идёт ПЕРВЫМ (v1.32.0):
+    агент читает warnings[0] и не должен узнать про чужой формат после
+    сообщений про расширения."""
+    if source_support is SourceSupport.FOREIGN_WITH_BSL:
+        return [UNSUPPORTED_FORMAT_SESSION_WARNING, *ext_warnings]
+    if source_support is SourceSupport.FOREIGN_NO_BSL:
+        return [GENERIC_MODE_SESSION_WARNING, *ext_warnings]
+    return list(ext_warnings)
 
 
 def _rlm_start(
@@ -810,6 +879,18 @@ def _rlm_start(
             sum(len(v) for v in ext_overrides.values()),
         )
 
+        # Гейт неподдерживаемых форматов (v1.32.0): классификация ВСЕГДА по живому
+        # диску — index fast path тут не помогает, чужое дерево могло получить
+        # индекс до появления гейта. Замеры: боевые cf/edt 0.4-1.4 мс.
+        source_support = classify_source(resolved)
+        generic_mode = source_support is SourceSupport.FOREIGN_NO_BSL
+        if source_support is not SourceSupport.SUPPORTED:
+            logger.warning(
+                "rlm_start: session=%s unsupported source format: source_support=%s",
+                session_id,
+                source_support.value,
+            )
+
         # Pre-import openai в фоне — только для inline: spawn-worker процесс
         # родительский прогрев всё равно не увидит (§12.1).
         if sandbox_mode == "inline" and os.environ.get("RLM_LLM_BASE_URL"):
@@ -834,6 +915,7 @@ def _rlm_start(
             callers_authoritative=_callers_authoritative,
             ext_paths_for_sandbox=ext_paths_for_sandbox,
             registry_epoch=registry_epoch,
+            enable_bsl_helpers=not generic_mode,
         )
         if not parent_owns_reader:
             # inline: reader теперь во владении backend — не закрывать вторично.
@@ -880,17 +962,22 @@ def _rlm_start(
 
         bsl_registry = backend.registry_snapshot
         t_step = time.monotonic()
-        strategy = get_strategy(
-            effort,
-            format_info,
-            detected_prefixes,
-            ext_context,
-            ext_overrides,
-            registry=bsl_registry,
-            idx_stats=idx_stats,
-            idx_warnings=idx_warnings,
-            query=query,
-        )
+        if generic_mode:
+            # BSL-хелперов в namespace нет — маршрутная карта не имеет права
+            # ссылаться ни на один из них.
+            strategy = build_generic_strategy(effort, has_llm_tools=has_llm_tools)
+        else:
+            strategy = get_strategy(
+                effort,
+                format_info,
+                detected_prefixes,
+                ext_context,
+                ext_overrides,
+                registry=bsl_registry,
+                idx_stats=idx_stats,
+                idx_warnings=idx_warnings,
+                query=query,
+            )
         t_strategy = time.monotonic() - t_step
 
         # Finding 4: если итоговые лимиты расходятся с пресетом effort (env-дефолт
@@ -903,6 +990,11 @@ def _rlm_start(
                 f"max_llm_calls={max_llm_calls}.\n"
                 f"(These override the '{effort}' preset defaults shown in the EFFORT block below.)\n\n" + strategy
             )
+
+        # Предупреждение о формате — САМОЕ первое в тексте стратегии, поэтому
+        # prepend идёт ПОСЛЕ баннера лимитов (иначе баннер оказался бы выше).
+        if source_support is SourceSupport.FOREIGN_WITH_BSL:
+            strategy = UNSUPPORTED_FORMAT_SESSION_WARNING + "\n\n" + strategy
 
         # Публикация атомарна с проверкой владельца: TTL-эвикция и shutdown не
         # могут оставить backend без соответствующей живой Session (§13.3).
@@ -1045,8 +1137,9 @@ def _rlm_start(
     response: dict = {
         "session_id": session_id,
         "resolved_path": resolved,
-        "warnings": ext_context.warnings,
+        "warnings": _session_warnings(source_support, ext_context.warnings),
         "config_format": format_info.format_label,
+        "source_support": source_support.value,
         "extension_context": {
             "is_extension": ext_context.current.role.value == "extension",
             "config_role": ext_context.current.role.value,
@@ -2240,6 +2333,17 @@ async def rlm_index(
             resolved_path, err_json = _normalize_and_validate_path(matches[0]["path"])
             if err_json is not None:
                 return err_json
+
+            # Единственная MCP-точка гейта чужих форматов (v1.32.0): только новое
+            # построение индекса и только до регистрации фоновой job — иначе
+            # отказ оставил бы за собой висящий job-слот. `update` не гейтится:
+            # без индекса builder.update() и так падает FileNotFoundError.
+            if action == "build":
+                gate_error = await anyio.to_thread.run_sync(lambda: _unsupported_format_build_error(resolved_path))
+                if gate_error is not None:
+                    logger.warning("rlm_index: build refused on unsupported format: path=%s", resolved_path)
+                    return gate_error
+
             job_key = resolved_path
 
             with _build_jobs_lock:

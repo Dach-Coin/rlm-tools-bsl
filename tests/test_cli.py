@@ -71,7 +71,9 @@ def test_cli_resolve_path_passes_through_cf_root(tmp_path):
 @pytest.fixture()
 def cli_bsl_project(tmp_path, monkeypatch):
     """Create a minimal BSL project and set RLM_INDEX_DIR."""
-    # CF-format structure
+    # CF-format structure. Валидный дескриптор обязателен с v1.32.0: без него
+    # `index build` упрётся в гейт чужого формата, а не в свой предмет.
+    (tmp_path / "Configuration.xml").write_text(_CF_MAIN_XML_FOR_CLI, encoding="utf-8")
     mod_dir = tmp_path / "CommonModules" / "TestModule" / "Ext"
     mod_dir.mkdir(parents=True)
     (mod_dir / "Module.bsl").write_text(
@@ -680,3 +682,189 @@ def test_main_dispatches_build(_cli_cf_project, monkeypatch, capsys):
             cli.main()
 
     assert "Index built" in capsys.readouterr().out
+
+
+# --- Гейт неподдерживаемых форматов у `index build` (v1.32.0) --------------
+
+
+@pytest.fixture()
+def _cli_foreign_with_bsl(tmp_path, monkeypatch):
+    """Чужой формат, но .bsl есть: build возможен только с подтверждением."""
+    (tmp_path / "Configuration.json").write_text('{"foreign": true}', encoding="utf-8")
+    (tmp_path / "Module.bsl").write_text("// code", encoding="utf-8")
+    idx_dir = tmp_path / "_index"
+    idx_dir.mkdir()
+    monkeypatch.setenv("RLM_INDEX_DIR", str(idx_dir))
+    return tmp_path
+
+
+@pytest.fixture()
+def _cli_foreign_no_bsl(tmp_path, monkeypatch):
+    """Чужой формат без единого .bsl: строить нечего, отказ безусловный."""
+    (tmp_path / "Configuration.json").write_text('{"foreign": true}', encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("alpha\n", encoding="utf-8")
+    idx_dir = tmp_path / "_index"
+    idx_dir.mkdir()
+    monkeypatch.setenv("RLM_INDEX_DIR", str(idx_dir))
+    return tmp_path
+
+
+def test_cli_build_refuses_foreign_without_bsl(_cli_foreign_no_bsl, capsys):
+    """Отказ приходит из _cmd_build — гейт реально подключён к сборке."""
+    from rlm_tools_bsl.cli import _cmd_build
+
+    with pytest.raises(SystemExit) as excinfo:
+        _cmd_build(_make_cmd_args(path=str(_cli_foreign_no_bsl)))
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert ".bsl" in err
+    assert not list((_cli_foreign_no_bsl / "_index").rglob("*.db"))
+
+
+def test_cli_build_survives_tty_that_cannot_answer(_cli_foreign_with_bsl, monkeypatch, capsys):
+    """isatty()=True ещё не значит, что есть кому отвечать.
+
+    Git Bash/mintty, docker без -i, CI с псевдо-tty дают терминал, чтение из
+    которого сразу упирается в EOF. Пользователь должен получить указание на
+    флаг, а НЕ трейсбек EOFError (воспроизведено на боевом CLI 1.32.0)."""
+    from rlm_tools_bsl.cli import _gate_unsupported_format
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def _eof(*_a):
+        raise EOFError("EOF when reading a line")
+
+    monkeypatch.setattr("builtins.input", _eof)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _gate_unsupported_format(str(_cli_foreign_with_bsl), allow=False)
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "--allow-unsupported-format" in captured.err
+    assert "EOFError" not in captured.err and "Traceback" not in captured.err
+
+
+def test_cli_build_treats_interrupt_at_prompt_as_cancel(_cli_foreign_with_bsl, monkeypatch, capsys):
+    """Ctrl+C на вопросе — это отказ, а не трейсбек KeyboardInterrupt."""
+    from rlm_tools_bsl.cli import _gate_unsupported_format
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def _interrupt(*_a):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _interrupt)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _gate_unsupported_format(str(_cli_foreign_with_bsl), allow=False)
+    assert excinfo.value.code == 1
+    assert "Отменено." in capsys.readouterr().out
+
+
+def test_cli_build_aborts_when_user_declines(_cli_foreign_with_bsl, monkeypatch, capsys):
+    from rlm_tools_bsl.cli import _cmd_build
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a: "n")
+
+    with pytest.raises(SystemExit) as excinfo:
+        _cmd_build(_make_cmd_args(path=str(_cli_foreign_with_bsl)))
+    assert excinfo.value.code == 1
+    out = capsys.readouterr().out
+    assert "ВНИМАНИЕ" in out
+    assert "Отменено." in out
+    assert not list((_cli_foreign_with_bsl / "_index").rglob("*.db"))
+
+
+@pytest.mark.parametrize("answer", ["y", "Y", "yes", "да", "ДА"])
+def test_cli_build_proceeds_when_user_confirms(_cli_foreign_with_bsl, monkeypatch, capsys, answer):
+    from rlm_tools_bsl.cli import _gate_unsupported_format
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a: answer)
+
+    _gate_unsupported_format(str(_cli_foreign_with_bsl), allow=False)  # не бросает
+    assert "ВНИМАНИЕ" in capsys.readouterr().out
+
+
+def test_cli_build_non_tty_requires_flag(_cli_foreign_with_bsl, monkeypatch, capsys):
+    """Без tty вопрос задать некому — нужен явный флаг, а не молчаливая сборка."""
+    from rlm_tools_bsl.cli import _gate_unsupported_format
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    def _no_input(*_a):
+        raise AssertionError("input() must not be called without a tty")
+
+    monkeypatch.setattr("builtins.input", _no_input)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _gate_unsupported_format(str(_cli_foreign_with_bsl), allow=False)
+    assert excinfo.value.code == 1
+    assert "--allow-unsupported-format" in capsys.readouterr().err
+
+
+def test_cli_build_flag_skips_prompt(_cli_foreign_with_bsl, monkeypatch, capsys):
+    from rlm_tools_bsl.cli import _gate_unsupported_format
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def _no_input(*_a):
+        raise AssertionError("input() must not be called with --allow-unsupported-format")
+
+    monkeypatch.setattr("builtins.input", _no_input)
+
+    _gate_unsupported_format(str(_cli_foreign_with_bsl), allow=True)  # не бросает
+    assert "ВНИМАНИЕ" in capsys.readouterr().out
+
+
+def test_cli_build_gate_is_noop_on_supported_cf(_cli_cf_project, monkeypatch, capsys):
+    """На нашем CF гейт молчит: ни вопроса, ни предупреждения."""
+    from rlm_tools_bsl.cli import _cmd_build
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def _no_input(*_a):
+        raise AssertionError("input() must not be called on a supported CF tree")
+
+    monkeypatch.setattr("builtins.input", _no_input)
+
+    project_path, _ = _cli_cf_project
+    with (
+        patch("rlm_tools_bsl.bsl_index.IndexBuilder") as BuilderMock,
+        patch("rlm_tools_bsl.bsl_index.IndexReader") as ReaderMock,
+    ):
+        BuilderMock.return_value.build.return_value = _mock_db(project_path)
+        ReaderMock.return_value.get_statistics.return_value = _stats_fixture()
+        _cmd_build(_make_cmd_args(path=str(project_path)))
+
+    out = capsys.readouterr().out
+    assert "ВНИМАНИЕ" not in out
+    assert "Index built" in out
+
+
+def test_cli_parser_exposes_flag_only_on_build(monkeypatch):
+    """Флаг живёт только у build; update/info/drop его не принимают."""
+    from rlm_tools_bsl import cli
+
+    captured = {}
+
+    def _fake_build(args):
+        captured["allow"] = args.allow_unsupported_format
+
+    monkeypatch.setattr(cli, "_cmd_build", _fake_build)
+    monkeypatch.setattr("rlm_tools_bsl._config.load_project_env", lambda: None)
+
+    monkeypatch.setattr(sys, "argv", ["rlm-bsl-index", "index", "build", "X", "--allow-unsupported-format"])
+    cli.main()
+    assert captured["allow"] is True
+
+    monkeypatch.setattr(sys, "argv", ["rlm-bsl-index", "index", "build", "X"])
+    cli.main()
+    assert captured["allow"] is False
+
+    for other in ("update", "info", "drop"):
+        monkeypatch.setattr(sys, "argv", ["rlm-bsl-index", "index", other, "X", "--allow-unsupported-format"])
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main()
+        assert excinfo.value.code == 2

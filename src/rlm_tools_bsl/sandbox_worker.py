@@ -603,6 +603,8 @@ def _build_session(payload: dict, out_buf, out_published, out_truncated, out_loc
         idx_zero_callers_authoritative=bool(payload.get("idx_zero_callers_authoritative")),
         extension_paths=list(payload.get("extension_paths") or []),
         output_capture_factory=lambda: writer,
+        # Отсутствие ключа = прежнее поведение (BSL-хелперы включены).
+        enable_bsl_helpers=bool(payload.get("enable_bsl_helpers", True)),
     )
     # reset() на каждый execute делает command loop; сохранить ссылку.
     sandbox._shared_stdout_writer = writer

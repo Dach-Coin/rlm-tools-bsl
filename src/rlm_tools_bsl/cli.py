@@ -64,6 +64,57 @@ def _resolve_path(raw: str) -> str:
     return effective
 
 
+def _gate_unsupported_format(base_path: str, allow: bool) -> None:
+    """Гейт нового построения индекса на чужом формате (v1.32.0).
+
+    Как и в MCP-гейте, ``classify_source`` не используется — дерево обходится
+    не более одного раза (дескриптор, затем при необходимости один ``probe_bsl``).
+    """
+    from rlm_tools_bsl.format_detector import (
+        NO_BSL_INDEX_REFUSAL,
+        UNSUPPORTED_FORMAT_INDEX_WARNING,
+        has_our_format_descriptor,
+        probe_bsl,
+    )
+
+    if has_our_format_descriptor(base_path):
+        return
+
+    if probe_bsl(base_path) != "found":
+        print(f"Error: {NO_BSL_INDEX_REFUSAL}", file=sys.stderr)
+        sys.exit(1)
+
+    if allow:
+        print(f"ВНИМАНИЕ: {UNSUPPORTED_FORMAT_INDEX_WARNING}")
+        return
+
+    flag_hint = "Повторите build с флагом --allow-unsupported-format."
+
+    if not sys.stdin.isatty():
+        print(f"Error: {UNSUPPORTED_FORMAT_INDEX_WARNING} {flag_hint}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"ВНИМАНИЕ: {UNSUPPORTED_FORMAT_INDEX_WARNING}")
+    try:
+        answer = input("Продолжить? [y/N]: ").strip().casefold()
+    except EOFError:
+        # isatty() НЕ доказывает, что есть кому отвечать: mintty/Git Bash, docker
+        # без -i, CI с псевдо-tty дают терминал, чтение из которого сразу упирается
+        # в EOF. Без этого пользователь получал трейсбек EOFError вместо указания
+        # на флаг — то есть ровно там, где подсказка нужнее всего. Предупреждение
+        # уже напечатано выше, поэтому здесь только суть и флаг.
+        print()  # закрыть строку приглашения
+        print(f"Error: ответить на вопрос некому (stdin закрыт). {flag_hint}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print()
+        print("Отменено.")
+        sys.exit(1)
+    if answer not in ("y", "yes", "д", "да"):
+        print("Отменено.")
+        sys.exit(1)
+
+
 def _fmt_size(size_bytes: int) -> str:
     """Format file size in human-readable form."""
     if size_bytes < 1024:
@@ -94,6 +145,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     _maybe_migrate_legacy_index_root()
     base_path = _resolve_path(args.path)
+    _gate_unsupported_format(
+        base_path,
+        allow=getattr(args, "allow_unsupported_format", False),
+    )
     build_calls = not args.no_calls
     build_metadata = not args.no_metadata
     build_fts = not args.no_fts
@@ -404,6 +459,11 @@ def main() -> None:
     build_p.add_argument("--no-metadata", action="store_true", help="Skip metadata tables (ES/SJ/FO)")
     build_p.add_argument("--no-fts", action="store_true", help="Skip FTS5 full-text search index")
     build_p.add_argument("--no-synonyms", action="store_true", help="Skip object synonyms table")
+    build_p.add_argument(
+        "--allow-unsupported-format",
+        action="store_true",
+        help="Строить неполный индекс на формате, отличном от cf/edt",
+    )
 
     # update
     update_p = idx_sub.add_parser("update", help="Incremental update by mtime+size")

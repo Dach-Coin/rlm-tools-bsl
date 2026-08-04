@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -34,6 +35,42 @@ class BslFileInfo:
     form_name: str | None
     command_name: str | None
     is_form_module: bool
+
+
+class SourceSupport(Enum):
+    """Уровень поддержки дерева исходников."""
+
+    SUPPORTED = "supported"
+    FOREIGN_WITH_BSL = "foreign_with_bsl"
+    FOREIGN_NO_BSL = "foreign_no_bsl"
+
+
+UNSUPPORTED_FORMAT_SESSION_WARNING = (
+    "== UNSUPPORTED SOURCE FORMAT ==\n"
+    "These sources are NOT a Configurator dump (cf) and NOT a 1C:EDT project. "
+    "Only cf and edt are supported.\n"
+    "Metadata and object-name helpers are not reliable on this layout. "
+    "Work from file paths and BSL text, treat empty metadata results as unsupported, "
+    "and state that the answer is best-effort."
+)
+
+GENERIC_MODE_SESSION_WARNING = (
+    "UNSUPPORTED SOURCE FORMAT: this directory is neither a Configurator dump (cf) "
+    "nor a 1C:EDT project, and no .bsl file was found. "
+    "Only generic file exploration is available in this session."
+)
+
+UNSUPPORTED_FORMAT_INDEX_WARNING = (
+    "Формат исходников не распознан как cf (выгрузка Конфигуратора) или edt (1С:EDT). "
+    "Индекс будет неполным: метаданные и навигация по объектам не гарантируются; "
+    "будут доступны только данные, производные от текста BSL."
+)
+
+NO_BSL_INDEX_REFUSAL = (
+    "Формат исходников не распознан как cf или edt, и ни одного .bsl-файла "
+    "в дереве не найдено (либо дерево недоступно для чтения) — "
+    "индекс строить не по чему."
+)
 
 
 METADATA_CATEGORIES: frozenset[str] = frozenset(
@@ -141,6 +178,108 @@ def detect_format(base_path: str) -> FormatInfo:
         has_configuration_xml=has_configuration_xml,
         metadata_categories_found=sorted(categories_found),
     )
+
+
+_CF_NS = "http://v8.1c.ru/8.3/MDClasses"
+_EDT_NS = "http://g5.1c.ru/v8/dt/metadata/mdclass"
+
+
+def _is_cf_descriptor(path: Path) -> bool:
+    """Сигнатура CF: корень {MDClasses}MetaDataObject, первый дочерний — Configuration.
+
+    Ранний выход: читаются только два первых start-события iterparse, то есть
+    префикс файла. Многомегабайтный боевой Configuration.xml целиком не читается.
+
+    LookupError ловится наравне с ParseError: незнакомая кодировка в XML-декларации
+    (`encoding="x-invalid"`) — это НЕ наш дескриптор, а не повод уронить гейт
+    необработанным исключением. Гейт обязан быть тотальным: он стоит на входе
+    сессии и построения индекса, и любой нечитаемый файл для него значит «нет».
+    """
+    try:
+        with open(path, "rb") as fh:
+            events = ET.iterparse(fh, events=("start",))
+            _, root = next(events)
+            if root.tag != f"{{{_CF_NS}}}MetaDataObject":
+                return False
+            _, child = next(events)
+            return child.tag == f"{{{_CF_NS}}}Configuration"
+    except (OSError, ET.ParseError, LookupError, StopIteration):
+        return False
+
+
+def _is_edt_descriptor(path: Path) -> bool:
+    """Сигнатура EDT: корень {mdclass}Configuration. Читается только префикс файла.
+
+    Набор перехватываемых исключений — тот же, что у CF (см. `_is_cf_descriptor`).
+    """
+    try:
+        with open(path, "rb") as fh:
+            _, root = next(ET.iterparse(fh, events=("start",)))
+            return root.tag == f"{{{_EDT_NS}}}Configuration"
+    except (OSError, ET.ParseError, LookupError, StopIteration):
+        return False
+
+
+def _subdirs(path: Path) -> list[Path]:
+    """Видимые подкаталоги одним scandir; недоступный каталог — пусто."""
+    try:
+        with os.scandir(path) as it:
+            return [Path(entry.path) for entry in it if entry.is_dir() and not entry.name.startswith(".")]
+    except OSError:
+        return []
+
+
+def _candidate_config_roots(base: Path):
+    """Корень, прямые дети и один уровень обертки (BFS).
+
+    Контракт скорости: листинг каталогов — только уровни 0 и 1. Кандидаты
+    уровня 2 проверяются двумя точечными open() без листинга их содержимого:
+    os.walk листил бы тысячи объектных каталогов чужого дерева (~800 мс).
+    """
+    yield base
+    level1 = _subdirs(base)
+    yield from level1
+    for child in level1:
+        yield from _subdirs(child)
+
+
+def has_our_format_descriptor(base_path: str) -> bool:
+    """Есть ли валидный дескриптор CF/EDT в поддерживаемой раскладке."""
+    base = Path(base_path)
+    if not base.is_dir():
+        return False
+    for root in _candidate_config_roots(base):
+        if _is_cf_descriptor(root / "Configuration.xml"):
+            return True
+        if _is_edt_descriptor(root / "Configuration" / "Configuration.mdo"):
+            return True
+    return False
+
+
+def probe_bsl(base_path: str) -> str:
+    """Возвращает found/none/unknown и выходит на первом индексируемом .bsl."""
+    unreadable = False
+
+    def _on_error(_exc: OSError) -> None:
+        nonlocal unreadable
+        unreadable = True
+
+    base = Path(base_path)
+    if not base.is_dir():
+        return "unknown"
+
+    for _root, _dirs, files in os.walk(base, onerror=_on_error):
+        for fname in files:
+            if os.path.normcase(fname).endswith(".bsl"):
+                return "found"
+    return "unknown" if unreadable else "none"
+
+
+def classify_source(base_path: str) -> SourceSupport:
+    """Классифицирует дерево только по живому диску."""
+    if has_our_format_descriptor(base_path):
+        return SourceSupport.SUPPORTED
+    return SourceSupport.FOREIGN_NO_BSL if probe_bsl(base_path) == "none" else SourceSupport.FOREIGN_WITH_BSL
 
 
 def parse_bsl_path(file_path: str, base_path: str) -> BslFileInfo:

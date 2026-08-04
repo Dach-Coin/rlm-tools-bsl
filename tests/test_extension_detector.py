@@ -5,6 +5,8 @@ import os
 import tempfile
 import textwrap
 
+import pytest
+
 from rlm_tools_bsl.extension_detector import (
     ConfigRole,
     detect_extension_context,
@@ -420,3 +422,69 @@ def test_annotation_izmenenieikontrol():
         assert overrides[0]["extension_method"] == "мр_СтароеИмя"
         assert overrides[0]["object_name"] == "МойМодуль"
         assert overrides[0]["module_type"] == "Module"
+
+
+# ---------------------------------------------------------------------------
+# Tests: незнакомая кодировка в XML-декларации дескриптора
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("parser_name", "filename", "declared_encoding", "body"),
+    [
+        ("_parse_config_xml", "Configuration.xml", "x-invalid", "<MetaDataObject/>"),
+        ("_parse_config_mdo", "Configuration.mdo", "x-bogus", "<mdclass:Configuration/>"),
+    ],
+)
+def test_unknown_xml_encoding_yields_no_config_instead_of_crash(
+    tmp_path, parser_name, filename, declared_encoding, body
+):
+    """Оба парсера дескриптора обязаны вернуть None, а не бросить исключение.
+
+    ElementTree на незнакомой кодировке бросает LookupError, а НЕ ParseError.
+    Раньше он уходил наружу и валил весь `detect_extension_context` — то есть
+    и `rlm_start`, даже когда битый файл лежал у СОСЕДА (см. парный
+    end-to-end тест в tests/test_foreign_format_gate.py).
+
+    Файл лежит на два уровня ниже tmp_path: скан соседей достаёт
+    `сосед/Configuration.xml` и `сосед/обёртка/Configuration.mdo`, поэтому
+    более мелкое вложение сделало бы фикстуру видимой для чужих тестов.
+    """
+    import rlm_tools_bsl.extension_detector as ed
+
+    target = tmp_path / "case" / "cfg" / filename
+    target.parent.mkdir(parents=True)
+    target.write_text(f'<?xml version="1.0" encoding="{declared_encoding}"?>{body}', encoding="utf-8")
+
+    parser = getattr(ed, parser_name)
+    assert parser(str(target), str(target.parent)) is None
+
+
+def test_poisoned_edt_neighbour_does_not_break_extension_scan(tmp_path):
+    """EDT-ветка скана соседей (`_scan_for_mdo` → `_parse_config_mdo`).
+
+    Раскладка ровно как у настоящего соседа-EDT: `сосед/обёртка/Configuration.mdo`.
+    Битый дескриптор соседа обязан быть просто не найден, а живая конфигурация
+    рядом — по-прежнему найдена (иначе тест прошёл бы на «ничего не сканируем»).
+    """
+    parent = tmp_path / "container"
+
+    broken = parent / "СломанныйСосед" / "cfg"
+    broken.mkdir(parents=True)
+    (broken / "Configuration.mdo").write_text(
+        '<?xml version="1.0" encoding="x-bogus"?><mdclass:Configuration/>', encoding="utf-8"
+    )
+
+    healthy = parent / "ЖивойСосед" / "cfg"
+    healthy.mkdir(parents=True)
+    (healthy / "Configuration.mdo").write_text(_edt_extension_mdo(name="ЖивоеРасширение"), encoding="utf-8")
+
+    own = parent / "Основная"
+    _write(str(own / "Configuration" / "Configuration.mdo"), _EDT_MAIN_MDO)
+
+    ctx = detect_extension_context(str(own))
+
+    assert ctx.current.role == ConfigRole.MAIN
+    names = {e.name for e in ctx.nearby_extensions}
+    assert "ЖивоеРасширение" in names, "живой EDT-сосед потерян — тест перестал стеречь скан"
+    assert not any(e.path.endswith("СломанныйСосед") for e in ctx.nearby_extensions)
