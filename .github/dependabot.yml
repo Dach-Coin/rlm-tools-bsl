@@ -17,3 +17,11 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "deps"
+    ignore:
+      # Мажорные обновления mcp предлагать не нужно: в 2.0 модуль
+      # `mcp.server.fastmcp` переехал в `mcp.server.mcpserver` (FastMCP →
+      # MCPServer), поэтому снятие границы `<2` без переписывания server.py
+      # ломает установку из PyPI (issue #22). Границу снимаем вместе с
+      # миграцией, вручную. Минорные и патч-обновления 1.x приходят как прежде.
+      - dependency-name: "mcp"
+        update-types: ["version-update:semver-major"]
