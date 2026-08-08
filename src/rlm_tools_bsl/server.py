@@ -2910,6 +2910,51 @@ def _warmup_imports():
     logger.info("warmup: completed in %.1fs", time.monotonic() - _t0)
 
 
+def _prepare_stdio_transport():
+    """Развести дескрипторы и выбрать способ запуска stdio-транспорта.
+
+    Возвращает `(restore, runner)`: `runner is None` означает «поднимать
+    транспорт обычным `mcp.run()`».
+
+    Предпочтительный путь — отдать транспорту провода ЯВНО, оставив
+    `sys.stdin`/`sys.stdout` на отводах: тогда посторонний `print()` из любого
+    кода процесса физически не может попасть в JSON-RPC поток. Точка входа
+    FastMCP для этого резолвится ДО разводки: если её не окажется, поднимать
+    транспорт с уже уведённым fd 1 нельзя — ответы молча ушли бы в stderr,
+    поэтому в этом случае разводка выполняется с подменой sys-потоков, а
+    транспорт запускается штатно.
+    """
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    from rlm_tools_bsl._stdio_hardening import harden_stdio_for_children
+
+    low_level = getattr(mcp, "_mcp_server", None)
+    explicit_streams = callable(getattr(low_level, "run", None)) and callable(
+        getattr(low_level, "create_initialization_options", None)
+    )
+
+    hardening = harden_stdio_for_children(swap_sys_streams=not explicit_streams)
+    logger.info("stdio hardening: applied=%s (%s)", hardening.applied, hardening.detail)
+    if not explicit_streams:
+        logger.warning(
+            "stdio transport: точка входа FastMCP недоступна — протокол берётся из sys-потоков, "
+            "посторонний вывод в stdout не изолирован от протокола"
+        )
+
+    if not (explicit_streams and hardening.applied):
+        return hardening.restore, None
+
+    async def _serve() -> None:
+        async with stdio_server(
+            stdin=anyio.wrap_file(hardening.wire_stdin),
+            stdout=anyio.wrap_file(hardening.wire_stdout),
+        ) as (read_stream, write_stream):
+            await low_level.run(read_stream, write_stream, low_level.create_initialization_options())
+
+    return hardening.restore, lambda: anyio.run(_serve)
+
+
 def main():
     global session_manager
     from rlm_tools_bsl._config import load_project_env
@@ -3080,11 +3125,32 @@ def main():
     except Exception as exc:
         logger.warning("cleanup_stale_cache failed: %s", exc)
 
+    # stdio: увести fd 0/1 с протокольных труб ДО старта транспорта и любого
+    # спавна. Иначе дочерний Python (sandbox-worker) наследует стандартные
+    # хэндлы родителя и зависает внутри инициализации интерпретатора на pipe,
+    # где транспорт держит блокирующее чтение (CPython gh-78961). Best-effort:
+    # неудача разводки не имеет права сорвать старт сервера.
+    stdio_restore = None
+    run_stdio = None
+    if args.transport == "stdio":
+        try:
+            stdio_restore, run_stdio = _prepare_stdio_transport()
+        except Exception as exc:
+            logger.warning("stdio hardening failed: %s: %s", type(exc).__name__, exc)
+
     _begin_sandbox_backend_lifecycle()
     try:
         threading.Thread(target=_warmup_imports, daemon=True).start()
-        mcp.run(transport=args.transport)
+        if run_stdio is not None:
+            run_stdio()
+        else:
+            mcp.run(transport=args.transport)
     finally:
         # Не полагаться на daemon-семантику процессов: явный bounded shutdown
         # всех sandbox workers с единым deadline (§13.6).
         _shutdown_all_sandbox_backends()
+        if stdio_restore is not None:
+            try:
+                stdio_restore()
+            except Exception as exc:  # shutdown-путь: диагностика, но не новая ошибка
+                logger.warning("stdio hardening restore failed: %s: %s", type(exc).__name__, exc)

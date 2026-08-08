@@ -251,7 +251,7 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host " Done! HTTP MCP server is running." -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "Version:  $(& rlm-tools-bsl --version 2>&1)"
+Write-Host "Version:  $(cmd /c 'rlm-tools-bsl --version 2>nul')"  # via cmd: under ErrorActionPreference=Stop any stderr from a native exe (e.g. a dependency warning) aborts the script
 Write-Host "Endpoint: $mcpUrl"
 Write-Host "Health:   $url"
 Write-Host ""
