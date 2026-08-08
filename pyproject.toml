@@ -24,7 +24,7 @@ dependencies = [
     # в `mcp.server.mcpserver` (FastMCP → MCPServer), из-за чего установка из PyPI
     # падала с ModuleNotFoundError. Ветка 1.x продолжает получать патчи.
     # Снимать `<2` только вместе с миграцией server.py на MCPServer.
-    "mcp[cli]>=1.26.0,<2",
+    "mcp[cli]>=1.26.0,<3",
     "anthropic>=0.40.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
