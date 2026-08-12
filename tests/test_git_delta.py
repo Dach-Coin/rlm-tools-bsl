@@ -99,16 +99,16 @@ def _install_worktree_timeout(monkeypatch) -> None:
     work-tree probes (which carry ``--ignore-cr-at-eol`` or ``ls-files
     --others``) raise ``TimeoutExpired``, marking detection unreliable.
     """
-    real_run = subprocess.run
+    real_run_git = bsl_index_mod.run_git
 
-    def fake_run(args, **kwargs):
+    def fake_run_git(args, timeout):
         is_worktree_diff = "--ignore-cr-at-eol" in args
         is_untracked = "ls-files" in args and "--others" in args
         if is_worktree_diff or is_untracked:
-            raise subprocess.TimeoutExpired(cmd=args, timeout=kwargs.get("timeout", 60))
-        return real_run(args, **kwargs)
+            raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+        return real_run_git(args, timeout)
 
-    monkeypatch.setattr(bsl_index_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(bsl_index_mod, "run_git", fake_run_git)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +171,19 @@ def git_bsl_project_with_metadata(tmp_path, monkeypatch):
 
 
 class TestGitAvailable:
+    def test_uses_common_runner(self, monkeypatch):
+        calls = []
+
+        def fake_run_git(args, timeout):
+            calls.append((args, timeout))
+            return subprocess.CompletedProcess(args, 0, "true\n", "")
+
+        monkeypatch.setattr(bsl_index_mod, "_git_base_cmd", lambda base_path: ["git", "-C", base_path])
+        monkeypatch.setattr(bsl_index_mod, "run_git", fake_run_git)
+
+        assert _git_available("repo") is True
+        assert calls == [(["git", "-C", "repo", "rev-parse", "--is-inside-work-tree"], 10)]
+
     def test_inside_repo(self, git_bsl_project):
         assert _git_available(str(git_bsl_project)) is True
 

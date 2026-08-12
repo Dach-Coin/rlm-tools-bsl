@@ -23,6 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
+from rlm_tools_bsl._git_process import run_git
 from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS, _merge_proc_continuations
 from rlm_tools_bsl.cache import _paths_hash
 from rlm_tools_bsl.format_detector import BslFileInfo, parse_bsl_path
@@ -1080,15 +1081,6 @@ _GLOBAL_TABLE_BY_CATEGORY: dict[str, str] = {
 
 _git_exe: str | None | bool = None  # cached: str=path, False=not found, None=not yet searched
 
-# Common kwargs for all git subprocess calls.
-# errors="replace" handles cp1251 stderr from git on Windows services.
-_GIT_SUBPROCESS_KW: dict = {
-    "capture_output": True,
-    "text": True,
-    "encoding": "utf-8",
-    "errors": "replace",
-}
-
 
 class _GitDirtyResult(NamedTuple):
     """Result of a git dirty / changed-files detection.
@@ -1219,11 +1211,7 @@ def _git_available(base_path: str) -> bool:
         logger.debug("_git_available: _find_git returned None")
         return False
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "--is-inside-work-tree"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "--is-inside-work-tree"], timeout=10)
         ok = r.returncode == 0 and r.stdout.strip() == "true"
         if not ok:
             logger.info(
@@ -1249,11 +1237,7 @@ def _git_repo_info(base_path: str) -> tuple[str, str] | None:
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "--show-toplevel"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "--show-toplevel"], timeout=10)
         if r.returncode != 0:
             return None
         git_root = r.stdout.strip()
@@ -1271,11 +1255,7 @@ def _git_head_sha(base_path: str) -> str | None:
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "HEAD"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "HEAD"], timeout=10)
         return r.stdout.strip() if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -1296,11 +1276,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "merge-base", "--is-ancestor", since_commit, "HEAD"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=60,
-        )
+        r = run_git([*cmd, "merge-base", "--is-ancestor", since_commit, "HEAD"], timeout=60)
         if r.returncode != 0:
             return None
     except (subprocess.TimeoutExpired, OSError):
@@ -1313,7 +1289,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
     def _run_critical(args: list[str]) -> set[str] | None:
         """Run a critical git command; ``None`` on failure aborts the fast path."""
         try:
-            r = subprocess.run(args, **_GIT_SUBPROCESS_KW, timeout=60)
+            r = run_git(args, timeout=60)
             if r.returncode != 0:
                 return None
             return _lines_to_set(r.stdout)
@@ -1329,7 +1305,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
         """
         nonlocal unreliable_reason
         try:
-            r = subprocess.run(args, **_GIT_SUBPROCESS_KW, timeout=best_effort_timeout)
+            r = run_git(args, timeout=best_effort_timeout)
             if r.returncode != 0:
                 logger.info("_git_changed_files: %s rc=%d, marking unreliable", label, r.returncode)
                 if unreliable_reason is None:
@@ -1446,7 +1422,7 @@ def _git_current_dirty(base_path: str, prefix: str) -> _GitDirtyResult:
     def _run(cmd: list[str], label: str, parser=_lines_to_set) -> set[str]:
         nonlocal unreliable_reason
         try:
-            r = subprocess.run(cmd, **_GIT_SUBPROCESS_KW, timeout=best_effort_timeout)
+            r = run_git(cmd, timeout=best_effort_timeout)
             if r.returncode == 0:
                 return parser(r.stdout)
             if unreliable_reason is None:
@@ -1805,7 +1781,7 @@ def _git_grep(
 
     t = timeout if timeout is not None else _git_grep_timeout()
     try:
-        r = subprocess.run(grep_cmd, **_GIT_SUBPROCESS_KW, timeout=t)
+        r = run_git(grep_cmd, timeout=t)
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
         logger.info("_git_grep: %s: %s", type(exc).__name__, exc)
         kind = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "spawn_failed"
