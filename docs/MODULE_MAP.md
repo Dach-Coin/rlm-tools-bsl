@@ -1,6 +1,6 @@
 # Карта модулей
 
-Актуально для **v1.32.1** (`BUILDER_VERSION = 14` — схема индекса НЕ менялась, пересборка индексов при обновлении не требуется).
+Актуально для **v1.32.2** (`BUILDER_VERSION = 14` — схема индекса НЕ менялась, пересборка индексов при обновлении не требуется).
 
 Числа-снимки ниже застолблены тестами — если правишь сущность, обнови и число, и тест:
 
@@ -48,8 +48,9 @@
   - **Граф вызовов**: каждое ребро резолвится в стабильный `callee_key = "<rel_path>::<casefold(метод)>"` (`_make_callee_key` — единый источник для build и query) по двум tier'ам — local (`B()`) и common_exported (`A.B()` через `_build_common_exported`); неоднозначные/платформенные → `NULL` by design. `_reresolve_qualified_callers` держит инвариант `update ≡ build` по `callee_key`. Перф: выражение-индексы `idx_calls_callee_short`/`idx_calls_callee` (единый источник `_callee_short_expr`/`_callee_match_clause`) + FK-индекс `idx_meth_module`, оба с безусловным self-heal в `_update_locked`.
   - **Чтение (read-only слой поверх схемы)**: `get_callers` (+`edge_exact`), `get_inbound_edges` (не-call рёбра: подписки, регламентные задания, обработчики форм, CFE-перехваты — в общем пространстве `callee_key`), `resolve_target_identity`, `find_metadata_refs_from`, `sample_method_definitions` (дешёвая проба многозначности имени для ambiguity-guard `find_path`), exact-ридеры (`get_roles_exact`/`get_event_subscriptions_exact`/`get_functional_options_exact`) и счётчики (`count_regions`/`count_module_headers`/`count_metadata_references`/`count_code_usages`/`count_overrides_by_extension_root`). Read-time фильтр шума в `get_register_movements`/`get_register_writers` (`_MOVEMENT_METHOD_NOISE` — `Движения.Записать()` и прочие методы набора не выдаются за регистры даже на старом индексе, без пересборки). Кириллица в substring-поиске — через `py_lower(col) LIKE py_lower(?)`, а не `COLLATE NOCASE` (тот фолдит только ASCII). Декоратор `@_transient_safe` гасит ДВА транзиентных `OperationalError` in-place пересборки (`no such table`, `database is locked`) и ре-raise'ит всё остальное.
   - **Общее с хелперами**: `_scan_module` (multiline/comment/string-aware сканер — используется и в FS-fallback `bsl_helpers`), `_iter_metadata_xml_files` (path-scan XML/MDO — DRY с extension pass `bsl_helpers`), `_git_grep` + санитайзеры (`_sanitize_grep_path` нормализует внутренний backslash, режет ведущие `/`/`\`, drive/glob/`..`/UNC).
+  - **Git-процессы (v1.32.2)**: все восемь точек запуска Git используют `_git_process.run_git`; timeout сохраняет прежнюю семантику fallback, но cleanup процесса и pipe теперь ограничен по времени, включая завершение дерева процессов на Windows.
 
-  → `bsl_knowledge` (`BSL_PATTERNS`, `_merge_proc_continuations`), `cache`, `format_detector`, `bsl_xml_parsers`, `extension_detector`
+  → `_git_process`, `bsl_knowledge` (`BSL_PATTERNS`, `_merge_proc_continuations`), `cache`, `format_detector`, `bsl_xml_parsers`, `extension_detector`
 - **`bsl_xml_parsers.py`** — парсеры XML-метаданных 1С, **оба формата (CF и EDT)** за общим фасадом (`parse_metadata_xml` → `dict | None`, `parse_form_xml`, `parse_rights_xml`, `parse_event_subscription_xml`, `parse_scheduled_job_xml`, `parse_enum_xml`, `parse_predefined_items`, `parse_functional_option_xml`, `parse_http_service_xml`, `parse_web_service_xml`, `parse_xdto_package_xml`/`parse_xdto_types`, `parse_exchange_plan_content`, `parse_defined_type`, `parse_pvh_characteristics`, `parse_command_parameter_type`, `canonicalize_type_ref`, `normalize_type_string`). `_RU_META_FORMS` — единый источник RU/EN форм метаданных + производные карты (`_CODE_MANAGER_COLLECTIONS`/`_CODE_QUERY_COLLECTIONS`/`_RU_REFTYPE_TO_CANONICAL`) для code-usage-экстрактора; leaf → импортируется и в `bsl_index`, и в `bsl_helpers` без циклов. → `format_detector`
 
 ### Детектирование формата
@@ -57,6 +58,7 @@
 - **`extension_detector.py`** — обнаружение расширений 1С и перехватов методов: `ConfigRole` (MAIN/EXTENSION), `ExtensionContext`, `detect_extension_context`, `resolve_config_root`, `find_extension_overrides` (скан `&Вместо/&Перед/&После/&ИзменениеИКонтроль`; опциональные diagnostics фиксируют неполный обход и нечитаемые BSL-файлы), `_build_warnings`, `_ext_list_cap`. → `format_detector`, `helpers`
 
 ### Инфраструктура
+- **`_git_process.py`** — leaf (v1.32.2): единый `run_git(args, timeout)` с `DEVNULL` для stdin и UTF-8/`errors="replace"` для captured stdout/stderr. При timeout Windows-дерево best-effort завершается через системный `taskkill.exe /T /F` с отдельным лимитом; затем на всех ОС завершается непосредственный процесс, а drain pipe и ожидание имеют собственные границы. Всегда пере-брасывает исходный `subprocess.TimeoutExpired`. → _(нет внутренних зависимостей)_
 - **`helpers.py`** — generic-тулбокс песочницы (не BSL-специфичный): `make_helpers(base_path, idx_reader=None)` → `read_file`, `read_files`, `grep`, `grep_summary`, `grep_read`, `glob_files`, `tree`, `find_files` + резолвер `_resolve_safe` (base-only). Кэши файлов/грепа, `_SKIP_DIRS`/`_BINARY_EXTENSIONS` (переиспользуются `extension_detector`, `bsl_helpers`, `server`), индексные fast-path'ы через `idx_reader` с FS-fallback на zero-hit. → `regex_safety`
 - **`regex_safety.py`** — leaf-guard против catastrophic backtracking (ReDoS): `has_catastrophic_nesting(pattern)` + общий текст ошибки `NESTED_QUANTIFIER_ERROR`. Зовётся ПЕРВЫМ действием на ОБОИХ входах grep (`helpers.grep`, `bsl_helpers.safe_grep`) — до кэша/`re.compile`/прогрева индекса. Эвристика по СТРУКТУРЕ (вложенные неограниченные кванторы), не полноценный wall-clock-kill: bounded-кванторы (`(\d{4})+`) не блокируются. → _(нет внутренних зависимостей)_
 - **`log_retention.py`** — leaf: ротация `server.log` по ВРЕМЕНИ на старте (`purge_log_older_than`, окно `RLM_LOG_RETENTION_DAYS`, дефолт 20; `log_retention_days()`). Лог append-only и хронологический → достаточно одной точки среза. Работает на БАЙТАХ с ASCII-регексом (хвост переписывается verbatim — старые логи смешанной кодировки не портятся), понимает timestamp watchdog-строк службы, перезапись атомарная (temp + `os.replace`), **никогда не бросает исключений**. Должен вызываться ДО открытия файла писателем: на Windows — из службы (`_service_win`), иначе — из `server.main()`. → _(нет внутренних зависимостей)_
@@ -124,6 +126,7 @@ graph TD
     bsl_helpers --> _format
 
     bsl_index --> bsl_knowledge
+    bsl_index --> _git_process
     bsl_index --> cache
     bsl_index --> format_detector
     bsl_index --> bsl_xml_parsers
