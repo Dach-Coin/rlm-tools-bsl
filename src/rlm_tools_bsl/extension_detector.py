@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from rlm_tools_bsl.bsl_knowledge import mask_comments_and_strings
 from rlm_tools_bsl.format_detector import parse_bsl_path
 from rlm_tools_bsl.helpers import _SKIP_DIRS
 
@@ -54,9 +55,11 @@ _ANNOTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Procedure/function definition following an annotation
+# Procedure/function definition following an annotation.
+# Префикс Асинх/Async обязателен: без него перехват асинхронной функции
+# оставался с пустым extension_method.
 _PROC_DEF_RE = re.compile(
-    r"^\s*(?:Процедура|Функция|Procedure|Function)\s+(\w+)",
+    r"^\s*(?:(?:Асинх|Async)\s+)?(?:Процедура|Функция|Procedure|Function)\s+(\w+)",
     re.IGNORECASE,
 )
 
@@ -634,21 +637,36 @@ def _scan_bsl_for_annotations(
 
     bsl_info = parse_bsl_path(fpath, ext_base)
 
-    for i, line in enumerate(lines):
-        m = _ANNOTATION_RE.search(line)
+    # v1.33.0: ВСЕ решения — по маске. `// &Вместо("X")` не перехват, а на боевых
+    # расширениях таких 4 из 803, и каждая приписывала себе следующую живую функцию.
+    # Режим keep_string_content=True: имя целевого метода лежит в строковом литерале,
+    # полная маска убила бы сам сигнал, и одна строка годится и для детекта, и для
+    # извлечения имени.
+    masked = mask_comments_and_strings(lines, keep_string_content=True)
+
+    for i, mline in enumerate(masked):
+        m = _ANNOTATION_RE.search(mline)
         if m is None:
             continue
 
         annotation = m.group(1)
         target_method = m.group(2)
 
-        # Try to find the procedure/function name on the next line(s)
+        # Имя объявления ищем не в фиксированном окне, а пропуская незначащее:
+        # комментарии, пустые строки, директивы препроцессора (#) и компиляции (&).
+        # Фиксированное окно в 3 строки оставляло без имени 7% перехватов на боевой
+        # конфигурации, когда объявление отделено блоком комментариев.
         extension_method = ""
-        for j in range(i + 1, min(i + 4, len(lines))):
-            pm = _PROC_DEF_RE.match(lines[j])
+        for j in range(i + 1, len(masked)):
+            stripped = masked[j].strip()
+            if not stripped or stripped.startswith(("#", "&")):
+                if _ANNOTATION_RE.search(masked[j]):
+                    break  # начался следующий перехват — этот остаётся без имени
+                continue
+            pm = _PROC_DEF_RE.match(masked[j])
             if pm:
                 extension_method = pm.group(1)
-                break
+            break
 
         results.append(
             {

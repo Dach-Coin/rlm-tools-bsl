@@ -254,7 +254,7 @@ class TestBuilderFilePaths:
         conn = sqlite3.connect(str(db_path))
         row = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()
         conn.close()
-        assert row[0] == "14"
+        assert int(row[0]) == BUILDER_VERSION
 
     def test_file_paths_count_in_meta(self, tmp_path, monkeypatch):
         _make_test_fixture(tmp_path)
@@ -550,13 +550,3 @@ class TestUpdateFilePaths:
         reader.close()
 
         assert new_count == initial_count + 1
-
-
-# ---------------------------------------------------------------------------
-# Version bump test
-# ---------------------------------------------------------------------------
-
-
-class TestVersionBump:
-    def test_builder_version_is_10(self):
-        assert BUILDER_VERSION == 14

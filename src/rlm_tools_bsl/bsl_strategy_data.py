@@ -38,7 +38,7 @@ Step 1 — DISCOVER: find what you need
   search_methods('substring')            → precise: find METHODS by code name (FTS)
   search_regions('имя')                  → precise: find code regions
   search_module_headers('текст')         → precise: find modules by header
-  NOTE: search_regions/search_module_headers молча усекаются по limit — для census бери count_only=True: тот же scope, что и выдача (с CFE +total_main/total_extensions)
+  NOTE: search_regions/search_module_headers режутся по limit (порядок — не релевантность): census — count_only=True (тот же scope, что и выдача; при CFE +total_main/total_extensions), топ-N — search_regions(group_by='name')
   NOTE: search() = broad first pass; specialized helpers = precise follow-up when you need specific fields
   parse_object_xml(path) → attributes, tabular sections, dimensions, resources
   find_attributes('ИмяРеквизита')        → INSTANT: attribute name → type(s)

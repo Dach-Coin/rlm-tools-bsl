@@ -278,6 +278,10 @@ class Sandbox:
         # invocations: an execute with only 1-2 top-level helper calls is "sparse".
         # Accumulated across the session (NOT cleared in execute(), unlike _helper_calls).
         self._session_sparse_execute_count: int = 0
+        # Списочные хелперы, чья выдача упёрлась в limit В ЭТОМ execute:
+        # {helper: (returned, limit)}. Очищается вместе с _helper_calls, потому что
+        # подсказка обязана прийти в ТОМ ЖЕ ответе, где агент получил срез.
+        self._execute_saturated: dict[str, tuple[int, int]] = {}
         self._setup_namespace()
 
     def _setup_namespace(self) -> None:
@@ -412,7 +416,9 @@ class Sandbox:
                         _akey = (_name, _fp)
                         self._session_helper_arg_counts[_akey] = self._session_helper_arg_counts.get(_akey, 0) + 1
                     try:
-                        return _fn(*args, **kwargs)
+                        _res = _fn(*args, **kwargs)
+                        self._note_saturation(_name, args, kwargs, _res)
+                        return _res
                     finally:
                         self._helper_calls.append(
                             HelperCall(
@@ -427,6 +433,49 @@ class Sandbox:
             else:
                 wrapped[name] = obj
         return wrapped
+
+    # Списочные хелперы, у которых выдача молча режется по limit: {helper: (позиция
+    # limit в позиционных аргументах, значение по умолчанию)}. Признака усечения в
+    # самом ответе нет и добавить его некуда — это list[dict], а параллельный
+    # count_only-контракт заморожен побайтно. Поэтому сигнал уходит в
+    # efficiency_hints конверта rlm_execute: возврат хелпера и stdout не меняются
+    # (test_sandbox_helper_return_value_unchanged).
+    _SATURATING_LIST_HELPERS = {
+        "search_regions": (1, 200),
+        "search_module_headers": (1, 200),
+        "search_objects": (1, 50),
+        "search_methods": (1, 30),
+    }
+
+    def _note_saturation(self, name: str, args: tuple, kwargs: dict, result) -> None:
+        """Запомнить, что списочный хелпер вернул РОВНО limit строк.
+
+        Это не доказательство усечения (реальный итог мог совпасть с limit) — текст
+        подсказки так и сформулирован. Ложный позитив здесь дешевле пропуска: агент
+        строит агрегаты по срезу и получает систематически неверный ответ, а
+        `search_regions` при пустом query отдаёт вообще алфавитный префикс.
+        """
+        spec = self._SATURATING_LIST_HELPERS.get(name)
+        if spec is None or not isinstance(result, list):
+            return
+        pos, default = spec
+        limit = kwargs.get("limit", args[pos] if len(args) > pos else default)
+        # Зеркалим `_coerce_bound` хелпера, иначе подсказка разойдётся с реальностью
+        # в обе стороны: вызов с limit="200" реально усёкся бы по 200 строкам, а
+        # молчали бы; и наоборот — limit=250.0 хелпер ПРИНИМАЕТ (усекает до 250),
+        # так что подстановка дефолта 200 дала бы ложный хинт на 230 строках.
+        if isinstance(limit, bool) or not isinstance(limit, (int, float)) or limit != limit:
+            limit = default  # bool / не-число / NaN
+        else:
+            limit = int(limit)  # float усекается — как в _coerce_bound
+            if limit < 0:
+                limit = default
+        if limit <= 0:
+            # limit=0 для `_coerce_bound` валиден и даёт пустую выдачу. Формально это
+            # усечение, но сигнализировать нечего: агент сам попросил ноль строк.
+            return
+        if len(result) >= limit:
+            self._execute_saturated[name] = (len(result), limit)
 
     # Batch/aggregate helpers — using ANY of them means the agent is already batching,
     # which suppresses the generic "batch more" nudge.
@@ -445,7 +494,8 @@ class Sandbox:
         Lives in the ``rlm_execute`` response metadata (never the helper return / stdout —
         see ``test_sandbox_helper_return_value_unchanged``). Each hint:
         ``{id, message, trigger, helper?, count?}`` with stable ids
-        ``read_files`` / ``reuse_var`` / ``batch`` / ``redundant_get_index_info``."""
+        ``read_files`` / ``reuse_var`` / ``batch`` / ``redundant_get_index_info`` /
+        ``list_truncated:<helper>`` (последний — per-execute, остальные session-cumulative)."""
         out: list[dict] = []
         nc = self._session_helper_name_counts
         emitted = self._emitted_efficiency_hints
@@ -540,6 +590,50 @@ class Sandbox:
                         ),
                     }
                 )
+
+        # (5) Списочная выдача упёрлась в limit В ЭТОМ execute. Признака усечения в
+        # самом ответе нет (см. _SATURATING_LIST_HELPERS), поэтому агент строит топ-N
+        # по срезу и получает неверный ответ: у search_regions с пустым query срез
+        # вообще алфавитный.
+        #
+        # ЭТА подсказка НЕ троттлится по сессии, в отличие от четырёх выше, и
+        # `emitted` намеренно не трогает. Те — советы о СТИЛЕ работы ("батчи",
+        # "переиспользуй переменную"): их достаточно дать один раз. Здесь же факт
+        # относится к КОНКРЕТНОМУ результату: каждый усечённый вызов — свой набор
+        # данных, по которому агент может построить неверный агрегат. Однократность
+        # ломала бы заявленный контракт «сигнал приходит в том же ответе, где получен
+        # срез»: первый же вызов, случайно вернувший ровно limit строк (например
+        # limit=1 на существующей единственной строке), съедал бы id, и настоящее
+        # усечение дальше в сессии осталось бы беззвучным. Дедуп есть, но в пределах
+        # одного execute: `_execute_saturated` — dict по имени хелпера.
+        for helper, (returned, limit) in sorted(self._execute_saturated.items()):
+            # Порядок выдачи упоминается ТОЛЬКО там, где он и правда не релевантность:
+            # search_methods ранжирует по BM25, search_objects — четырёхуровневым
+            # ранжированием, и для них общая фраза противоречила бы контракту хелпера.
+            if helper == "search_regions":
+                fix = (
+                    "точное число — search_regions(query, count_only=True)['total'], "
+                    "топ-N — search_regions(query, group_by='name')"
+                )
+                order_note = " Порядок выдачи — не релевантность."
+            elif helper == "search_module_headers":
+                fix = "точное число — search_module_headers(query, count_only=True)['total']"
+                order_note = " Порядок выдачи — не релевантность."
+            else:
+                fix = "подними limit или сузь запрос"
+                order_note = ""  # ранжированная выдача: усекается хвост, а не случайное
+            out.append(
+                {
+                    "id": f"list_truncated:{helper}",
+                    "helper": helper,
+                    "count": returned,
+                    "trigger": f"{helper} returned {returned} rows == limit {limit}",
+                    "message": (
+                        f"{helper} вернул ровно limit={limit} строк — выдача, возможно, усечена."
+                        f"{order_note} Не строй по ней агрегаты: {fix}."
+                    ),
+                }
+            )
         return out
 
     @contextmanager
@@ -623,6 +717,7 @@ class Sandbox:
 
     def _execute_locked(self, code: str) -> ExecutionResult:
         self._helper_calls.clear()
+        self._execute_saturated.clear()
         blocked = self._validate_readonly(code)
         if blocked is not None:
             return ExecutionResult(

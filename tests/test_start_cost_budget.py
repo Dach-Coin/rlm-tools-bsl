@@ -187,3 +187,134 @@ def test_full_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
         assert "has_object_attributes" in data["index"]
     finally:
         _rlm_end(data["session_id"])
+
+
+# ── v1.33.0: длинные пояснения переехали из sig в recipe ────────────────────
+#
+# `sig` уходит агенту на КАЖДОМ старте и лежит в бюджете, `recipe` — нет
+# (его отдаёт rlm_help по запросу). Шесть самых длинных sig занимали 4166
+# символов из 12727 всего available_functions; запаса под контракты v1.33.0
+# при этом не оставалось (slim+рецепт 49 символов, full payload 244).
+_SIG_CEILINGS = {
+    "find_call_hierarchy": 560,
+    "find_path": 540,
+    "get_object_full_structure": 520,
+    "get_object_modules": 500,
+    "get_module_outline": 470,
+    "find_register_movements": 380,
+    # Четыре подписи, несущие предупреждения о ложном отрицательном выводе
+    # (см. test_sigs_warn_about_false_negative_answers). Потолок нужен именно им:
+    # предупреждение тянет текст вверх, а sig уходит агенту на КАЖДОМ старте.
+    # Запас к фактическому размеру ~10%: смысл дописывать можно, растекаться — нет.
+    "parse_form": 600,
+    "search_regions": 560,
+    "search_module_headers": 340,
+    "search_methods": 320,
+}
+
+
+@pytest.mark.parametrize("helper,ceiling", sorted(_SIG_CEILINGS.items()))
+def test_long_sigs_are_trimmed(helper, ceiling):
+    """v1.33.0: длинные пояснения переехали в recipe (не в бюджете), sig несёт имена
+    ключей/параметров И критические pre-call предупреждения — те, без которых агент
+    делает ЛОЖНЫЙ вывод из ответа (см. test_sigs_warn_about_false_negative_answers:
+    рецепт читают не всегда, sig уходит на каждом старте). Всё остальное — в recipe.
+    Растить обратно нельзя — бюджет старта на пределе."""
+    snap = build_helper_metadata_snapshot()
+    sig = snap[helper]["sig"]
+    assert len(sig) <= ceiling, f"{helper} sig = {len(sig)} > {ceiling}: перенеси пояснение в recipe"
+
+
+def test_trimmed_sigs_keep_their_keys():
+    """Сокращение НЕ должно съесть имена ключей: агент выбирает вызов по ним."""
+    snap = build_helper_metadata_snapshot()
+    required = {
+        "find_register_movements": [
+            "code_registers",
+            "suppressed_main_code_registers",
+            "posting_handler_present",
+        ],
+        "get_object_modules": ["modules", "category", "object_name"],
+        "find_path": ["from_name", "to_name", "max_depth"],
+        "find_call_hierarchy": ["direction", "depth", "module_hint"],
+        "get_module_outline": ["regions", "methods"],
+        "get_object_full_structure": ["attributes", "tabular_sections"],
+    }
+    for helper, keys in required.items():
+        sig = snap[helper]["sig"]
+        for k in keys:
+            assert k in sig, f"{helper}: ключ {k} пропал из sig при сокращении"
+
+
+def _sig_says(sig: str, alternatives: tuple[str, ...], helper: str, what: str) -> None:
+    """Хотя бы одна из формулировок обязана присутствовать.
+
+    Гард намеренно НЕ требует дословного текста: он проверяет, что смысл на месте,
+    и переживает нормальную редактуру. Дословное совпадение ломало бы даже более
+    точную переформулировку — а это провоцирует «поправить тест», а не текст.
+    """
+    low = sig.casefold()
+    assert any(a.casefold() in low for a in alternatives), (
+        f"{helper}: из sig пропало {what} (ни одна из формулировок {alternatives} не найдена)"
+    )
+
+
+def test_sigs_warn_about_false_negative_answers():
+    """Предупреждения о ЛОЖНОМ отрицательном выводе обязаны жить в sig, а не в рецепте.
+
+    Рецепт (`rlm_help`) читают не всегда, а sig уходит агенту на КАЖДОМ старте.
+    Каждое предупреждение обязано нести ТРИ вещи: причину, границы (где именно ответ
+    неполон) и ДЕЙСТВИЕ — без действия предупреждение агента не спасает.
+
+    Происхождение (важно для будущих правок — что здесь факт, а что профилактика):
+      * `parse_form` — воспроизведённый инцидент: после смены контракта `types` со
+        строки на list идиома `'DynamicList' in a['types']` стала сравнением по
+        ЭЛЕМЕНТУ, а в выгрузке Конфигуратора элемент несёт префикс пространства имён
+        (на боевой конфигурации это cfg:/xs:/v8:/mxl:/v8ui:/dcsset:). Отчёт заявил
+        «DynamicList нет ни в одной форме», хотя он есть в двух. В EDT префикса нет
+        вовсе, и та же проверка сработала бы — поэтому в sig названы ОБА формата.
+      * `search_regions` — воспроизведённый инцидент: подстрока без стемминга,
+        'Себестоимость' не находит 'Себестоимости', и отчёт заявил, что подсистемы
+        себестоимости «нет как таковой».
+      * `search_module_headers` — механика поиска та же самая, поэтому предупреждение
+        закреплено ПРОФИЛАКТИЧЕСКИ: отдельного инцидента по нему не было.
+      * `search_methods` — токенайзер trigram: запрос короче 3 символов по основному
+        индексу не ищется вовсе. При расширениях live-ветка фильтрует подстрокой без
+        порога длины, поэтому совпадения, ЕСЛИ они есть, придут только из расширений;
+        если их нет — ответ останется пустым. Ни пустой, ни extension-only ответ не
+        доказывает отсутствия метода в основной конфигурации.
+    """
+    snap = build_helper_metadata_snapshot()
+
+    sig = snap["parse_form"]["sig"]
+    for marker in ("list[str]", "CF", "EDT", "DynamicList"):
+        assert marker.casefold() in sig.casefold(), f"parse_form: в sig нет упоминания {marker!r}"
+    _sig_says(sig, ("rsplit(", "endswith(", "removeprefix(", "хвост"), "parse_form", "ДЕЙСТВИЕ (как сверять тип)")
+
+    sig = snap["search_methods"]["sig"]
+    _sig_says(sig, ("trigram",), "search_methods", "причина (токенайзер)")
+    _sig_says(sig, ("короче 3", "от 3 символов", "3 символов"), "search_methods", "порог длины запроса")
+    _sig_says(sig, ("основному", "main"), "search_methods", "граница scope (какой индекс не ищет)")
+    _sig_says(sig, ("расширени", "extension"), "search_methods", "оговорка про live-ветку расширений")
+    # Без этих двух предупреждение вырождается: «расширения поддерживаются» пройдёт
+    # проверки выше, но не скажет ни что выдача СОСТОИТ из одних расширений, ни что
+    # с этим делать. Ровно тот же набор (причина + граница + ДЕЙСТВИЕ), что ниже
+    # требуется от search_regions/search_module_headers.
+    _sig_says(
+        sig,
+        ("только из их методов", "только из расширен", "extension-only"),
+        "search_methods",
+        "граница результата при query < 3 (выдача — ОДНИ расширения)",
+    )
+    _sig_says(
+        sig,
+        ("бери от 3", "используй запрос от 3", "query >= 3", "запрос от 3"),
+        "search_methods",
+        "ДЕЙСТВИЕ (как получить ответ по main)",
+    )
+
+    for helper in ("search_regions", "search_module_headers"):
+        sig = snap[helper]["sig"]
+        _sig_says(sig, ("стемминг",), helper, "причина (нет стемминга)")
+        _sig_says(sig, ("отсутстви",), helper, "суть (0 ≠ отсутствие)")
+        _sig_says(sig, ("проверь", "попробуй", "возьми"), helper, "ДЕЙСТВИЕ (что делать при нуле)")

@@ -23,7 +23,11 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
-from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS, _merge_proc_continuations
+from rlm_tools_bsl.bsl_knowledge import (
+    BSL_PATTERNS,
+    _merge_proc_continuations_with_mask,
+    mask_comments_and_strings,
+)
 from rlm_tools_bsl.cache import _paths_hash
 from rlm_tools_bsl.format_detector import BslFileInfo, parse_bsl_path
 from rlm_tools_bsl.bsl_xml_parsers import (
@@ -35,7 +39,7 @@ from rlm_tools_bsl.bsl_xml_parsers import (
 
 logger = logging.getLogger(__name__)
 
-BUILDER_VERSION = 14
+BUILDER_VERSION = 15
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
@@ -2278,38 +2282,65 @@ def _scan_module(lines: list[str]):
     """
     in_string = False
     for lineno, raw in enumerate(lines, start=1):
+        # v1.33.0: комментарий между строками-продолжениями многострочного литерала
+        # 1С допускает, и состояние он НЕ меняет. Без этого правила закомментированный
+        # конец запроса (`//|  Поле";`) закрывал бы литерал, и разбор рассинхронизировался
+        # бы до конца модуля. См. mask_comments_and_strings в bsl_knowledge.
+        if in_string and raw.lstrip().startswith("//"):
+            yield lineno, "", []
+            continue
         n = len(raw)
+        # Быстрый путь: строка ВНЕ литерала, где нет кавычек, — это чистый код
+        # (с возможным хвостом-комментарием). Ни одного посимвольного шага и ни
+        # одной склейки. Так идёт большинство строк, и именно это делает скан
+        # дешёвым на ЕРП-масштабе.
+        if not in_string:
+            q = raw.find('"')
+            c = raw.find("//")
+            if q < 0:
+                yield lineno, (raw if c < 0 else raw[:c]), []
+                continue
+            if 0 <= c < q:  # комментарий начинается раньше литерала
+                yield lineno, raw[:c], []
+                continue
+
+        # Медленный путь — та же машина состояний, но прыжками по str.find и
+        # срезами вместо символ-за-символом (семантика идентична посимвольной
+        # версии, покрыта тестом эквивалентности на боевых исходниках).
         i = 0
-        code_chars: list[str] = []
+        code_parts: list[str] = []
         strings: list[str] = []
         seg_start = 0 if in_string else -1
         while i < n:
-            ch = raw[i]
             if in_string:
-                if ch == '"':
-                    if i + 1 < n and raw[i + 1] == '"':
-                        i += 2  # escaped "" — stays inside the string
-                        continue
-                    strings.append(raw[seg_start:i])
-                    in_string = False
-                    seg_start = -1
-                    i += 1
-                else:
-                    i += 1
+                j = raw.find('"', i)
+                if j < 0:
+                    break  # литерал продолжается на следующей строке
+                if j + 1 < n and raw[j + 1] == '"':
+                    i = j + 2  # экранированная "" — остаёмся внутри литерала
+                    continue
+                strings.append(raw[seg_start:j])
+                in_string = False
+                seg_start = -1
+                i = j + 1
             else:
-                if ch == '"':
+                q = raw.find('"', i)
+                c = raw.find("//", i)
+                if q < 0 and c < 0:
+                    code_parts.append(raw[i:])
+                    break
+                if q >= 0 and (c < 0 or q < c):
+                    code_parts.append(raw[i:q])
                     in_string = True
-                    seg_start = i + 1
-                    i += 1
-                elif ch == "/" and i + 1 < n and raw[i + 1] == "/":
-                    break  # line comment — rest is neither code nor string
+                    seg_start = q + 1
+                    i = q + 1
                 else:
-                    code_chars.append(ch)
-                    i += 1
+                    code_parts.append(raw[i:c])
+                    break  # комментарий — остаток строки не код и не литерал
         if in_string:
-            # literal continues onto the next line — emit what we have here
+            # литерал продолжается на следующей строке — отдаём накопленное здесь
             strings.append(raw[seg_start:])
-        yield lineno, "".join(code_chars), strings
+        yield lineno, "".join(code_parts), strings
 
 
 def _extract_code_usages(
@@ -2384,23 +2415,30 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
     Returns list of dicts: {name, type, line, end_line, is_export, params, loc}.
     Здесь ``params`` — СЫРАЯ строка сигнатуры (build-time, хранится в TEXT-колонке).
     На helper-границе ``_split_params`` превращает её в list[str] для агента (v1.18.0).
+
+    v1.33.0: и матч сигнатуры, и поиск ``КонецПроцедуры``, и решение о склейке идут
+    по МАСКЕ (комментарии и содержимое строковых литералов погашены), а ``params``
+    вырезается из ОРИГИНАЛА по смещениям маски — она посимвольно той же длины,
+    поэтому строковый дефолт (``Знач Адрес = "http://x/y"``) сохраняется дословно.
     """
-    merged_lines, line_map = _merge_proc_continuations(lines)
+    masked = mask_comments_and_strings(lines)
+    merged_lines, merged_masked, line_map = _merge_proc_continuations_with_mask(lines, masked)
     total_merged = len(merged_lines)
     total_orig = len(lines)
 
     procedures: list[dict] = []
     m_idx = 0
     while m_idx < total_merged:
-        merged = merged_lines[m_idx]
-        m = _PROC_DEF_RE.search(merged)
+        m = _PROC_DEF_RE.search(merged_masked[m_idx])
         if not m:
             m_idx += 1
             continue
 
+        original = merged_lines[m_idx]
         proc_type = m.group(1)
         proc_name = m.group(2)
-        params = m.group(3).strip() if m.group(3) else ""
+        # params — из ОРИГИНАЛА по смещениям маски (см. докстринг).
+        params = original[m.start(3) : m.end(3)].strip() if m.group(3) is not None else ""
         is_export = m.group(4) is not None and m.group(4).strip() != ""
         line_number = line_map[m_idx]  # 1-based original line
 
@@ -2410,7 +2448,9 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
 
         end_line: int | None = None
         for orig_idx in range(scan_from, total_orig):
-            if _PROC_END_RE.search(lines[orig_idx]):
+            # По маске: строковый литерал "КонецПроцедуры" в начале строки обманул бы
+            # заякоренный _PROC_END_RE и оборвал тело раньше времени.
+            if _PROC_END_RE.search(masked[orig_idx]):
                 end_line = orig_idx + 1
                 break
 
@@ -2743,46 +2783,6 @@ def _collect_metadata_tables(
             return cat in _METADATA_REFERENCES_TRIGGER_CATEGORIES
         return cat in _active_ref_cats
 
-    # Match <Name>X</Name> (CF) and <name>X</name> (EDT) — case-sensitive on tag name
-    _NAME_RE_CACHE: dict[str, re.Pattern] = {}
-
-    def _name_re(name: str) -> re.Pattern:
-        pat = _NAME_RE_CACHE.get(name)
-        if pat is None:
-            pat = re.compile(rf"<\s*[Nn]ame\s*>{re.escape(name)}<\s*/\s*[Nn]ame\s*>")
-            _NAME_RE_CACHE[name] = pat
-        return pat
-
-    def _line_for_ref(ref: dict, content_lines: list[str] | None) -> int | None:
-        """Best-effort line lookup for attribute-level refs.
-
-        Looks up `<Name>AttrName</Name>` in the file content. Cheap (one regex scan
-        per attribute name). Returns None when content is unavailable or the suffix
-        does not encode an attribute name.
-        """
-        if content_lines is None:
-            return None
-        suffix = ref.get("used_in_suffix", "")
-        if not suffix:
-            return None
-        # Suffixes we can resolve: Attribute.X.Type, Dimension.X.Type, Resource.X.Type,
-        # TabularSection.TS.Attribute.X.Type
-        target_name: str | None = None
-        if suffix.startswith(("Attribute.", "Dimension.", "Resource.")):
-            parts = suffix.split(".")
-            if len(parts) >= 2:
-                target_name = parts[1]
-        elif suffix.startswith("TabularSection.") and ".Attribute." in suffix:
-            after = suffix.split(".Attribute.", 1)[1]
-            target_name = after.split(".", 1)[0]
-        if not target_name:
-            return None
-        pat = _name_re(target_name)
-        for idx, line in enumerate(content_lines, start=1):
-            if pat.search(line):
-                return idx
-        return None
-
     def _emit_refs(
         parsed_refs: list[dict],
         source_object: str,
@@ -2795,13 +2795,16 @@ def _collect_metadata_tables(
             return
         type_prefix = _CATEGORY_TO_TYPE_PREFIX.get(source_category, source_category)
         used_in_root = f"{type_prefix}.{source_object}"
+        # Индекс якорей строится ОДИН раз на файл: порядок отдачи ссылок парсером не
+        # совпадает с порядком в документе, поэтому резолв идёт по ключу, а не по позиции.
+        anchor = _ref_anchor_index(content_lines)
         for ref in parsed_refs:
             ref_object = ref.get("ref_object", "")
             if not ref_object:
                 continue
             suffix = ref.get("used_in_suffix", "")
             used_in = f"{used_in_root}.{suffix}" if suffix else used_in_root
-            line = _line_for_ref(ref, content_lines)
+            line = anchor.line_for(ref)
             result["metadata_references"].append(
                 (
                     source_object,
@@ -3964,41 +3967,314 @@ def _can_use_pointwise(
 
 
 # ---------------------------------------------------------------------------
-# Pointwise — line-number lookup for attribute-level metadata_references
-# (полный аналог _line_for_ref / _emit_refs из _collect_metadata_tables)
+# Якорь ссылок метаданных: номер строки САМОЙ ссылки (v1.33.0)
+#
+# Заменяет _line_for_ref / _line_for_ref_pointwise, которые искали <Name>X</Name>
+# и отдавали ПЕРВОЕ вхождение имени по файлу: замер на боевых показал, что на
+# 3000 ссылок attribute_type строка НИ РАЗУ не совпала со строкой тега типа,
+# а 30% имён реквизитов встречаются в одном XML больше одного раза.
 # ---------------------------------------------------------------------------
-_POINTWISE_NAME_RE_CACHE: dict[str, re.Pattern] = {}
+_SECTION_OPEN_RE = re.compile(
+    r"<\s*(Attribute|Dimension|Resource|TabularSection"
+    r"|attributes|dimensions|resources|tabularSections)\b"
+)
+_TS_CLOSE_RE = re.compile(r"</\s*(?:TabularSection|tabularSections)\s*>")
+_ANCHOR_NAME_RE = re.compile(r"<\s*[Nn]ame\s*>([^<]+)<\s*/\s*[Nn]ame\s*>")
+_TYPE_BLOCK_OPEN_RE = re.compile(r"<\s*(?:Type|type|valueType)\s*>")
+_TYPE_BLOCK_CLOSE_RE = re.compile(r"</\s*(?:Type|type|valueType)\s*>")
+# Отдельный ТИП внутри блока: его текст нужен, чтобы сопоставить строку с ref_object
+_TYPE_ITEM_RE = re.compile(r"<\s*(?:v8:Type|types)\s*>([^<]+)<")
+# ref_kind -> охватывающий тег (CF-вариант, EDT-вариант). Нужен, чтобы owner и
+# based_on с ОДНИМ ref_object не схлопнулись в одну строку: такие пары есть в боевых
+# конфигурациях, и порядок секций у CF и EDT противоположный.
+_KIND_SECTION_TAGS: dict[str, tuple[str, ...]] = {
+    "owner": ("Owners", "owners"),
+    "based_on": ("BasedOn", "basedOn"),
+}
+
+# Виды, которым v1.33.0 заполняет `line`. Ровно те, что физически проходят через
+# `_emit_refs` (единственный call-site — внутри цикла по `_ATTR_CATEGORIES`) и
+# получают там `content_lines`. Всё остальное пишется своими коллекторами с жёстким
+# `None` и остаётся NULL.
+# ВАЖНО: `subsystem_content` в этот список НЕ входит. Подсистемы собирает отдельный
+# цикл, который аппендит ссылку с `None` напрямую и `_emit_refs` не зовёт;
+# Subsystems нет и в `_ATTR_CATEGORIES`.
+# `characteristic_type` через `_emit_refs` проходит, но резолвится лишь частично
+# (замер на боевых: заполнено 5 из 486), поэтому принудительно возвращается в None:
+# «заполнено у одного процента» — контракт хуже честного NULL.
+_ANCHORED_REF_KINDS: frozenset[str] = frozenset(
+    {
+        "attribute_type",
+        "owner",
+        "based_on",
+        "default_object_form",
+        "default_list_form",
+    }
+)
+
+_TAG_VALUE_RE_CACHE: dict[str, re.Pattern] = {}
 
 
-def _pointwise_name_re(name: str) -> re.Pattern:
-    pat = _POINTWISE_NAME_RE_CACHE.get(name)
+def _tag_value_re(value: str) -> re.Pattern:
+    """Точное значение внутри тега: ``>Document.X<`` или ``="Document.X"``.
+
+    Подстрочный поиск здесь запрещён: ``Document.Заказ`` нашёлся бы внутри
+    ``Document.ЗаказКлиента`` и дал бы чужую строку.
+    """
+    pat = _TAG_VALUE_RE_CACHE.get(value)
     if pat is None:
-        pat = re.compile(rf"<\s*[Nn]ame\s*>{re.escape(name)}<\s*/\s*[Nn]ame\s*>")
-        _POINTWISE_NAME_RE_CACHE[name] = pat
+        e = re.escape(value)
+        pat = re.compile(rf">\s*{e}\s*<|=\s*\"{e}\"")
+        _TAG_VALUE_RE_CACHE[value] = pat
     return pat
 
 
-def _line_for_ref_pointwise(ref: dict, content_lines: list[str] | None) -> int | None:
+_ANCHOR_KIND_BY_TAG = {
+    "attribute": "Attribute",
+    "attributes": "Attribute",
+    "dimension": "Dimension",
+    "dimensions": "Dimension",
+    "resource": "Resource",
+    "resources": "Resource",
+    "tabularsection": "TabularSection",
+    "tabularsections": "TabularSection",
+}
+
+
+class _RefAnchorIndex:
+    """Строки ссылок метаданных: один проход по файлу, резолв ПО КЛЮЧУ ВЛАДЕЛЬЦА + ССЫЛКЕ.
+
+    Почему не «монотонный курсор по файлу»: парсеры отдают ссылки НЕ в порядке
+    документа (у регистров <Resource> в файле раньше <Dimension>, а эмитится позже;
+    у документов <BasedOn> раньше <ChildObjects>, а эмитится позже), поэтому любой
+    позиционный резолвер промахивается или откатывается к началу файла — то есть
+    возвращает первое вхождение имени, а это ровно тот дефект, который тут чинится.
+
+    Почему ключ включает ref_object, а не только имя владельца: составной тип даёт по
+    ссылке на КАЖДЫЙ тип, и все они лежат на РАЗНЫХ строках внутри одного блока <Type>.
+    Максимум на боевых — 266 типов у одного реквизита, растянутых на 266 строк:
+    резолвер, отдающий всем строку контейнера <Type>, промахивается на сотни строк.
+
+    ``line_for`` отдаёт строку КОНКРЕТНОГО типа, если ссылка сопоставлена; иначе строку
+    открывающего <Type>; иначе строку объявления. ``None`` означает «якорь не найден»;
+    подставлять произвольную строку запрещено.
+    """
+
+    _TYPE_LOOKAHEAD = 60
+
+    def __init__(self, content_lines: list[str]) -> None:
+        self._lines = content_lines
+        # ключ владельца -> список экземпляров в порядке файла
+        self._owners: dict[tuple[str, str, str], list[dict]] = {}
+        # ключ владельца -> выбранный экземпляр (кеш: составной тип спрашивает многократно)
+        self._picked: dict[tuple[str, str, str], dict | None] = {}
+        self._plain: dict[tuple[str, str, str], int | None] = {}
+        self._spans: dict[tuple[str, ...], list[tuple[int, int]]] = {}
+        self._build()
+
+    def _collect_types(self, start: int) -> tuple[int | None, dict[str, int]]:
+        """От строки объявления найти блок типа и запомнить строку КАЖДОГО типа."""
+        lines = self._lines
+        block: int | None = None
+        for j in range(start, min(start + self._TYPE_LOOKAHEAD, len(lines))):
+            if _TYPE_BLOCK_OPEN_RE.search(lines[j]):
+                block = j + 1
+                break
+            if _ANCHOR_NAME_RE.search(lines[j]):
+                return None, {}  # начался следующий элемент — у этого типа нет
+        if block is None:
+            return None, {}
+        by_ref: dict[str, int] = {}
+        for j in range(block - 1, len(lines)):
+            for m in _TYPE_ITEM_RE.finditer(lines[j]):
+                canon = canonicalize_type_ref(m.group(1).strip())
+                if canon and canon not in by_ref:
+                    by_ref[canon] = j + 1
+            if j > block - 1 and _TYPE_BLOCK_CLOSE_RE.search(lines[j]):
+                break
+        return block, by_ref
+
+    def _build(self) -> None:
+        cur_kind: str | None = None
+        cur_ts = ""
+        in_ts = False
+        pending_ts_name = False
+        lines = self._lines
+        for idx, line in enumerate(lines):
+            if _TS_CLOSE_RE.search(line):
+                in_ts = False
+                cur_ts = ""
+                cur_kind = None
+            for m in _SECTION_OPEN_RE.finditer(line):
+                tag = _ANCHOR_KIND_BY_TAG.get(m.group(1).lower())
+                if tag == "TabularSection":
+                    in_ts = True
+                    pending_ts_name = True
+                    cur_kind = None
+                else:
+                    cur_kind = tag
+            nm = _ANCHOR_NAME_RE.search(line)
+            if nm is None:
+                continue
+            name = nm.group(1).strip()
+            if pending_ts_name:
+                cur_ts = name
+                pending_ts_name = False
+                continue
+            if cur_kind is None:
+                continue
+            block, by_ref = self._collect_types(idx + 1)
+            key = (cur_kind, cur_ts if in_ts else "", name)
+            self._owners.setdefault(key, []).append({"decl": idx + 1, "block": block, "by_ref": by_ref})
+            cur_kind = None  # один <Name> на секцию
+
+    @staticmethod
+    def _key(ref: dict) -> tuple[str, str, str] | None:
+        suffix = ref.get("used_in_suffix", "") or ""
+        if suffix.startswith(("Attribute.", "Dimension.", "Resource.")):
+            head, rest = suffix.split(".", 1)
+            return head, "", rest.split(".", 1)[0]
+        if suffix.startswith("TabularSection.") and ".Attribute." in suffix:
+            ts = suffix.split("TabularSection.", 1)[1].split(".", 1)[0]
+            name = suffix.split(".Attribute.", 1)[1].split(".", 1)[0]
+            return "Attribute", ts, name
+        return None
+
+    def line_for(self, ref: dict) -> int | None:
+        # Белый список видов — ЖЁСТКИЙ контракт, а не оптимизация (см. _ANCHORED_REF_KINDS).
+        if ref.get("ref_kind", "") not in _ANCHORED_REF_KINDS:
+            return None
+        key = self._key(ref)
+        if key is not None:
+            # Экземпляр владельца выбирается ОДИН раз и кешируется: составной тип
+            # спрашивает один и тот же ключ по разу на каждый тип (до 266 раз), и без
+            # кеша владелец «исчерпался» бы после первого обращения. Следствие: если
+            # один ключ (вид, табличная часть, имя) встречается в файле дважды — а в
+            # валидных метаданных 1С имена внутри секции уникальны, — все ссылки уедут
+            # в ПЕРВЫЙ экземпляр. На боевых конфигурациях такого входа не встретилось.
+            if key not in self._picked:
+                bucket = self._owners.get(key)
+                self._picked[key] = bucket.pop(0) if bucket else None
+            owner = self._picked[key]
+            if owner is None:
+                return None
+            canon = (ref.get("ref_object") or "").strip()
+            return owner["by_ref"].get(canon) or owner["block"] or owner["decl"]
+
+        # Виды без имени реквизита в суффиксе: owner, based_on,
+        # default_object_form, default_list_form.
+        # Якорь — ТОЧНОЕ значение внутри тега; и значение, и область поиска зависят от ВИДА.
+        kind = ref.get("ref_kind", "") or ""
+        suffix = ref.get("used_in_suffix", "") or ""
+        needle = self._plain_needle(ref)
+        if not needle:
+            return None
+        # Кеш ключуется ТРОЙКОЙ (вид, ПОЛНЫЙ суффикс, значение). Ни вида, ни пары
+        # (вид, значение) недостаточно: один объект бывает и владельцем, и основанием,
+        # а полный суффикс несёт имя элемента и разводит одноимённые роли.
+        ck = (kind, suffix, needle)
+        if ck in self._plain:
+            return self._plain[ck]
+        found = self._search_tag_value(kind, needle)
+        self._plain[ck] = found
+        return found
+
+    def _search_tag_value(self, kind: str, needle: str) -> int | None:
+        """Линейный поиск точного значения тега в пределах секции вида.
+
+        МИНА ДЛЯ ТОГО, КТО БУДЕТ РАСШИРЯТЬ ПОКРЫТИЕ. Это O(ссылок x строк).
+        Здесь это дёшево ТОЛЬКО потому, что якорятся исключительно виды из
+        ``_ANCHORED_REF_KINDS``: у них 2-3 ссылки на небольшой объектный XML.
+        Замер на боевых: 3122 ссылки на 1255 файлах — 4.4 с, и это БЫСТРЕЕ
+        одно-проходной карты (6.1 с): построить карту по каждому мелкому файлу
+        дороже, чем трижды его просканировать.
+
+        Как только сюда заведут ЛЮБОЙ объёмный вид (``role_rights``,
+        ``subsystem_content``, ``exchange_plan_content``, ``defined_type_content``),
+        линейный скан ОБЯЗАН быть заменён на одно-проходную карту
+        «значение тега -> первая строка». Замер, показывающий цену ошибки: боевой
+        файл прав на 1 162 203 строки и 105 282 ссылки — экстраполяция равномерной
+        выборки даёт ~8700 с резолва на ОДИН файл против ~0.9 с с картой при
+        идентичном результате.
+
+        Порядок секций у CF и EDT РАЗНЫЙ (в CF Owners раньше BasedOn, в EDT наоборот),
+        поэтому опираться на позицию нельзя — только на секцию.
+        """
+        pat = _tag_value_re(needle)
+        found: int | None = None
+        spans = self._kind_spans(kind)
+        if spans:
+            for a, b in spans:
+                for i in range(a, b + 1):
+                    if pat.search(self._lines[i]):
+                        found = i + 1
+                        break
+                if found is not None:
+                    break
+        else:
+            for i, line in enumerate(self._lines):
+                if pat.search(line):
+                    found = i + 1
+                    break
+        return found
+
+    def _kind_spans(self, kind: str) -> list[tuple[int, int]]:
+        """Границы секции, в которой обязана лежать ссылка данного вида (0-based, включая).
+
+        Пустой список -> ограничения нет, ищем по всему файлу.
+        """
+        tags = _KIND_SECTION_TAGS.get(kind)
+        if not tags:
+            return []
+        if tags in self._spans:
+            return self._spans[tags]
+        opens = [re.compile(rf"<\s*{t}\b") for t in tags]
+        closes = [re.compile(rf"</\s*{t}\s*>") for t in tags]
+        spans: list[tuple[int, int]] = []
+        start: int | None = None
+        for i, line in enumerate(self._lines):
+            if start is None and any(o.search(line) for o in opens):
+                start = i
+                if any(c.search(line) for c in closes):
+                    spans.append((start, i))
+                    start = None
+                continue
+            if start is not None and any(c.search(line) for c in closes):
+                spans.append((start, i))
+                start = None
+        self._spans[tags] = spans
+        return spans
+
+    @staticmethod
+    def _plain_needle(ref: dict) -> str | None:
+        """Что именно искать в файле для видов без имени реквизита.
+
+        Для default_object_form / default_list_form ``ref_object`` — это САМ объект
+        (self-reference), а путь формы лежит в ``used_in_suffix`` ПОСЛЕ ``=``: парсеры
+        кладут туда ``DefaultObjectForm=Document.X.Form.ФормаДокумента``. Поиск по
+        ``ref_object`` попадает в ``<Name>ИмяОбъекта</Name>`` в шапке файла — верных
+        было бы НОЛЬ, а раньше там стоял честный NULL, то есть это был бы регресс.
+
+        Ключа ``used_in`` в словаре ref НЕТ — он собирается в ``_emit_refs`` /
+        ``_insert_references_for_object`` уже ПОСЛЕ вызова резолвера.
+        """
+        kind = ref.get("ref_kind", "") or ""
+        suffix = ref.get("used_in_suffix", "") or ""
+        if kind in ("default_object_form", "default_list_form"):
+            return suffix.split("=", 1)[1].strip() if "=" in suffix else None
+        return (ref.get("ref_object") or "").strip() or None
+
+
+class _NullAnchorIndex:
+    def line_for(self, ref: dict) -> int | None:  # noqa: ARG002
+        return None
+
+
+def _ref_anchor_index(content_lines: list[str] | None):
+    """Фабрика: ``None`` на входе -> индекс, всегда отдающий ``None``."""
     if content_lines is None:
-        return None
-    suffix = ref.get("used_in_suffix", "")
-    if not suffix:
-        return None
-    target_name: str | None = None
-    if suffix.startswith(("Attribute.", "Dimension.", "Resource.")):
-        parts = suffix.split(".")
-        if len(parts) >= 2:
-            target_name = parts[1]
-    elif suffix.startswith("TabularSection.") and ".Attribute." in suffix:
-        after = suffix.split(".Attribute.", 1)[1]
-        target_name = after.split(".", 1)[0]
-    if not target_name:
-        return None
-    pat = _pointwise_name_re(target_name)
-    for idx, line in enumerate(content_lines, start=1):
-        if pat.search(line):
-            return idx
-    return None
+        return _NullAnchorIndex()
+    return _RefAnchorIndex(content_lines)
 
 
 def _insert_references_for_object(
@@ -4014,12 +4290,14 @@ def _insert_references_for_object(
 
     Применяет _CATEGORY_TO_TYPE_PREFIX, пропускает refs без ref_object,
     собирает used_in (root + optional suffix), вычисляет line через
-    _line_for_ref_pointwise. Caller обязан проверить has_metadata_references_table.
+    _ref_anchor_index. Caller обязан проверить has_metadata_references_table.
     """
     if not parsed_refs:
         return
     type_prefix = _CATEGORY_TO_TYPE_PREFIX.get(source_category, source_category)
     used_in_root = f"{type_prefix}.{source_object}"
+    # Один индекс якорей на файл — см. _emit_refs.
+    anchor = _ref_anchor_index(content_lines)
     rows: list[tuple] = []
     for ref in parsed_refs:
         ref_object = ref.get("ref_object", "")
@@ -4027,7 +4305,7 @@ def _insert_references_for_object(
             continue
         suffix = ref.get("used_in_suffix", "")
         used_in = f"{used_in_root}.{suffix}" if suffix else used_in_root
-        line = _line_for_ref_pointwise(ref, content_lines)
+        line = anchor.line_for(ref)
         rows.append(
             (
                 source_object,
@@ -4858,6 +5136,52 @@ _ADAPTED_REG_RE = re.compile(
     re.IGNORECASE,
 )  # ИмяРегистра = "RegName"
 
+
+# Прямое создание набора записей из ManagerModule:
+#   РегистрыСведений.X.СоздатьНаборЗаписей()  |  InformationRegisters.X.CreateRecordSet()
+# Наивное расширение `Движения.X` на менеджер давало 31-34% ложных срабатываний
+# (Движения.Количество / .Отбор / .Колонки — поля набора, а не имена регистров),
+# поэтому берётся только эта однозначная форма, и имя дополнительно
+# валидируется по каталогу регистров при вставке.
+_MANAGER_RECORDSET_RE = re.compile(
+    r"(?<![\w.])(?:\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u044b(?:\u0421\u0432\u0435\u0434\u0435\u043d\u0438\u0439|\u041d\u0430\u043a\u043e\u043f\u043b\u0435\u043d\u0438\u044f|\u0411\u0443\u0445\u0433\u0430\u043b\u0442\u0435\u0440\u0438\u0438|\u0420\u0430\u0441\u0447\u0435\u0442\u0430)"
+    r"|(?:Information|Accumulation|Accounting|Calculation)Registers)"
+    r"\s*\.\s*(\w+)\s*\.\s*(?:\u0421\u043e\u0437\u0434\u0430\u0442\u044c\u041d\u0430\u0431\u043e\u0440\u0417\u0430\u043f\u0438\u0441\u0435\u0439|CreateRecordSet)\s*\(",
+    re.IGNORECASE,
+)  # РегистрыСведений.X.СоздатьНаборЗаписей( | InformationRegisters.X.CreateRecordSet(
+
+_REGISTER_CATALOG_DIRS = (
+    "InformationRegisters",
+    "AccumulationRegisters",
+    "AccountingRegisters",
+    "CalculationRegisters",
+)
+
+
+def _known_register_names(base: Path) -> frozenset[str]:
+    """Имена всех регистров конфигурации (нижний регистр) — по каталогам на диске.
+
+    Четыре ``iterdir``: дешевле и полнее, чем выборка из ``object_synonyms`` (у регистра
+    может не быть ни синонима, ни модуля). Нужен для отбраковки ложных имён,
+    извлечённых из ManagerModule: сам регекс однозначен, но сверка защищает от
+    мусорных имён на конфигурациях, которые мы не мерили.
+    """
+    names: set[str] = set()
+    for cat in _REGISTER_CATALOG_DIRS:
+        d = base / cat
+        if not d.is_dir():
+            continue
+        try:
+            for entry in d.iterdir():
+                if entry.is_dir():
+                    names.add(entry.name.lower())
+                elif entry.suffix.lower() in (".xml", ".mdo"):
+                    names.add(entry.stem.lower())
+        except OSError:
+            continue
+    return frozenset(names)
+
+
 # ---------------------------------------------------------------------------
 # Region parser (stack-based #Область/#КонецОбласти)
 # ---------------------------------------------------------------------------
@@ -4959,16 +5283,29 @@ def _extract_movements(
     info: BslFileInfo,
     rel_path: str,
 ) -> list[tuple[str, str, str]]:
-    """Extract register movements from Document modules (in-band, no extra I/O)."""
+    """Extract register movements from Document modules (in-band, no extra I/O).
+
+    v1.33.0: ни один регекс больше не работает по СЫРОМУ тексту.
+      * ``full`` — комментарии И строковые литералы погашены. По ней идут регексы,
+        читающие имя из КОДА: ``Движения.X``, ``ТекстЗапросаТаблицаX``. Иначе
+        ``// Движения.X`` и ``"Движения.X"`` попадали в таблицу как настоящая запись.
+      * ``comments_only`` — погашены только комментарии, литералы целы. По ней идут
+        ``_ERP_MECHANISM_RE`` и ``_ADAPTED_REG_RE``: они по замыслу читают имя ИЗ
+        литерала, полная маска убила бы сигнал. Работа по сырому тексту тащила
+        закомментированные ``//МеханизмыДокумента.Добавить("X")``.
+    """
     if info.category != "Documents":
         return []
     if info.module_type not in ("ObjectModule", "ManagerModule"):
         return []
 
     results: list[tuple[str, str, str]] = []
+    src_lines = content.splitlines()
+    full = "\n".join(mask_comments_and_strings(src_lines))
+    comments_only = "\n".join(mask_comments_and_strings(src_lines, keep_string_content=True))
 
     if info.module_type == "ObjectModule":
-        for m in _MOVEMENTS_RE.finditer(content):
+        for m in _MOVEMENTS_RE.finditer(full):
             reg = m.group(1)
             # Belt-and-suspenders: the lookahead already rejects Движения.Method(),
             # but a paren-less Движения.Записать would still capture — drop stop-set names.
@@ -4976,14 +5313,24 @@ def _extract_movements(
                 continue
             results.append((reg, "code", rel_path))
     elif info.module_type == "ManagerModule":
-        for m in _ERP_MECHANISM_RE.finditer(content):
+        for m in _ERP_MECHANISM_RE.finditer(comments_only):
             results.append((m.group(1), "erp_mechanism", rel_path))
-        for m in _MANAGER_TABLE_RE.finditer(content):
+        for m in _MANAGER_TABLE_RE.finditer(full):
             results.append((m.group(1), "manager_table", rel_path))
-        adapted_match = _ADAPTED_PROC_RE.search(content)
+        # ИЗВЕСТНАЯ ГРАНИЦА (не регресс v1.33.0): `_ADAPTED_PROC_RE` ищет границы функции
+        # по `comments_only`, где литералы целы, поэтому строка `"КонецФункции"` ВНУТРИ
+        # литерала обрывает блок раньше и следующие `ИмяРегистра = "X"` теряются. В v14
+        # поиск шёл по сырому тексту с тем же эффектом. Лечится разделением: границы
+        # функции искать по полной маске, а имя — по `comments_only`; на боевых
+        # конфигурациях случай не встретился, поэтому в этот релиз не входит.
+        adapted_match = _ADAPTED_PROC_RE.search(comments_only)
         if adapted_match:
             for m in _ADAPTED_REG_RE.finditer(adapted_match.group(1)):
                 results.append((m.group(1), "adapted", rel_path))
+        # Имя регистра берётся из КОДА, поэтому маска ``full``. Отбраковка по каталогу
+        # регистров идёт при ВСТАВКЕ: per-file экстрактор каталога не видит.
+        for m in _MANAGER_RECORDSET_RE.finditer(full):
+            results.append((m.group(1), "manager_code", rel_path))
 
     return results
 
@@ -5628,10 +5975,16 @@ def _collect_form_elements(base_path: str) -> list[tuple]:
                 )
             )
         for a in parsed.get("attributes", []):
-            extra = ""
+            # v1.33.0: parse_form_xml отдаёт types СПИСКОМ. Колонка element_type — TEXT,
+            # и передача списка дала бы sqlite3.InterfaceError на первой же форме.
+            # Формат хранения НЕ меняется (v14 и v15 идентичны): ", ".join — и он же
+            # единственный источник истины, дублировать types в extra_json не надо
+            # (замер: 455 912 XML-узлов типов, значений со встроенной запятой — 0).
+            types_list = a.get("types") or []
+            if isinstance(types_list, str):  # толерантность к старому shape
+                types_list = [t.strip() for t in types_list.split(",") if t.strip()]
             qt = a.get("query_text", "")
-            if qt:
-                extra = json.dumps({"query_text": qt}, ensure_ascii=False)
+            extra = json.dumps({"query_text": qt}, ensure_ascii=False) if qt else ""
             rows.append(
                 (
                     obj_name,
@@ -5640,7 +5993,7 @@ def _collect_form_elements(base_path: str) -> list[tuple]:
                     "attribute",
                     "",
                     a.get("name", ""),
-                    a.get("types", ""),
+                    ", ".join(types_list),
                     "",
                     "",
                     "",
@@ -6065,10 +6418,18 @@ class IndexBuilder:
             _insert_metadata_tables(conn, md_tables)
 
         # Level-3: register movements (in-band, already extracted)
+        # Строки source='manager_code' проходят через каталог регистров: извлечение
+        # из ManagerModule статически неоднозначно, и без сверки в таблицу попали бы
+        # имена полей набора записей.
+        known_registers = _known_register_names(base)
         all_movements: list[tuple[str, str, str, str]] = []
+        dropped_manager = 0
         for r in results:
             if r.movements and r.info.object_name:
                 for reg_name, source, file_path_str in r.movements:
+                    if source == "manager_code" and reg_name.lower() not in known_registers:
+                        dropped_manager += 1
+                        continue
                     all_movements.append((r.info.object_name, reg_name, source, file_path_str))
         if all_movements:
             conn.executemany(
@@ -6076,7 +6437,11 @@ class IndexBuilder:
                 all_movements,
             )
             conn.commit()
-            logger.info("Register movements: %d entries", len(all_movements))
+            logger.info(
+                "Register movements: %d entries (manager_code rows dropped by register catalog: %d)",
+                len(all_movements),
+                dropped_manager,
+            )
 
         # Level-3: role rights (parallel regex parsing)
         role_rights = _collect_role_rights(base_path)
@@ -6324,9 +6689,14 @@ class IndexBuilder:
         # NB: a plain version bump without this forced rebuild would route v13
         # DBs into the version-mismatch full *scan* below, which INSERTs into the
         # OLD schema (no callee_key column) and fails — so the rebuild is required.
+        #
+        # v15 — миграция СОДЕРЖИМОГО, а не схемы, но механизм тот же: полный СКАН
+        # считает дельту по mtime/size и нетронутые модули не перечитывает, поэтому
+        # без подъёма порога старые methods / register_movements / form_elements /
+        # metadata_references пережили бы бамп вместе с призраками из комментариев.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 14:
+        if old_version < 15:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -6633,23 +7003,36 @@ class IndexBuilder:
                     )
 
                 # Update register_movements for changed/added Document modules
-                if results:
-                    changed_doc_names = set()
-                    for r in results:
-                        if r.info.category == "Documents" and r.info.object_name:
-                            changed_doc_names.add(r.info.object_name)
-                    for doc_name in changed_doc_names:
+                # `or to_remove`: при ЧИСТОМ удалении модуля results пуст, и прежний
+                # guard `if results:` оставлял его движения в таблице сиротами навсегда.
+                if results or to_remove:
+                    # Удаление идёт по ФАЙЛУ, а не по имени документа. Удаление по
+                    # document_name сносило строки ОБОИХ модулей документа, а
+                    # восстанавливались только строки переобработанного: правка
+                    # ObjectModule стирала erp_mechanism/manager_table/adapted/manager_code
+                    # из НЕтронутого ManagerModule и наоборот. Дефект пре-существующий
+                    # (воспроизводится и на источниках v14), но с появлением manager_code
+                    # он стал массовым: у большинства документов с записью из менеджера
+                    # есть и ObjectModule. `to_remove` = removed | changed, поэтому
+                    # удалённый модуль тоже чистится, а нетронутый сосед остаётся цел.
+                    stale_files = set(to_remove) | {r.info.relative_path for r in results}
+                    for stale_rel in stale_files:
                         try:
                             conn.execute(
-                                "DELETE FROM register_movements WHERE document_name = ?",
-                                (doc_name,),
+                                "DELETE FROM register_movements WHERE file = ?",
+                                (stale_rel,),
                             )
                         except sqlite3.OperationalError:
                             pass
+                    # Каталог регистров считаем ОДИН раз перед циклом (тот же фильтр,
+                    # что и на полной сборке — иначе инкремент вернул бы мусорные имена).
+                    known_registers = _known_register_names(base)
                     new_movements: list[tuple[str, str, str, str]] = []
                     for r in results:
                         if r.movements and r.info.object_name:
                             for reg_name, source, fpath in r.movements:
+                                if source == "manager_code" and reg_name.lower() not in known_registers:
+                                    continue
                                 new_movements.append((r.info.object_name, reg_name, source, fpath))
                     if new_movements:
                         conn.executemany(
@@ -7146,23 +7529,35 @@ class IndexBuilder:
                         new_rel_paths,
                     )
 
-                if results:
-                    changed_doc_names = set()
-                    for r in results:
-                        if r.info.category == "Documents" and r.info.object_name:
-                            changed_doc_names.add(r.info.object_name)
-                    for doc_name in changed_doc_names:
+                # `or to_remove`: при ЧИСТОМ удалении модуля results пуст, и прежний
+                # guard `if results:` оставлял его движения в таблице сиротами навсегда.
+                if results or to_remove:
+                    # Удаление идёт по ФАЙЛУ, а не по имени документа. Удаление по
+                    # document_name сносило строки ОБОИХ модулей документа, а
+                    # восстанавливались только строки переобработанного: правка
+                    # ObjectModule стирала erp_mechanism/manager_table/adapted/manager_code
+                    # из НЕтронутого ManagerModule и наоборот. Дефект пре-существующий
+                    # (воспроизводится и на источниках v14), но с появлением manager_code
+                    # он стал массовым: у большинства документов с записью из менеджера
+                    # есть и ObjectModule. `to_remove` = removed | changed, поэтому
+                    # удалённый модуль тоже чистится, а нетронутый сосед остаётся цел.
+                    stale_files = set(to_remove) | {r.info.relative_path for r in results}
+                    for stale_rel in stale_files:
                         try:
                             conn.execute(
-                                "DELETE FROM register_movements WHERE document_name = ?",
-                                (doc_name,),
+                                "DELETE FROM register_movements WHERE file = ?",
+                                (stale_rel,),
                             )
                         except sqlite3.OperationalError:
                             pass
+                    # Каталог регистров считаем ОДИН раз перед циклом (см. полную сборку).
+                    known_registers = _known_register_names(base)
                     new_movements: list[tuple[str, str, str, str]] = []
                     for r in results:
                         if r.movements and r.info.object_name:
                             for reg_name, source, fpath in r.movements:
+                                if source == "manager_code" and reg_name.lower() not in known_registers:
+                                    continue
                                 new_movements.append((r.info.object_name, reg_name, source, fpath))
                     if new_movements:
                         conn.executemany(
@@ -7202,8 +7597,21 @@ class IndexBuilder:
         # --- Selective metadata refresh based on separate trigger sets ---
         # .xml/.mdo → category-based metadata tables, attrs, synonyms
         xml_mdo_changed = {p for p in git_changed if p.lower().endswith((".xml", ".mdo"))}
-        # .form → form_elements only
-        form_changed = {p for p in git_changed if p.lower().endswith(".form")}
+        # .form (EDT) ИЛИ */Ext/Form.xml (CF) → form_elements.
+        # v1.33.0: без CF-ветки обычная правка формы Конфигуратора не пересобирала
+        # form_elements ВООБЩЕ — такой путь попадает только в xml_mdo_changed, а
+        # пересборка идёт строго `if form_changed`. Form.xml остаётся и в
+        # xml_mdo_changed: он несёт и метаданные объекта.
+        # Сузить до `/Forms/<Имя>/Ext/Form.xml` нельзя: у CommonForms промежуточного
+        # `Forms/` НЕТ (`CommonForms/<Имя>/Ext/Form.xml`), и такой регекс пропускал бы
+        # 433 общие формы на боевом CF — их `main` и `types` замерзали бы навсегда.
+        # Признак `*/Ext/Form.xml` точен: на боевом CF 10 124 таких файла, и все до
+        # единого — формы (`Ext/Form.xml` вне каталога формы не встречается).
+        form_changed = {
+            p
+            for p in git_changed
+            if p.lower().endswith(".form") or re.search(r"(?:^|/)Ext/Form\.xml$", p, re.IGNORECASE)
+        }
         # .rights → role_rights only
         rights_changed = {p for p in git_changed if p.lower().endswith(".rights")}
         # .xdto → xdto_packages (via category detection from path)
@@ -9792,6 +10200,52 @@ class IndexReader:
                         (query.strip(),),
                     ).fetchone()
                 return int(row[0]) if row is not None else 0
+            except sqlite3.OperationalError:
+                return None
+
+    @_transient_safe(lambda: None)
+    def group_regions(self, query: str = "", by: str = "name", limit: int = 200) -> dict | None:
+        """Топ-N областей, сгруппированных по ``name`` либо ``category``.
+
+        Зачем отдельный метод, а не срез выдачи: списочная ветка ``search_regions``
+        при пустом query идёт ``ORDER BY r.name``, поэтому ``limit`` даёт АЛФАВИТНЫЙ
+        префикс, а не выборку. Любая агрегация по такому срезу систематически неверна
+        (на боевой конфигурации топ-10 по 5000 строкам из 57 652 не пересекался с
+        истинным). Здесь считает SQLite по ПОЛНОМУ набору, а ``limit`` режет уже
+        готовые группы.
+
+        WHERE повторяет ``search_regions``/``count_regions`` слово в слово, поэтому
+        сумма COUNT по ВСЕМ группам равна ``count_regions(query)``.
+
+        Returns:
+            ``{"groups": [{"key", "count"}], "groups_total": N}`` (группы отсортированы
+            по убыванию count, при равенстве — по ключу), либо None если таблицы нет.
+        """
+        col = "m.category" if by == "category" else "r.name"
+        with self._lock:
+            try:
+                where = ""
+                params: tuple = ()
+                if query and query.strip():
+                    where = "WHERE py_lower(r.name) LIKE '%' || py_lower(?) || '%' "
+                    params = (query.strip(),)
+                rows = self._conn.execute(
+                    f"SELECT {col} AS k, COUNT(*) AS c "
+                    "FROM regions r JOIN modules m ON m.id = r.module_id "
+                    f"{where}"
+                    f"GROUP BY {col} ORDER BY c DESC, k LIMIT ?",
+                    (*params, limit),
+                ).fetchall()
+                total_row = self._conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM regions r JOIN modules m ON m.id = r.module_id "
+                    f"{where}"
+                    f"GROUP BY {col})",
+                    params,
+                ).fetchone()
+                return {
+                    "groups": [{"key": r["k"], "count": int(r["c"])} for r in rows],
+                    "groups_total": int(total_row[0]) if total_row is not None else 0,
+                }
             except sqlite3.OperationalError:
                 return None
 

@@ -488,3 +488,107 @@ def test_poisoned_edt_neighbour_does_not_break_extension_scan(tmp_path):
     names = {e.name for e in ctx.nearby_extensions}
     assert "ЖивоеРасширение" in names, "живой EDT-сосед потерян — тест перестал стеречь скан"
     assert not any(e.path.endswith("СломанныйСосед") for e in ctx.nearby_extensions)
+
+
+# ── v1.33.0: детектор расширений знает префикс Асинх ────────────────────────
+
+from rlm_tools_bsl.extension_detector import _PROC_DEF_RE  # noqa: E402
+
+
+def test_proc_def_re_knows_async():
+    assert _PROC_DEF_RE.search("Асинх Функция Х(А) Экспорт")
+    assert _PROC_DEF_RE.search("  Async Function Y(A) Export")
+
+
+def test_proc_def_re_still_rejects_comment():
+    assert not _PROC_DEF_RE.search("// Процедура Призрак(А) Экспорт")
+    assert not _PROC_DEF_RE.search("//Процедура Призрак(А) Экспорт")
+
+
+def test_proc_def_re_still_matches_plain():
+    m = _PROC_DEF_RE.search("Функция Х(А) Экспорт")
+    assert m and m.group(1) == "Х"
+
+
+# ── v1.33.0: окно сканера аннотаций ────────────────────────────────────────
+
+from rlm_tools_bsl.extension_detector import _scan_bsl_for_annotations  # noqa: E402
+
+
+def _scan(tmp_path, text):
+    f = tmp_path / "Ext" / "ObjectModule.bsl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(text, encoding="utf-8")
+    out: list[dict] = []
+    _scan_bsl_for_annotations(str(f), "Ext/ObjectModule.bsl", str(tmp_path), out)
+    return out
+
+
+def test_annotation_finds_method_behind_long_comment_block(tmp_path):
+    rows = _scan(
+        tmp_path,
+        '&Вместо("ОбработкаПроведения")\n'
+        "// Комментарий 1\n// Комментарий 2\n// Комментарий 3\n"
+        "// Комментарий 4\n// Комментарий 5\n"
+        "\n"
+        "Процедура Расш_ОбработкаПроведения(Отказ, Режим)\nКонецПроцедуры\n",
+    )
+    assert rows and rows[0]["extension_method"] == "Расш_ОбработкаПроведения"
+
+
+def test_annotation_skips_directives_and_blank_lines(tmp_path):
+    rows = _scan(
+        tmp_path,
+        '&После("ПриЗаписи")\n\n#Если Сервер Тогда\n&НаСервере\n\nПроцедура Расш_ПриЗаписи(Отказ)\nКонецПроцедуры\n',
+    )
+    assert rows and rows[0]["extension_method"] == "Расш_ПриЗаписи"
+
+
+def test_annotation_does_not_leak_into_next_annotation_block(tmp_path):
+    """Если объявления нет, имя НЕ подхватывается из следующего перехвата."""
+    rows = _scan(
+        tmp_path,
+        '&Перед("А")\n&Вместо("Б")\nПроцедура Расш_Б()\nКонецПроцедуры\n',
+    )
+    by_target = {r["target_method"]: r["extension_method"] for r in rows}
+    assert by_target["Б"] == "Расш_Б"
+    assert by_target["А"] == ""
+
+
+def test_annotation_finds_async_method(tmp_path):
+    rows = _scan(
+        tmp_path,
+        '&Вместо("Загрузить")\nАсинх Функция Расш_Загрузить(Ссылка) Экспорт\nКонецФункции\n',
+    )
+    assert rows and rows[0]["extension_method"] == "Расш_Загрузить"
+
+
+def test_commented_annotation_is_not_an_interceptor(tmp_path):
+    """Закомментированная аннотация не перехват. На боевых расширениях таких 4 из 803,
+    и каждая приписывает себе следующую живую функцию."""
+    rows = _scan(
+        tmp_path,
+        '// &Вместо("ЗапросПоРеквизитамОбъектов")\n\nФункция ОбычнаяЖиваяФункция(А) Экспорт\nКонецФункции\n',
+    )
+    assert rows == [], f"призрачный перехват из комментария: {rows}"
+
+
+def test_commented_annotation_does_not_steal_next_live_annotation(tmp_path):
+    rows = _scan(
+        tmp_path,
+        '//&Вместо("Мертвая")\n&Вместо("Живая")\nПроцедура Расш_Живая()\nКонецПроцедуры\n',
+    )
+    assert [r["target_method"] for r in rows] == ["Живая"]
+    assert rows[0]["extension_method"] == "Расш_Живая"
+
+
+def test_commented_annotation_after_live_one_does_not_cut_the_search(tmp_path):
+    """ОБРАТНЫЙ порядок: живая аннотация, за ней закомментированная, затем объявление.
+    Если проверка «началась следующая аннотация» идёт по сырой строке, живая аннотация
+    останется с пустым extension_method."""
+    rows = _scan(
+        tmp_path,
+        '&Вместо("Живая")\n// &Вместо("Старая")\nПроцедура Расш_Живая()\nКонецПроцедуры\n',
+    )
+    assert [r["target_method"] for r in rows] == ["Живая"]
+    assert rows[0]["extension_method"] == "Расш_Живая", "поиск оборвался на комментарии"

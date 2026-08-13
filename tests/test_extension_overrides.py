@@ -9,7 +9,7 @@ import textwrap
 
 import pytest
 
-from rlm_tools_bsl.bsl_index import BUILDER_VERSION, IndexBuilder, IndexReader
+from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +117,6 @@ def _make_extension_only(parent_dir):
 
 
 class TestSchema:
-    def test_builder_version_is_10(self):
-        assert BUILDER_VERSION == 14
-
     def test_extension_overrides_table_created(self, tmp_path, monkeypatch):
         """Build creates extension_overrides table in schema."""
         monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
@@ -1304,5 +1301,127 @@ def test_find_ext_overrides_carries_extension_provenance(tmp_path, monkeypatch):
         for row in live_rows:
             assert row["extension_name"] == "ТестовоеРасширение"
             assert row["extension_root"] == cfe
+    finally:
+        reader.close()
+
+
+# ── v1.33.0: read-time разбор CFE в паритете с билдером ─────────────────────
+#
+# АДРЕС ФИКСА. Правка лежит в `_read_procedure_one` (bsl_helpers). `get_overrides`
+# этот код НЕ вызывает и отдаёт ключ `overrides` (не `items`), поля `extension_body`
+# в нём нет вовсе — тест через него был бы вакуумно зелёным. Единственный публичный
+# путь: `read_procedure(..., include_overrides=True)`.
+#
+# ЧТО ИМЕННО ДИСКРИМИНИРУЕТ МАСКУ. Закомментированное объявление `// Процедура X(...)`
+# на этой точке отсекается уже ЯКОРЕМ в `procedure_def`, поэтому ghost-тест по
+# комментарию зелен и БЕЗ маски — он ничего не доказывает. Маска здесь нужна для
+# двух других вещей, они и проверяются:
+#   1) многострочная сигнатура перехвата (30 из 799 живых перехватов на боевых);
+#   2) фальшивый `КонецПроцедуры` ВНУТРИ строкового литерала, который обрывает тело.
+
+_MAIN_REL = "Catalogs/Номенклатура/Ext/ObjectModule.bsl"
+_MAIN_BSL = "Процедура ПередЗаписью(Отказ)\n    // основная логика\nКонецПроцедуры\n"
+
+_EXT_MULTILINE = (
+    '&Вместо("ПередЗаписью")\n'
+    "Процедура мр_ПередЗаписью(Отказ,\n"
+    "    ДопПараметр) Экспорт\n"
+    "    // МАРКЕР_НАСТОЯЩЕГО_ТЕЛА\n"
+    "КонецПроцедуры\n"
+)
+
+_EXT_FAKE_END = (
+    '&Вместо("ПередЗаписью")\n'
+    "Процедура мр_ПередЗаписью(Отказ) Экспорт\n"
+    '    Т = "\n'
+    "КонецПроцедуры\n"
+    '    ";\n'
+    "    // МАРКЕР_НАСТОЯЩЕГО_ТЕЛА\n"
+    "КонецПроцедуры\n"
+)
+
+_EXT_SINGLE_LINE = (
+    '&Вместо("ПередЗаписью")\nПроцедура мр_ПередЗаписью(Отказ) Экспорт\n    // МАРКЕР_НАСТОЯЩЕГО_ТЕЛА\nКонецПроцедуры\n'
+)
+
+
+def _ext_env(tmp_path, ext_bsl, main_bsl=_MAIN_BSL):
+    """Дерево main+CFE поверх существующих хелперов файла.
+
+    `_make_main_with_extension` и `_write` уже есть; `_bsl_for` возвращает ОДИН dict —
+    распаковывать его в `(bsl, reader)` нельзя.
+    """
+    cf, cfe = _make_main_with_extension(tmp_path)
+    _write(os.path.join(cf, "Catalogs", "Номенклатура", "Ext", "ObjectModule.bsl"), main_bsl)
+    _write(os.path.join(cfe, "Catalogs", "Номенклатура", "Ext", "ObjectModule.bsl"), ext_bsl)
+    db_path = IndexBuilder().build(cf, build_calls=False, build_metadata=False, build_fts=False)
+    return cf, cfe, IndexReader(db_path)
+
+
+def test_multiline_interceptor_body_is_found(tmp_path, monkeypatch):
+    """Полный `procedure_def` требует закрывающую ')', которой на первой строке
+    многострочной сигнатуры нет. Построчный поиск теряет такие тела целиком —
+    на боевых расширениях это 30 перехватов из 799."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, _cfe, reader = _ext_env(tmp_path, _EXT_MULTILINE)
+    try:
+        bsl = _bsl_for(cf, reader)
+        text = bsl["read_procedure"](_MAIN_REL, "ПередЗаписью", include_overrides=True)
+        assert text, "основная процедура не прочиталась — тест ничего не проверяет"
+        assert "МАРКЕР_НАСТОЯЩЕГО_ТЕЛА" in text, f"тело многострочного перехвата не найдено: {text!r}"
+        assert "ДопПараметр" in text, "тело начато не с первой строки сигнатуры"
+    finally:
+        reader.close()
+
+
+def test_body_not_truncated_by_end_inside_string_literal(tmp_path, monkeypatch):
+    """`КонецПроцедуры` внутри строкового литерала не должен обрывать тело.
+    Это и есть то, ради чего поиск конца переведён на маску."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, _cfe, reader = _ext_env(tmp_path, _EXT_FAKE_END)
+    try:
+        bsl = _bsl_for(cf, reader)
+        text = bsl["read_procedure"](_MAIN_REL, "ПередЗаписью", include_overrides=True)
+        assert text, "основная процедура не прочиталась"
+        assert "МАРКЕР_НАСТОЯЩЕГО_ТЕЛА" in text, "тело оборвано фальшивым КонецПроцедуры из литерала"
+    finally:
+        reader.close()
+
+
+def test_single_line_interceptor_still_found(tmp_path, monkeypatch):
+    """Регресс-гард: обычный однострочный перехват обязан работать как раньше."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, _cfe, reader = _ext_env(tmp_path, _EXT_SINGLE_LINE)
+    try:
+        bsl = _bsl_for(cf, reader)
+        text = bsl["read_procedure"](_MAIN_REL, "ПередЗаписью", include_overrides=True)
+        assert "МАРКЕР_НАСТОЯЩЕГО_ТЕЛА" in text
+    finally:
+        reader.close()
+
+
+def test_extract_procedures_read_time_ignores_ghosts(tmp_path, monkeypatch):
+    """read-time разбор модуля РАСШИРЕНИЯ обязан вести себя как билдер.
+
+    `extract_procedures` — публичная обёртка над вложенной `_parse_procedures`,
+    которую правит Шаг 4; импортом та недостижима.
+    """
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    ghost = (
+        "// Пример:\n"
+        "//   Процедура Призрак(А) Экспорт\n"
+        "//   КонецПроцедуры\n"
+        'Шаблон = "Процедура ПризракИзСтроки(Б) Экспорт";\n'
+        'Процедура Настоящая(Знач В = ", ", Г) Экспорт\n'
+        "КонецПроцедуры\n"
+    )
+    cf, cfe, reader = _ext_env(tmp_path, ghost)
+    try:
+        bsl = _bsl_for(cfe, None)  # разбор идёт по дереву РАСШИРЕНИЯ, индекс не нужен
+        procs = bsl["extract_procedures"]("Catalogs/Номенклатура/Ext/ObjectModule.bsl")
+        assert procs, "модуль не разобрался — тест ничего не проверяет"
+        assert [p["name"] for p in procs] == ["Настоящая"], procs
+        assert isinstance(procs[0]["params"], list), procs[0]
+        assert procs[0]["params"] == ["В", "Г"], procs[0]
     finally:
         reader.close()

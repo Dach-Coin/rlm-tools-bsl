@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from rlm_tools_bsl.bsl_index import (
-    BUILDER_VERSION,
     IndexBuilder,
     IndexReader,
     _METADATA_REFERENCES_TRIGGER_CATEGORIES,
@@ -87,6 +86,7 @@ _CF_CATALOG_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
                 xmlns:v8="http://v8.1c.ru/8.1/data/core"
                 xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                 xmlns:xs="http://www.w3.org/2001/XMLSchema">
   <Catalog>
     <Properties>
@@ -98,9 +98,10 @@ _CF_CATALOG_XML = """<?xml version="1.0" encoding="UTF-8"?>
         </v8:item>
       </Synonym>
       <Owners>
-        <v8:Type>CatalogRef.Организации</v8:Type>
+        <xr:Item xsi:type="xr:MDObjectRef">Catalog.Организации</xr:Item>
       </Owners>
       <DefaultObjectForm>Catalog.Контрагенты.Form.ФормаЭлемента</DefaultObjectForm>
+      <DefaultListForm>Catalog.Контрагенты.Form.ФормаСписка</DefaultListForm>
     </Properties>
     <ChildObjects>
       <Attribute>
@@ -139,12 +140,13 @@ _EDT_CATALOG_MDO = """<?xml version="1.0" encoding="UTF-8"?>
 _CF_DOCUMENT_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
                 xmlns:v8="http://v8.1c.ru/8.1/data/core"
-                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable">
+                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <Document>
     <Properties>
       <Name>РеализацияТоваровУслуг</Name>
       <BasedOn>
-        <v8:Type>DocumentRef.ЗаказКлиента</v8:Type>
+        <xr:Item xsi:type="xr:MDObjectRef">Document.ЗаказКлиента</xr:Item>
       </BasedOn>
     </Properties>
     <ChildObjects>
@@ -288,6 +290,25 @@ _CF_DEFINED_TYPE_XML = """<?xml version="1.0" encoding="UTF-8"?>
       </Type>
     </Properties>
   </DefinedType>
+</MetaDataObject>
+"""
+
+# v1.33.0: ПВХ нужен в фикстуре, чтобы белый список _ANCHORED_REF_KINDS реально
+# проверялся — на characteristic_type он ОБЯЗАН оставить line=NULL.
+_CF_PVH_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
+                xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <ChartOfCharacteristicTypes>
+    <Properties>
+      <Name>ВидыСубконто</Name>
+      <Type>
+        <v8:Type>cfg:CatalogRef.Организации</v8:Type>
+        <v8:Type>cfg:CatalogRef.Контрагенты</v8:Type>
+      </Type>
+      <DefaultObjectForm>ChartOfCharacteristicTypes.ВидыСубконто.Form.ФормаЭлемента</DefaultObjectForm>
+      <DefaultListForm>ChartOfCharacteristicTypes.ВидыСубконто.Form.ФормаСписка</DefaultListForm>
+    </Properties>
+  </ChartOfCharacteristicTypes>
 </MetaDataObject>
 """
 
@@ -494,6 +515,15 @@ def refs_cf_fixture(tmp_path, monkeypatch):
     # DefinedType (collector iterates DefinedTypes/ for *.xml files)
     _write(base / "DefinedTypes" / "ВладелецКонтрагента.xml", _CF_DEFINED_TYPE_XML)
 
+    # ChartOfCharacteristicTypes: даёт characteristic_type (на нём проверяется
+    # белый список) и второй источник default_list_form. Sibling-XML нужен по тем же
+    # причинам, что у Catalog/Document выше.
+    _write(
+        base / "ChartsOfCharacteristicTypes" / "ВидыСубконто" / "Ext" / "ChartOfCharacteristicTypes.xml",
+        _CF_PVH_XML,
+    )
+    _write(base / "ChartsOfCharacteristicTypes" / "ВидыСубконто.xml", _CF_PVH_XML)
+
     builder = IndexBuilder()
     db_path = builder.build(
         str(base),
@@ -508,9 +538,6 @@ def refs_cf_fixture(tmp_path, monkeypatch):
 
 
 class TestIndexV12:
-    def test_builder_version_is_14(self):
-        assert BUILDER_VERSION == 14
-
     def test_metadata_references_categories_set(self):
         # DefinedTypes must be a top-level trigger category for v12
         assert "DefinedTypes" in _METADATA_REFERENCES_TRIGGER_CATEGORIES
@@ -836,14 +863,20 @@ class TestAttributeLineFilled:
         assert attr_rows[0]["line"] is not None
         assert attr_rows[0]["line"] > 0
 
-    def test_index_owner_ref_line_is_none(self, refs_cf_fixture):
-        """Object-level refs (owner, based_on, forms) keep `line=None` — by contract."""
-        reader, _, _ = refs_cf_fixture
+    def test_index_owner_ref_line_points_at_the_owners_item(self, refs_cf_fixture):
+        """v1.33.0 сменила контракт: у owner/based_on/default-форм `line` больше НЕ None,
+        а указывает на строку САМОЙ ссылки. До этого релиза здесь стоял честный NULL —
+        поэтому тест проверяет не «не None», а попадание в нужную строку."""
+        reader, base, _ = refs_cf_fixture
         rows = reader.find_metadata_references("Catalog.Организации")
         assert rows is not None
         owner_rows = [r for r in rows if r["ref_kind"] == "owner"]
         assert owner_rows
-        assert owner_rows[0]["line"] is None
+        row = owner_rows[0]
+        assert row["line"] is not None
+        text = (Path(base) / row["path"]).read_text(encoding="utf-8-sig").splitlines()
+        assert "Catalog.Организации" in text[row["line"] - 1]
+        assert "Owners" in "".join(text[max(0, row["line"] - 2) : row["line"] + 1])
 
     def test_live_fallback_attribute_ref_has_line(self, tmp_path, monkeypatch):
         monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
@@ -870,6 +903,13 @@ class TestAttributeLineFilled:
         assert attr_refs, "live attribute_type ref missing"
         assert attr_refs[0]["line"] is not None
         assert attr_refs[0]["line"] > 0
+        # v1.33.0: live-фолбэк якорится ТЕМ ЖЕ резолвером, что и билдер, поэтому `line`
+        # обязана указывать на САМУ ссылку (тег типа), а не на объявление владельца —
+        # иначе один ключ ответа значил бы разное на двух путях одного хелпера.
+        text = (Path(base) / attr_refs[0]["path"]).read_text(encoding="utf-8-sig").splitlines()
+        anchored = text[attr_refs[0]["line"] - 1]
+        assert "Банки" in anchored, anchored
+        assert "Name" not in anchored, f"якорь сел на объявление владельца: {anchored!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -1195,3 +1235,285 @@ class TestFindDataPath:
             assert res["partial"] is True
         finally:
             reader2.close()
+
+
+# ── v1.33.0: якорь ссылок метаданных ───────────────────────────────────────
+
+from rlm_tools_bsl.bsl_index import _ref_anchor_index  # noqa: E402
+
+
+def _ref(suffix: str, *, kind: str = "attribute_type", ref_object: str = "") -> dict:
+    """Словарь ссылки РОВНО как его отдаёт парсер — с ``ref_kind``.
+
+    Без `ref_kind` белый список `_ANCHORED_REF_KINDS` вернёт None, и весь набор
+    тестов Задачи 7 станет красным. Продовый парсер `ref_kind` кладёт всегда.
+    """
+    return {"ref_kind": kind, "used_in_suffix": suffix, "ref_object": ref_object}
+
+
+_ANCHOR_XML = """<MetaDataObject>
+ <Document>
+  <Properties>
+   <Name>Док</Name>
+   <BasedOn><Item>Document.Основание</Item></BasedOn>
+  </Properties>
+  <ChildObjects>
+   <Attribute><Properties>
+     <Name>Организация</Name>
+     <Synonym><item><content>Организация</content></item></Synonym>
+     <Type><v8:Type>cfg:CatalogRef.Организации</v8:Type></Type>
+   </Properties></Attribute>
+   <TabularSection><Properties><Name>Товары</Name></Properties>
+    <ChildObjects><Attribute><Properties>
+      <Name>Организация</Name>
+      <Type><v8:Type>cfg:CatalogRef.Другие</v8:Type></Type>
+    </Properties></Attribute></ChildObjects>
+   </TabularSection>
+  </ChildObjects>
+ </Document>
+</MetaDataObject>
+"""
+_ANCHOR_LINES = _ANCHOR_XML.split("\n")
+
+
+def test_line_points_at_type_tag_not_at_name():
+    idx = _ref_anchor_index(_ANCHOR_LINES)
+    line = idx.line_for(_ref("Attribute.Организация.Type"))
+    assert "v8:Type" in _ANCHOR_LINES[line - 1]
+    assert "CatalogRef.Организации" in _ANCHOR_LINES[line - 1]
+
+
+def test_repeated_name_resolves_to_its_own_section():
+    """Реквизит ТЧ с тем же именем обязан получить СВОЮ строку, а не первую по файлу."""
+    idx = _ref_anchor_index(_ANCHOR_LINES)
+    head = idx.line_for(_ref("Attribute.Организация.Type"))
+    ts = idx.line_for(_ref("TabularSection.Товары.Attribute.Организация.Type"))
+    assert ts > head
+    assert "CatalogRef.Другие" in _ANCHOR_LINES[ts - 1]
+
+
+def test_resolution_is_order_independent():
+    """Порядок отдачи парсером не совпадает с порядком в файле — резолв обязан
+    давать тот же ответ при обратном порядке запросов."""
+    forward = _ref_anchor_index(_ANCHOR_LINES)
+    a1 = forward.line_for(_ref("Attribute.Организация.Type"))
+    b1 = forward.line_for(_ref("TabularSection.Товары.Attribute.Организация.Type"))
+    backward = _ref_anchor_index(_ANCHOR_LINES)
+    b2 = backward.line_for(_ref("TabularSection.Товары.Attribute.Организация.Type"))
+    a2 = backward.line_for(_ref("Attribute.Организация.Type"))
+    assert None not in (a1, b1, a2, b2), "резолв вернул None — тест был бы зелёным на (None, None)"
+    assert (a1, b1) == (a2, b2)
+
+
+_COMPOSITE = """<MetaDataObject>
+ <InformationRegister>
+  <ChildObjects>
+   <Dimension><Properties>
+     <Name>Ссылка</Name>
+     <Type>
+       <v8:Type>cfg:DocumentRef.Первый</v8:Type>
+       <v8:Type>cfg:DocumentRef.Второй</v8:Type>
+       <v8:Type>cfg:DocumentRef.Третий</v8:Type>
+     </Type>
+   </Properties></Dimension>
+  </ChildObjects>
+ </InformationRegister>
+</MetaDataObject>
+""".split("\n")
+
+
+def test_composite_type_each_component_gets_its_own_line():
+    """Составной тип: КАЖДЫЙ тип лежит на своей строке, и ссылка обязана указывать
+    на свою, а не на общий контейнер <Type>. На боевой конфигурации у одного реквизита
+    бывает до 266 типов — промах контейнером стоит сотни строк."""
+    idx = _ref_anchor_index(_COMPOSITE)
+    lines = {}
+    for name in ("Первый", "Второй", "Третий"):
+        ln = idx.line_for(_ref("Dimension.Ссылка.Type", ref_object=f"Document.{name}"))
+        lines[name] = ln
+        assert f"DocumentRef.{name}" in _COMPOSITE[ln - 1], f"{name} -> строка {ln}"
+    assert len(set(lines.values())) == 3, f"все три ссылки схлопнулись в одну строку: {lines}"
+
+
+def test_composite_type_repeat_query_is_cached_not_exhausted():
+    """Повторный запрос той же ссылки обязан дать ту же строку, а не None:
+    владелец не должен «исчерпываться» после первого обращения."""
+    idx = _ref_anchor_index(_COMPOSITE)
+    ref = _ref("Dimension.Ссылка.Type", ref_object="Document.Второй")
+    first = idx.line_for(ref)
+    assert first is not None
+    for _ in range(300):
+        assert idx.line_for(ref) == first
+
+
+def test_unknown_ref_object_falls_back_to_type_block_not_to_none():
+    """Если конкретный тип сопоставить не удалось, ссылка указывает на блок <Type>,
+    а не теряется."""
+    idx = _ref_anchor_index(_COMPOSITE)
+    ln = idx.line_for(_ref("Dimension.Ссылка.Type", ref_object="Catalog.НетТакого"))
+    assert ln is not None
+    assert "<Type>" in _COMPOSITE[ln - 1]
+
+
+_FORMS_XML = """<MetaDataObject>
+ <Document>
+  <Properties>
+   <Name>БольничныйЛист</Name>
+   <DefaultObjectForm>Document.БольничныйЛист.Form.ФормаДокумента</DefaultObjectForm>
+   <DefaultListForm>Document.БольничныйЛист.Form.ФормаСписка</DefaultListForm>
+  </Properties>
+ </Document>
+</MetaDataObject>
+""".split("\n")
+
+
+def test_default_form_refs_do_not_land_on_object_name():
+    """ref_object у этих видов — САМ объект, поэтому наивный поиск ref_object попадает
+    в <Name> в шапке файла.
+
+    Словарь ref собран РОВНО как его отдаёт парсер: `used_in_suffix` и `ref_object`,
+    БЕЗ ключа `used_in` — он появляется только в `_emit_refs`, уже после резолвера.
+    """
+    idx = _ref_anchor_index(_FORMS_XML)
+    obj = idx.line_for(
+        {
+            "ref_kind": "default_object_form",
+            "ref_object": "Document.БольничныйЛист",
+            "used_in_suffix": "DefaultObjectForm=Document.БольничныйЛист.Form.ФормаДокумента",
+        }
+    )
+    lst = idx.line_for(
+        {
+            "ref_kind": "default_list_form",
+            "ref_object": "Document.БольничныйЛист",
+            "used_in_suffix": "DefaultListForm=Document.БольничныйЛист.Form.ФормаСписка",
+        }
+    )
+    assert obj != lst, "обе ссылки схлопнулись в одну строку"
+    assert "DefaultObjectForm" in _FORMS_XML[obj - 1]
+    assert "DefaultListForm" in _FORMS_XML[lst - 1]
+    name_line = next(i for i, s in enumerate(_FORMS_XML, 1) if "<Name>" in s)
+    assert obj != name_line and lst != name_line, "ссылка села на имя объекта в шапке"
+
+
+def test_plain_anchor_requires_exact_tag_value():
+    """Подстрочный поиск запрещён: Catalog.Заказ не должен находиться в Catalog.ЗаказКлиента.
+
+    Вид взят ЯКОРНЫЙ (`owner`): невключённые в белый список виды проверяли бы
+    только сам белый список.
+    """
+    lines = [
+        "<Owners>",
+        "  <Item>Catalog.ЗаказКлиента</Item>",
+        "  <Item>Catalog.Заказ</Item>",
+        "</Owners>",
+    ]
+    idx = _ref_anchor_index(lines)
+    assert idx.line_for(_ref("Owners", kind="owner", ref_object="Catalog.Заказ")) == 3
+
+
+_CF_OWNER_THEN_BASEDON = """<MetaDataObject><Catalog><Properties>
+ <Name>КонтактныеЛица</Name>
+ <Owners><Item>Catalog.Партнеры</Item></Owners>
+ <BasedOn><Item>Catalog.Партнеры</Item></BasedOn>
+</Properties></Catalog></MetaDataObject>
+""".split("\n")
+
+_EDT_BASEDON_THEN_OWNER = """<mdclass:Catalog>
+ <name>КонтактныеЛица</name>
+ <basedOn>Catalog.Партнеры</basedOn>
+ <owners>Catalog.Партнеры</owners>
+</mdclass:Catalog>
+""".split("\n")
+
+
+@pytest.mark.parametrize("lines", [_CF_OWNER_THEN_BASEDON, _EDT_BASEDON_THEN_OWNER])
+def test_owner_and_based_on_with_same_object_get_different_lines(lines):
+    """Один объект бывает и владельцем, и основанием. Поиск и кеш обязаны учитывать
+    ref_kind. Оба порядка тегов проверяются намеренно: в CF Owners раньше BasedOn,
+    в EDT наоборот, поэтому решение «по позиции» неверно в одном из форматов."""
+    idx = _ref_anchor_index(lines)
+    own = idx.line_for({"ref_kind": "owner", "ref_object": "Catalog.Партнеры", "used_in_suffix": "Owners"})
+    based = idx.line_for({"ref_kind": "based_on", "ref_object": "Catalog.Партнеры", "used_in_suffix": "BasedOn"})
+    assert own is not None and based is not None, (own, based)
+    assert own != based, "owner и based_on схлопнулись в одну строку"
+    assert "wner" in lines[own - 1], lines[own - 1]
+    assert "asedOn" in lines[based - 1], lines[based - 1]
+
+
+def test_missing_anchor_returns_none_not_wrong_line():
+    idx = _ref_anchor_index(_ANCHOR_LINES)
+    assert idx.line_for(_ref("Attribute.Организация.Type")) is not None, "якорь не работает вовсе"
+    assert idx.line_for(_ref("Attribute.НетТакого.Type")) is None
+
+
+def test_null_index_when_content_unavailable():
+    idx = _ref_anchor_index(None)
+    assert idx.line_for(_ref("Attribute.Х.Type")) is None
+
+
+# ── v1.33.0: проверка ЧЕРЕЗ ПРОДОВЫЙ ПУТЬ, а не вызовом якоря ──────────────
+
+from rlm_tools_bsl.bsl_index import _ANCHORED_REF_KINDS  # noqa: E402
+
+# Осознанно НЕ якорятся в v1.33.0. Пишутся своими коллекторами с жёстким None.
+# `subsystem_content` и `characteristic_type` — здесь же: первый собирает отдельный
+# цикл и `_emit_refs` не зовёт, второй проходит через `_emit_refs`, но белым списком
+# принудительно возвращается в None (иначе было бы «заполнено 5 из 486» — контракт
+# хуже честного NULL).
+_KNOWN_NULL_KINDS = {
+    "role_rights",
+    "subsystem_content",
+    "exchange_plan_content",
+    "event_subscription_source",
+    "defined_type_content",
+    "functional_option_content",
+    "characteristic_type",
+    "predefined_characteristic_type",
+    "command_parameter_type",
+}
+
+
+def test_anchored_kinds_have_line_in_built_index(refs_cf_fixture):
+    """Проверяется РЕЗУЛЬТАТ СБОРКИ, а не вызов резолвера.
+
+    Прогон, где якорь дёргают напрямую, измеряет ВОЗМОЖНОСТЬ, а не то, что попадёт
+    в индекс: продовые точки записи резолвер могут не вызывать вовсе.
+    """
+    _, _, db_path = refs_cf_fixture
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT ref_kind, COUNT(*), SUM(line IS NULL) FROM metadata_references GROUP BY 1"
+        ).fetchall()
+    finally:
+        conn.close()
+    seen = {r[0] for r in rows}
+    assert _ANCHORED_REF_KINDS <= seen, f"фикстура не покрывает якорные виды: не хватает {_ANCHORED_REF_KINDS - seen}"
+    assert "characteristic_type" in seen, "нет ПВХ — белый список не проверяется"
+    for kind, total, nulls in rows:
+        if kind in _ANCHORED_REF_KINDS:
+            assert nulls == 0, f"{kind}: {nulls} из {total} строк без line — якорь не подключен"
+        elif kind in _KNOWN_NULL_KINDS:
+            assert nulls == total, f"{kind}: неожиданно заполнен — перепроверь стоимость"
+        else:
+            raise AssertionError(f"новый вид ссылок {kind} не классифицирован")
+
+
+def test_attribute_type_line_points_at_the_reference_itself(refs_cf_fixture):
+    """Гейт качества: строка обязана СОДЕРЖАТЬ текст самой ссылки, а не просто быть
+    не-NULL. Критерий «строка не пуста» пропустил бы промах контейнером <Type>."""
+    _, base, db_path = refs_cf_fixture
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT ref_object, path, line FROM metadata_references "
+            "WHERE ref_kind = 'attribute_type' AND line IS NOT NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows, "нет строк attribute_type — тест был бы вакуумным"
+    for ref_object, rel, line in rows:
+        text = (Path(base) / rel).read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        short = ref_object.split(".")[-1]
+        assert short in text[line - 1], f"{ref_object} -> {rel}:{line} = {text[line - 1]!r}"

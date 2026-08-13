@@ -12,7 +12,10 @@ from rlm_tools_bsl.bsl_strategy_data import (
 
 
 BSL_PATTERNS = {
-    "procedure_def": r"(Процедура|Функция|Procedure|Function)\s+(\w+)\s*\(([^)]*)\)\s*(Экспорт|Export)?",
+    # Заякорен на начало строки (v1.33.0): неякорный поиск ловил объявления из
+    # комментариев и строковых литералов. Префикс Асинх/Async — non-capturing,
+    # нумерация групп 1..4 сохранена, поэтому call-site'ы правки не требуют.
+    "procedure_def": r"^\s*(?:(?:Асинх|Async)\s+)?(Процедура|Функция|Procedure|Function)\s+(\w+)\s*\(([^)]*)\)\s*(Экспорт|Export)?",
     "procedure_end": r"^\s*(КонецПроцедуры|КонецФункции|EndProcedure|EndFunction)",
     "export_marker": r"\)\s*(Экспорт|Export)\s*$",
     "module_call": r"(\w+)\.(\w+)\s*\(",
@@ -158,10 +161,103 @@ def _normalize_method_params(rows: list[dict]) -> list[dict]:
 # paren-list. The actual `procedure_def` regex (above) requires a balanced
 # `([^)]*)` — too strict for multi-line cases where `)` lives on a later row.
 _PROC_DEF_PREFIX_RE = re.compile(
-    r"^\s*(?:Процедура|Функция|Procedure|Function)\s+\w+\s*\(",
+    r"^\s*(?:(?:Асинх|Async)\s+)?(?:Процедура|Функция|Procedure|Function)\s+\w+\s*\(",
     re.IGNORECASE,
 )
 _PROC_STRING_LITERAL_RE = re.compile(r'"[^"\r\n]*"')
+
+
+def mask_comments_and_strings(
+    lines: list[str],
+    *,
+    keep_string_content: bool = False,
+) -> list[str]:
+    """Маска той же длины: текст комментариев (и, по умолчанию, содержимое строковых
+    литералов) заменяется пробелами.
+
+    Та же машина состояний, что у ``_scan_module`` в билдере (``""`` — экранированная
+    кавычка, ``//`` начинает комментарий только ВНЕ строки), но с сохранением длины:
+    смещения групп регекса, посчитанные по маске, применимы к оригиналу. Это и есть
+    причина существования отдельной функции — ``_scan_module`` длину не сохраняет,
+    поэтому ``params`` через него взять нельзя.
+
+    ``keep_string_content=True`` гасит ТОЛЬКО комментарии. Этот режим нужен регексам,
+    которые по замыслу читают имя ИЗ строкового литерала
+    (``МеханизмыДокумента.Добавить("X")``, ``ИмяРегистра = "X"``): полная маска убила бы
+    сам сигнал, а работа по сырому тексту тащит в индекс закомментированные вызовы.
+
+    Кавычки-ограничители сохраняются всегда: без них ``_count_unquoted_parens`` перестал
+    бы видеть границы литерала.
+    """
+    out: list[str] = []
+    in_string = False
+    for raw in lines:
+        n = len(raw)
+        # 1С допускает КОММЕНТАРИЙ между строками-продолжениями многострочного
+        # литерала. Такая строка — комментарий, а НЕ содержимое литерала, и её
+        # кавычки состояние не меняют. Без этого правила закомментированный конец
+        # запроса (`//|  ОбъектРасчетов";`) закрывает литерал в маске, машина
+        # состояний рассинхронизируется и гасит ОСТАТОК МОДУЛЯ.
+        if in_string and raw.lstrip().startswith("//"):
+            out.append(" " * n)
+            continue
+
+        # БЫСТРЫЙ ПУТЬ. Машина состояний ниже посимвольная только по необходимости:
+        # строка ВНЕ литерала, в которой нет ни кавычки, ни `//`, маской не меняется
+        # вовсе и отдаётся как есть (без единой аллокации). На боевых конфигурациях
+        # это большинство строк, и именно он окупает маску на сборке ЕРП-масштаба.
+        if not in_string:
+            q = raw.find('"')
+            c = raw.find("//")
+            if q < 0:
+                if c < 0:
+                    out.append(raw)
+                else:
+                    out.append(raw[:c] + " " * (n - c))
+                continue
+            if 0 <= c < q:  # комментарий начинается раньше литерала
+                out.append(raw[:c] + " " * (n - c))
+                continue
+
+        # МЕДЛЕННЫЙ ПУТЬ — та же машина состояний, но прыжками по str.find
+        # и срезами вместо символ-за-символом. Семантика идентична посимвольной
+        # версии (см. тест эквивалентности на боевых исходниках).
+        buf: list[str] = []
+        i = 0
+        while i < n:
+            if in_string:
+                j = raw.find('"', i)
+                if j < 0:  # литерал продолжается на следующей строке
+                    buf.append(raw[i:] if keep_string_content else " " * (n - i))
+                    break
+                if j > i:
+                    buf.append(raw[i:j] if keep_string_content else " " * (j - i))
+                if j + 1 < n and raw[j + 1] == '"':
+                    # экранированная "" — остаёмся в строке; длина всегда 2 символа
+                    buf.append('""' if keep_string_content else "  ")
+                    i = j + 2
+                else:
+                    buf.append('"')
+                    in_string = False
+                    i = j + 1
+            else:
+                q = raw.find('"', i)
+                c = raw.find("//", i)
+                if q < 0 and c < 0:
+                    buf.append(raw[i:])
+                    break
+                if q >= 0 and (c < 0 or q < c):
+                    buf.append(raw[i:q])
+                    buf.append('"')
+                    in_string = True
+                    i = q + 1
+                else:
+                    buf.append(raw[i:c])
+                    buf.append(" " * (n - c))  # хвост строки — комментарий
+                    break
+        out.append("".join(buf))
+    return out
+
 
 _MULTILINE_HARD_CAP_LINES = 20
 _MULTILINE_HARD_CAP_CHARS = 2000
@@ -177,56 +273,84 @@ def _count_unquoted_parens(line: str) -> tuple[int, int]:
     return sanitized.count("("), sanitized.count(")")
 
 
-def _merge_proc_continuations(lines: list[str]) -> tuple[list[str], list[int]]:
-    """Merge multi-line BSL procedure signatures into single logical lines.
+def _merge_proc_continuations_with_mask(
+    lines: list[str],
+    masked: list[str],
+) -> tuple[list[str], list[str], list[int]]:
+    """Склейка многострочных сигнатур с параллельной маской.
 
     Args:
-        lines: Original file lines (no trailing newline).
+        lines: исходные строки файла (без завершающего перевода строки).
+        masked: результат ``mask_comments_and_strings(lines)`` — посимвольно той же
+            длины, что и ``lines``.
 
     Returns:
-        (merged_lines, line_map) where ``line_map[i]`` is the **1-based** number
-        of the original line that begins ``merged_lines[i]``. For non-merged
-        lines the map is identity.
+        ``(merged_lines, merged_masked, line_map)``; ``line_map[i]`` — **1-based**
+        номер исходной строки, с которой начинается ``merged_lines[i]``.
+        ``merged_lines[i]`` и ``merged_masked[i]`` посимвольно одинаковой длины,
+        поэтому смещения групп регекса, посчитанные по маске, применимы к оригиналу.
 
-    Hard caps: 20 lines / 2000 chars per signature — guards against runaway
-    merges on truncated/garbage files with unbalanced `(`.
+    Решение о склейке принимается ПО МАСКЕ, поэтому закомментированное объявление с
+    несбалансированной скобкой больше не проглатывает соседей.
+
+    Hard caps: 20 строк / 2000 символов на сигнатуру — защита от разбега на битых
+    файлах с несбалансированной `(`.
     """
     merged_lines: list[str] = []
+    merged_masked: list[str] = []
     line_map: list[int] = []
 
     total = len(lines)
     i = 0
     while i < total:
         line = lines[i]
-        if _PROC_DEF_PREFIX_RE.match(line):
-            open_count, close_count = _count_unquoted_parens(line)
+        mline = masked[i]
+        if _PROC_DEF_PREFIX_RE.match(mline):
+            open_count, close_count = _count_unquoted_parens(mline)
             balance = open_count - close_count
             if balance > 0:
                 combined = line
+                combined_mask = mline
                 start_original = i + 1
                 last_index = i
                 for j in range(i + 1, min(i + _MULTILINE_HARD_CAP_LINES, total)):
-                    nxt = lines[j]
-                    combined = combined + " " + nxt
-                    o, c = _count_unquoted_parens(nxt)
+                    combined = combined + " " + lines[j]
+                    combined_mask = combined_mask + " " + masked[j]
+                    o, c = _count_unquoted_parens(masked[j])
                     balance += o - c
                     last_index = j
                     if balance <= 0:
                         break
                     if len(combined) > _MULTILINE_HARD_CAP_CHARS:
                         break
-                # Treat the whole span as one logical line regardless of whether
-                # we reached balance (hard-cap exits also collapse to single
-                # logical row so callers don't get duplicate signature matches).
+                # Весь пролёт становится одной логической строкой независимо от того,
+                # достигнут ли баланс (выход по hard-cap тоже схлопывается, иначе
+                # вызывающий получил бы дубли совпадений сигнатуры).
                 merged_lines.append(combined)
+                merged_masked.append(combined_mask)
                 line_map.append(start_original)
                 i = last_index + 1
                 continue
         merged_lines.append(line)
+        merged_masked.append(mline)
         line_map.append(i + 1)
         i += 1
 
-    return merged_lines, line_map
+    return merged_lines, merged_masked, line_map
+
+
+def _merge_proc_continuations(lines: list[str]) -> tuple[list[str], list[int]]:
+    """Обёртка: решение о склейке — по сырым строкам (как до 1.33.0).
+
+    Оставлена для вызовов, которые уже подают очищенный текст (``_live_code_only``)
+    либо одиночное объявление обработчика.
+
+    NB: поведение НЕ полностью идентично v14 — ``_PROC_DEF_PREFIX_RE`` теперь знает
+    префикс ``Асинх``, поэтому многострочная ``Асинх Функция`` склеивается и здесь.
+    Это желаемое изменение (v14 такие объявления не видел вовсе).
+    """
+    merged, _masked, line_map = _merge_proc_continuations_with_mask(lines, lines)
+    return merged, line_map
 
 
 @dataclass
@@ -315,7 +439,7 @@ Step 1 — DISCOVER: find what you need
   search_methods('substring')            → precise: find METHODS by code name (FTS)
   search_regions('имя')                  → precise: find code regions
   search_module_headers('текст')         → precise: find modules by header
-  NOTE: search_regions/search_module_headers молча усекаются по limit — для census бери count_only=True: тот же scope, что и выдача (с CFE +total_main/total_extensions)
+  NOTE: search_regions/search_module_headers режутся по limit (порядок — не релевантность): census — count_only=True (тот же scope, что и выдача; при CFE +total_main/total_extensions), топ-N — search_regions(group_by='name')
   NOTE: search() = broad first pass; specialized helpers = precise follow-up when you need specific fields
   parse_object_xml(path) → attributes, tabular sections, dimensions, resources
   find_attributes('ИмяРеквизита')        → INSTANT: attribute name → type(s)
@@ -1293,7 +1417,7 @@ def _build_full_strategy(
         if has_fts:
             idx_lines.append(
                 "search_methods(query) — full-text search by method name substring. "
-                "Use in Step 1 DISCOVER to find methods across the entire codebase without knowing the module name."
+                "Use in Step 1 DISCOVER to find methods across the codebase (main FTS: query >= 3 chars)."
             )
         if synonyms_count:
             idx_lines.append(
@@ -1630,7 +1754,7 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
     if has_fts:
         idx_lines.append(
             "search_methods(query) — full-text search by method name substring. "
-            "Use in Step 1 DISCOVER to find methods across the entire codebase without knowing the module name."
+            "Use in Step 1 DISCOVER to find methods across the codebase (main FTS: query >= 3 chars)."
         )
     if synonyms_count:
         idx_lines.append(

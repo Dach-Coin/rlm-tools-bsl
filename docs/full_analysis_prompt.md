@@ -648,7 +648,7 @@ Replace `<path>` with the actual path to your 1C source code (EDT or CF format).
 3. **Детали обработчиков событий**:
    - Выбери форму с наибольшим количеством обработчиков
    - Сгруппируй обработчики по scope: сколько form-level, ext_info-level, element-level
-   - Для element-level обработчиков: покажи element_name, element_type, event, handler, data_path
+   - Для element-level обработчиков: покажи element, element_type, event, handler, data_path
    - Какие события самые частые (OnChange, StartChoice, Selection)?
 
 4. **Обратный поиск: процедура → элемент**:

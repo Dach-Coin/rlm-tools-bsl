@@ -1461,11 +1461,25 @@ def test_find_functional_options_limit_per_bucket(tmp_path):
 
     # limit=1 → по 1 из КАЖДОГО бакета (per-bucket), НЕ 1 суммарно (global-cap дал бы returned=1).
     limited = bsl["find_functional_options"]("ПриобретениеТоваров", limit=1)
-    assert set(limited.keys()) == {"object", "xml_options", "code_options", "total", "returned", "has_more"}
+    # v1.33.0: к пагинационным полям добавлены xml_total/code_total. `total` — сумма
+    # корзин РАЗНОЙ точности (xml — exact, code — подстрочный grep), и два e2e-прогона
+    # подряд агент читал её как «столько ФО у объекта». Ветка БЕЗ limit при этом
+    # осталась байт-в-байт прежней (проверено выше).
+    assert set(limited.keys()) == {
+        "object",
+        "xml_options",
+        "code_options",
+        "total",
+        "xml_total",
+        "code_total",
+        "returned",
+        "has_more",
+    }
     assert len(limited["xml_options"]) == 1
     assert len(limited["code_options"]) == 1
     assert limited["returned"] == 2  # global-cap дал бы 1
     assert limited["total"] == 2
+    assert (limited["xml_total"], limited["code_total"]) == (1, 1)  # разбивка совпадает с корзинами
     assert limited["has_more"] is False  # каждый бакет ровно в пределах limit
 
 
@@ -5075,7 +5089,10 @@ def test_posting_hint_route_executes_end_to_end_and_names_the_delegate():
             # хелпер НАХОДИТ прямого писателя, значит ноль ниже — не «хелпер сломан», а слепота к наборам.
             assert bsl["find_register_writers"]("ТоварыНаСкладах")["total_writers"] >= 1
             assert bsl["find_register_writers"]("ВзаиморасчетыСКонтрагентами")["total_writers"] == 0
-            assert "НЕ НАЙДЕТ" in hint, "hint не говорит, что find_register_writers наборы не найдет"
+            # v1.33.0: наборы записей из МОДУЛЯ МЕНЕДЖЕРА индекс знает (source='manager_code'),
+            # а из прочих модулей (здесь — общий модуль-делегат) по-прежнему НЕТ. Hint обязан
+            # называть эту границу, иначе агент решит, что ноль писателей = писателей нет.
+            assert "модулях" in hint and "НЕТ" in hint, f"hint не называет границу видимости наборов записей: {hint}"
             # Стенд НЕ под git → git_search в песочнице НЕ зарегистрирован, и hint не имеет права
             # его советовать (дословное копирование дало бы NameError); живой фолбэк — safe_grep.
             assert "git_search(" not in hint, f"hint советует незарегистрированный git_search: {hint}"
@@ -9200,3 +9217,165 @@ def test_ctor_query_found_in_extension_module(tmp_path):
     assert len(q) == 1
     assert q[0]["tables"] == ["Справочник.Номенклатура"]
     assert q[0]["procedure"] == "ext_Тест"
+
+
+# ── v1.33.0: manager_code обязан дойти до ПУБЛИЧНОЙ выдачи ─────────────────
+#
+# Фикстура ЛОКАЛЬНАЯ и ПОЛНАЯ: `guarded_bsl` объявлена модульной в
+# tests/test_arg_guards.py, в conftest.py её нет — отсюда она невидима
+# (fixture not found), и вдобавок не содержит ни ManagerModule, ни регистров.
+
+_MGR_CONFIG_XML = (
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+    "<Configuration><Properties><Name>Т</Name></Properties></Configuration></MetaDataObject>"
+)
+_MGR_DOC_XML = (
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+    'xmlns:v8="http://v8.1c.ru/8.1/data/core"><Document><Properties>'
+    "<Name>Д</Name><Posting>Allow</Posting></Properties></Document></MetaDataObject>"
+)
+_MGR_REG_XML = (
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><InformationRegister>'
+    "<Properties><Name>МойРегистр</Name></Properties></InformationRegister></MetaDataObject>"
+)
+
+
+def _v1330_bsl_for(base_path, reader):
+    """Хелперы поверх собранного индекса (пять строк вместо чужой фикстуры)."""
+    helpers, resolve_safe = make_helpers(base_path, idx_reader=reader)
+    return make_bsl_helpers(
+        base_path=base_path,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=detect_format(base_path),
+        idx_reader=reader,
+    )
+
+
+@pytest.fixture
+def mgr_movements_bsl(tmp_path, monkeypatch):
+    """Документ, чей ManagerModule пишет набор записей в СУЩЕСТВУЮЩИЙ регистр."""
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    base = tmp_path / "cf"
+
+    def _w(rel, text):
+        p = base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+    _w("Configuration.xml", _MGR_CONFIG_XML)
+    _w("Documents/Д.xml", _MGR_DOC_XML)
+    _w("Documents/Д/Ext/Document.xml", _MGR_DOC_XML)
+    _w(
+        "Documents/Д/Ext/ManagerModule.bsl",
+        "Процедура Провести() Экспорт\n"
+        "    Наб = РегистрыСведений.МойРегистр.СоздатьНаборЗаписей();\n"
+        "    Наб.Записать();\n"
+        "КонецПроцедуры\n",
+    )
+    # ObjectModule ОБЯЗАТЕЛЕН: без него find_register_movements возвращает
+    # error="ObjectModule для документа 'Д' не найден", и тесты падали бы не по той причине.
+    _w(
+        "Documents/Д/Ext/ObjectModule.bsl",
+        "Процедура ОбработкаПроведения(Отказ, Режим)\nКонецПроцедуры\n",
+    )
+    _w("InformationRegisters/МойРегистр.xml", _MGR_REG_XML)
+    _w("InformationRegisters/МойРегистр/Ext/InformationRegister.xml", _MGR_REG_XML)
+
+    db_path = IndexBuilder().build(str(base), build_calls=False, build_metadata=True, build_fts=False)
+    reader = IndexReader(db_path)
+    try:
+        yield _v1330_bsl_for(str(base), reader)
+    finally:
+        reader.close()
+
+
+def test_manager_code_reaches_public_movements_contract(mgr_movements_bsl):
+    """Строка из ManagerModule обязана дойти до агента, а не только лечь в БД.
+    Регресс-гард: фикс, о котором агент не узнал, — мёртвый фикс."""
+    res = mgr_movements_bsl["find_register_movements"]("Документ.Д")
+    assert not res.get("error"), res
+    assert res["code_registers"], f"выдача пуста — тест был бы вакуумным: {res}"
+    sources = {r["source"] for r in res["code_registers"]}
+    assert "manager_code" in sources, f"manager_code не дошёл до code_registers: {res}"
+
+
+def test_manager_code_counted_in_profile_summary(mgr_movements_bsl):
+    prof = mgr_movements_bsl["get_object_profile"]("Документ.Д", sections=["registers"])
+    sec = prof["sections"]["registers"]
+    assert sec["items"], f"секция пуста — сводка сошлась бы тривиально: {sec}"
+    counted = sum(
+        sec["summary"][k] for k in ("code_registers", "erp_mechanisms", "manager_tables", "adapted_registers")
+    )
+    assert counted == len(sec["items"]), f"сводка разошлась со списком: {sec}"
+
+
+def test_manager_code_visible_in_reverse_lookup(mgr_movements_bsl):
+    """find_register_writers читает register_movements напрямую — проверить, а не предположить."""
+    res = mgr_movements_bsl["find_register_writers"]("МойРегистр")
+    assert res["writers"], f"обратный поиск пуст: {res}"
+    assert any(w.get("source") == "manager_code" for w in res["writers"]), res
+
+
+# ── v1.33.0: index-backed parse_form держит тот же контракт, что live-парсер ─
+
+_CF_FORM_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Attributes>
+    <Attribute name="Список">
+      <Type><v8:Type>cfg:DynamicList</v8:Type></Type>
+      <MainAttribute>true</MainAttribute>
+    </Attribute>
+    <Attribute name="Объект">
+      <Type><v8:Type>cfg:CatalogObject.Х</v8:Type><v8:Type>cfg:CatalogRef.Х</v8:Type></Type>
+    </Attribute>
+  </Attributes>
+</Form>
+"""
+
+
+@pytest.fixture
+def form_bsl(tmp_path, monkeypatch):
+    """Хелперы поверх индекса с ОДНОЙ реальной CF-формой.
+
+    v14 и v15 хранят типы одинаково в `element_type`; новая логика меняет только
+    helper-границу `str -> list[str]`, поэтому искусственная развилка фикстуры не нужна.
+    """
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    base = tmp_path / "cf"
+
+    def _w(rel, text):
+        p = base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+    _w("Configuration.xml", _MGR_CONFIG_XML)  # из блока Задачи 4
+    _w("Documents/Д.xml", _MGR_DOC_XML)
+    _w("Documents/Д/Ext/Document.xml", _MGR_DOC_XML)
+    # Хотя бы один .bsl обязателен: без него build() уходит в ранний return.
+    _w("Documents/Д/Ext/ObjectModule.bsl", "Процедура Пусто() Экспорт\nКонецПроцедуры\n")
+    _w("Documents/Д/Forms/ФормаДокумента/Ext/Form.xml", _CF_FORM_XML)
+
+    db_path = IndexBuilder().build(str(base), build_calls=False, build_metadata=True, build_fts=False)
+    reader = IndexReader(db_path)
+    try:
+        yield _v1330_bsl_for(str(base), reader)
+    finally:
+        reader.close()
+
+
+def test_parse_form_types_is_list_on_index_backed_path(form_bsl):
+    """Index-backed ветвь обязана держать списочный контракт live-парсера."""
+    forms = form_bsl["parse_form"]("Документ.Д")
+    assert forms, "фикстура не отдала ни одной формы — тест вакуумен"
+    attrs = [a for f in forms for a in f["attributes"]]
+    assert attrs, "у формы нет атрибутов — проверять нечего"
+    for a in attrs:
+        assert isinstance(a["types"], list), f"index-backed отдал {type(a['types'])}: {a}"
+    assert any(a["main"] for a in attrs), "MainAttribute не доехал до index-backed выдачи"

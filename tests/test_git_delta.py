@@ -11,6 +11,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -883,3 +884,240 @@ class TestGetStatisticsGitInfo:
         reader.close()
         assert stats["git_accelerated"] is False
         assert stats["git_head_commit"] is None
+
+
+# ── v1.33.0: CF-форма (*/Forms/*/Ext/Form.xml) триггерит пересборку form_elements ──
+
+
+_CF_FORM_V1 = """<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Attributes>
+    <Attribute name="Объект">
+      <Type><v8:Type>cfg:CatalogObject.Х</v8:Type></Type>
+    </Attribute>
+  </Attributes>
+</Form>
+"""
+
+_CF_FORM_V2 = """<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Attributes>
+    <Attribute name="Объект">
+      <Type><v8:Type>cfg:CatalogObject.Х</v8:Type><v8:Type>cfg:CatalogRef.Х</v8:Type></Type>
+      <MainAttribute>true</MainAttribute>
+    </Attribute>
+  </Attributes>
+</Form>
+"""
+
+_CF_DOC_XML = (
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Document><Properties>'
+    "<Name>Д</Name></Properties></Document></MetaDataObject>"
+)
+
+
+def _form_elements_state(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return {
+            (r[0], r[1], r[2])
+            for r in conn.execute(
+                "SELECT element_name, element_type, attribute_is_main FROM form_elements WHERE kind = 'attribute'"
+            )
+        }
+    finally:
+        conn.close()
+
+
+def test_cf_form_xml_change_rebuilds_form_elements(tmp_path, monkeypatch):
+    """До v1.33.0 form_changed отбирал только `.form` (формат EDT), поэтому правка
+    CF-формы (`*/Forms/*/Ext/Form.xml`) НЕ пересобирала form_elements никогда —
+    `main` и `types` оставались устаревшими навсегда."""
+    root = tmp_path
+    base = root / "src"
+
+    (base / "CommonModules" / "МойМодуль" / "Ext").mkdir(parents=True)
+    (base / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl").write_text(COMMON_MODULE_BSL, encoding="utf-8-sig")
+    form_path = base / "Documents" / "Д" / "Forms" / "ФормаДокумента" / "Ext" / "Form.xml"
+    form_path.parent.mkdir(parents=True)
+    form_path.write_text(_CF_FORM_V1, encoding="utf-8")
+    (base / "Documents" / "Д.xml").write_text(_CF_DOC_XML, encoding="utf-8")
+
+    _git_init(root)
+    monkeypatch.setenv("RLM_INDEX_DIR", str(base / ".index"))
+    builder = IndexBuilder()
+    db_path = builder.build(str(base), build_calls=False, build_metadata=True)
+
+    before = _form_elements_state(db_path)
+    assert before == {("Объект", "cfg:CatalogObject.Х", 0)}, before
+
+    form_path.write_text(_CF_FORM_V2, encoding="utf-8")
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "изменена форма")
+
+    result = builder.update(str(base))
+    assert result["git_fast_path"] is True, result
+
+    after = _form_elements_state(db_path)
+    assert after == {("Объект", "cfg:CatalogObject.Х, cfg:CatalogRef.Х", 1)}, after
+
+
+# ── Инкремент не должен стирать движения из НЕизменённого модуля ────────────
+
+
+_MV_CONFIG_XML = (
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Configuration>'
+    "<Properties><Name>Т</Name></Properties></Configuration></MetaDataObject>"
+)
+_MV_REG_XML = (
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><InformationRegister>'
+    "<Properties><Name>{n}</Name></Properties></InformationRegister></MetaDataObject>"
+)
+_MV_OBJECT_BSL = (
+    "Процедура ОбработкаПроведения(Отказ, Режим)\n    Движения.РегОбъекта.Записывать = Истина;\nКонецПроцедуры\n"
+)
+_MV_MANAGER_BSL = (
+    "Процедура Настроить() Экспорт\n"
+    '    МеханизмыДокумента.Добавить("МеханизмХ");\n'
+    "    Н = РегистрыСведений.РегМенеджера.СоздатьНаборЗаписей();\n"
+    "КонецПроцедуры\n"
+)
+
+
+def _mv_movements(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return sorted(conn.execute("SELECT register_name, source FROM register_movements"))
+    finally:
+        conn.close()
+
+
+def _mv_project(root):
+    base = root / "src"
+
+    def _w(rel, text):
+        p = base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+    _w("Configuration.xml", _MV_CONFIG_XML)
+    _w("InformationRegisters/РегОбъекта.xml", _MV_REG_XML.format(n="РегОбъекта"))
+    _w("InformationRegisters/РегМенеджера.xml", _MV_REG_XML.format(n="РегМенеджера"))
+    _w("Documents/Д/Ext/ObjectModule.bsl", _MV_OBJECT_BSL)
+    _w("Documents/Д/Ext/ManagerModule.bsl", _MV_MANAGER_BSL)
+    return base
+
+
+@pytest.mark.parametrize("use_git", [True, False])
+def test_incremental_keeps_movements_of_untouched_sibling_module(tmp_path, monkeypatch, use_git):
+    """Правка ObjectModule не должна стирать движения из НЕтронутого ManagerModule.
+
+    Дефект пре-существующий: удаление шло по `document_name` и сносило строки ОБОИХ
+    модулей документа, а восстанавливались только строки переобработанного файла.
+    Теряются и v14-источники (`erp_mechanism`), и `manager_code` из v1.33.0.
+    Проверяются ОБЕ ветки инкремента: git-fast и полный скан.
+    """
+    root = tmp_path
+    base = _mv_project(root)
+    if use_git:
+        _git_init(root)
+    monkeypatch.setenv("RLM_INDEX_DIR", str(base / ".index"))
+
+    builder = IndexBuilder()
+    db_path = builder.build(str(base), build_calls=False, build_metadata=True)
+
+    before = _mv_movements(db_path)
+    assert ("РегОбъекта", "code") in before, before
+    assert ("МеханизмХ", "erp_mechanism") in before, before
+    assert ("РегМенеджера", "manager_code") in before, before
+
+    # меняем ТОЛЬКО ObjectModule
+    obj = base / "Documents" / "Д" / "Ext" / "ObjectModule.bsl"
+    obj.write_text(_MV_OBJECT_BSL.replace("КонецПроцедуры", "    // правка\nКонецПроцедуры"), encoding="utf-8")
+    if use_git:
+        _git(root, "add", ".")
+        _git(root, "commit", "-m", "edit object module only")
+    else:
+        os.utime(obj, (time.time() + 10, time.time() + 10))
+
+    result = builder.update(str(base))
+    assert result["git_fast_path"] is use_git, result
+
+    after = _mv_movements(db_path)
+    assert after == before, f"инкремент потерял движения нетронутого модуля: {set(before) - set(after)}"
+
+
+def test_incremental_drops_movements_of_deleted_module(tmp_path, monkeypatch):
+    """Обратная сторона: удалённый модуль обязан унести СВОИ движения с собой."""
+    root = tmp_path
+    base = _mv_project(root)
+    _git_init(root)
+    monkeypatch.setenv("RLM_INDEX_DIR", str(base / ".index"))
+
+    builder = IndexBuilder()
+    db_path = builder.build(str(base), build_calls=False, build_metadata=True)
+    assert ("РегМенеджера", "manager_code") in _mv_movements(db_path)
+
+    (base / "Documents" / "Д" / "Ext" / "ManagerModule.bsl").unlink()
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "drop manager module")
+
+    builder.update(str(base))
+    after = _mv_movements(db_path)
+    assert ("РегМенеджера", "manager_code") not in after, after
+    assert ("МеханизмХ", "erp_mechanism") not in after, after
+    assert ("РегОбъекта", "code") in after, "движения уцелевшего модуля не должны пострадать"
+
+
+_CF_COMMON_FORM_V1 = """<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Attributes>
+    <Attribute name="Объект">
+      <Type><v8:Type>cfg:String</v8:Type></Type>
+    </Attribute>
+  </Attributes>
+</Form>
+"""
+
+_CF_COMMON_FORM_V2 = """<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Attributes>
+    <Attribute name="Объект">
+      <Type><v8:Type>cfg:String</v8:Type><v8:Type>cfg:CatalogRef.Тест</v8:Type></Type>
+      <MainAttribute>true</MainAttribute>
+    </Attribute>
+  </Attributes>
+</Form>
+"""
+
+
+def test_common_form_xml_change_rebuilds_form_elements(tmp_path, monkeypatch):
+    """У CommonForms промежуточного `Forms/` НЕТ (`CommonForms/<Имя>/Ext/Form.xml`),
+    поэтому регекс, требующий `/Forms/`, их пропускал: `main` и `types` общей формы
+    замерзали до полной пересборки. На боевом CF таких файлов 433."""
+    root = tmp_path
+    base = root / "src"
+
+    (base / "CommonModules" / "МойМодуль" / "Ext").mkdir(parents=True)
+    (base / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl").write_text(COMMON_MODULE_BSL, encoding="utf-8-sig")
+    form_path = base / "CommonForms" / "ОбщаяФорма" / "Ext" / "Form.xml"
+    form_path.parent.mkdir(parents=True)
+    form_path.write_text(_CF_COMMON_FORM_V1, encoding="utf-8")
+
+    _git_init(root)
+    monkeypatch.setenv("RLM_INDEX_DIR", str(base / ".index"))
+    builder = IndexBuilder()
+    db_path = builder.build(str(base), build_calls=False, build_metadata=True)
+
+    before = _form_elements_state(db_path)
+    assert before == {("Объект", "cfg:String", 0)}, before
+
+    form_path.write_text(_CF_COMMON_FORM_V2, encoding="utf-8")
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "изменена общая форма")
+
+    result = builder.update(str(base))
+    assert result["git_fast_path"] is True, result
+
+    after = _form_elements_state(db_path)
+    assert after == {("Объект", "cfg:String, cfg:CatalogRef.Тест", 1)}, after

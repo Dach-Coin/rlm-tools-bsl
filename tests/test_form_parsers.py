@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from rlm_tools_bsl.bsl_index import BUILDER_VERSION
 from rlm_tools_bsl.bsl_xml_parsers import parse_form_xml
 
 
@@ -533,7 +534,7 @@ class TestFormElementsIndex:
         conn.close()
         assert has["value"] == "1"
         assert int(count["value"]) > 0
-        assert int(bv["value"]) == 14
+        assert int(bv["value"]) == BUILDER_VERSION
 
     def test_index_reader_get_form_elements(self, indexed_db):
         db_path, _ = indexed_db
@@ -847,3 +848,82 @@ class TestParseFormParityEmpty:
             assert live[0]["attributes"] == indexed[0]["attributes"] == []
         finally:
             reader.close()
+
+
+# ── v1.33.0: MainAttribute в CF-форме и types списком ──────────────────────
+
+
+_V1330_CF_FORM = """<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Attributes>
+    <Attribute name="Список">
+      <Type><v8:Type>cfg:DynamicList</v8:Type></Type>
+      <MainAttribute>true</MainAttribute>
+    </Attribute>
+    <Attribute name="Объект">
+      <Type><v8:Type>cfg:CatalogObject.Х</v8:Type><v8:Type>cfg:CatalogRef.Х</v8:Type></Type>
+    </Attribute>
+  </Attributes>
+</Form>
+"""
+
+
+def test_cf_form_main_attribute_is_recognized():
+    res = parse_form_xml(_V1330_CF_FORM)
+    by_name = {a["name"]: a for a in res["attributes"]}
+    assert by_name["Список"]["main"] is True
+    assert by_name["Объект"]["main"] is False
+
+
+def test_cf_form_types_is_a_list():
+    res = parse_form_xml(_V1330_CF_FORM)
+    by_name = {a["name"]: a for a in res["attributes"]}
+    assert by_name["Объект"]["types"] == ["cfg:CatalogObject.Х", "cfg:CatalogRef.Х"]
+    assert by_name["Список"]["types"] == ["cfg:DynamicList"]
+
+
+def test_cf_form_no_type_gives_empty_list():
+    res = parse_form_xml(
+        '<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><Attributes><Attribute name="Пусто"/></Attributes></Form>'
+    )
+    assert res["attributes"][0]["types"] == []
+
+
+def test_cf_form_legacy_main_tag_still_honored():
+    """Тег <Main> в природе не встречается, но если он есть — читать его тоже."""
+    res = parse_form_xml(
+        '<Form xmlns="http://v8.1c.ru/8.3/xcf/logform">'
+        '<Attributes><Attribute name="А"><Main>true</Main></Attribute></Attributes></Form>'
+    )
+    assert res["attributes"][0]["main"] is True
+
+
+# Форма EDT: `name` и `main` — ДОЧЕРНИЕ ЭЛЕМЕНТЫ, а не XML-атрибуты
+# (сверено с боевым Form.form конфигурации на EDT).
+_V1330_EDT_FORM = """<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xmlns:form="http://g5.1c.ru/v8/dt/form">
+  <attributes>
+    <name>Объект</name>
+    <id>1</id>
+    <valueType>
+      <types>CatalogObject.Х</types>
+      <types>CatalogRef.Х</types>
+    </valueType>
+    <main>true</main>
+  </attributes>
+  <attributes>
+    <name>Прочий</name>
+    <id>2</id>
+    <valueType><types>String</types></valueType>
+  </attributes>
+</form:Form>
+"""
+
+
+def test_edt_form_types_is_a_list_too():
+    """EDT-ветка обязана держать тот же списочный контракт, что и CF."""
+    res = parse_form_xml(_V1330_EDT_FORM)
+    by_name = {a["name"]: a for a in res["attributes"]}
+    assert by_name["Объект"]["types"] == ["CatalogObject.Х", "CatalogRef.Х"]
+    assert by_name["Прочий"]["types"] == ["String"]

@@ -2459,15 +2459,12 @@ def _parse_form_edt(root) -> dict:
         is_main = main_val.lower() == "true" if main_val else False
         # types
         vt_el = _find_child(attr_el, "valueType")
-        types_str = ""
+        types: list[str] = []
         if vt_el is not None:
-            type_parts = []
             for t_el in vt_el:
                 local = t_el.tag.split("}")[-1] if "}" in t_el.tag else t_el.tag
-                if local == "types":
-                    if t_el.text:
-                        type_parts.append(t_el.text.strip())
-            types_str = ", ".join(type_parts)
+                if local == "types" and t_el.text:
+                    types.append(t_el.text.strip())
         # DynamicList extInfo
         main_table = ""
         query_text = ""
@@ -2478,7 +2475,7 @@ def _parse_form_edt(root) -> dict:
             if qt:
                 query_text = qt[:512]
 
-        attr_dict: dict = {"name": attr_name, "types": types_str, "main": is_main}
+        attr_dict: dict = {"name": attr_name, "types": types, "main": is_main}
         if main_table:
             attr_dict["main_table"] = main_table
         if query_text:
@@ -2595,22 +2592,24 @@ def _parse_form_cf(root) -> dict:
             attr_name = attr.get("name", "")
             if not attr_name:
                 continue
-            # main
-            main_el = attr.find("{%s}Main" % _FORM_NS_CF)
+            # main: реальные формы Конфигуратора пишут <MainAttribute>, не <Main>
+            # (замер: 331 вхождение <MainAttribute> и НОЛЬ <Main> на 400 живых CF-формах,
+            # из-за чего attribute_is_main=1 не встречался в индексе ни разу).
+            # <Main> оставлен как запасной вариант — стоит один поиск.
             is_main = False
-            if main_el is not None and main_el.text:
-                is_main = main_el.text.strip().lower() == "true"
+            for tag in ("MainAttribute", "Main"):
+                el = attr.find("{%s}%s" % (_FORM_NS_CF, tag))
+                if el is not None and el.text:
+                    is_main = el.text.strip().lower() == "true"
+                    break
             # type
             type_el = attr.find("{%s}Type" % _FORM_NS_CF)
-            types_str = ""
+            types: list[str] = []
             if type_el is not None:
-                type_parts = []
                 for t in type_el:
                     t_local = t.tag.split("}")[-1] if "}" in t.tag else t.tag
-                    if t_local == "Type":
-                        if t.text:
-                            type_parts.append(t.text.strip())
-                types_str = ", ".join(type_parts)
+                    if t_local == "Type" and t.text:
+                        types.append(t.text.strip())
             # DynamicList settings
             main_table = ""
             query_text = ""
@@ -2626,7 +2625,7 @@ def _parse_form_cf(root) -> dict:
                     if qt_el is not None and qt_el.text:
                         query_text = qt_el.text.strip()[:512]
 
-            attr_dict: dict = {"name": attr_name, "types": types_str, "main": is_main}
+            attr_dict: dict = {"name": attr_name, "types": types, "main": is_main}
             if main_table:
                 attr_dict["main_table"] = main_table
             if query_text:

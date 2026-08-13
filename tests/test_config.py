@@ -161,3 +161,14 @@ class TestSaveConfigOverride:
         assert default_cfg.exists()
         cfg = json.loads(default_cfg.read_text(encoding="utf-8"))
         assert cfg["host"] == "127.0.0.1"
+
+
+def test_server_reports_our_version_not_mcp_version():
+    """FastMCP 1.x не принимает version в конструкторе, а низкоуровневый сервер без неё
+    подставляет версию пакета mcp — интегратор видел в serverInfo.version чужую версию."""
+    import importlib.metadata as im
+
+    from rlm_tools_bsl.server import mcp
+
+    assert mcp._mcp_server.version == im.version("rlm-tools-bsl")
+    assert mcp._mcp_server.version != im.version("mcp")

@@ -9,6 +9,7 @@ import sqlite3
 import pytest
 
 from rlm_tools_bsl.bsl_index import (
+    BUILDER_VERSION,
     IndexBuilder,
     IndexReader,
     _CATEGORY_RU,
@@ -440,12 +441,12 @@ class TestBuildSynonyms:
         assert count == 0
         assert meta[0] == "0"
 
-    def test_builder_version_8(self, built_cf_index):
+    def test_builder_version_matches_constant(self, built_cf_index):
         db_path, _ = built_cf_index
         conn = sqlite3.connect(str(db_path))
         row = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()
         conn.close()
-        assert row[0] == "14"
+        assert int(row[0]) == BUILDER_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +634,7 @@ class TestHelpers:
         info = bsl["get_index_info"]()
         reader.close()
         assert info["status"] == "ok"
-        assert info["builder_version"] == 14
+        assert info["builder_version"] == BUILDER_VERSION
         assert info["has_synonyms"] is True
 
     def test_get_index_info_no_index(self):
@@ -804,7 +805,7 @@ class TestIncrementalUpdate:
         conn = sqlite3.connect(str(db_path))
         ver = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()[0]
         conn.close()
-        assert ver == "14"
+        assert int(ver) == BUILDER_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +840,7 @@ class TestV7toV8Migration:
 
         conn = sqlite3.connect(str(db_path))
         ver = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()[0]
-        assert ver == "14"
+        assert int(ver) == BUILDER_VERSION
         # regions and module_headers tables must exist (no OperationalError)
         regions_count = conn.execute("SELECT COUNT(*) FROM regions").fetchone()[0]
         headers_count = conn.execute("SELECT COUNT(*) FROM module_headers").fetchone()[0]

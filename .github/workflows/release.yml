@@ -9,7 +9,55 @@ permissions:
   id-token: write
 
 jobs:
+  # Гейт качества. При пуше тега `ci.yml` и `release.yml` стартуют ПАРАЛЛЕЛЬНО,
+  # поэтому раньше и публичный GitHub Release, и публикация на PyPI могли уехать
+  # при красном CI. Гейтить только `publish` недостаточно: job `release` создаёт
+  # ПУБЛИЧНЫЙ релиз, и без needs он отработал бы до окончания тестов — получился бы
+  # публичный релиз без пакета и с красным CI. Цепочка: quality -> release -> publish -> smoke.
+  quality:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # shell: bash обязателен. Под дефолтным pwsh на windows-ноге статус шага
+      # определяет ТОЛЬКО последняя команда ($LASTEXITCODE), поэтому упавший
+      # `ruff check` при зелёном `ruff format --check` не завалил бы гейт.
+      - name: Lint & format check
+        shell: bash
+        run: |
+          uv run ruff check src/ tests/
+          uv run ruff format --check src/ tests/
+
+      - name: Run tests
+        run: uv run pytest tests/ -q
+
+      # Версия пакета не выводится из тега и исторически бампалась вручную внутри
+      # релизного коммита — то есть её легко потерять. Тогда по тегу vX.Y.Z уехал бы
+      # артефакт предыдущей версии, а post-publish smoke ниже гарантированно упал бы
+      # уже ПОСЛЕ создания публичного релиза. Три строки ловят это до него.
+      - name: Версия тега совпадает с версией пакета
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(uv run python -c "import importlib.metadata as im; print(im.version('rlm-tools-bsl'))")
+          test "$TAG" = "$PKG" || { echo "тег $TAG != пакет $PKG"; exit 1; }
+
   release:
+    needs: quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -53,3 +101,37 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Post-publish smoke: ставим ИМЕННО ту версию, что только что опубликована,
+  # в чистое окружение из PyPI — без исходников репозитория. Версия берётся из
+  # тега, не хардкодится.
+  smoke:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install the just-published version from PyPI
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          uv venv .venv-smoke
+          # PyPI-индекс может отдавать новую версию не сразу — короткий ретрай.
+          for attempt in 1 2 3 4 5 6; do
+            if uv pip install --python .venv-smoke --no-cache "rlm-tools-bsl==${VERSION}"; then
+              exit 0
+            fi
+            echo "попытка $attempt: версия ${VERSION} ещё не видна в индексе, ждём"
+            sleep 20
+          done
+          echo "версия ${VERSION} не появилась в PyPI"
+          exit 1
+
+      - name: Smoke — импорт сервера, версия и CLI
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          .venv-smoke/bin/python -c "import rlm_tools_bsl.server; print('server import OK')"
+          .venv-smoke/bin/python -c "import importlib.metadata as im, sys; v = im.version('rlm-tools-bsl'); print('installed:', v); sys.exit(0 if v == '${VERSION}' else 1)"
+          .venv-smoke/bin/rlm-bsl-index --help > /dev/null
+          .venv-smoke/bin/rlm-tools-bsl --version

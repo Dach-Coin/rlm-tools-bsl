@@ -942,3 +942,158 @@ def test_update_refreshes_detected_prefixes(tmp_path, monkeypatch):
     updated_prefixes = json.loads(row[0])
     assert any("тст" in p for p in updated_prefixes)
     assert any("абв" in p for p in updated_prefixes)
+
+
+# ── v1.33.0: миграция 14 -> 15 и поведение устаревшего/недостроенного индекса ──
+
+
+def test_v14_index_is_force_rebuilt_not_scanned(tmp_path, monkeypatch):
+    """Порог обязан ехать вместе с BUILDER_VERSION: иначе нетронутые модули
+    сохранят призраков из v14 (дельта полного скана считается по mtime/size)."""
+    from rlm_tools_bsl.bsl_index import BUILDER_VERSION
+
+    obj = tmp_path / "Documents" / "Д" / "Ext"
+    obj.mkdir(parents=True)
+    src = obj / "ObjectModule.bsl"
+    src.write_text(
+        "// Процедура Призрак() Экспорт\n// КонецПроцедуры\nПроцедура Настоящая() Экспорт\nКонецПроцедуры\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Configuration.xml").write_text(
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Configuration>'
+        "<Properties><Name>Т</Name></Properties></Configuration></MetaDataObject>",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
+    b = IndexBuilder()
+    db_path = b.build(str(tmp_path), build_calls=False, build_metadata=True)
+
+    # искусственно состариваем индекс до v14 и подсаживаем призрака
+    con = sqlite3.connect(db_path)
+    con.execute("UPDATE index_meta SET value='14' WHERE key='builder_version'")
+    con.execute(
+        "INSERT INTO methods (module_id, name, type, line, end_line, is_export, params) "
+        "SELECT id, 'Призрак', 'Процедура', 1, 2, 1, '' FROM modules LIMIT 1"
+    )
+    con.commit()
+    con.close()
+
+    res = b.update(str(tmp_path))
+    assert "rebuild_reason" in res, "v14 -> v15 обязан идти через принудительную пересборку"
+
+    con = sqlite3.connect(db_path)
+    names = {r[0] for r in con.execute("SELECT name FROM methods")}
+    ver = con.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()[0]
+    con.close()
+    assert "Призрак" not in names, "призрак пережил миграцию — порог пересборки не поднят"
+    assert int(ver) == BUILDER_VERSION
+
+
+def test_stale_index_still_serves_with_warning(tmp_path, monkeypatch):
+    """Ошибку PR #21 не повторять: устаревший индекс обязан ОТВЕЧАТЬ, а не закрываться."""
+    from rlm_tools_bsl.bsl_index import BUILDER_VERSION
+    from rlm_tools_bsl.server import _rlm_end, _rlm_start
+
+    obj = tmp_path / "Documents" / "Д" / "Ext"
+    obj.mkdir(parents=True)
+    (obj / "ObjectModule.bsl").write_text("Процедура Настоящая() Экспорт\nКонецПроцедуры\n", encoding="utf-8")
+    (tmp_path / "Configuration.xml").write_text(
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Configuration>'
+        "<Properties><Name>Т</Name></Properties></Configuration></MetaDataObject>",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
+    db_path = IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=True)
+
+    # состарить индекс до v14, НЕ ломая его содержимое
+    con = sqlite3.connect(db_path)
+    con.execute("UPDATE index_meta SET value='14' WHERE key='builder_version'")
+    con.commit()
+    con.close()
+
+    raw = _rlm_start(path=str(tmp_path), query="")
+    try:
+        data = json.loads(raw)
+        assert data["index"]["loaded"] is True, "ридер закрылся на несовпадении версии (PR #21)"
+        assert data["index"]["builder_version"] < BUILDER_VERSION
+        assert data["index"]["methods"] >= 1, "устаревший индекс перестал отдавать данные"
+        assert any("ересобер" in w or "ересборк" in w for w in data["index"]["warnings"]), data["index"]["warnings"]
+    finally:
+        # сессия держит ОТКРЫТЫЙ IndexReader — без закрытия течёт SQLite handle,
+        # а на Windows временный каталог не удаляется (WinError 32).
+        _rlm_end(json.loads(raw)["session_id"])
+
+
+def test_interrupted_v15_rebuild_is_detected_and_retryable(tmp_bsl_project, tmp_path, monkeypatch):
+    """Пересборка in-place: падение в середине оставляет ДЕТЕКТИРУЕМОЕ состояние,
+    а повторный запуск доводит её до конца."""
+    from rlm_tools_bsl.bsl_index import BUILDER_VERSION, index_incomplete
+
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
+    # Дерево ОБЯЗАНО содержать хотя бы один .bsl: при пустом наборе build() уходит в
+    # ранний `return db_path` ДО `_bulk_insert`, инъекция отказа не срабатывает
+    # и `pytest.raises` падает, ничего не проверив.
+    root = tmp_bsl_project
+    db_path = IndexBuilder().build(str(root), build_calls=False, build_metadata=True)
+
+    # Воспроизводим реальный release-путь: update() видит предыдущую версию и запускает
+    # обязательную полную пересборку v15, а не прямой build() текущей версии.
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "UPDATE index_meta SET value=? WHERE key='builder_version'",
+            (str(BUILDER_VERSION - 1),),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    real_bulk = IndexBuilder._bulk_insert
+
+    def _explode(self, conn, results, build_calls):
+        raise RuntimeError("инъекция отказа посреди пересборки")
+
+    # context(), а не setattr+undo: undo откатил бы и RLM_INDEX_DIR, и повтор
+    # ушёл бы в ДРУГУЮ базу — тест бы прошёл, ничего не проверив.
+    with monkeypatch.context() as mp:
+        mp.setattr(IndexBuilder, "_bulk_insert", _explode)
+        with pytest.raises(RuntimeError):
+            IndexBuilder().update(str(root))
+        assert index_incomplete(db_path), "незавершённая сборка обязана детектироваться"
+
+    assert IndexBuilder._bulk_insert is real_bulk
+    delta = IndexBuilder().update(str(root))
+    assert delta.get("rebuild_reason") == "incomplete prior build", delta
+    assert not index_incomplete(db_path), "повторная сборка обязана снять маркер"
+
+
+def test_incomplete_index_is_reported_by_public_start(tmp_bsl_project, tmp_path, monkeypatch):
+    """Заявленное предупреждение обязано быть проверено ЧЕРЕЗ ПУБЛИЧНЫЙ СТАРТ,
+    а не выведено из наличия маркера в базе."""
+    from rlm_tools_bsl.bsl_index import index_incomplete
+    from rlm_tools_bsl.server import _rlm_end, _rlm_start
+
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
+    root = tmp_bsl_project  # пустое дерево не годится: см. ранний return в build()
+    db_path = IndexBuilder().build(str(root), build_calls=False, build_metadata=True)
+
+    def _explode(self, conn, results, build_calls):
+        raise RuntimeError("инъекция отказа посреди пересборки")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(IndexBuilder, "_bulk_insert", _explode)
+        with pytest.raises(RuntimeError):
+            IndexBuilder().build(str(root), build_calls=False, build_metadata=True)
+    assert index_incomplete(db_path)
+
+    # _rlm_start РЕГИСТРИРУЕТ сессию и может открыть ридер — закрывать обязательно,
+    # иначе на Windows временный каталог не удалится (WinError 32) и потечёт handle.
+    raw = _rlm_start(path=str(root), query="")
+    try:
+        data = json.loads(raw)
+        assert data["index"]["index_status"] == "incomplete", data["index"]
+        # Предупреждения ОБ ИНДЕКСЕ живут в index.warnings; верхнеуровневый warnings
+        # собирается только из _session_warnings и индексных сообщений не содержит.
+        assert any("ересбор" in w or "езавершен" in w for w in data["index"]["warnings"]), data["index"]
+    finally:
+        _rlm_end(json.loads(raw)["session_id"])

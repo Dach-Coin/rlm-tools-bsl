@@ -549,3 +549,230 @@ def test_generic_strategy_does_not_advertise_missing_llm(effort):
 
     assert "llm_query" not in build_generic_strategy(effort, has_llm_tools=False)
     assert "llm_query" in build_generic_strategy(effort, has_llm_tools=True)
+
+
+# ── v1.33.0: маска комментариев и строковых литералов ──────────────────────
+
+from rlm_tools_bsl.bsl_knowledge import (  # noqa: E402
+    _merge_proc_continuations,
+    _merge_proc_continuations_with_mask,
+    mask_comments_and_strings,
+)
+
+
+def test_mask_preserves_length_line_by_line():
+    src = [
+        'Шаблон = "Процедура Призрак(А) Экспорт";',
+        "// Процедура Комментарий(Б) Экспорт",
+        "Процедура Настоящая(В) Экспорт",
+    ]
+    out = mask_comments_and_strings(src)
+    assert [len(x) for x in out] == [len(x) for x in src]
+
+
+def test_mask_hides_string_literal_but_keeps_quotes():
+    (out,) = mask_comments_and_strings(['Шаблон = "Процедура Призрак(А) Экспорт";'])
+    assert out == 'Шаблон = "                            ";'
+
+
+def test_mask_hides_line_comment_entirely():
+    (out,) = mask_comments_and_strings(["    // Процедура Комментарий(Б) Экспорт"])
+    assert out.strip() == ""
+    assert len(out) == len("    // Процедура Комментарий(Б) Экспорт")
+
+
+def test_mask_keeps_real_code_untouched():
+    src = ["Процедура Настоящая(Знач А = 1) Экспорт"]
+    assert mask_comments_and_strings(src) == src
+
+
+def test_mask_double_quote_is_escape_not_terminator():
+    # контент 'а""б' — 4 символа, значит ровно 4 пробела; длина строки сохраняется (18)
+    (out,) = mask_comments_and_strings(['Т = "а""б"; Х = 1;'])
+    assert out == 'Т = "    "; Х = 1;'
+    assert len(out) == len('Т = "а""б"; Х = 1;')
+
+
+def test_mask_slashes_inside_string_do_not_start_comment():
+    (out,) = mask_comments_and_strings(['Адрес = "http://x/y"; А = 1;'])
+    assert out == 'Адрес = "          "; А = 1;'
+
+
+def test_mask_keep_string_content_blanks_only_comments():
+    """Режим для регексов, читающих имя ИЗ литерала: строка цела, комментарий погашен."""
+    src = ['Х = "Живой"; // Х = "Мертвый"']
+    (out,) = mask_comments_and_strings(src, keep_string_content=True)
+    assert '"Живой"' in out
+    assert "Мертвый" not in out
+    assert len(out) == len(src[0])
+
+
+def test_mask_keep_string_content_preserves_length_with_escaped_quotes():
+    src = ['Б = "а""б"; // хвост']
+    (out,) = mask_comments_and_strings(src, keep_string_content=True)
+    # эталон считается, а не набирается пробелами вручную: literal с посчитанными
+    # пробелами уже один раз разъехался на единицу при правке плана
+    assert out == 'Б = "а""б";' + " " * (len(src[0]) - len('Б = "а""б";'))
+    assert len(out) == len(src[0])
+
+
+def test_mask_multiline_literal_continuation():
+    src = [
+        'Текст = "ВЫБРАТЬ',
+        "|Процедура Призрак(Б) Экспорт",
+        '|ИЗ Справочник.Х";',
+    ]
+    out = mask_comments_and_strings(src)
+    assert "Призрак" not in out[1]
+    assert [len(x) for x in out] == [len(x) for x in src]
+
+
+def test_merge_with_mask_returns_aligned_pair():
+    src = ["Процедура Х(А,", "  Б) Экспорт", "КонецПроцедуры"]
+    masked = mask_comments_and_strings(src)
+    m_orig, m_mask, line_map = _merge_proc_continuations_with_mask(src, masked)
+    assert len(m_orig) == len(m_mask) == len(line_map)
+    assert [len(a) for a in m_orig] == [len(b) for b in m_mask]
+    assert line_map[0] == 1
+
+
+def test_mask_comment_inside_multiline_literal_does_not_desync():
+    """БЛОКЕР, найденный ревью на боевых исходниках.
+
+    1С разрешает комментарий между строками-продолжениями многострочного литерала,
+    и разработчики этим пользуются, чтобы закомментировать кусок текста запроса.
+    Если такая строка несёт закрывающую кавычку, наивная машина состояний считает
+    литерал закрытым и гасит ВЕСЬ остаток модуля.
+    """
+    src = [
+        'ТекстЗапроса = "',
+        "|ВЫБРАТЬ",
+        '//|\tОбъектРасчетов";',
+        "|\tПоле",
+        '|";',
+        "",
+        "Процедура ПослеЗапроса() Экспорт",
+        "КонецПроцедуры",
+    ]
+    out = mask_comments_and_strings(src)
+    assert [len(x) for x in out] == [len(x) for x in src]
+    assert out[2].strip() == "", "закомментированная строка литерала обязана быть погашена"
+    # ключевое: маска не залипла — реальное объявление ПОСЛЕ литерала цело
+    assert "Процедура ПослеЗапроса" in out[6], "маска рассинхронизировалась и съела код после литерала"
+
+
+def test_merge_backward_compatible_signature():
+    src = ["Процедура Х(А,", "  Б) Экспорт", "КонецПроцедуры"]
+    merged, line_map = _merge_proc_continuations(src)
+    assert merged[0].startswith("Процедура Х(А,")
+    assert line_map == [1, 3]
+
+
+def test_merge_decision_ignores_commented_declaration():
+    """Закомментированное объявление с несбалансированной скобкой не должно
+    склеивать следующие строки в одну логическую."""
+    src = ["// Процедура Х(А,", "Процедура Настоящая() Экспорт", "КонецПроцедуры"]
+    masked = mask_comments_and_strings(src)
+    m_orig, _m, line_map = _merge_proc_continuations_with_mask(src, masked)
+    assert line_map == [1, 2, 3]
+
+
+def test_async_multiline_signature_is_merged():
+    src = ["Асинх Функция Длинная(Ссылка,", "  Второй) Экспорт", "КонецФункции"]
+    masked = mask_comments_and_strings(src)
+    m_orig, _m, line_map = _merge_proc_continuations_with_mask(src, masked)
+    assert "Второй" in m_orig[0], "Асинх-сигнатура не склеилась"
+
+
+# ---------------------------------------------------------------------------
+# Рецепты как ИСПОЛНЯЕМЫЙ код, а не как проза
+# ---------------------------------------------------------------------------
+
+
+def test_parse_form_recipe_searches_types_over_full_form_set():
+    """Рецепт `parse_form` обязан искать типы по ПОЛНОМУ набору форм.
+
+    Регресс-гард на реальный дефект: рецепт сначала показывает обратный поиск
+    `parse_form(..., handler=...)`, и если его результат положить в ту же
+    переменную `forms`, следующий блок «какие формы несут DynamicList» станет
+    считать по ОТФИЛЬТРОВАННОМУ набору. Формы без этого обработчика выпадут, и
+    агент получит ложное «типа нет ни в одной форме» — ровно тот класс вывода,
+    ради которого рецепт и писался.
+
+    Рецепт исполняется по-настоящему: подставляем фальшивые `parse_form` и
+    `extract_procedures` и проверяем, что `dyn` нашёл реквизит в форме, которой
+    в handler-выборке НЕТ. Если рецепт когда-нибудь перестанет быть валидным
+    Python, тест упадёт на exec — для этого рецепта это верный сигнал, он
+    подаётся агенту как готовый к запуску код.
+    """
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    recipe = build_helper_metadata_snapshot()["parse_form"]["recipe"]
+
+    with_handler = {
+        "form_name": "ФормаДокумента",
+        "module_path": "Documents/X/Forms/ФормаДокумента/Ext/Form/Module.bsl",
+        "handlers": [],
+        "commands": [],
+        "attributes": [{"name": "Объект", "types": ["cfg:DocumentObject.X"], "main": True}],
+    }
+    without_handler = {
+        "form_name": "ФормаВыбора",
+        "module_path": "",
+        "handlers": [],
+        "commands": [],
+        "attributes": [{"name": "Список", "types": ["cfg:DynamicList"], "main": True}],
+    }
+
+    def fake_parse_form(object_name, form_name="", handler=""):
+        return [with_handler] if handler else [with_handler, without_handler]
+
+    ns: dict = {"parse_form": fake_parse_form, "extract_procedures": lambda path: []}
+    exec(compile(recipe, "<parse_form recipe>", "exec"), ns)
+
+    assert ns["dyn"] == [("ФормаВыбора", "Список")], (
+        "рецепт ищет типы по отфильтрованному набору форм — вернулась не та выборка"
+    )
+
+
+def test_parse_form_recipe_type_check_survives_both_formats():
+    """Проверка типа из рецепта обязана работать и на CF (с префиксом), и на EDT (без).
+
+    В выгрузке Конфигуратора элементы `types` несут префикс пространства имён
+    (на боевой конфигурации это cfg:/xs:/v8:/mxl:/v8ui:/dcsset:), в проекте EDT
+    префикса нет вовсе. И посторонний тип, чьё имя лишь ЗАКАНЧИВАЕТСЯ на нужное,
+    приниматься не должен.
+    """
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    recipe = build_helper_metadata_snapshot()["parse_form"]["recipe"]
+    forms = [
+        {
+            "form_name": "CF",
+            "module_path": "",
+            "handlers": [],
+            "commands": [],
+            "attributes": [{"name": "СписокCF", "types": ["cfg:DynamicList"], "main": False}],
+        },
+        {
+            "form_name": "EDT",
+            "module_path": "",
+            "handlers": [],
+            "commands": [],
+            "attributes": [{"name": "СписокEDT", "types": ["DynamicList"], "main": False}],
+        },
+        {
+            "form_name": "Посторонняя",
+            "module_path": "",
+            "handlers": [],
+            "commands": [],
+            "attributes": [{"name": "Чужой", "types": ["cfg:МойDynamicList"], "main": False}],
+        },
+    ]
+    ns: dict = {
+        "parse_form": lambda object_name, form_name="", handler="": [forms[0]] if handler else forms,
+        "extract_procedures": lambda path: [],
+    }
+    exec(compile(recipe, "<parse_form recipe>", "exec"), ns)
+
+    assert ns["dyn"] == [("CF", "СписокCF"), ("EDT", "СписокEDT")]

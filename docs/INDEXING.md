@@ -278,8 +278,8 @@ $ rlm-bsl-index index drop D:\ERP\src
 
 | key                     | Описание                                                | Пример                             |
 | ----------------------- | ------------------------------------------------------- | ---------------------------------- |
-| `version`               | Версия схемы                                            | `14`                               |
-| `builder_version`       | Версия построителя                                      | `14`                               |
+| `version`               | Версия схемы                                            | `15`                               |
+| `builder_version`       | Версия построителя                                      | `15`                               |
 | `bsl_count`             | Количество .bsl файлов                                  | `23461`                            |
 | `paths_hash`            | MD5-хеш отсортированных путей                           | `6c4e5a0f0d506f67...`              |
 | `built_at`              | Unix-timestamp построения                               | `1773740509.56`                    |
@@ -879,7 +879,11 @@ Unified reverse-index всех ссылок объектов метаданны�
 | `default_object_form`          |           1 190 |           1 190 |
 | `based_on`                     |             631 |             594 |
 
-Поле `line` заполнено для attribute‑level kind (~17–22% от общего числа ссылок) — `find_references_to_object` выдаёт best-effort позицию первого по XML‑файлу `<Name>X</Name>` (CF) / `<name>X</name>` (EDT) для `attribute_type`/`dimension`/`resource`/TS‑attribute. При одноимённых элементах якорь может относиться к более раннему блоку; это не позиция тега типа (`<v8:Type>` в CF / `<types>` в EDT). Для object‑level kind (`owner`, `based_on`, формы и т.п.) `line=None` по контракту.
+Поле `line` — **строка САМОЙ ссылки** (тег типа `<v8:Type>` в CF / `<types>` в EDT), а не строка объявления её владельца (v15). До v15 искалось `<Name>X</Name>` и бралось ПЕРВОЕ вхождение имени по файлу: на выборке 3000 ссылок `attribute_type` строка ни разу не совпала со строкой тега типа, а 30% имён реквизитов встречаются в одном XML больше одного раза (в 1042 случаях из 1195 это был реквизит табличной части, для которого возвращалась строка чужого элемента).
+
+Резолв идёт по ключу владельца (вид, табличная часть, имя) плюс сама ссылка, а не по позиции, — порядок, в котором парсер отдаёт ссылки, не совпадает с порядком в документе (у регистров `<Resource>` в файле раньше `<Dimension>`, а эмитится позже; у документов `<BasedOn>` раньше `<ChildObjects>`). Составной тип получает по своей строке на каждый тип (до 266 типов у одного реквизита).
+
+`line` заполняется у пяти видов — `attribute_type`, `owner`, `based_on`, `default_object_form`, `default_list_form`: это ровно те, что проходят через `_emit_refs` / `_insert_references_for_object` и получают там содержимое файла (белый список `_ANCHORED_REF_KINDS` в `bsl_index.py`). У остальных видов (`role_rights`, `subsystem_content`, `exchange_plan_content`, `event_subscription_source`, `defined_type_content`, `functional_option_content`, `characteristic_type`, `predefined_characteristic_type`, `command_parameter_type`) `line=None` — это **заявленный контракт**, а не пропуск: их пишут собственные коллекторы, которым содержимое файла не передаётся, а ценность строки там нулевая (ссылка в файле прав указывает на `<object>Document.X</object>` и ничего не добавляет). Расширение белого списка требует замены линейного поиска в `_search_tag_value` на одно-проходную карту «значение тега → первая строка» — предупреждение об этом стоит в докстринге метода.
 
 **Распределение по `source_category` (топ-5 на CF):** Subsystems 30 511, Roles 18 445, ExchangePlans 17 944, Documents 17 808, DefinedTypes 15 035.
 
@@ -985,7 +989,7 @@ Unified reverse-index всех ссылок объектов метаданны�
 | `.xml`/`.command` в `<Catalogs|Documents|…>/X/Commands/` (nested) | **родительская категория** — `metadata_references` (через `command_parameter_type`). `Commands/` НЕ top-level. С v1.9.3 `.command` корректно триггерит refresh (раньше игнорировался) |
 | `.xml`/`.mdo`/`.command` в `CommonCommands/` | `metadata_references` (source_category=CommonCommands). С v1.9.3 — fallback path (категория вне pointwise whitelist), synonym-rescan **не** срабатывает |
 | `.xml`/`.mdo` в `Roles/` или `.rights` | `role_rights`, `metadata_references` (source_category=Roles) |
-| `.form` | `form_elements` |
+| `.form` (EDT) или `*/Ext/Form.xml` (CF — и `<Категория>/X/Forms/<Имя>/`, и `CommonForms/<Имя>/`) | `form_elements`. **Внимание:** ветка не селективна — любое изменение формы пересобирает `form_elements` по ВСЕЙ конфигурации. Замер на боевом CF-проекте: 10 109 файлов форм, 258 100 строк, **45 с** на один инкрементальный `update`, затронувший хотя бы одну форму. Так было и для `.form`; с v1.33.0 то же распространено на CF, иначе правка CF-формы не отражалась в индексе вообще. Селективность — отдельная задача, в v1.33.0 не вводится |
 
 #### Fallback на полный скан
 
@@ -996,7 +1000,13 @@ Git-ускорение автоматически отключается (с п�
 - В `index_meta` нет сохранённого `git_head_commit` (первый update
   после build старой версией — `git_head_commit` записывается для следующего раза)
 - Сохранённый коммит не найден в истории (force push, rebase, shallow clone)
-- Версия индекса (`builder_version`) отличается от текущей
+- Версия индекса (`builder_version`) отличается от текущей.
+  С v15 расхождение **ниже порога** означает не просто отключение git-ускорения, а
+  **принудительную полную пересборку** индекса на месте: полный СКАН считает дельту
+  по mtime/size и нетронутые модули не перечитывает, поэтому старое содержимое
+  пережило бы бамп. Порог живёт отдельной константой в `IndexBuilder._update_locked()`
+  (`if old_version < 15`) и поднимается вместе с `BUILDER_VERSION`, когда меняется
+  не только схема, но и СОДЕРЖИМОЕ производных таблиц
 - Критичная git-команда (`merge-base`, `git diff <saved>..HEAD`) завершилась ошибкой или таймаутом (60 сек)
 - **Предыдущий детект незакоммиченного был помечен как ненадёжный** (`git_dirty_unreliable=1` — см. ниже)
 

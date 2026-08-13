@@ -9,6 +9,7 @@ import sqlite3
 import pytest
 
 from rlm_tools_bsl.bsl_index import (
+    BUILDER_VERSION,
     IndexBuilder,
     IndexReader,
     _extract_header_comment,
@@ -373,12 +374,12 @@ class TestRegionsIntegration:
         assert "module_headers" in stats
         assert stats["module_headers"] == 1
 
-    def test_builder_version_is_8(self, built_regions_index):
+    def test_builder_version_matches_constant(self, built_regions_index):
         db_path, _ = built_regions_index
         conn = sqlite3.connect(str(db_path))
         ver = conn.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()[0]
         conn.close()
-        assert ver == "14"
+        assert int(ver) == BUILDER_VERSION
 
 
 class TestRegionsDeltaCleanup:
@@ -704,3 +705,312 @@ class TestRegionsStrategy:
         )
         assert "search_regions()" in strategy
         assert "search_module_headers()" in strategy
+
+
+# ---------------------------------------------------------------------------
+# group_by (v1.33.x): корректная агрегация вместо топ-N по срезу выдачи
+# ---------------------------------------------------------------------------
+
+
+def _make_skewed_regions_fixture(root):
+    """Дистрибуция, на которой АЛФАВИТНЫЙ срез врёт.
+
+    `АРедкая` — одна штука, но первая по алфавиту; `ЯЧастая` — пять штук, но
+    последняя. Значит топ-1 по срезу `limit=2` списочной ветки даст `АРедкая`,
+    а правильный ответ — `ЯЧастая`. Ровно этот класс ошибки поймал e2e-агент на
+    боевой конфигурации (топ-10 по 5000 строкам из 57 652).
+    """
+    for i in range(5):
+        d = root / "CommonModules" / f"Модуль{i}" / "Ext"
+        d.mkdir(parents=True)
+        d.joinpath("Module.bsl").write_text(
+            "#Область ЯЧастая\nПроцедура П()\nКонецПроцедуры\n#КонецОбласти\n",
+            encoding="utf-8-sig",
+        )
+    d = root / "Documents" / "Док" / "Ext"
+    d.mkdir(parents=True)
+    d.joinpath("ObjectModule.bsl").write_text(
+        "#Область АРедкая\nПроцедура Р()\nКонецПроцедуры\n#КонецОбласти\n"
+        "#Область БСредняя\nПроцедура С()\nКонецПроцедуры\n#КонецОбласти\n",
+        encoding="utf-8-sig",
+    )
+    d.joinpath("ManagerModule.bsl").write_text(
+        "#Область БСредняя\nПроцедура С2()\nКонецПроцедуры\n#КонецОбласти\n",
+        encoding="utf-8-sig",
+    )
+    return root
+
+
+class TestSearchRegionsGroupBy:
+    @pytest.fixture
+    def skewed(self, tmp_path, monkeypatch):
+        project = _make_skewed_regions_fixture(tmp_path)
+        monkeypatch.setenv("RLM_INDEX_DIR", str(project / ".index"))
+        db_path = IndexBuilder().build(str(project), build_calls=False, build_fts=False, build_synonyms=False)
+        return db_path, project
+
+    def _bsl(self, db_path, project):
+        from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+        reader = IndexReader(str(db_path))
+        bsl = make_bsl_helpers(
+            base_path=str(project),
+            resolve_safe=lambda p: __import__("pathlib").Path(p),
+            read_file_fn=lambda p: "",
+            grep_fn=lambda pat, path="": [],
+            glob_files_fn=lambda pat: [],
+            idx_reader=reader,
+        )
+        return bsl, reader
+
+    def test_list_slice_is_alphabetical_and_misleads(self, skewed):
+        """Гард на САМ дефект: срез списочной ветки — не выборка, а алфавит."""
+        db_path, project = skewed
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            sliced = bsl["search_regions"]("", limit=2)
+            assert [r["name"] for r in sliced] == ["АРедкая", "БСредняя"], (
+                "срез обязан быть алфавитным — если это изменилось, тест ниже перестал что-либо доказывать"
+            )
+            # Топ по такому срезу: ЯЧастая (5 штук) не видна вовсе.
+            assert "ЯЧастая" not in {r["name"] for r in sliced}
+        finally:
+            reader.close()
+
+    def test_group_by_name_returns_true_top(self, skewed):
+        db_path, project = skewed
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            res = bsl["search_regions"]("", group_by="name", limit=2)
+            assert res["group_by"] == "name"
+            assert res["groups"][0] == {"key": "ЯЧастая", "count": 5}
+            assert res["groups"][1] == {"key": "БСредняя", "count": 2}
+            assert res["groups_returned"] == 2
+            assert res["groups_total"] == 3  # АРедкая/БСредняя/ЯЧастая
+            assert res["truncated"] is True
+            assert res["source"] == "index"
+            assert res["scope"] == "main_index"
+        finally:
+            reader.close()
+
+    def test_group_sum_equals_count_only_total(self, skewed):
+        """Инвариант: два ответа одного хелпера обязаны сходиться."""
+        db_path, project = skewed
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            full = bsl["search_regions"]("", group_by="name", limit=10**6)
+            census = bsl["search_regions"]("", count_only=True)
+            assert full["truncated"] is False
+            assert sum(g["count"] for g in full["groups"]) == census["total"] == 8
+        finally:
+            reader.close()
+
+    def test_group_by_category(self, skewed):
+        db_path, project = skewed
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            res = bsl["search_regions"]("", group_by="category", limit=10)
+            assert {g["key"]: g["count"] for g in res["groups"]} == {
+                "CommonModules": 5,
+                "Documents": 3,
+            }
+        finally:
+            reader.close()
+
+    def test_group_by_respects_query_filter(self, skewed):
+        db_path, project = skewed
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            res = bsl["search_regions"]("Част", group_by="name", limit=10)
+            assert res["groups"] == [{"key": "ЯЧастая", "count": 5}]
+            assert res["groups_total"] == 1
+        finally:
+            reader.close()
+
+    def test_unknown_group_by_warns_instead_of_lying(self, skewed):
+        """Тот же контракт, что у kinds= — пусто, но ГРОМКО."""
+        db_path, project = skewed
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            res = bsl["search_regions"]("", group_by="имя")
+            assert res["groups"] == []
+            warn = (res.get("_meta") or {}).get("arg_warning") or ""
+            assert "group_by" in warn and "name" in warn and "category" in warn
+        finally:
+            reader.close()
+
+    def test_list_and_count_only_contracts_unchanged(self, skewed):
+        """group_by не должен задеть две существующие ветки."""
+        db_path, project = skewed
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            rows = bsl["search_regions"]("", limit=10)
+            assert isinstance(rows, list) and len(rows) == 8
+            assert set(rows[0]) == {"name", "line", "end_line", "module_path", "object_name", "category"}
+            assert bsl["search_regions"]("", count_only=True) == {
+                "total": 8,
+                "source": "index",
+                "truncated": False,
+                "scope": "main_index",
+            }
+        finally:
+            reader.close()
+
+    def test_group_by_without_index(self, tmp_path):
+        from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+        bsl = make_bsl_helpers(
+            base_path=str(tmp_path),
+            resolve_safe=lambda p: __import__("pathlib").Path(p),
+            read_file_fn=lambda p: "",
+            grep_fn=lambda pat, path="": [],
+            glob_files_fn=lambda pat: [],
+        )
+        res = bsl["search_regions"]("", group_by="name")
+        assert res["groups"] == [] and res["groups_total"] == 0
+        assert res["source"] == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# group_by на конфигурации С РАСШИРЕНИЯМИ — ветка слияния main+live.
+# Именно здесь ревью нашло блокер: main-группы брались top-N, поэтому вклад
+# ключа, лежащего в main ВНЕ топа, при слиянии терялся.
+# ---------------------------------------------------------------------------
+
+_CFE_MAIN_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+    <Configuration uuid="00000000-0000-0000-0000-000000000001">
+        <Properties><Name>MainCfg</Name><NamePrefix/></Properties>
+    </Configuration>
+</MetaDataObject>
+"""
+
+_CFE_EXT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+    <Configuration uuid="00000000-0000-0000-0000-000000000002">
+        <Properties>
+            <ObjectBelonging>Adopted</ObjectBelonging>
+            <Name>ExtAddOn</Name>
+            <ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>
+            <NamePrefix>ext_</NamePrefix>
+        </Properties>
+    </Configuration>
+</MetaDataObject>
+"""
+
+
+def _region_module(*names):
+    body = ""
+    for n in names:
+        body += f"#Область {n}\nПроцедура П_{n}()\nКонецПроцедуры\n#КонецОбласти\n"
+    return body
+
+
+class TestSearchRegionsGroupByCFE:
+    """main: РегионА×6, РегионБ×4, РегионВ×3;  ext: РегионВ×2.
+
+    Истинный топ-2 — [РегионА 6, РегионВ 5], всего ключей 3. При top-N выборке
+    main-групп (limit=2) РегионВ приходил в слияние с нулём: получал счёт 2,
+    вылетал из топа, а `groups_total` завышался до 4.
+    """
+
+    @pytest.fixture
+    def cfe_env(self, tmp_path, monkeypatch):
+        from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+        from rlm_tools_bsl.format_detector import detect_format
+        from rlm_tools_bsl.helpers import make_helpers
+
+        cf = tmp_path / "src" / "cf"
+        cfe = tmp_path / "src" / "cfe" / "ExtAddOn"
+        (cf / "CommonModules").mkdir(parents=True)
+        (cf / "Configuration.xml").write_text(_CFE_MAIN_XML, encoding="utf-8")
+        for i in range(6):
+            d = cf / "CommonModules" / f"МодА{i}" / "Ext"
+            d.mkdir(parents=True)
+            (d / "Module.bsl").write_text(_region_module("РегионА"), encoding="utf-8-sig")
+        for i in range(4):
+            d = cf / "CommonModules" / f"МодБ{i}" / "Ext"
+            d.mkdir(parents=True)
+            (d / "Module.bsl").write_text(_region_module("РегионБ"), encoding="utf-8-sig")
+        for i in range(3):
+            d = cf / "CommonModules" / f"МодВ{i}" / "Ext"
+            d.mkdir(parents=True)
+            (d / "Module.bsl").write_text(_region_module("РегионВ"), encoding="utf-8-sig")
+
+        (cfe / "CommonModules").mkdir(parents=True)
+        (cfe / "Configuration.xml").write_text(_CFE_EXT_XML, encoding="utf-8")
+        for i in range(2):
+            d = cfe / "CommonModules" / f"ЭкстВ{i}" / "Ext"
+            d.mkdir(parents=True)
+            (d / "Module.bsl").write_text(_region_module("РегионВ"), encoding="utf-8-sig")
+        # Область, которой в main НЕТ вовсе — только она доказывает ветку
+        # `k not in counts → groups_total += 1`. Имя нарочно без подстроки
+        # «Регион», чтобы не сдвинуть ожидания остальных тестов этого класса.
+        d = cfe / "CommonModules" / "ЭкстОсобыйМодуль" / "Ext"
+        d.mkdir(parents=True)
+        (d / "Module.bsl").write_text(_region_module("ЭкстОсобая"), encoding="utf-8-sig")
+
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+        db_path = IndexBuilder().build(str(cf), build_calls=False, build_fts=False, build_synonyms=False)
+        reader = IndexReader(str(db_path))
+        generic, resolve_safe = make_helpers(str(cf), idx_reader=reader)
+        bsl = make_bsl_helpers(
+            base_path=str(cf),
+            resolve_safe=resolve_safe,
+            read_file_fn=generic["read_file"],
+            grep_fn=generic["grep"],
+            glob_files_fn=generic["glob_files"],
+            format_info=detect_format(str(cf)),
+            idx_reader=reader,
+            extension_paths=[str(cfe)],
+        )
+        try:
+            yield bsl
+        finally:
+            reader.close()
+
+    def test_ext_rows_do_not_starve_main_key_outside_top_n(self, cfe_env):
+        """РЕГРЕСС-ГАРД на найденный ревью блокер."""
+        res = cfe_env["search_regions"]("Регион", group_by="name", limit=2)
+        assert res["scope"] == "main_index+live_extensions"
+        assert res["source"] == "index+live"
+        assert res["groups"] == [
+            {"key": "РегионА", "count": 6},
+            {"key": "РегионВ", "count": 5},  # 3 в main + 2 в расширении
+        ], "ключ main вне top-N обязан сохранить свой вклад при слиянии"
+        assert res["groups_total"] == 3, "РегионВ есть в main — новым ключом он не является"
+        assert res["truncated"] is True
+
+    def test_cfe_sum_equals_count_only_total(self, cfe_env):
+        """Тот же инвариант, что и на main-only, но в ветке слияния."""
+        full = cfe_env["search_regions"]("Регион", group_by="name", limit=10**6)
+        census = cfe_env["search_regions"]("Регион", count_only=True)
+        assert full["truncated"] is False
+        assert sum(g["count"] for g in full["groups"]) == census["total"] == 15
+        assert full["groups_total"] == len(full["groups"]) == 3
+
+    def test_ext_only_key_counts_as_new(self, cfe_env):
+        """Обратная сторона: ключа, которого в main нет, groups_total обязан прибавить.
+
+        Запрос 'о' ловит и три main-области, и ext-only `ЭкстОсобая`, которой в
+        индексе нет вовсе — то есть проверяется именно ветка `k not in counts`.
+        """
+        res = cfe_env["search_regions"]("о", group_by="name", limit=10**6)
+        counts = {g["key"]: g["count"] for g in res["groups"]}
+        assert counts == {"РегионА": 6, "РегионБ": 4, "РегионВ": 5, "ЭкстОсобая": 1}
+        assert res["groups_total"] == 4, "ext-only ключ обязан прибавить к groups_total"
+        assert res["groups_total"] == len(res["groups"])
+        # И инвариант суммы держится, когда в наборе есть ключ только из расширения.
+        assert sum(counts.values()) == cfe_env["search_regions"]("о", count_only=True)["total"]
+
+    def test_empty_query_stays_main_only(self, cfe_env):
+        """Пустой запрос НЕ сливается с live — как и у count_only."""
+        res = cfe_env["search_regions"]("", group_by="name", limit=10**6)
+        assert res["scope"] == "main_index"
+        assert res["source"] == "index"
+        assert {g["key"]: g["count"] for g in res["groups"]} == {
+            "РегионА": 6,
+            "РегионБ": 4,
+            "РегионВ": 3,  # без расширения
+        }
+        assert sum(g["count"] for g in res["groups"]) == cfe_env["search_regions"]("", count_only=True)["total"]

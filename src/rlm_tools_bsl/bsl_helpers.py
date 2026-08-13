@@ -16,13 +16,16 @@ from rlm_tools_bsl.bsl_knowledge import (
     BSL_PATTERNS,
     _AttrRecord,
     _merge_proc_continuations,
+    _merge_proc_continuations_with_mask,
     _normalize_method_params,
     _split_params,
+    mask_comments_and_strings,
 )
 from rlm_tools_bsl.bsl_index import (
     _BSL_GLOBAL_FUNCS_LOWER,
     _make_callee_key,
     _MOVEMENT_METHOD_NOISE,
+    _ref_anchor_index,
     _scan_module,
 )
 from rlm_tools_bsl.cache import load_index, save_index
@@ -357,16 +360,11 @@ def _live_code_only(body: str) -> str:
     """Тело модуля БЕЗ комментариев и строковых литералов (общесистемный ``_scan_module``).
 
     И «объявление процедуры», и «прямое обращение `Движения.<Регистр>`» — это утверждения про
-    КОД, а не про текст в комментарии или в тексте запроса. Общий парсер методов
-    (``BSL_PATTERNS["procedure_def"]``) применяется через неякорный ``.search()`` к СЫРОЙ строке
-    и потому считает процедурой даже `// Процедура X()`; экстрактор движений в билдере тоже
-    матчит по сырому content. Мы на это НЕ опираемся: обе перепроверки этого хелпера идут по
-    вырезанному коду, поэтому отвечают ровно то, что обещает контракт.
+    КОД, а не про текст в комментарии или в тексте запроса. Обе перепроверки этого хелпера идут
+    по вырезанному коду, поэтому отвечают ровно то, что обещает контракт.
 
-    NB: сквозная слепота билдера к комментариям/строкам (закомментированная процедура попадает
-    в таблицу ``methods``, закомментированное `Движения.X` — в ``register_movements``) — ОТДЕЛЬНЫЙ
-    пре-существующий дефект. Лечится только в билдере, а это бамп BUILDER_VERSION + пересборка
-    индексов, что в этот релиз не входит. Здесь мы лишь не тиражируем его в новый сигнал.
+    С v1.33.0 билдер смотрит на исходник через ту же маску (``mask_comments_and_strings``),
+    поэтому расхождения read-time и build-time здесь больше нет.
     """
     return "\n".join(code for _lineno, code, _strings in _scan_module(body.splitlines()))
 
@@ -1002,19 +1000,80 @@ def make_bsl_helpers(
                 # is itself index-backed and therefore can expose the same stale module
                 # list we are deliberately bypassing.
                 main_root = Path(base_path).resolve()
-                for dirpath, dirnames, filenames in os.walk(main_root):
-                    dirnames[:] = [
-                        name for name in dirnames if name not in _GENERIC_SKIP_DIRS and not name.startswith(".")
-                    ]
-                    for filename in filenames:
-                        if not filename.lower().endswith(".bsl"):
-                            continue
+                main_root_str = str(main_root)
+                # Обход СВОИМ стеком поверх scandir, а не os.walk: os.walk дергает
+                # islink на КАЖДЫЙ элемент (на боевой ЕРП-конфигурации это 106 000
+                # системных вызовов, 4.3 с), тогда как DirEntry отдает тип из уже
+                # прочитанного каталога бесплатно.
+                stack = [main_root_str]
+                # Каталоги, уже поставленные в очередь. Нужны, чтобы каталог-
+                # перенаправление ВНУТРЬ базы не задваивал модули и не зацикливал
+                # обход на петле `base/Loop -> base`.
+                # Ключ — `os.path.normcase`, а НЕ `casefold`: на Windows он приводит
+                # регистр (там `Alpha` и `alpha` — один каталог), а на регистро-
+                # зависимой ФС оставляет строку как есть. Безусловный `casefold`
+                # схлопывал бы два РАЗНЫХ каталога Linux в один, и файлы второго
+                # пропадали бы из каталога модулей.
+                seen_dirs: set[str] = {os.path.normcase(main_root_str)}
+                while stack:
+                    try:
+                        scan = list(os.scandir(stack.pop()))
+                    except OSError:
+                        continue
+                    for entry in scan:
                         try:
-                            resolved = (Path(dirpath) / filename).resolve()
-                            resolved.relative_to(main_root)
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name in _GENERIC_SKIP_DIRS or entry.name.startswith("."):
+                                    continue
+                                target = entry.path
+                                # КАТАЛОГ-ПЕРЕНАПРАВЛЕНИЕ: на Windows это не только
+                                # симлинк, но и junction, у которого `is_symlink()`
+                                # == False. Прежняя ветка резолвила КАЖДЫЙ файл, и
+                                # именно этим отсекала цель вне базы; проверка только
+                                # симлинков пропускала бы через junction чужие файлы.
+                                # Резолвим ОДИН раз на каталог и дальше идём по
+                                # РАЗРЕШЁННОМУ пути: цель вне базы даст ValueError и
+                                # будет пропущена, цель внутри базы будет перечислена
+                                # ровно как при старом обходе — включая случай, когда
+                                # она лежит в скрытом или пропускаемом каталоге и
+                                # прямым проходом НЕ достижима.
+                                # `stat(follow_symlinks=False)` на Windows берётся из
+                                # уже прочитанного каталога — лишних системных вызовов
+                                # нет; `st_reparse_tag` есть только на Windows, на
+                                # POSIX работает ветка `is_symlink()`.
+                                if entry.is_symlink() or getattr(
+                                    entry.stat(follow_symlinks=False), "st_reparse_tag", 0
+                                ):
+                                    resolved_dir = Path(target).resolve()
+                                    resolved_dir.relative_to(main_root)
+                                    target = str(resolved_dir)
+                                key = os.path.normcase(target)
+                                if key in seen_dirs:
+                                    continue
+                                seen_dirs.add(key)
+                                stack.append(target)
+                                continue
+                            if not entry.name.lower().endswith(".bsl"):
+                                continue
+                            path = entry.path
+                            # realpath — ТОЛЬКО для симлинка. Гард «файл не уводит за
+                            # пределы песочницы» обязан остаться, но платить им за
+                            # каждый обычный файл незачем: 23 508 вызовов
+                            # nt._getfinalpathname = 4.5 с на одну конфигурацию.
+                            if entry.is_symlink():
+                                # Симлинк на КАТАЛОГ с именем вида `X.bsl` сюда тоже
+                                # попадает (`is_dir(follow_symlinks=False)` у ссылки —
+                                # False), а os.walk такое клал в dirnames и модулем
+                                # НИКОГДА не считал. Без этой проверки каталог уехал бы
+                                # в список модулей и упал бы позже на чтении.
+                                if entry.is_dir():
+                                    continue
+                                resolved = Path(path).resolve()
+                                resolved.relative_to(main_root)
+                                path = str(resolved)
                         except (OSError, ValueError):
                             continue
-                        info = parse_bsl_path(str(resolved), str(main_root))
+                        info = parse_bsl_path(path, main_root_str)
                         entries.append((info.relative_path, info))
                 # Extension modules are already enumerated live by the side-load pass;
                 # the direct walk above is intentionally scoped to the main root.
@@ -1387,10 +1446,15 @@ def make_bsl_helpers(
         Handles multi-line procedure signatures (``Процедура X(a,\n  b)``) by
         merging continuation lines before matching ``BSL_PATTERNS['procedure_def']``.
         ``end_line`` is taken from the original line list.
+
+        v1.33.0 (паритет с билдером): и матч, и склейка, и поиск ``КонецПроцедуры``
+        идут по МАСКЕ — объявления из комментариев и строковых литералов больше не
+        попадают в результат, а фальшивый конец в литерале не обрывает тело.
         """
         content = _ext_read_file(path)
         lines = content.splitlines()
-        merged_lines, line_map = _merge_proc_continuations(lines)
+        masked = mask_comments_and_strings(lines)
+        merged_lines, merged_masked, line_map = _merge_proc_continuations_with_mask(lines, masked)
         total_orig = len(lines)
         total_merged = len(merged_lines)
 
@@ -1400,8 +1464,7 @@ def make_bsl_helpers(
         procedures: list[dict] = []
         m_idx = 0
         while m_idx < total_merged:
-            merged = merged_lines[m_idx]
-            m = proc_def_re.search(merged)
+            m = proc_def_re.search(merged_masked[m_idx])
             if not m:
                 m_idx += 1
                 continue
@@ -1409,7 +1472,10 @@ def make_bsl_helpers(
             proc_type = m.group(1)
             proc_name = m.group(2)
             # v1.18.0 Фикс 2: params -> list[str] имён параметров (на агент-границе).
-            params = _split_params(m.group(3) or "")
+            # Срез берётся из ОРИГИНАЛА по смещениям маски (та же длина) и ОБЯЗАТЕЛЬНО
+            # идёт через _split_params: публичный контракт — list[str], не str.
+            raw_params = merged_lines[m_idx][m.start(3) : m.end(3)] if m.group(3) is not None else ""
+            params = _split_params(raw_params)
             is_export = m.group(4) is not None and m.group(4).strip() != ""
             line_number = line_map[m_idx]  # 1-based
 
@@ -1418,7 +1484,7 @@ def make_bsl_helpers(
 
             end_line: int | None = None
             for orig_idx in range(scan_from, total_orig):
-                if proc_end_re.search(lines[orig_idx]):
+                if proc_end_re.search(masked[orig_idx]):
                     end_line = orig_idx + 1
                     break
 
@@ -2068,24 +2134,29 @@ def make_bsl_helpers(
                     try:
                         ext_content = candidate.read_text(encoding="utf-8-sig", errors="replace")
                         ext_lines = ext_content.splitlines()
-                        # Find method by name in extension file
+                        # Поиск метода по имени в файле расширения.
+                        # v1.33.0: построчного поиска НЕДОСТАТОЧНО — полный `procedure_def`
+                        # требует закрывающую ')', которой у многострочной сигнатуры на
+                        # первой строке нет, и такие тела не находились вовсе (30 из 799
+                        # живых перехватов на боевых расширениях). Границы ищутся по маске
+                        # и line_map, тело собирается из ОРИГИНАЛЬНЫХ строк.
+                        ext_masked = mask_comments_and_strings(ext_lines)
+                        merged, merged_masked, line_map = _merge_proc_continuations_with_mask(ext_lines, ext_masked)
                         proc_def_re = re.compile(BSL_PATTERNS["procedure_def"], re.IGNORECASE)
                         proc_end_re = re.compile(BSL_PATTERNS["procedure_end"], re.IGNORECASE)
                         search_name = (ext_method or "").lower()
-                        in_target = False
                         start_idx = None
-                        for i, ln in enumerate(ext_lines):
-                            if not in_target:
-                                m = proc_def_re.search(ln)
-                                if m and m.group(2).lower() == search_name:
-                                    in_target = True
-                                    start_idx = i
-                            else:
-                                if proc_end_re.search(ln):
-                                    ext_body = "\n".join(ext_lines[start_idx : i + 1])
-                                    break
-                        if in_target and ext_body is None and start_idx is not None:
+                        for m_idx, mline in enumerate(merged_masked):
+                            m = proc_def_re.search(mline)
+                            if m and m.group(2).lower() == search_name:
+                                start_idx = line_map[m_idx] - 1  # 0-based в ОРИГИНАЛЕ
+                                break
+                        if start_idx is not None:
                             ext_body = "\n".join(ext_lines[start_idx:])
+                            for j in range(start_idx, len(ext_masked)):
+                                if proc_end_re.search(ext_masked[j]):
+                                    ext_body = "\n".join(ext_lines[start_idx : j + 1])
+                                    break
                     except OSError:
                         pass
 
@@ -4586,6 +4657,14 @@ def make_bsl_helpers(
         "fo": "functional_options",
         "options": "functional_options",
         "опции": "functional_options",
+        # v1.33.0: flow и code_usages включались ТОЛЬКО булевыми include_*, а
+        # sections=['flow'] — естественная догадка по имени секции в самом же
+        # ответе — молча давала пустой профиль.
+        "flow": "flow",
+        "поток": "flow",
+        "code_usages": "code_usages",
+        "usages": "code_usages",
+        "использования": "code_usages",
     }
 
     def get_object_profile(
@@ -4709,14 +4788,25 @@ def make_bsl_helpers(
         )
 
         # ── which sections to run ──────────────────────────────────
+        # v1.33.0: неизвестное имя секции больше не отбрасывается молча. Раньше
+        # ЛЮБАЯ опечатка давала УСПЕШНЫЙ ответ с пустым sections — отличить её от
+        # «в конфигурации этого нет» было нельзя. Это недоделка арг-гардов 1.30.0:
+        # там ровно этот класс порчи закрыли через arg_warning, а этот путь пропустили.
+        section_warning: str | None = None
         if sections is None:
             wanted = list(_PROFILE_DEFAULT_SECTIONS)
         else:
             wanted = []
+            unknown: list[str] = []
             for s in sections:
                 key = _PROFILE_SECTION_ALIASES.get(str(s).strip().lower())
-                if key and key not in wanted:
+                if key is None:
+                    unknown.append(str(s))
+                elif key not in wanted:
                     wanted.append(key)
+            if unknown:
+                accepted = ", ".join(sorted(set(_PROFILE_SECTION_ALIASES.values())))
+                section_warning = f"Неизвестные имена секций отброшены: {', '.join(unknown)}. Принимаются: {accepted}."
         if include_flow and "flow" not in wanted:
             wanted.append("flow")
         if include_code_usages and "code_usages" not in wanted:
@@ -5010,11 +5100,21 @@ def make_bsl_helpers(
             # ``file``, however, so such rows would become indistinguishable and inflate its
             # summary. Collapse only that lossy representation, preserving stable display case.
             ordered = _profile_movement_pairs(rows)
-            by_source: dict[str, list[str]] = {"code": [], "erp_mechanism": [], "manager_table": [], "adapted": []}
+            # v1.33.0: manager_code перечислен ЯВНО — иначе setdefault ниже положил бы его
+            # в ordered/items, но не в summary, и сводка разошлась бы со списком.
+            # Ключи summary НЕ меняются (это контракт профиля и бюджет): запись из модуля
+            # менеджера — тоже код, провенанс виден в items[].source.
+            by_source: dict[str, list[str]] = {
+                "code": [],
+                "manager_code": [],
+                "erp_mechanism": [],
+                "manager_table": [],
+                "adapted": [],
+            }
             for src, n in ordered:
                 by_source.setdefault(src, []).append(n)
             summary = {
-                "code_registers": len(by_source["code"]),
+                "code_registers": len(by_source["code"]) + len(by_source["manager_code"]),
                 "erp_mechanisms": len(by_source["erp_mechanism"]),
                 "manager_tables": len(by_source["manager_table"]),
                 "adapted_registers": len(by_source["adapted"]),
@@ -5218,6 +5318,9 @@ def make_bsl_helpers(
                 }
             )
 
+        # Оба гарда пишут в ОДИН ключ _meta.arg_warning (как на границе
+        # find_callers_context): у потребителя не должно быть двух мест, куда смотреть.
+        _profile_warning = " ".join(w for w in (_w_limit, section_warning) if w)
         return {
             "object_name": object_name,
             "category": category,
@@ -5227,7 +5330,7 @@ def make_bsl_helpers(
                 "extension_visibility": extension_visibility,
                 "total_elapsed_ms": _ms(prof_t0),
                 "sections": meta_sections,
-                **({"arg_warning": _w_limit} if _w_limit else {}),
+                **({"arg_warning": _profile_warning} if _profile_warning else {}),
             },
         }
 
@@ -6090,10 +6193,13 @@ def make_bsl_helpers(
                 )
                 result = {
                     "document": document_name,
+                    # v1.33.0: manager_code — запись набора из МОДУЛЯ МЕНЕДЖЕРА документа.
+                    # Это тоже код, поэтому строка идёт в code_registers; провенанс агент
+                    # видит в ключе `source` и без нового ключа в контракте.
                     "code_registers": [
                         {"name": m["register_name"], "source": m["source"], "file": m["file"]}
                         for m in idx_movements
-                        if m["source"] == "code"
+                        if m["source"] in ("code", "manager_code")
                     ],
                     "modules_scanned": cfe_modules_scanned,
                     "erp_mechanisms": [m["register_name"] for m in idx_movements if m["source"] == "erp_mechanism"],
@@ -6332,7 +6438,8 @@ def make_bsl_helpers(
         "find_register_movements(document) применяет Posting/CFE, но main code_registers берет из снимка "
         "индекса: для измененного после build main-модуля проверь живое тело найденного пути. Увидел НАБОР ЗАПИСЕЙ "
         "(Регистры<Тип>.X.СоздатьНаборЗаписей() — любого вида: Накопления/Сведений/Бухгалтерии/Расчета) -> "
-        "find_register_writers ИХ НЕ НАЙДЕТ (он ищет только прямые Движения.X в ObjectModule документов): "
+        "в МОДУЛЕ МЕНЕДЖЕРА документа такую запись индекс с v1.33.0 ЗНАЕТ (source='manager_code', "
+        "имя сверено с каталогом регистров), в остальных модулях — НЕТ: "
         "ищи имя регистра через git_search (он идет по ВСЕМУ дереву и любым типам файлов). "
         "РАЗБОР ТЕЛА ВЫШЕ СДЕЛАН СЕРВЕРОМ по живому модулю (комментарии и строковые литералы вырезаны) и он "
         "BEST-EFFORT: смотрит ТОЛЬКО тело обработчика и не раскручивает вложенные вызовы. Что не удалось "
@@ -7264,8 +7371,9 @@ def make_bsl_helpers(
             parts.append(
                 f"ЗАПИСЬ РЕГИСТРОВ ПРЯМО В ОБРАБОТЧИКЕ (набор/менеджер записи: после создания виден "
                 f"Записать() по нему): {regs} -> регистры УЖЕ НАЗВАНЫ, {closing}"
-                "ВНИМАНИЕ: find_register_writers их НЕ НАЙДЕТ (он ищет только прямые "
-                f"Движения.X в ObjectModule документов) — статические reverse-кандидаты ищи через "
+                "ВНИМАНИЕ: find_register_writers их НЕ НАЙДЕТ (набор записей в ObjectModule "
+                "индекс не разбирает; из МОДУЛЯ МЕНЕДЖЕРА такую запись он знает — source "
+                f"'manager_code') — статические reverse-кандидаты ищи через "
                 f"{_register_search_route()}, затем проверяй живой вызывающий путь. "
             )
 
@@ -7778,8 +7886,12 @@ def make_bsl_helpers(
 
     def find_register_writers(register_name: str) -> dict:
         """Find static document references to a specific register.
-        Searches all document ObjectModules for 'Движения.RegisterName'. CFE
-        replacement reachability and Posting=Deny are intentionally not applied.
+
+        Отдаёт ВСЕ известные индексу источники записи, а не только прямые
+        ``Движения.RegisterName`` из ObjectModule: `code`, `manager_code` (набор
+        записей из модуля менеджера, v1.33.0), `erp_mechanism`, `manager_table`,
+        `adapted`. CFE replacement reachability and Posting=Deny are intentionally
+        not applied.
         ``find_register_movements(document)`` applies those filters, but main code
         rows there still come from the index snapshot.
 
@@ -8398,9 +8510,15 @@ def make_bsl_helpers(
                     }
                 )
             elif kind == "attribute":
+                # v1.33.0: контракт `types` — list[str] на ОБОИХ путях. Без этого
+                # parse_form отдавал бы список на live-разборе и строку из индекса.
+                # Формат хранения element_type одинаков в v14 и v15, поэтому список
+                # восстанавливается и на устаревшем индексе.
+                raw_types = r.get("element_type", "") or ""
+                types_list = [t.strip() for t in raw_types.split(",") if t.strip()]
                 attr: dict = {
                     "name": r.get("element_name", ""),
-                    "types": r.get("element_type", ""),
+                    "types": types_list,
                     "main": bool(r.get("attribute_is_main", 0)),
                 }
                 mt = r.get("main_table", "")
@@ -9268,6 +9386,8 @@ def make_bsl_helpers(
             except Exception:
                 pass
 
+        # Ветка без limit — прежний контракт БАЙТ-В-БАЙТ (набор ключей зафиксирован
+        # тестом): считать корзины тут не нужно, длины лежат прямо в списках.
         if limit is None:
             return {
                 "object": object_name,
@@ -9275,6 +9395,10 @@ def make_bsl_helpers(
                 "code_options": code_options,
             }
         # Per-bucket cap (#6): each list truncated independently to ``limit``.
+        # `xml_total` / `code_total` идут рядом с `total`, потому что `total` — сумма
+        # корзин РАЗНОЙ точности (xml — exact-отбор, code — подстрочный grep), и агент
+        # читает её как «столько функциональных опций у объекта». Два прогона подряд
+        # (e2e 1.30.0 и 1.33.0) на этом давали 167 вместо точных 34.
         xt, ct = len(xml_options), len(code_options)
         n = max(0, int(limit))
         xp, cp = xml_options[:n], code_options[:n]
@@ -9283,6 +9407,8 @@ def make_bsl_helpers(
             "xml_options": xp,
             "code_options": cp,
             "total": xt + ct,
+            "xml_total": xt,
+            "code_total": ct,
             "returned": len(xp) + len(cp),
             "has_more": xt > len(xp) or ct > len(cp),
         }
@@ -9746,12 +9872,81 @@ def make_bsl_helpers(
             "scope": "main_index+live_extensions",
         }
 
-    def search_regions(query: str = "", limit: int = 200, count_only: bool = False) -> list[dict] | dict:
+    _VALID_REGION_GROUP_BY = ("name", "category")
+
+    def _group_regions_payload(query: str, by: str, limit: int, empty_query: bool) -> dict:
+        """Ответ ``group_by`` для search_regions.
+
+        Scope повторяет ``_count_only_payload`` слово в слово (main-only при пустом
+        query либо без расширений; иначе main index + live-расширения), поэтому
+        ``sum(count по ВСЕМ группам) == search_regions(query, count_only=True)['total']``
+        — это инвариант, закреплённый тестом. Иначе агент получил бы две
+        несогласованные цифры от одного хелпера.
+        """
+        merging_ext = bool(not empty_query and _ext_paths_raw)
+        # При слиянии с расширениями main-группы берутся ЦЕЛИКОМ, а не top-N.
+        # Иначе ключ, который в main есть, но в top-N не попал, приходил бы в merge
+        # с нулём: его main-вклад терялся бы (заниженный счёт либо выпадение из
+        # топа), а `new_keys` считал бы его новым и завышал `groups_total`. Резать
+        # можно только ПОСЛЕ слияния. Различных имён областей на боевой
+        # конфигурации — тысячи, полный набор дешёвый.
+        read_limit = 10**9 if merging_ext else limit
+        indexed = idx_reader.group_regions(query, by, read_limit) if idx_reader is not None else None
+        base = indexed or {"groups": [], "groups_total": 0}
+        counts: dict = {g["key"]: g["count"] for g in base["groups"]}
+        groups_total = base["groups_total"]
+        source = "index" if indexed is not None else "unavailable"
+        scope = "main_index"
+
+        if merging_ext:
+            _ensure_index()  # заполняет _extension_paths_set (см. _count_only_payload)
+            ext_rows = _live_search_regions(query, limit)
+            if ext_rows:
+                # Живые строки берём ЦЕЛИКОМ (limit у _live_search_regions не режет —
+                # скан полный), поэтому groups_total пересчитывается по объединению:
+                # ключ расширения мог не встретиться в main вовсе.
+                ext_counts: dict = {}
+                for r in ext_rows:
+                    k = r.get("category") if by == "category" else r.get("name")
+                    ext_counts[k] = ext_counts.get(k, 0) + 1
+                # `counts` здесь — ВСЕ main-ключи (см. read_limit выше), поэтому
+                # `k not in counts` действительно означает «в main такого нет».
+                groups_total += sum(1 for k in ext_counts if k not in counts)
+                for k, c in ext_counts.items():
+                    counts[k] = counts.get(k, 0) + c
+            source = "index+live" if indexed is not None else "live"
+            scope = "main_index+live_extensions"
+
+        groups = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[:limit]
+        return {
+            "group_by": by,
+            "groups": [{"key": k, "count": c} for k, c in groups],
+            "groups_total": groups_total,
+            "groups_returned": len(groups),
+            "truncated": len(groups) < groups_total,
+            "source": source,
+            "scope": scope,
+        }
+
+    def search_regions(
+        query: str = "",
+        limit: int = 200,
+        count_only: bool = False,
+        group_by: str | None = None,
+    ) -> list[dict] | dict:
         """Search code regions (#Область/#Region) by name substring.
 
         Args:
             query: Search string (e.g. 'Себестоимость', 'Инициализация').
             limit: Max results (default 200).
+            group_by: 'name' | 'category' — вернуть ТОП-N групп со счётчиками вместо
+                строк. Считает SQLite по полному набору; ``limit`` режет уже готовые
+                группы. Нужен потому, что списочная ветка при пустом query идёт
+                ``ORDER BY name``, и топ-N по её срезу систематически неверен.
+                Неизвестное значение даёт пустые ``groups`` + ``_meta.arg_warning``
+                (тот же контракт, что у ``kinds=`` в find_references_to_object).
+                При одновременном ``count_only=True`` побеждает ``group_by``: он
+                строго информативнее — его ``groups`` дают и разбивку, и итог.
             count_only: если True — вернуть само-описательный dict вместо списка.
                 Census идёт в ТОМ ЖЕ scope, что и обычная выдача (v1.30.0): при
                 настроенных расширениях и непустом query это
@@ -9771,6 +9966,27 @@ def make_bsl_helpers(
         limit, _w = _coerce_bound(limit, 200, "limit", "search_regions(query, limit=200, count_only=False)")
         _warn_bound(_w)
         empty_query = _is_empty_query(query)
+        if group_by is not None:
+            # Гард ПЕРЕД count_only: group_by — более специфичный запрос, и молчаливое
+            # проглатывание опечатки здесь дало бы ровно тот класс, что чинили у
+            # sections=/kinds= — успешный ответ, неотличимый от «данных нет».
+            if group_by not in _VALID_REGION_GROUP_BY:
+                return {
+                    "group_by": group_by,
+                    "groups": [],
+                    "groups_total": 0,
+                    "groups_returned": 0,
+                    "truncated": False,
+                    "source": "unavailable",
+                    "scope": "main_index",
+                    "_meta": {
+                        "arg_warning": (
+                            f"group_by: неизвестное значение {group_by!r} — ответ пустой. "
+                            f"Допустимые: {list(_VALID_REGION_GROUP_BY)}."
+                        )
+                    },
+                }
+            return _group_regions_payload(query, group_by, limit, empty_query)
         if count_only:
             return _count_only_payload(
                 idx_reader.count_regions(query) if idx_reader is not None else None,
@@ -10978,10 +11194,26 @@ def make_bsl_helpers(
         # Без гарда битый limit роняет индексный запрос, голый `except Exception`
         # ниже его глушит, и управление уходит в live-скан ВСЕЙ конфигурации —
         # 45 секунд и жёсткое убийство воркера вместо быстрой ошибки.
-        # `_meta` у этого хелпера нет (ключи: by_kind/object/partial/references/
-        # total/truncated), поэтому предупреждение — только в лог.
+        # Предупреждение по limit остаётся только в логе: оно про величину, а не про
+        # смысл ответа (запрос всё равно отработает по нормализованному значению).
         limit, _w = _coerce_bound(limit, 1000, "limit", "find_references_to_object(object_ref, kinds=None, limit=1000)")
         _warn_bound(_w)
+
+        # Неизвестный вид ссылки не совпадает ни с одной строкой, и раньше это давало
+        # МОЛЧАЛИВЫЙ `total=0` — ответ, неотличимый от честного «ссылок нет». Тот же
+        # класс порчи, что закрыт для `get_object_profile(sections=...)`: аргумент
+        # отбрасывается, а потребитель об этом не узнаёт. Здесь `kinds` не мутируется —
+        # валидные виды продолжают фильтровать как прежде, добавляется только
+        # `_meta.arg_warning` (ключ появляется ТОЛЬКО при наличии предупреждения).
+        _kind_warning: str | None = None
+        if kinds:
+            _unknown = [k for k in kinds if k not in _REF_KIND_PRIORITY]
+            if _unknown:
+                _kind_warning = (
+                    f"kinds: неизвестные виды {_unknown} ни с чем не совпадут"
+                    + (" — отобраны только остальные. " if len(_unknown) < len(kinds) else " — ответ будет пустым. ")
+                    + f"Допустимые: {sorted(_REF_KIND_PRIORITY)}."
+                )
 
         def _finish(res: dict) -> dict:
             if include_code:
@@ -10992,6 +11224,8 @@ def make_bsl_helpers(
                 res["code_truncated"] = code["truncated"]
                 res["code_partial"] = code["partial"]
                 res["code_meta"] = code["_meta"]
+            if _kind_warning:
+                res.setdefault("_meta", {})["arg_warning"] = _kind_warning
             return res
 
         canonical, _ = _normalize_object_ref(object_ref)
@@ -11414,28 +11648,6 @@ def make_bsl_helpers(
         # of source file path (in production both files have identical content).
         emitted_keys: set[tuple[str, str]] = set()
 
-        import re as _re
-
-        def _resolve_attr_line(suffix: str, lines: list[str]) -> int | None:
-            """Same heuristic as bsl_index._line_for_ref — find <Name>X</Name> line."""
-            if not suffix:
-                return None
-            target_name: str | None = None
-            if suffix.startswith(("Attribute.", "Dimension.", "Resource.")):
-                parts = suffix.split(".")
-                if len(parts) >= 2:
-                    target_name = parts[1]
-            elif suffix.startswith("TabularSection.") and ".Attribute." in suffix:
-                after = suffix.split(".Attribute.", 1)[1]
-                target_name = after.split(".", 1)[0]
-            if not target_name:
-                return None
-            pat = _re.compile(rf"<\s*[Nn]ame\s*>{_re.escape(target_name)}<\s*/\s*[Nn]ame\s*>")
-            for idx, line in enumerate(lines, start=1):
-                if pat.search(line):
-                    return idx
-            return None
-
         def _emit_from_xml(xml_path: Path, category: str, fallback_name: str) -> None:
             if xml_path in seen_files:
                 return
@@ -11455,6 +11667,10 @@ def make_bsl_helpers(
             type_prefix = _CATEGORY_TYPE.get(category, category)
             used_in_root = f"{type_prefix}.{obj_name}"
             content_lines: list[str] | None = None
+            # v1.33.0: live-фолбэк (индекс без таблицы metadata_references) якорится ТЕМ ЖЕ
+            # резолвером, что и билдер, — иначе `line` значил бы разное на двух путях
+            # одного хелпера. Индекс якорей строится один раз на файл и лениво.
+            anchor = None
             for ref in parsed.get("references", []):
                 if ref.get("ref_object", "").lower() != canonical_lower:
                     continue
@@ -11469,7 +11685,8 @@ def make_bsl_helpers(
                 emitted_keys.add(key)
                 if content_lines is None:
                     content_lines = content.splitlines()
-                line = _resolve_attr_line(suffix, content_lines)
+                    anchor = _ref_anchor_index(content_lines)
+                line = anchor.line_for(ref)
                 results.append({"used_in": used_in, "path": rel, "line": line, "kind": kind})
 
         def _emit_command_param_refs(
@@ -11838,11 +12055,11 @@ def make_bsl_helpers(
         "{root, direction, depth, tree:[{name, target_hint, target_key, "
         "meta:{exact_rows, fallback_rows, exact_available, target_exact}, "
         "callers:[{caller_name, module_path, category, object_name, line, is_export, level}], "
-        "triggers:[{edge_type, source_name, source_kind, detail, file, line, caller_name, object_name, category, target_key, resolved}]}], "
+        "triggers?}], "
         "visited:int, truncated_targets:[{name, level, total, returned}], "
         "_meta:{exact_available, root_exact, exact_targets, fallback_targets, exact_rows, fallback_rows, "
         "node_budget_exceeded, visited_cap}} "
-        "| {error, hint, supported_directions}  # triggers: ключ есть ТОЛЬКО при include_triggers=True (не-call рёбра: подписки/события форм/рег.задания/CFE-перехваты)",
+        "| {error, hint, supported_directions}",
         "code",
         [
             "иерархия вызовов",
@@ -11896,6 +12113,9 @@ def make_bsl_helpers(
         "  # Для глубины 1 эффективнее обычный find_callers_context().\n"
         "  # ТРИГГЕРЫ (include_triggers=True): метод вызывается не только из кода. Подмешивает на\n"
         "  #   КАЖДЫЙ узел node['triggers'] — не-call ребра (подписки/события форм/рег.задания/CFE).\n"
+        "  #   Ключ triggers есть ТОЛЬКО при include_triggers=True; форма строки:\n"
+        "  #   {edge_type, source_name, source_kind, detail, file, line, caller_name, object_name,\n"
+        "  #    category, target_key, resolved}\n"
         "  #   Для ОбработкаПроведения из ТРИГГЕРОВ придет разве что CFE-перехват обработчика\n"
         "  #   расширением: ребра «его зовет платформа» не существует. (Явные BSL-вызовы, если\n"
         "  #   они есть, приходят обычными callers — триггеры к ним отношения не имеют.)\n"
@@ -11913,8 +12133,7 @@ def make_bsl_helpers(
         "_meta:{max_depth, nodes_expanded, visited_cap, budget_exceeded, from_key, to_exact, to_key, "
         "precision:'exact'|'heuristic', direction:'callers-reverse'}} | "
         "{found:False, error, hint, candidates:[{object_name, category, module_type, file, line}], _meta:{ambiguous, ambiguous_arg}}  "
-        "# ДОСТИЖИМОСТЬ по графу ВЫЗОВОВ (from → … → to). call_line = строка РЕБРА к следующему узлу (НЕ определения); у терминального (to) None. "
-        "Многозначное имя без своего hint → ранний {error, hint, candidates} (проверяй 'error' in res ПЕРЕД found/budget_exceeded; добавь to_hint/from_hint из candidates)",
+        "# ДОСТИЖИМОСТЬ по графу ВЫЗОВОВ; call_line — строка РЕБРА; сначала проверяй 'error'",
         "code",
         [
             "путь вызовов",
@@ -11925,7 +12144,10 @@ def make_bsl_helpers(
             "вызывает ли",
             "путь между методами",
         ],
-        "FIND PATH (достижим ли to_name из from_name по графу ВЫЗОВОВ):\n"
+        "FIND PATH (достижим ли to_name из from_name по графу ВЫЗОВОВ, from → … → to):\n"
+        "  # call_line у ТЕРМИНАЛЬНОГО узла (to) равен None — ребра дальше нет.\n"
+        "  # Многозначное имя без своего hint → ранний {error, hint, candidates}: проверяй\n"
+        "  #   'error' in res ПЕРЕД found/budget_exceeded и добавь to_hint/from_hint из candidates.\n"
         "  res = find_path('НизкоуровневыйМетод', 'ОбработчикUI')\n"
         "  if 'error' in res:  # многозначное имя без hint — проверь ПЕРЕД found/budget_exceeded\n"
         "      # res['candidates'] = [{object_name, category, module_type, file, line}] — для МНОГОЗНАЧНОГО конца\n"
@@ -11987,9 +12209,7 @@ def make_bsl_helpers(
         "module_type, totals:{methods, exports, regions, loc}, outline:[{region, line, end_line, totals:{methods, "
         "exports}, children:[...], methods:[...]}], orphan_methods, _meta:{index_used, fallback_reason, "
         "skipped_live?, resolved_from_name, chosen_module?, candidates?, ambiguous?}}  "
-        "# ДЕШЁВЫЙ СКЕЛЕТ модуля (дерево #Область + агрегаты) — первый хоп перед чтением тел; "
-        "path ИЛИ имя объекта (имя → прозрачный авто-выбор модуля, resolver-ключи в _meta, ambiguous=True при тай-брейке); "
-        "no_live=True → на stale/no-index НЕ читает файл (skipped-маркер _meta.skipped_live)",
+        "# ДЕШЕВЫЙ СКЕЛЕТ модуля (#Область + агрегаты) — первый хоп перед чтением тел",
         "code",
         [
             "оглавление",
@@ -12003,6 +12223,10 @@ def make_bsl_helpers(
             "скелет модуля",
         ],
         "MODULE OUTLINE (дешёвая структурная карта ДО чтения тел):\n"
+        "  # Первый аргумент — path ИЛИ имя объекта: по имени идет прозрачный авто-выбор модуля,\n"
+        "  #   resolver-ключи в _meta (resolved_from_name / chosen_module / candidates),\n"
+        "  #   ambiguous=True при тай-брейке. no_live=True → на stale/no-index файл НЕ читается\n"
+        "  #   вовсе (skipped-маркер _meta.skipped_live).\n"
         "  mods = find_module('Расчёты')\n"
         "  if mods:\n"
         "      o = get_module_outline(mods[0]['path'], include_methods=False)  # только области + агрегаты\n"
@@ -12090,7 +12314,7 @@ def make_bsl_helpers(
     _reg(
         "parse_form",
         parse_form,
-        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers, commands, attributes:[{name, types, main, main_table, query_text}]}]  # у атрибута формы ключ types — СТРОКА 'Тип1, Тип2' (не list: для списка используй types.split(', ') if types else []), НЕ attr_type (это поле find_attributes)",
+        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers:[{element, element_type, event, handler, data_path, scope}], commands:[{name, action}], attributes:[{name, types, main, main_table, query_text}]}]  # имя элемента — element (НЕ element_name: так называется колонка БД); НЕ attr_type (это поле find_attributes); types — list[str]; в CF элемент несет префикс пространства имен (cfg:/xs:/v8:), в EDT нет, поэтому `'DynamicList' in types` — сравнение по ЭЛЕМЕНТУ — на CF дает False: сверяй ХВОСТ t.rsplit(':',1)[-1]",
         "xml",
         kw=["parse_form", "события формы", "обработчики формы", "элементы формы", "form handler", "form event"],
         recipe=(
@@ -12100,13 +12324,25 @@ def make_bsl_helpers(
             '    print(f\'{f["form_name"]}: {len(f["handlers"])} handlers, {len(f["commands"])} commands\')\n'
             "    for h in f['handlers']:\n"
             '        print(f\'  {h["element"] or "[form]"}.{h["event"]} → {h["handler"]}\')\n\n'
-            "# Обратный поиск: к чему привязана процедура?\n"
-            "forms = parse_form('БанковскиеСчетаОрганизаций', handler='ПриСозданииНаСервере')\n\n"
-            "# module_path для быстрого перехода к коду:\n"
-            "for f in forms:\n"
-            "    if f['module_path']:\n"
-            "        procs = extract_procedures(f['module_path'])\n"
-            "        print(f'{f[\"form_name\"]}: {len(procs)} procedures')\n"
+            "# Обратный поиск: к чему привязана процедура? ОТДЕЛЬНАЯ переменная —\n"
+            "# отфильтрованный набор НЕЛЬЗЯ переиспользовать для анализа реквизитов:\n"
+            "# формы без этого обработчика выпадут, и вывод «типа X нет» будет ложным.\n"
+            "handler_forms = parse_form('БанковскиеСчетаОрганизаций', handler='ПриСозданииНаСервере')\n\n"
+            "# module_path именно найденных привязок:\n"
+            "for hf in handler_forms:\n"
+            "    if hf['module_path']:\n"
+            "        procs = extract_procedures(hf['module_path'])\n"
+            "        print(f'{hf[\"form_name\"]}: {len(procs)} procedures')\n\n"
+            "# ТИПЫ РЕКВИЗИТА: types — СПИСОК строк, не строка. В выгрузке Конфигуратора\n"
+            "# элемент несет префикс пространства имен (cfg:/xs:/v8:/mxl:...), в EDT его нет,\n"
+            "# поэтому `'DynamicList' in a['types']` — сравнение по ЭЛЕМЕНТУ — на CF дает\n"
+            "# False: на боевой конфигурации это дало ложный вывод «DynamicList нет ни в\n"
+            "# одной форме», хотя он есть в двух. Сверяй ХВОСТ элемента — работает в обоих\n"
+            "# форматах и не ловит посторонний 'МойDynamicList'. Ищи по ПОЛНОМУ набору форм:\n"
+            "dyn = [(f['form_name'], a['name']) for f in forms for a in f['attributes']\n"
+            "       if any(t.rsplit(':', 1)[-1] == 'DynamicList' for t in a['types'])]\n"
+            "# Основной реквизит формы — a['main']: True НЕ БОЛЕЕ чем у одного, а у общих\n"
+            "# и произвольных форм его может не быть вовсе (next(...) без default упадет).\n"
         ),
     )
     _reg(
@@ -12226,12 +12462,7 @@ def make_bsl_helpers(
         "get_object_full_structure(name) -> {object_name, category, synonym, posting, attributes, "
         "tabular_sections:[{name, synonym, columns}], dimensions, resources, predefined_items, "
         "enum_values_for_typed_refs:{Enum.X:[{name,synonym}]}, forms:[str], "
-        "_meta:{index_used: bool — True когда возвращённые структурные секции взяты из индекса "
-        "(контракт об ИСТОЧНИКЕ, не о ПОЛНОТЕ — для проверки полноты на stale-индексе вызывай parse_object_xml); "
-        "fallback_reason: 'index_unavailable_or_table_missing' | 'index_empty_for_object' | "
-        "'category_without_attributes_filled_via_live_xml' | 'index_partially_enriched_from_live_xml' | "
-        "'parse_failed: ...' | None; "
-        "ts_synonyms_available: bool — True ТОЛЬКО если у хотя бы одной TS в результате непустой synonym}}",
+        "_meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}",
         "composite",
         [
             "структура объекта",
@@ -12265,7 +12496,14 @@ def make_bsl_helpers(
         "      print(f\"  ресурс {r['name']}: {r['type']}\")\n"
         "  # _meta.index_used=False означает live XML fallback (синонимы ТЧ доступны только в этом режиме)\n"
         "  if not s['_meta']['index_used']:\n"
-        "      print('Fallback:', s['_meta']['fallback_reason'])",
+        "      print('Fallback:', s['_meta']['fallback_reason'])\n"
+        "  # _meta подробно:\n"
+        "  #   index_used — True когда возвращенные структурные секции взяты из индекса. Это контракт\n"
+        "  #     об ИСТОЧНИКЕ, а НЕ о ПОЛНОТЕ: полноту на устаревшем индексе проверяй parse_object_xml.\n"
+        "  #   fallback_reason — 'index_unavailable_or_table_missing' | 'index_empty_for_object' |\n"
+        "  #     'category_without_attributes_filled_via_live_xml' |\n"
+        "  #     'index_partially_enriched_from_live_xml' | 'parse_failed: ...' | None.\n"
+        "  #   ts_synonyms_available — True ТОЛЬКО если хотя бы у одной ТЧ в результате непустой synonym.",
     )
     _reg(
         "get_object_modules",
@@ -12275,9 +12513,7 @@ def make_bsl_helpers(
         "outline:[{region, line, end_line, totals, children, methods?}], "
         "overrides:{count, methods:[...]}, _meta:{index_used, fallback_reason, skipped_live}}], "
         "totals:{modules, methods, exports, overrides}, _meta:{index_used, modules_truncated, modules_skipped_live}} | {error, _meta}  "
-        "# ДЕШЁВЫЙ КОД-СКЕЛЕТ объекта: все модули + дерево #Область + агрегаты + флаги перехватов в 1 вызов. "
-        "НЕ читает тела (extract_procedures) на индексном пути и НЕ парсит XML — легче analyze_object; "
-        "no_live=True → stale/no-index модули помечаются skipped_live БЕЗ live-чтения",
+        "# ДЕШЕВЫЙ КОД-СКЕЛЕТ объекта за 1 вызов",
         "composite",
         [
             "модули объекта",
@@ -12289,6 +12525,8 @@ def make_bsl_helpers(
             "области объекта",
         ],
         "OBJECT CODE SKELETON (все модули объекта + #Область + агрегаты, 1 вызов вместо find_module+N×get_module_outline):\n"
+        "  # На индексном пути НЕ читает тела (extract_procedures) и НЕ парсит XML — легче analyze_object.\n"
+        "  # no_live=True → stale/no-index модули помечаются skipped_live БЕЗ live-чтения.\n"
         "  om = get_object_modules('РеализацияТоваров')  # include_methods=False — только области + агрегаты\n"
         "  if 'error' in om:\n"
         "      print(om['error'])\n"
@@ -12392,12 +12630,20 @@ def make_bsl_helpers(
         "find_register_movements(doc_name, posting_calls_offset=0) -> {code_registers:[dict], suppressed_main_code_registers?:[dict],"
         " erp_mechanisms/manager_tables/adapted_registers:[str], is_postable?, posting_handler_present?,"
         " hint?, partial?, _meta?}"
-        "  # code_registers — словари, остальные три — списки ИМЕН-строк;"
-        " partial=True означает неполное чтение CFE, modules_scanned содержит только успешно прочитанные модули;"
-        " сначала смотри is_postable; при пустом code_registers — posting_handler_present + hint",
+        "  # code_registers — словари (source: code|manager_code), остальные три — списки ИМЕН-строк",
         "business",
         ["движени", "movement", "регистр", "register", "проведен", "posting"],
         "TRACE DOCUMENT REGISTER MOVEMENTS:\n"
+        "  # partial=True означает неполное чтение CFE: _meta.modules_scanned содержит только\n"
+        "  #   успешно прочитанные модули. При пустом code_registers смотри posting_handler_present + hint.\n"
+        "  # source у строки code_registers:\n"
+        "  #   'code'         — прямое Движения.X в ObjectModule документа;\n"
+        "  #   'manager_code' — запись набора из МОДУЛЯ МЕНЕДЖЕРА документа\n"
+        "  #     (Регистры<Тип>.X.СоздатьНаборЗаписей()), имя сверено с каталогом регистров.\n"
+        "  #     Фреймворковые схемы, где имя регистра собирается в структуре во время\n"
+        "  #     исполнения, статически неразрешимы и сюда НЕ попадают.\n"
+        "  #   &Вместо('ОбработкаПроведения') относится к процедуре ObjectModule и строку\n"
+        "  #     менеджера НЕ подавляет: связь между ними не доказана.\n"
         "  result = find_register_movements('ПриобретениеТоваровУслуг')\n"
         "  suppressed = result.get('suppressed_main_code_registers', [])  # main-handler, отсеченный CFE-заменой\n"
         "  if result.get('is_postable') is not False:\n"
@@ -12446,6 +12692,10 @@ def make_bsl_helpers(
         "FIND STATIC WRITER CANDIDATES:\n"
         "  result = find_register_writers('ТоварыНаСкладах')\n"
         "  # runtime_filtered=False: CFE/Posting проверь через forward; свежесть main-строки — по живому файлу\n"
+        "  # source: code | manager_code | erp_mechanism | manager_table | adapted.\n"
+        "  #   manager_code — набор записей из МОДУЛЯ МЕНЕДЖЕРА документа, имя сверено\n"
+        "  #   с каталогом регистров. Схемы, где имя регистра собирается в структуре\n"
+        "  #   во время исполнения, статически неразрешимы и сюда НЕ попадают.\n"
         "  for w in result['writers']:\n"
         "      detail = w.get('lines') or w.get('source', '')\n"
         "      print(f\"  {w['document']} ({detail})\")",
@@ -12488,7 +12738,8 @@ def make_bsl_helpers(
         "find_functional_options",
         find_functional_options,
         "find_functional_options(obj_name, include_code=True, limit=None) -> {xml_options, code_options}"
-        " | {…, total, returned, has_more, partial?, _meta?}  # limit — per-bucket cap;"
+        " | {…, total, xml_total, code_total, returned, has_more, partial?, _meta?}  # total = xml_total + code_total, но точность корзин РАЗНАЯ:"
+        " xml_total — exact-отбор (это и есть ответ «сколько ФО у объекта»), code_total — подстрочный grep; limit — per-bucket cap;"
         " empty obj сканирует 20 BSL-модулей и при большем каталоге ставит partial=True;"
         " вызывать limit= ИМЕНОВАННО (2-й позиционный — include_code)",
         "business",
@@ -12544,7 +12795,9 @@ def make_bsl_helpers(
     _reg(
         "search_methods",
         search_methods,
-        "search_methods(query, limit=30) -> [{name, type, is_export, params(list), module_path, object_name, rank}]",
+        "search_methods(query, limit=30) -> [{name, type, is_export, params(list), module_path, object_name, rank}]"
+        "  # main FTS — trigram: запрос короче 3 символов по ОСНОВНОМУ индексу не ищется вовсе,"
+        " а при расширениях ответ будет пуст либо ТОЛЬКО из их методов — для поиска по main бери от 3 символов",
         "discovery",
         ["поиск метод", "search", "fts", "full-text", "найти метод", "подстрок"],
         "SEARCH METHODS BY NAME (FTS5, requires pre-built index with --no-fts NOT set):\n"
@@ -12570,16 +12823,32 @@ def make_bsl_helpers(
     _reg(
         "search_regions",
         search_regions,
-        "search_regions(query, limit=200, count_only=False) -> [{name, line, end_line, module_path, object_name, category}] "
-        "| {total, source, truncated, scope} + total_main/total_extensions при CFE",
+        "search_regions(query, limit=200, count_only=False, group_by=None) -> [{name, line, end_line, module_path, object_name, category}] "
+        "| count_only: {total, source, truncated, scope} + total_main/total_extensions при CFE "
+        "| group_by='name'|'category': {groups:[{key,count}], groups_total, groups_returned, truncated, group_by, source, scope}"
+        "  # список режется по limit и идет ORDER BY name — агрегаты только через group_by;"
+        " 0 совпадений НЕ доказывает отсутствие: подстрока без стемминга — проверь словоформу/корень",
         "discovery",
         ["область", "region", "search_regions", "#Область"],
         "FIND CODE REGIONS:\n"
         "  regions = search_regions('Себестоимость')\n"
         "  for r in regions:\n"
         "      print(r['category'], r['object_name'], r['name'], f'L{r[\"line\"]}-{r[\"end_line\"]}')\n"
-        "  # CENSUS (молча усекается по limit без сигнала) — точное число без выдачи:\n"
+        "  # 0 совпадений — НЕ доказательство отсутствия: поиск идёт подстрокой без\n"
+        "  # стемминга, поэтому 'Себестоимость' не находит 'Себестоимости'. Прежде чем\n"
+        "  # писать «такого нет», проверь другую словоформу или корень ('Себестоимост').\n"
+        "  # CENSUS — точное число без выдачи:\n"
         "  n = search_regions('Себестоимость', count_only=True)['total']\n"
+        "  # ТОП-N ПО ЧАСТОТЕ — только так. Списочная ветка при пустом query идет\n"
+        "  # ORDER BY name, поэтому limit дает АЛФАВИТНЫЙ префикс, и топ по нему неверен\n"
+        "  # (на боевой конфигурации топ-10 по 5000 из 57652 не пересекся с истинным).\n"
+        "  # group_by считает SQLite по ПОЛНОМУ набору, limit режет уже готовые группы:\n"
+        "  top = search_regions('', group_by='name', limit=10)\n"
+        "  for g in top['groups']:\n"
+        "      print(g['key'], g['count'])   # groups_total = сколько всего разных имен\n"
+        "  # sum(count по ВСЕМ группам) == count_only['total'] — scope у них одинаковый.\n"
+        "  # Если списочный вызов вернул ровно limit строк, в ответе rlm_execute придет\n"
+        "  # efficiency_hint list_truncated:<helper> — выдача, возможно, усечена.\n"
         "  # count считает в ТОМ ЖЕ scope, что и выдача (v1.30.0): при настроенных\n"
         "  # расширениях и непустом query это main index + live-расширения, ответ несёт\n"
         "  # total_main/total_extensions и scope='main_index+live_extensions'.\n"
@@ -12590,7 +12859,8 @@ def make_bsl_helpers(
         "search_module_headers",
         search_module_headers,
         "search_module_headers(query, limit=200, count_only=False) -> [{module_path, object_name, category, header_comment}] "
-        "| {total, source, truncated, scope} + total_main/total_extensions при CFE",
+        "| {total, source, truncated, scope} + total_main/total_extensions при CFE"
+        "  # подстрока без стемминга, как у search_regions: 0 совпадений НЕ доказывает отсутствие — проверь словоформу/корень",
         "discovery",
         ["заголовок", "header", "комментарий", "search_module_headers"],
         "FIND MODULES BY HEADER COMMENT:\n"
@@ -12698,7 +12968,9 @@ def make_bsl_helpers(
     _reg(
         "find_references_to_object",
         find_references_to_object,
-        "find_references_to_object(object_ref, kinds=None, limit=1000, include_code=False) -> {object, references: [{used_in, path, line, kind}], total, truncated, partial, by_kind} (+ code_usages/code_total/code_by_kind/code_truncated/code_partial/code_meta when include_code=True)",
+        "find_references_to_object(object_ref, kinds=None, limit=1000, include_code=False) -> {object, references: [{used_in, path, line, kind}], total, truncated, partial, by_kind} (+ code_usages/code_total/code_by_kind/code_truncated/code_partial/code_meta when include_code=True)"
+        "  # line заполнена у 5 видов (attribute_type, owner, based_on, default_object_form, default_list_form) на индексе v15+, у остальных None — это КОНТРАКТ, а не пропуск;"
+        " неизвестный kind даёт пустой ответ + _meta.arg_warning",
         "business",
         [
             "ссылк",
@@ -12720,10 +12992,10 @@ def make_bsl_helpers(
         "  full = find_references_to_object('Документ.X', include_code=True)\n"
         "  print(f\"meta={full['total']} code={full['code_total']} {full['code_by_kind']}\")\n"
         "  # On v11 indexes (no metadata_references table) — partial=True via live scan\n"
-        "  # NB: line у attribute_type — best-effort строка первого по файлу\n"
-        "  #   <Name>Имя</Name> (CF) / <name>Имя</name> (EDT), а не строка тега типа\n"
-        "  #   (<v8:Type> в CF / <types> в EDT);\n"
-        "  #   при одноимённых элементах якорь может относиться к более раннему блоку",
+        "  # line — строка САМОЙ ссылки (тег типа), а не строка объявления владельца.\n"
+        "  #   Заполнена у видов attribute_type / owner / based_on / default_object_form /\n"
+        "  #   default_list_form; у остальных видов line=None — это заявленный контракт,\n"
+        "  #   а не пропуск (например, у role_rights строка файла прав агенту ничего не дает).",
     )
 
     _reg(

@@ -101,6 +101,11 @@ mcp = FastMCP(
         "helpers via rlm_execute; rlm_help() lists the available recipes and helpers."
     ),
 )
+# FastMCP 1.x не принимает version в конструкторе, а низкоуровневый сервер без неё
+# подставляет версию пакета mcp — интегратор видел в serverInfo.version чужую версию
+# (при mcp 1.29.0 и нашей 1.32.1 сервер представлялся как 1.29.0) и не мог выбрать
+# парсер под нашу.
+mcp._mcp_server.version = importlib.metadata.version("rlm-tools-bsl")
 
 session_manager = SessionManager()  # defaults for tests/import
 
@@ -796,8 +801,11 @@ def _rlm_start(
                         idx_version = int(idx_stats.get("builder_version") or 0)
                         if idx_version < BUILDER_VERSION:
                             msg = (
-                                f"Index built with v{idx_version}, current v{BUILDER_VERSION} — "
-                                f'new helpers available after rebuild: rlm-bsl-index index build "{resolved}"'
+                                f"Индекс собран сборщиком v{idx_version}, текущий v{BUILDER_VERSION}. "
+                                "Он продолжает работать, но содержит объявления и движения, взятые "
+                                "из комментариев и строковых литералов. Следующий 'rlm-bsl-index "
+                                f'index update "{resolved}"\' пересоберет индекс полностью — '
+                                "это разовая длительная операция."
                             )
                             idx_warnings.append(msg)
                             logger.warning("rlm_start: session=%s %s", session_id, msg)
@@ -1102,6 +1110,15 @@ def _rlm_start(
         # No index loaded — SAME key set with safe defaults so the payload shape is stable
         # (strategy/docs tell the agent to read these from rlm_start.index; a missing key
         # would break that or push agents back to a get_index_info() call).
+        _incomplete_status = "incomplete" if (index_incomplete(db_path) or idx_load_failed) else "missing"
+        if _incomplete_status == "incomplete":
+            # v1.33.0: раньше здесь выставлялся только машинный index_status, а
+            # idx_warnings оставался пустым — человек и агент об оборванной сборке
+            # не узнавали. Текст без «ё» (ломает совпадение по ключевым словам).
+            idx_warnings.append(
+                "Предыдущая пересборка индекса не была завершена. Повторите "
+                "'rlm-bsl-index index update' — это доведет сборку до конца."
+            )
         index_block = {
             "loaded": index_loaded,
             "index_check": "quick",
@@ -1130,7 +1147,7 @@ def _rlm_start(
             # — the marker may already be cleared by a finishing rebuild, so "missing" would
             # lie; "incomplete" signals retry — codex Low). Else "missing". index_incomplete
             # is None-safe → a non-existent db yields "missing".
-            "index_status": "incomplete" if (index_incomplete(db_path) or idx_load_failed) else "missing",
+            "index_status": _incomplete_status,
             "warnings": idx_warnings,
         }
 

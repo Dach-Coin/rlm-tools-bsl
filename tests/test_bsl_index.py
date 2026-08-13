@@ -2312,3 +2312,226 @@ def test_substr_readers_cyrillic_case_insensitive(tmp_path, monkeypatch):
         assert reader.get_xdto_packages("обмен")  # ПакетОбмена
     finally:
         reader.close()
+
+
+# ── v1.33.0: билдер смотрит на исходник через маску ─────────────────────────
+
+from rlm_tools_bsl.bsl_index import _extract_movements, _parse_procedures_from_lines  # noqa: E402
+
+
+def _names(src: str):
+    return [p["name"] for p in _parse_procedures_from_lines(src.split("\n"))]
+
+
+def test_bsp_header_example_does_not_create_ghost_and_does_not_eat_real_method():
+    src = (
+        "// Модуль содержит служебные процедуры.\n"
+        "//\n"
+        "// Пример использования:\n"
+        "//   Процедура ОпределитьНастройки(Настройки) Экспорт\n"
+        '//       Настройки.Вставить("Ключ", Значение);\n'
+        "//   КонецПроцедуры\n"
+        "\n"
+        "Процедура НастроитьВарианты(Настройки) Экспорт\n"
+        '    Настройки.Вставить("А", 1);\n'
+        "КонецПроцедуры\n"
+    )
+    assert _names(src) == ["НастроитьВарианты"]
+
+
+def test_module_level_string_literal_does_not_create_ghost():
+    src = (
+        "Перем Шаблон;\n"
+        'Шаблон = "Процедура Призрак(А) Экспорт";\n'
+        "\n"
+        "Процедура РеальныйМетод(Б) Экспорт\n"
+        "    Возврат;\n"
+        "КонецПроцедуры\n"
+    )
+    assert _names(src) == ["РеальныйМетод"]
+
+
+def test_query_continuation_line_does_not_create_ghost():
+    src = (
+        "Перем ТекстЗапроса;\n"
+        'ТекстЗапроса = "ВЫБРАТЬ *\n'
+        "    |Процедура Призрак(Б) Экспорт\n"
+        '    |ИЗ Справочник.Х";\n'
+        "\n"
+        "Процедура РеальныйМетод(В) Экспорт\n"
+        "КонецПроцедуры\n"
+    )
+    assert _names(src) == ["РеальныйМетод"]
+
+
+def test_string_default_param_is_stored_verbatim_not_masked():
+    """params берётся из ОРИГИНАЛА по смещениям — маска не должна съесть дефолт."""
+    src = 'Процедура СоЗначением(Знач Адрес = "http://x/y", Знач Разделитель = ", ") Экспорт\nКонецПроцедуры\n'
+    (proc,) = _parse_procedures_from_lines(src.split("\n"))
+    assert proc["params"] == 'Знач Адрес = "http://x/y", Знач Разделитель = ", "'
+
+
+def test_async_single_line_function_still_indexed():
+    src = "Асинх Функция ЗагрузитьДанные(Ссылка) Экспорт\n    Возврат 1;\nКонецФункции\n"
+    assert _names(src) == ["ЗагрузитьДанные"]
+
+
+def test_async_multiline_function_now_indexed():
+    src = "Асинх Функция Длинная(Ссылка,\n    Второй) Экспорт\n    Возврат 1;\nКонецФункции\n"
+    (proc,) = _parse_procedures_from_lines(src.split("\n"))
+    assert proc["name"] == "Длинная"
+    assert proc["params"] == "Ссылка,     Второй"
+    assert proc["is_export"] is True
+
+
+def test_commented_end_procedure_still_does_not_shorten_method():
+    src = "Процедура Настоящая()\n    // КонецПроцедуры\n    А = 1;\nКонецПроцедуры\n"
+    (proc,) = _parse_procedures_from_lines(src.split("\n"))
+    assert proc["end_line"] == 4
+
+
+# ОБЩАЯ ФАБРИКА — BslFileInfo это dataclass с СЕМЬЮ обязательными полями
+# (format_detector.py): relative_path, category, object_name, module_type,
+# form_name, command_name, is_form_module. Вызов с тремя полями даёт TypeError
+# ДО входа в проверяемый код, то есть тест падает, ничего не проверив.
+def _doc_info(module_type: str, object_name: str = "Д", rel: str = "m.bsl"):
+    from rlm_tools_bsl.format_detector import BslFileInfo
+
+    return BslFileInfo(
+        relative_path=rel,
+        category="Documents",
+        object_name=object_name,
+        module_type=module_type,
+        form_name=None,
+        command_name=None,
+        is_form_module=False,
+    )
+
+
+def test_commented_movement_is_not_extracted():
+    info = _doc_info("ObjectModule", rel="x.bsl")
+    content = (
+        "Процедура ОбработкаПроведения(Отказ, Режим)\n"
+        "    // Движения.Призрак.Записать();\n"
+        "    Движения.Настоящий.Записывать = Истина;\n"
+        "КонецПроцедуры\n"
+    )
+    regs = {r[0] for r in _extract_movements(content, info, "x.bsl")}
+    assert regs == {"Настоящий"}
+
+
+def test_commented_erp_mechanism_is_not_extracted():
+    """Ветка erp_mechanism читает имя ИЗ литерала, поэтому идёт по маске-только-комментарии."""
+    info = _doc_info("ManagerModule")
+    content = (
+        'МеханизмыДокумента.Добавить("Живой");\n'
+        '//МеханизмыДокумента.Добавить("Мертвый");\n'
+        '// МеханизмыДокумента.Добавить("МертвыйСПробелом");\n'
+    )
+    rows = _extract_movements(content, info, "m.bsl")
+    regs = {r[0] for r in rows if r[1] == "erp_mechanism"}
+    assert regs == {"Живой"}
+
+
+def test_commented_adapted_register_is_not_extracted():
+    """Та же ветка для adapted: ИмяРегистра = "X" внутри закомментированного блока."""
+    info = _doc_info("ManagerModule")
+    content = (
+        "Функция АдаптированныйТекстЗапросаДвиженийПоРегистру(П)\n"
+        '    ИмяРегистра = "Живой";\n'
+        '    // ИмяРегистра = "Мертвый";\n'
+        "КонецФункции\n"
+    )
+    rows = _extract_movements(content, info, "m.bsl")
+    regs = {r[0] for r in rows if r[1] == "adapted"}
+    assert regs == {"Живой"}
+
+
+# ── v1.33.0: движения из ManagerModule (source='manager_code') ──────────────
+
+from rlm_tools_bsl.bsl_index import _known_register_names  # noqa: E402
+
+
+def _mgr(content):
+    # _doc_info — фабрика выше: BslFileInfo требует все семь полей
+    return _extract_movements(content, _doc_info("ManagerModule"), "m.bsl")
+
+
+def test_manager_create_recordset_is_extracted():
+    rows = _mgr(
+        "Процедура Провести() Экспорт\n"
+        "    Наб = РегистрыСведений.МойРегистр.СоздатьНаборЗаписей();\n"
+        "    Наб.Записать();\n"
+        "КонецПроцедуры\n"
+    )
+    assert ("МойРегистр", "manager_code", "m.bsl") in rows
+
+
+def test_manager_create_recordset_all_register_kinds():
+    for coll, reg in (
+        ("РегистрыНакопления", "Р1"),
+        ("РегистрыБухгалтерии", "Р2"),
+        ("РегистрыРасчета", "Р3"),
+        ("РегистрыСведений", "Р4"),
+    ):
+        rows = _mgr(f"Н = {coll}.{reg}.СоздатьНаборЗаписей();\n")
+        assert (reg, "manager_code", "m.bsl") in rows, coll
+
+
+def test_manager_commented_create_recordset_is_not_extracted():
+    rows = _mgr("// Наб = РегистрыСведений.Призрак.СоздатьНаборЗаписей();\n")
+    assert not [r for r in rows if r[0] == "Призрак"]
+
+
+def test_manager_field_access_is_not_a_register():
+    """Движения.Количество в менеджере — поле набора, не регистр: source manager_code не выдаётся."""
+    rows = _mgr("Для Каждого Стр Из Движения Цикл\n    Стр.Количество = Движения.Количество;\nКонецЦикла;\n")
+    assert not [r for r in rows if r[1] == "manager_code"]
+
+
+def test_known_register_names_scans_four_catalogs(tmp_path):
+    for cat, name in (
+        ("InformationRegisters", "РС1"),
+        ("AccumulationRegisters", "РН1"),
+        ("AccountingRegisters", "РБ1"),
+        ("CalculationRegisters", "РР1"),
+    ):
+        (tmp_path / cat / name).mkdir(parents=True)
+    assert _known_register_names(tmp_path) == {"рс1", "рн1", "рб1", "рр1"}
+
+
+def test_manager_rows_filtered_by_register_catalog(tmp_path, monkeypatch):
+    """Строка manager_code с именем, которого нет среди регистров, до таблицы не доходит."""
+    (tmp_path / "InformationRegisters" / "Настоящий").mkdir(parents=True)
+    (tmp_path / "Documents" / "Д" / "Ext").mkdir(parents=True)
+    (tmp_path / "Documents" / "Д" / "Ext" / "ManagerModule.bsl").write_text(
+        "Н = РегистрыСведений.Настоящий.СоздатьНаборЗаписей();\n"
+        "М = РегистрыСведений.НетТакого.СоздатьНаборЗаписей();\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Configuration.xml").write_text(
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Configuration>'
+        "<Properties><Name>Т</Name></Properties></Configuration></MetaDataObject>",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
+    db_path = IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=True)
+    con = sqlite3.connect(db_path)
+    regs = {r[0] for r in con.execute("SELECT register_name FROM register_movements WHERE source='manager_code'")}
+    con.close()
+    assert regs == {"Настоящий"}
+
+
+def test_manager_recordset_requires_left_boundary():
+    """Имя коллекции регистров обязано начинаться на границе идентификатора.
+
+    Без левой границы `МоиРегистрыСведений.Мой.СоздатьНаборЗаписей()` и
+    `Обертка.РегистрыСведений.Мой...` давали ложную пару документ-регистр:
+    сверка с каталогом регистров это ловит не всегда — имя могло совпасть
+    с настоящим регистром.
+    """
+    assert not [r for r in _mgr("Н = МоиРегистрыСведений.Мой.СоздатьНаборЗаписей();\n") if r[1] == "manager_code"]
+    assert not [r for r in _mgr("Н = Обертка.РегистрыСведений.Мой.СоздатьНаборЗаписей();\n") if r[1] == "manager_code"]
+    # регресс-гард: законные формы по-прежнему находятся
+    assert ("Мой", "manager_code", "m.bsl") in _mgr("    Н = РегистрыСведений.Мой.СоздатьНаборЗаписей();\n")
+    assert ("Foo", "manager_code", "m.bsl") in _mgr("X = InformationRegisters.Foo.CreateRecordSet();\n")

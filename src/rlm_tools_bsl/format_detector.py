@@ -284,16 +284,52 @@ def classify_source(base_path: str) -> SourceSupport:
 
 def parse_bsl_path(file_path: str, base_path: str) -> BslFileInfo:
     """Universal parser for .bsl file paths."""
-    fp = Path(file_path)
-    bp = Path(base_path)
+    # Быстрый путь: строковый префикс вместо Path.relative_to. Функция зовется на
+    # КАЖДЫЙ модуль — и билдером при сборке, и живым каталогом хелперов, — а два
+    # объекта Path нужны здесь исключительно ради относительного пути (замер: 23 461
+    # вызов = 2.4 с только внутри relative_to). Откат на прежнюю ветку — при любом
+    # нетривиальном пути (несовпадение регистра, `//`, `/./`, `/../`), поэтому
+    # семантика не меняется, меняется только цена типичного случая.
+    relative_path: str | None = None
+    if base_path:
+        # Обратный слэш — разделитель ТОЛЬКО на Windows. На POSIX это допустимый
+        # символ имени файла, и `PurePosixPath` его разделителем не считает: слепой
+        # replace превратил бы `Name\Ext\Module.bsl` в несуществующий путь из трёх
+        # сегментов, а билдер сохранил бы такой `rel_path` в индекс.
+        norm_fp = file_path.replace("\\", "/") if os.name == "nt" else file_path
+        norm_bp = (base_path.replace("\\", "/") if os.name == "nt" else base_path).rstrip("/")
+        # База, которую `Path.relative_to` НЕ принимает как якорь, и потому старая
+        # ветка отдавала полный путь: голый диск (`C:` — он drive-RELATIVE, а не
+        # корень) и UNC-хост без шары (`//server`). Быстрый префикс тут срезал бы
+        # лишнее и разошёлся бы со старым поведением.
+        drive_relative = norm_bp.endswith(":")
+        unc_hostonly = norm_bp.startswith("//") and norm_bp.count("/") < 3
+        if not drive_relative and not unc_hostonly and norm_fp.startswith(norm_bp + "/"):
+            tail = norm_fp[len(norm_bp) + 1 :]
+            # `tail.startswith("/")` — это двойной разделитель РОВНО на границе базы
+            # (`D:/a/b//X`): внутри tail его уже не видно, а Path такой путь схлопывает.
+            # `tail.endswith("/")` — хвостовой разделитель, который Path тоже схлопывает
+            # (иначе появился бы пустой сегмент и поехал бы разбор `parts`).
+            if (
+                tail
+                and not tail.startswith(("/", "./", "../"))
+                and not tail.endswith("/")
+                and "//" not in tail
+                and "/./" not in tail
+                and "/../" not in tail
+            ):
+                relative_path = tail
+    if relative_path is None:
+        fp = Path(file_path)
+        bp = Path(base_path)
 
-    # Compute relative path and normalize to forward slashes
-    try:
-        rel = fp.relative_to(bp)
-    except ValueError:
-        rel = fp
+        # Compute relative path and normalize to forward slashes
+        try:
+            rel = fp.relative_to(bp)
+        except ValueError:
+            rel = fp
 
-    relative_path = rel.as_posix()
+        relative_path = rel.as_posix()
     parts = relative_path.split("/")
 
     category: str | None = None
