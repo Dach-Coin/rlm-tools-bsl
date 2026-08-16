@@ -100,16 +100,21 @@ def _install_worktree_timeout(monkeypatch) -> None:
     work-tree probes (which carry ``--ignore-cr-at-eol`` or ``ls-files
     --others``) raise ``TimeoutExpired``, marking detection unreliable.
     """
-    real_run = subprocess.run
+    # Патчим именно связанное имя ``bsl_index.run_git``, а не ``subprocess.run``:
+    # на Windows реальный runner вообще не ходит через ``subprocess.run`` (у него
+    # свой CreateProcessW-путь), а seam ``_git_process._run_posix`` захвачен на
+    # импорте. Делегат сохраняется ДО подмены, поэтому критические команды
+    # (rev-parse / merge-base / committed diff) выполняются по-настоящему.
+    real_run_git = bsl_index_mod.run_git
 
-    def fake_run(args, **kwargs):
+    def fake_run_git(args, *, timeout):
         is_worktree_diff = "--ignore-cr-at-eol" in args
         is_untracked = "ls-files" in args and "--others" in args
         if is_worktree_diff or is_untracked:
-            raise subprocess.TimeoutExpired(cmd=args, timeout=kwargs.get("timeout", 60))
-        return real_run(args, **kwargs)
+            raise subprocess.TimeoutExpired(cmd=list(args), timeout=timeout)
+        return real_run_git(args, timeout=timeout)
 
-    monkeypatch.setattr(bsl_index_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(bsl_index_mod, "run_git", fake_run_git)
 
 
 # ---------------------------------------------------------------------------

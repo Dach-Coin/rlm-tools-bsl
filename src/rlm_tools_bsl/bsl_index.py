@@ -23,6 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
+from rlm_tools_bsl._git_process import run_git
 from rlm_tools_bsl.bsl_knowledge import (
     BSL_PATTERNS,
     _merge_proc_continuations_with_mask,
@@ -1084,15 +1085,6 @@ _GLOBAL_TABLE_BY_CATEGORY: dict[str, str] = {
 
 _git_exe: str | None | bool = None  # cached: str=path, False=not found, None=not yet searched
 
-# Common kwargs for all git subprocess calls.
-# errors="replace" handles cp1251 stderr from git on Windows services.
-_GIT_SUBPROCESS_KW: dict = {
-    "capture_output": True,
-    "text": True,
-    "encoding": "utf-8",
-    "errors": "replace",
-}
-
 
 class _GitDirtyResult(NamedTuple):
     """Result of a git dirty / changed-files detection.
@@ -1151,6 +1143,20 @@ def _parse_numstat_paths(stdout: str) -> set[str]:
     return paths
 
 
+def _abs_git_exe(path: str) -> str:
+    """Windows: абсолютный путь к git.exe; на POSIX — без изменений.
+
+    ``run_git`` на Windows создаёт процесс напрямую через ``CreateProcessW`` и
+    передаёт ``lpApplicationName``, а тот PATH не ищет. ``shutil.which`` уже
+    возвращает абсолютный путь в подавляющем большинстве случаев, но
+    нормализация обязана произойти **до** записи в кеш, иначе относительный
+    результат осел бы в ``_git_exe`` на весь процесс.
+    """
+    if os.name != "nt":
+        return path
+    return os.path.abspath(path)
+
+
 def _find_git() -> str | None:
     """Resolve git executable path (cached).
 
@@ -1163,8 +1169,8 @@ def _find_git() -> str | None:
 
     found = shutil.which("git")
     if found:
-        _git_exe = found
-        logger.debug("_find_git: shutil.which → %s", found)
+        _git_exe = _abs_git_exe(found)
+        logger.debug("_find_git: shutil.which → %s", _git_exe)
         return _git_exe
 
     # Windows fallback: check common locations
@@ -1176,8 +1182,8 @@ def _find_git() -> str | None:
         ]
         for c in candidates:
             if os.path.isfile(c):
-                _git_exe = c
-                logger.info("_find_git: found at %s (PATH fallback)", c)
+                _git_exe = _abs_git_exe(c)
+                logger.info("_find_git: found at %s (PATH fallback)", _git_exe)
                 return _git_exe
         # Registry fallback
         try:
@@ -1189,8 +1195,8 @@ def _find_git() -> str | None:
                         install_path = winreg.QueryValueEx(key, "InstallPath")[0]
                         candidate = os.path.join(install_path, "cmd", "git.exe")
                         if os.path.isfile(candidate):
-                            _git_exe = candidate
-                            logger.info("_find_git: found at %s (registry)", candidate)
+                            _git_exe = _abs_git_exe(candidate)
+                            logger.info("_find_git: found at %s (registry)", _git_exe)
                             return _git_exe
                 except OSError:
                     pass
@@ -1223,23 +1229,13 @@ def _git_available(base_path: str) -> bool:
         logger.debug("_git_available: _find_git returned None")
         return False
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "--is-inside-work-tree"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "--is-inside-work-tree"], timeout=10)
         ok = r.returncode == 0 and r.stdout.strip() == "true"
         if not ok:
-            logger.info(
-                "_git_available: cmd=%s rc=%d stdout=%r stderr=%r",
-                cmd[0],
-                r.returncode,
-                r.stdout.strip(),
-                r.stderr.strip()[:200],
-            )
+            logger.info("_git_available: rc=%d", r.returncode)
         return ok
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
-        logger.info("_git_available: exception %s: %s", type(exc).__name__, exc)
+        logger.info("_git_available: exception %s", type(exc).__name__)
         return False
 
 
@@ -1253,11 +1249,7 @@ def _git_repo_info(base_path: str) -> tuple[str, str] | None:
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "--show-toplevel"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "--show-toplevel"], timeout=10)
         if r.returncode != 0:
             return None
         git_root = r.stdout.strip()
@@ -1275,11 +1267,7 @@ def _git_head_sha(base_path: str) -> str | None:
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "HEAD"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "HEAD"], timeout=10)
         return r.stdout.strip() if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -1300,11 +1288,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "merge-base", "--is-ancestor", since_commit, "HEAD"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=60,
-        )
+        r = run_git([*cmd, "merge-base", "--is-ancestor", since_commit, "HEAD"], timeout=60)
         if r.returncode != 0:
             return None
     except (subprocess.TimeoutExpired, OSError):
@@ -1317,7 +1301,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
     def _run_critical(args: list[str]) -> set[str] | None:
         """Run a critical git command; ``None`` on failure aborts the fast path."""
         try:
-            r = subprocess.run(args, **_GIT_SUBPROCESS_KW, timeout=60)
+            r = run_git(args, timeout=60)
             if r.returncode != 0:
                 return None
             return _lines_to_set(r.stdout)
@@ -1333,7 +1317,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
         """
         nonlocal unreliable_reason
         try:
-            r = subprocess.run(args, **_GIT_SUBPROCESS_KW, timeout=best_effort_timeout)
+            r = run_git(args, timeout=best_effort_timeout)
             if r.returncode != 0:
                 logger.info("_git_changed_files: %s rc=%d, marking unreliable", label, r.returncode)
                 if unreliable_reason is None:
@@ -1450,7 +1434,7 @@ def _git_current_dirty(base_path: str, prefix: str) -> _GitDirtyResult:
     def _run(cmd: list[str], label: str, parser=_lines_to_set) -> set[str]:
         nonlocal unreliable_reason
         try:
-            r = subprocess.run(cmd, **_GIT_SUBPROCESS_KW, timeout=best_effort_timeout)
+            r = run_git(cmd, timeout=best_effort_timeout)
             if r.returncode == 0:
                 return parser(r.stdout)
             if unreliable_reason is None:
@@ -1809,9 +1793,11 @@ def _git_grep(
 
     t = timeout if timeout is not None else _git_grep_timeout()
     try:
-        r = subprocess.run(grep_cmd, **_GIT_SUBPROCESS_KW, timeout=t)
+        r = run_git(grep_cmd, timeout=t)
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
-        logger.info("_git_grep: %s: %s", type(exc).__name__, exc)
+        # В лог — только класс исключения: argv несёт repo path и grep-pattern.
+        # Agent-facing ``detail`` остаётся прежним.
+        logger.info("_git_grep: %s", type(exc).__name__)
         kind = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "spawn_failed"
         return _fail(kind, detail=f"{type(exc).__name__}: {exc}")
 
@@ -1822,7 +1808,9 @@ def _git_grep(
         # git ЗАПУСТИЛСЯ и сам объяснил, что не так (битый ERE → rc=128 + "Invalid preceding
         # regular expression" / "unmatched ( for expression group"). Его вердикт точнее любой
         # эвристики на нашей стороне: он называет и pattern, и причину.
-        logger.info("_git_grep: rc=%d stderr=%r", rc, (r.stderr or "")[:200])
+        # rc — контролируемое число; сырой stderr git содержит и pattern, и пути,
+        # поэтому в server.log он не попадает (агенту отдаётся как прежде).
+        logger.info("_git_grep: rc=%d", rc)
         return _fail("rc", rc=rc, stderr=(r.stderr or "")[:500])
 
     stdout = r.stdout or ""

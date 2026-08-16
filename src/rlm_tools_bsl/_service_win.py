@@ -10,6 +10,7 @@ Architecture:
 import datetime
 import os
 import pathlib
+import stat
 import subprocess
 import threading
 import time
@@ -20,6 +21,7 @@ import win32event
 import win32service
 import win32serviceutil
 
+from rlm_tools_bsl._git_process import CAPTURE_FILE_GLOB, GIT_CAPTURE_DIR_ENV, SERVICE_CAPTURE_DIRNAME
 from rlm_tools_bsl._service_env import build_service_env_vars
 from rlm_tools_bsl.service import _config_path, load_config, save_config
 
@@ -46,9 +48,36 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
     _svc_display_name_ = SERVICE_DISPLAY
     _svc_description_ = SERVICE_DESC
 
+    # Результат подготовки capture-каталога (см. SvcDoRun). Значения по
+    # умолчанию нужны, чтобы _run_server оставался вызываемым сам по себе.
+    _git_capture_dir: pathlib.Path | None = None
+    _git_capture_error: str | None = None
+    _git_capture_swept: int = 0
+
     def SvcDoRun(self) -> None:
         self._stop_event = win32event.CreateEvent(None, 0, 0, None)
         self._proc: subprocess.Popen | None = None
+        # Приватный capture-каталог для git-вызовов сервера. Best-effort: отказ
+        # выключает ТОЛЬКО Git-ускорение, а не службу, поэтому watchdog-поток
+        # стартует и SERVICE_RUNNING сообщается в любом случае.
+        self._git_capture_dir: pathlib.Path | None = None
+        self._git_capture_error: str | None = None
+        self._git_capture_swept: int = 0
+        try:
+            self._git_capture_dir = _prepare_git_capture_dir()
+        except BaseException as exc:  # noqa: BLE001 - старт службы не срывается ничем
+            self._git_capture_error = type(exc).__name__
+        else:
+            # Уборка — только по ПРОВЕРЕННОМУ каталогу: подметать что-то, чему мы
+            # не доверяем (не тот путь, ссылка, чужой DACL), нельзя. Отдельный
+            # try обязателен: провал уборки НЕ меняет вердикт о готовности
+            # каталога, иначе `_git_capture_error` оказался бы выставлен при
+            # живом `_git_capture_dir` — состояние, которого остальной код не
+            # ждёт (ошибка записана, но нигде не всплывёт).
+            try:
+                self._git_capture_swept = _sweep_git_capture_dir(self._git_capture_dir)
+            except BaseException:  # noqa: BLE001 - уборка не критична вовсе
+                self._git_capture_swept = 0
         self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
         self.ReportServiceStatus(win32service.SERVICE_RUNNING)
@@ -79,7 +108,21 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         # The child skips its own log-retention purge (see server._setup_file_logging):
         # we purge here, before opening server.log for the child's stderr redirect, so the
         # child never truncates a file this service holds open.
-        env["RLM_UNDER_SERVICE"] = "1"
+        #
+        # Обе переменные ниже — решения СЛУЖБЫ, а не настройки: вместе они и
+        # образуют гейт capture-каталога (`_git_process._git_capture_dir()`
+        # требует `RLM_UNDER_SERVICE=1` И точного совпадения маркера). Поэтому
+        # выставляются регистронезависимо — см. `_set_service_env_var`.
+        _set_service_env_var(env, "RLM_UNDER_SERVICE", "1")
+        # Маркер capture-каталога — приватный канал служба→ребёнок. Любое
+        # унаследованное значение (в т.ч. из `.env`, загруженного выше)
+        # вычищается: подставленный извне путь обошёл бы и mkdir, и
+        # DACL-проверку. Выставляем только то, что реально подготовили сами.
+        _set_service_env_var(
+            env,
+            GIT_CAPTURE_DIR_ENV,
+            str(self._git_capture_dir) if self._git_capture_dir is not None else None,
+        )
 
         log_dir = _config_path().parent / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +136,32 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             purge_log_older_than(log_path, days=log_retention_days())
         except Exception:
             pass
+
+        if self._git_capture_dir is None:
+            # Одна обезличенная строка: имя класса исключения без пути и ACL-деталей.
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    _log_watchdog(
+                        f,
+                        "Git capture unavailable; Git acceleration disabled (%s)",
+                        self._git_capture_error or "Unknown",
+                    )
+            except OSError:
+                pass
+        elif self._git_capture_swept:
+            # Штатно тут убирать нечего, поэтому непустой счётчик — сигнал. Но
+            # источников у него ДВА, и приписывать его только выключению ОС
+            # нельзя: осиротевший git из деградировавшей ветки (без Job) тоже
+            # мог пережить остановку службы и оставить своё имя в каталоге.
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    _log_watchdog(
+                        f,
+                        "Git capture: removed %d stale file(s) (unclean shutdown or an orphaned git process)",
+                        self._git_capture_swept,
+                    )
+            except OSError:
+                pass
 
         max_restarts = 5
         restart_count = 0
@@ -166,6 +235,197 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             except subprocess.TimeoutExpired:
                 proc.kill()
         win32event.SetEvent(self._stop_event)
+
+
+# ---------------------------------------------------------------------------
+# Приватный capture-каталог для git-вызовов сервера (v1.33.1)
+# ---------------------------------------------------------------------------
+# Все pywin32-модули, нужные только для подготовки/проверки DACL, импортируются
+# ЛОКАЛЬНО внутри этих Windows-only helper-ов. Top-level import seam модуля
+# намеренно не расширяется: существующий Linux-тест импортирует _service_win с
+# минимальными заглушками win32event/win32service/win32serviceutil и не должен
+# начать требовать service-extra.
+
+
+def _set_service_env_var(env: dict, name: str, value: str | None) -> None:
+    """Выставить (или снять) переменную службы, вычистив ЛЮБОЙ регистровый вариант.
+
+    Имена переменных окружения на Windows регистронезависимы, а собираемый здесь
+    `env` — обычный регистрозависимый dict. `os.environ.copy()` даёт ключи уже в
+    верхнем регистре, но `_load_env_file` кладёт их из `.env` **дословно**,
+    поэтому `env.pop("_RLM_GIT_CAPTURE_DIR")` не убирает `_rlm_git_capture_dir`
+    — а ребёнок получит его как раз под каноническим именем. Для приватного
+    маркера capture-каталога это означало бы обход и mkdir, и DACL-проверки:
+    при неудачной подготовке сервер принял бы непроверенный каталог и снова
+    включил Git-ускорение.
+
+    ``value=None`` — переменная снимается целиком (ни один вариант не уезжает).
+    """
+    upper = name.upper()
+    for key in [k for k in env if k.upper() == upper]:
+        del env[key]
+    if value is not None:
+        env[name] = value
+
+
+def _current_user_sid():
+    """SID учётной записи, под которой реально работает служба."""
+    import win32api
+    import win32security
+
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
+    try:
+        return win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    finally:
+        token.Close()
+
+
+def _git_capture_allowed_sids() -> list:
+    """Единственный источник истины для «кому можно»: служба, SYSTEM, Administrators.
+
+    Тем же списком и ставится DACL, и проверяется — иначе применение и проверка
+    могли бы разъехаться.
+    """
+    import win32security
+
+    candidates = [
+        _current_user_sid(),
+        win32security.CreateWellKnownSid(win32security.WinLocalSystemSid),
+        win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid),
+    ]
+    out: list = []
+    seen: set[str] = set()
+    for sid in candidates:
+        key = win32security.ConvertSidToStringSid(sid)
+        if key not in seen:
+            seen.add(key)
+            out.append(sid)
+    return out
+
+
+def _apply_protected_dacl(path: pathlib.Path) -> None:
+    """Protected DACL: наследование от родителя отрезается, ACE — только свои."""
+    import ntsecuritycon
+    import win32security
+
+    dacl = win32security.ACL()
+    inherit = win32security.OBJECT_INHERIT_ACE | win32security.CONTAINER_INHERIT_ACE
+    for sid in _git_capture_allowed_sids():
+        dacl.AddAccessAllowedAceEx(win32security.ACL_REVISION_DS, inherit, ntsecuritycon.FILE_ALL_ACCESS, sid)
+    win32security.SetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        dacl,
+        None,
+    )
+
+
+def _verify_protected_dacl(path: pathlib.Path) -> None:
+    """Перечитать DACL и убедиться, что он именно такой, каким его ставили.
+
+    Проверка отдельным чтением, а не «мы же только что записали»: только так
+    видно, что DACL действительно protected и что в нём не осталось
+    унаследованных или посторонних ACE.
+    """
+    import win32security
+
+    sd = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION
+    )
+    control, _revision = sd.GetSecurityDescriptorControl()
+    if not control & win32security.SE_DACL_PROTECTED:
+        raise OSError("git capture directory DACL is not protected")
+    dacl = sd.GetSecurityDescriptorDacl()
+    if dacl is None:
+        raise OSError("git capture directory has no DACL")
+    ace_count = dacl.GetAceCount()
+    if ace_count == 0:
+        raise OSError("git capture directory DACL is empty")
+    allowed = {win32security.ConvertSidToStringSid(s) for s in _git_capture_allowed_sids()}
+    for i in range(ace_count):
+        (_ace_type, ace_flags), _mask, sid = dacl.GetAce(i)
+        if ace_flags & win32security.INHERITED_ACE:
+            raise OSError("git capture directory DACL carries an inherited ACE")
+        if win32security.ConvertSidToStringSid(sid) not in allowed:
+            raise OSError("git capture directory DACL grants a foreign principal")
+
+
+def _is_reparse_point(path: pathlib.Path) -> bool:
+    """Junction/symlink увёл бы capture за пределы config-root."""
+    attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+    return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _prepare_git_capture_dir() -> pathlib.Path:
+    """Создать и проверить `<parent RLM_CONFIG_FILE>/git-capture`.
+
+    Возвращает готовый каталог либо поднимает исключение — половинчатого
+    результата не бывает: маркер `_RLM_GIT_CAPTURE_DIR` получает только каталог,
+    прошедший ВСЕ проверки, а `_git_process._git_capture_dir()` под службой
+    принимает исключительно этот путь. Поэтому частично созданный или не
+    прошедший DACL-check каталог использован быть не может в принципе.
+    """
+    config_file = _config_path()
+    if not config_file.is_absolute():
+        raise OSError("service config path is not absolute")
+    target = config_file.parent / SERVICE_CAPTURE_DIRNAME
+    target.mkdir(parents=True, exist_ok=True)
+    if not target.is_dir():
+        raise OSError("git capture path is not a directory")
+    if _is_reparse_point(target):
+        raise OSError("git capture path is a reparse point")
+    _apply_protected_dacl(target)
+    _verify_protected_dacl(target)
+    return target
+
+
+def _sweep_git_capture_dir(path: pathlib.Path) -> int:
+    """Убрать capture-файлы, пережившие АВАРИЙНОЕ выключение ОС. Возвращает число убранных.
+
+    Штатно уборка здесь не нужна и не работает: файлы открыты с
+    `FILE_FLAG_DELETE_ON_CLOSE`, поэтому ядро удаляет их при закрытии последнего
+    дескриптора — в том числе когда процессы просто убивают (остановка службы,
+    kill дерева по timeout). Остаются два случая: аварийное выключение самой ОС
+    (питание, BSOD, reset — дескрипторы не закрылись вовсе) и осиротевший git из
+    деградировавшей ветки без Job, переживший остановку службы.
+
+    Удалить имя у файла, который такой потомок ещё держит, безопасно: Windows
+    снимает имя сразу, а сам держатель продолжает читать и писать через свой
+    дескриптор, и данные освобождаются при его выходе. Своих читателей у нас
+    тут быть не может — `run_git` читает capture только через УЖЕ открытый
+    файловый объект и никогда не переоткрывает файл по имени.
+
+    Почему именно здесь. План (§2.2) отверг stale-cleanup **на критическом
+    пути** — сканер внутри каждого `run_git` не может иметь честного лимита по
+    времени вокруг блокирующих обращений к ФС. Разовый проход при старте службы
+    — другое дело: он вне критического пути, случается раз за запуск, каталог
+    приватный и маленький, а дочерний сервер в этот момент ещё не поднят, так
+    что занятых НАМИ файлов там быть не может.
+
+    Отдельная причина, почему без этого нельзя: системный temp (куда пишет
+    ручной запуск и CLI) рано или поздно чистит сама Windows, а приватный
+    `<config>/git-capture` не чистит НИЧТО, кроме нас.
+
+    Best-effort и поштучно: неудача на одном файле не мешает остальным и никогда
+    не срывает старт службы. Трогаются только файлы нашего шаблона — посторонние
+    остаются на месте.
+    """
+    removed = 0
+    try:
+        stale = sorted(path.glob(CAPTURE_FILE_GLOB))
+    except OSError:
+        return 0
+    for entry in stale:
+        try:
+            if entry.is_file():
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _load_env_file(path: str, env: dict) -> None:
