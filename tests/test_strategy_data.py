@@ -11,7 +11,7 @@ from rlm_tools_bsl.bsl_strategy_data import DISAMBIGUATION_PAIRS, STRATEGY_SECTI
 
 
 def test_disambiguation_pairs_count():
-    assert len(DISAMBIGUATION_PAIRS) == 11
+    assert len(DISAMBIGUATION_PAIRS) == 12
 
 
 def test_disambiguation_pair_shape():

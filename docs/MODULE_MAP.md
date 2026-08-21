@@ -6,7 +6,7 @@
 
 | Что | Значение | Где проверяется |
 |---|---|---|
-| Хелперов в песочнице (`_reg`) | **53** (discovery 8, code 12, xml 5, composite 7, business 15, extension 3, navigation 3) | `tests/test_start_cost_budget.py::test_helper_snapshot_count_locked` |
+| Хелперов в песочнице (`_reg`) | **56** (discovery 8, code 12, xml 5, composite 7, business 15, extension 3, navigation 6) | `tests/test_start_cost_budget.py::test_helper_snapshot_count_locked` |
 | Схема индекса | **v15**, 27 таблиц + FTS5 | `BUILDER_VERSION` в `bsl_index.py` |
 | Бизнес-домены / алиасы (`rlm_help(topic=…)`) | **16** доменов, **116** алиасов | `_BUSINESS_RECIPES` / `_RECIPE_ALIASES` |
 | Секции стратегии (`rlm_help(section=…)`) | **5** (+ виртуальная `disambiguation`) | `tests/test_strategy_data.py::test_strategy_sections_keys` |
@@ -204,8 +204,8 @@ graph TD
 - `tests/test_strategy_mode_env.py::test_router_full_matches_legacy_builder` — router `get_strategy(...)` под `RLM_STRATEGY_MODE=full` идентичен прямому вызову `_build_full_strategy(...)`;
 - `tests/test_start_cost_budget.py` — бюджет payload `rlm_start` (+5% к бэйслайну) и `test_helper_snapshot_count_locked`.
 
-**При добавлении пары DISAMBIGUATION:** обновить `assert len(DISAMBIGUATION_PAIRS) == 11` в `tests/test_strategy_data.py::test_disambiguation_pairs_count` И зеркальный `assert len(res["result"]) == 11` в `tests/test_rlm_help.py::test_disambiguation_full`.
+**При добавлении пары DISAMBIGUATION:** обновить `assert len(DISAMBIGUATION_PAIRS) == 12` в `tests/test_strategy_data.py::test_disambiguation_pairs_count` И зеркальный `assert len(res["result"]) == 12` в `tests/test_rlm_help.py::test_disambiguation_full`.
 
-**При добавлении хелпера:** обновить `test_helper_snapshot_count_locked` (сейчас `== 53`) — добавление/удаление хелпера всегда намеренное.
+**При добавлении хелпера:** обновить `test_helper_snapshot_count_locked` (сейчас `== 56`) — добавление/удаление хелпера всегда намеренное.
 
 **При добавлении бизнес-домена / категории хелпера:** обновить enum в `Field(description=…)` параметра `topic`/`category` у `rlm_help` ([server.py](../src/rlm_tools_bsl/server.py)) — это документация для агента. Сами значения берутся из `_BUSINESS_RECIPES` / `_CATEGORY_ORDER` динамически.

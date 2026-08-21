@@ -61,9 +61,15 @@ from rlm_tools_bsl.format_detector import detect_format
 # slim is NOT re-baselined: both slim cases are byte-for-byte what v1.29.1 emitted (the new
 # text lands in sections slim serves via rlm_help, not inline), so the default start path did
 # not grow at all — the cost is paid only in full mode.
+# v1.34.0 re-baseline of slim only: git_log / git_commit / git_pickaxe
+# signatures land in the HELPERS table of the frozen snapshot (force-register).
+# Growth is the agent-facing contract of the history helpers; trim would hide them.
+#   slim/""         7146 → 7675
+#   slim/"проведение" 7990 → 8614
+# full mode stayed under the previous +5% ceiling and is NOT re-baselined here.
 _BASELINES = {
-    ("slim", ""): 7146,
-    ("slim", "проведение"): 7990,
+    ("slim", ""): 7675,
+    ("slim", "проведение"): 8614,
     ("full", ""): 31508,
     ("full", "проведение"): 33233,
 }
@@ -136,7 +142,7 @@ def test_get_object_profile_signature_stays_compact():
 
 def test_helper_snapshot_count_locked():
     """Adding/removing a registered helper is an intentional change — update this number."""
-    assert len(build_helper_metadata_snapshot()) == 53
+    assert len(build_helper_metadata_snapshot()) == 56
 
 
 @pytest.mark.parametrize("mode", ["slim", "full"])

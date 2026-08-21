@@ -185,7 +185,8 @@ def test_business_recipes_structure():
     """All domains must have compact and full keys."""
     # v1.11.0+: 12 prior + 'иерархия вызовов' + 'расширения' = 14
     # v1.19.0+: + 'достижимость' + 'путь данных' = 16
-    assert len(_BUSINESS_RECIPES) == 16
+    # v1.34.0: + 'история' = 17
+    assert len(_BUSINESS_RECIPES) == 17
     short_full_allowed = {
         "тип реквизита": 3,
         "ссылки": 3,
@@ -243,12 +244,15 @@ def test_match_recipe_found():
     assert _match_recipe("Печать товарной накладной") == "печать"
     assert _match_recipe("Права доступа к справочнику") == "права"
     assert _match_recipe("Интеграция с внешними системами") == "интеграция"
+    assert _match_recipe("история изменений документа") == "история"
 
 
 def test_match_recipe_aliases():
     assert _match_recipe("обмен данными с сайтом") == "интеграция"
     assert _match_recipe("синхронизация с сайтом") == "интеграция"
     assert _match_recipe("exchange data with external system") == "интеграция"
+    assert _match_recipe("кто менял модуль") == "история"
+    assert _match_recipe("когда добавили процедуру") == "история"
 
 
 def test_match_recipe_form_events():

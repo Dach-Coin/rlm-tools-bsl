@@ -998,6 +998,35 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "ALT: find_references_to_object('Справочник.X') → все ВХОДЯЩИЕ ссылки на объект (обратное направление, 1 уровень)",
         ],
     },
+    "история": {
+        "compact": [
+            "find_module('Объект') → пути модулей, затем git_log(path=...) → коммиты по объекту",
+            "git_commit(sha) → файлы одного коммита (mode='names', без патча)",
+            "git_pickaxe('Строка', path=...) → в каком коммите строка появилась/исчезла",
+        ],
+        "full": [
+            "find_module('Объект') → возьми path модуля, не ходи git_log по всей конфигурации",
+            "git_log(path=..., limit=20) → [{sha, date, author, subject, body}]",
+            "gitsync: автор хранилища 1С часто в body, git author — служебный",
+            "git_log(grep='комментарий хранилища') → поиск по СООБЩЕНИЮ коммита, не по коду",
+            "git_commit(sha) → files[{status,file}]; mode='stat' → added/deleted. Полного патча нет",
+            "git_pickaxe('ПроцедураИмя', path=модуля) → git log -S, какой коммит добавил/убрал строку",
+            "git_search('строка') — это ТЕКУЩИЙ снимок, не история. Не путать с git_log",
+            "ALT: git_log(since='2 weeks ago', author='Иванов') по всей конфигурации, если объект неизвестен",
+        ],
+        "code_hint": (
+            "mods = find_module('АвансовыйОтчет')\n"
+            "p = mods[0]['path'] if mods else 'Documents/АвансовыйОтчет'\n"
+            "log = git_log(path=p, limit=15)\n"
+            "for c in log:\n"
+            "    print(c.get('short'), c.get('date', '')[:10], c.get('author'), c.get('subject'))\n"
+            "if log and 'error' not in log[0]:\n"
+            "    info = git_commit(log[0]['sha'], path=p)\n"
+            "    print('files', len(info.get('files', [])), info.get('subject'))\n"
+            "    for f in info.get('files', [])[:20]:\n"
+            "        print(f.get('status', ''), f.get('file'))"
+        ),
+    },
 }
 
 _RECIPE_ALIASES: dict[str, str] = {
@@ -1128,6 +1157,21 @@ _RECIPE_ALIASES: dict[str, str] = {
     "цепочка ссылок": "путь данных",
     "связь объектов": "путь данных",
     "find_data_path": "путь данных",
+    # «история»
+    "коммит": "история",
+    "коммиты": "история",
+    "git log": "история",
+    "git_log": "история",
+    "git_commit": "история",
+    "git_pickaxe": "история",
+    "кто менял": "история",
+    "когда меняли": "история",
+    "когда появилось": "история",
+    "когда добавили": "история",
+    "история изменений": "история",
+    "changelog": "история",
+    "blame": "история",
+    "pickaxe": "история",
 }
 
 _STRATEGY_IO_SECTION = """\
@@ -1157,15 +1201,16 @@ def build_helpers_table(registry: dict) -> str:
 
 
 def _git_search_routing(registry: dict | None) -> str:
-    """One routing block for git_search, only when it is in the live registry.
+    """Routing block for git-backed helpers, only when they are in the live registry.
 
     Presence is derived from the registry (gated by git availability at session
-    start) — no extra parameter needed. Disambiguates the three search intents so
-    the agent doesn't oscillate between safe_grep and git_search.
+    start). Disambiguates snapshot search vs commit history so the agent doesn't
+    oscillate between git_search and git_log.
     """
     if not registry or "git_search" not in registry:
         return ""
-    return (
+    history = "git_log" in registry
+    lines = [
         "\n== FULL-TEXT SEARCH (git detected) ==\n"
         "Sources are under git → git_search is available: full-text over ALL files,\n"
         "including raw XML/forms/rights/DCS/queries that name-based helpers and the index never see.\n"
@@ -1173,9 +1218,18 @@ def _git_search_routing(registry: dict | None) -> str:
         "  - by NAME (object/procedure/attribute) → search / find_module / find_attributes\n"
         "  - inside a KNOWN module → safe_grep(pattern, name_hint)   (scoped, fast)\n"
         "  - ANY substring ANYWHERE, incl. XML/forms/query text → git_search(pattern[, path, file_types])\n"
+    ]
+    if history:
+        lines.append(
+            "  - WHO/WHEN changed a path → git_log(path) ; one commit's files → git_commit(sha)\n"
+            "  - which COMMIT added/removed a string → git_pickaxe(pattern, path)\n"
+            "git_search = current snapshot (no history). git_log = commits. Always pass path from find_module.\n"
+        )
+    lines.append(
         "Anti-noise on common tokens: git_search(tok, mode='files') first (which files), or narrow\n"
         "file_types/path, then drill down. Mind max_results / the {'_truncated': True} sentinel."
     )
+    return "".join(lines)
 
 
 def _match_recipe(query: str) -> str | None:

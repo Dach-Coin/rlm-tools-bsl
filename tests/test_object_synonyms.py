@@ -954,6 +954,7 @@ class TestRecipesSearchObjects:
         # структура объекта (get_object_full_structure).
         # v1.11.0+ adds: иерархия вызовов (find_call_hierarchy), расширения (get_overrides).
         # v1.19.0+ adds: достижимость (find_path), путь данных (find_data_path).
+        # v1.34.0 adds: история (git_log / git_commit / git_pickaxe).
         _NO_SEARCH_OBJECTS = {
             "тип реквизита",
             "ссылки",
@@ -964,6 +965,7 @@ class TestRecipesSearchObjects:
             "расширения",
             "достижимость",
             "путь данных",
+            "история",
         }
         for domain, recipe in _BUSINESS_RECIPES.items():
             if domain in _NO_SEARCH_OBJECTS:

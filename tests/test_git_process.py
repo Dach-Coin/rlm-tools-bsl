@@ -711,7 +711,7 @@ class TestCallsitesAndLogs:
             elif isinstance(func, ast.Name) and func.id == "run_git":
                 run_git_calls += 1
         assert direct_runs == 0, "прямых Git-вызовов subprocess.run в bsl_index не осталось"
-        assert run_git_calls == 8, f"ожидалось 8 Git-callsite через run_git, найдено {run_git_calls}"
+        assert run_git_calls == 11, f"ожидалось 11 Git-callsite через run_git, найдено {run_git_calls}"
 
     def test_git_grep_log_does_not_leak_pattern_path_or_stderr(self, tmp_path, monkeypatch, caplog):
         from rlm_tools_bsl import bsl_index

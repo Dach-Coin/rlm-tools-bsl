@@ -1845,6 +1845,348 @@ def _git_grep(
 
 
 # ---------------------------------------------------------------------------
+# git log / show / pickaxe — commit history (same opt-in as git grep)
+# ---------------------------------------------------------------------------
+_GIT_LOG_FORMAT = "%H%x1f%h%x1f%aI%x1f%an%x1f%s%x1f%b%x1e"
+_GIT_LOG_MAX_BODY = 800
+_GIT_REV_RE = re.compile(r"^(?:HEAD(?:[~^][1-9]\d{0,2})?|[0-9a-fA-F]{4,40})$")
+_GIT_HISTORY_LIMIT_DEFAULT = 20
+_GIT_HISTORY_LIMIT_MAX = 100
+_GIT_COMMIT_FILES_DEFAULT = 80
+_GIT_COMMIT_FILES_MAX = 200
+
+
+def _git_history_timeout() -> int:
+    """Timeout (seconds) for ``git log`` / pickaxe / one-commit lookup.
+
+    Configurable via ``RLM_GIT_HISTORY_TIMEOUT``. Defaults to 30s. Invalid
+    values fall back to 30.
+    """
+    try:
+        return max(1, int(os.environ.get("RLM_GIT_HISTORY_TIMEOUT", "30")))
+    except (ValueError, TypeError):
+        return 30
+
+
+def _clamp_git_limit(value, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = default
+    return max(lo, min(hi, n))
+
+
+def _sanitize_git_text_filter(value, max_len: int) -> str | None:
+    """Return a safe filter string, ``""`` if unset, or ``None`` if malformed."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except (TypeError, ValueError):
+            return None
+    raw = value.strip()
+    if not raw:
+        return ""
+    if len(raw) > max_len:
+        return None
+    if any(ord(c) < 32 for c in raw):
+        return None
+    return raw
+
+
+def _sanitize_git_rev(rev) -> str | None:
+    """Allow only ``HEAD``, ``HEAD~N`` / ``HEAD^N``, or a 4–40 hex SHA."""
+    if not isinstance(rev, str):
+        return None
+    raw = rev.strip()
+    if not raw or not _GIT_REV_RE.match(raw):
+        return None
+    return raw
+
+
+def _history_pathspecs(path: str | None) -> list[str] | None:
+    """Pathspecs for history commands, scoped to *base_path* (``git -C``).
+
+    Empty/unset *path* → ``["."]`` so we do not leak commits that only touch
+    files outside the 1C sources. Malformed *path* → ``None``.
+    """
+    san = _sanitize_grep_path(path)
+    if san is None:
+        return None
+    return [san] if san else ["."]
+
+
+def _truncate_git_body(body: str) -> tuple[str, bool]:
+    text = (body or "").strip()
+    if len(text) <= _GIT_LOG_MAX_BODY:
+        return text, False
+    return text[:_GIT_LOG_MAX_BODY], True
+
+
+def _parse_git_log_records(stdout: str) -> list[dict]:
+    """Parse ``_GIT_LOG_FORMAT`` records into compact commit dicts."""
+    results: list[dict] = []
+    for raw in (stdout or "").split("\x1e"):
+        record = raw.strip("\n")
+        if not record:
+            continue
+        parts = record.split("\x1f")
+        if len(parts) != 6:
+            continue
+        sha, short, date, author, subject, body = parts
+        if not sha:
+            continue
+        body, body_trunc = _truncate_git_body(body)
+        rec = {
+            "sha": sha,
+            "short": short,
+            "date": date,
+            "author": author,
+            "subject": subject,
+            "body": body,
+        }
+        if body_trunc:
+            rec["_body_truncated"] = True
+        results.append(rec)
+    return results
+
+
+def _strip_git_root_prefix(path: str, prefix: str) -> str | None:
+    """Turn a git-root-relative path into a *base_path*-relative one."""
+    posix = (path or "").replace("\\", "/").strip()
+    if not posix:
+        return None
+    if not prefix:
+        return posix
+    pfx = prefix + "/"
+    if posix.startswith(pfx):
+        return posix[len(pfx) :]
+    if posix == prefix:
+        return ""
+    return None
+
+
+def _parse_name_status_line(line: str) -> dict | None:
+    parts = line.split("\t")
+    if len(parts) < 2:
+        return None
+    status = parts[0].strip()
+    if not status:
+        return None
+    kind = status[0]
+    if kind in ("R", "C") and len(parts) >= 3:
+        rec: dict = {"status": kind, "file": parts[2].strip(), "from": parts[1].strip()}
+        if len(status) > 1 and status[1:].isdigit():
+            rec["similarity"] = int(status[1:])
+        return rec
+    return {"status": kind, "file": parts[1].strip()}
+
+
+def _parse_history_numstat_line(line: str) -> dict | None:
+    parts = line.split("\t", 2)
+    if len(parts) != 3:
+        return None
+    added, deleted, path = parts
+    rec: dict = {"file": path.strip()}
+    rec["added"] = None if added == "-" else int(added) if added.lstrip("-").isdigit() else None
+    rec["deleted"] = None if deleted == "-" else int(deleted) if deleted.lstrip("-").isdigit() else None
+    return rec
+
+
+def _git_log(
+    base_path: str,
+    *,
+    path: str | None = None,
+    author: str = "",
+    since: str = "",
+    until: str = "",
+    grep: str = "",
+    ignore_case: bool = True,
+    limit: int = _GIT_HISTORY_LIMIT_DEFAULT,
+    pickaxe: str | None = None,
+    pickaxe_regex: bool = False,
+    timeout: int | None = None,
+) -> list[dict] | None:
+    """Run ``git log`` (optionally pickaxe ``-S`` / ``-G``) over *base_path*.
+
+    Returns a list of commit dicts, ``[]`` if nothing matched, or ``None`` on
+    a real failure. Empty *path* scopes to ``.`` so commits that only touch
+    files outside the 1C sources are omitted.
+    """
+    pathspecs = _history_pathspecs(path)
+    if pathspecs is None:
+        return None
+    author_s = _sanitize_git_text_filter(author, 100)
+    since_s = _sanitize_git_text_filter(since, 80)
+    until_s = _sanitize_git_text_filter(until, 80)
+    grep_s = _sanitize_git_text_filter(grep, 200)
+    if None in (author_s, since_s, until_s, grep_s):
+        return None
+    if pickaxe is not None:
+        pickaxe_s = _sanitize_git_text_filter(pickaxe, 200)
+        if not pickaxe_s:
+            return None
+    else:
+        pickaxe_s = ""
+
+    n = _clamp_git_limit(limit, _GIT_HISTORY_LIMIT_DEFAULT, 1, _GIT_HISTORY_LIMIT_MAX)
+    cmd = _git_base_cmd(base_path)
+    if cmd is None:
+        return None
+
+    log_cmd = [
+        *cmd,
+        "-c",
+        "core.quotePath=false",
+        "log",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        f"--format={_GIT_LOG_FORMAT}",
+        "-n",
+        str(n),
+    ]
+    if author_s:
+        log_cmd.append(f"--author={author_s}")
+    if since_s:
+        log_cmd.append(f"--since={since_s}")
+    if until_s:
+        log_cmd.append(f"--until={until_s}")
+    if grep_s:
+        log_cmd.append("-F")
+        if ignore_case:
+            log_cmd.append("--regexp-ignore-case")
+        log_cmd.append(f"--grep={grep_s}")
+    if pickaxe_s:
+        flag = "-G" if pickaxe_regex else "-S"
+        log_cmd.append(f"{flag}{pickaxe_s}")
+    log_cmd += ["--", *pathspecs]
+
+    t = timeout if timeout is not None else _git_history_timeout()
+    try:
+        r = run_git(log_cmd, timeout=t)
+    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        logger.info("_git_log: %s", type(exc).__name__)
+        return None
+    if r.returncode != 0:
+        logger.info("_git_log: rc=%d", r.returncode)
+        return None
+    records = _parse_git_log_records(r.stdout or "")
+    if len(records) > n:
+        records = records[:n]
+        records.append({"_truncated": True, "shown": n})
+    return records
+
+
+def _git_commit(
+    base_path: str,
+    rev: str,
+    *,
+    path: str | None = None,
+    mode: str = "names",
+    max_files: int = _GIT_COMMIT_FILES_DEFAULT,
+    timeout: int | None = None,
+) -> dict | None:
+    """Return metadata + changed files for a single revision.
+
+    *mode* ``"names"`` → ``--name-status``; *mode* ``"stat"`` → ``--numstat``.
+    Paths are rewritten relative to *base_path*. Returns ``None`` on failure.
+    """
+    if mode not in ("names", "stat"):
+        return None
+    sha = _sanitize_git_rev(rev)
+    if sha is None:
+        return None
+    pathspecs = _history_pathspecs(path)
+    if pathspecs is None:
+        return None
+    nfiles = _clamp_git_limit(max_files, _GIT_COMMIT_FILES_DEFAULT, 1, _GIT_COMMIT_FILES_MAX)
+
+    cmd = _git_base_cmd(base_path)
+    if cmd is None:
+        return None
+    repo_info = _git_repo_info(base_path)
+    prefix = repo_info[1] if repo_info else ""
+
+    t = timeout if timeout is not None else _git_history_timeout()
+    base_args = [*cmd, "-c", "core.quotePath=false"]
+    meta_cmd = [
+        *base_args,
+        "log",
+        "-1",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        f"--format={_GIT_LOG_FORMAT}",
+        sha,
+    ]
+    diff_flag = "--name-status" if mode == "names" else "--numstat"
+    files_cmd = [
+        *base_args,
+        "diff-tree",
+        "--no-commit-id",
+        "--root",
+        "-r",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--find-renames",
+        diff_flag,
+        sha,
+        "--",
+        *pathspecs,
+    ]
+    try:
+        meta_r = run_git(meta_cmd, timeout=t)
+        files_r = run_git(files_cmd, timeout=t)
+    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        logger.info("_git_commit: %s", type(exc).__name__)
+        return None
+    if meta_r.returncode != 0:
+        logger.info("_git_commit: log rc=%d", meta_r.returncode)
+        return None
+    if files_r.returncode != 0:
+        logger.info("_git_commit: diff-tree rc=%d", files_r.returncode)
+        return None
+
+    meta_list = _parse_git_log_records(meta_r.stdout or "")
+    if not meta_list:
+        return None
+    out = dict(meta_list[0])
+    parser = _parse_name_status_line if mode == "names" else _parse_history_numstat_line
+    files: list[dict] = []
+    truncated = False
+    for line in (files_r.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parsed = parser(line)
+        if parsed is None:
+            continue
+        rel = _strip_git_root_prefix(parsed.get("file", ""), prefix)
+        if rel is None:
+            continue
+        parsed["file"] = rel
+        if "from" in parsed:
+            src = _strip_git_root_prefix(parsed["from"], prefix)
+            if src is None:
+                parsed.pop("from", None)
+            else:
+                parsed["from"] = src
+        if len(files) >= nfiles:
+            truncated = True
+            break
+        files.append(parsed)
+    out["files"] = files
+    out["mode"] = mode
+    if truncated:
+        out["_truncated"] = True
+        out["shown"] = nfiles
+    return out
+
+
+# ---------------------------------------------------------------------------
 # IndexStatus enum
 # ---------------------------------------------------------------------------
 class IndexStatus(Enum):

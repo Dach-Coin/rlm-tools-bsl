@@ -1568,7 +1568,7 @@ def test_business_recipes_v1_10_count():
     # v1.10.0: 9 base + перечисления + ввод на основании + структура объекта = 12
     # v1.11.0+ adds 'иерархия вызовов' + 'расширения' → 14
     # v1.19.0+ adds 'достижимость' + 'путь данных' → 16
-    assert len(_BUSINESS_RECIPES) == 16
+    assert len(_BUSINESS_RECIPES) == 17
     for new in (
         "перечисления",
         "ввод на основании",
@@ -1577,6 +1577,7 @@ def test_business_recipes_v1_10_count():
         "расширения",
         "достижимость",
         "путь данных",
+        "история",
     ):
         assert new in _BUSINESS_RECIPES
 

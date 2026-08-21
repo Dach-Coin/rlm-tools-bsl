@@ -221,4 +221,12 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "rule": "Разные стороны объекта, дополняют друг друга. Нужен код → get_object_modules; нужны реквизиты/ТЧ → get_object_full_structure; нужно и то и то → зови оба (каждый дёшев на индексе).",
         "tags": ["modules", "structure", "metadata", "composite"],
     },
+    {
+        "pair": ("git_search", "git_log"),
+        "summary": "current snapshot vs commit history",
+        "when_a": "git_search — ТЕКУЩИЕ файлы на диске (вкл. dirty/untracked). Любая подстрока в коде/XML. Истории нет.",
+        "when_b": "git_log — КОММИТЫ (who/when/subject/body). git_commit(sha) — файлы одного коммита. git_pickaxe — какой коммит добавил/убрал строку.",
+        "rule": "«Где сейчас в коде» → git_search. «Что сделал коммит / кто менял объект» → git_log → git_commit. «Когда появилась строка» → git_pickaxe. Не подставляй git_search в вопросы про историю.",
+        "tags": ["git", "search", "history"],
+    },
 ]

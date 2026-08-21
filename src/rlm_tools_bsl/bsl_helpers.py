@@ -485,9 +485,10 @@ def build_helper_metadata_snapshot() -> dict[str, dict]:
             read_file_fn=_stub_read,
             grep_fn=_stub_grep,
             glob_files_fn=_stub_glob,
-            # Force git_search into the snapshot regardless of the server's cwd /
-            # whether git is reachable, so `rlm_help git_search` is always
-            # documented. Live sessions gate it via "auto" (see make_bsl_helpers).
+            # Force git-backed helpers into the snapshot regardless of the
+            # server's cwd / whether git is reachable, so `rlm_help git_search`
+            # / `git_log` / `git_commit` / `git_pickaxe` are always documented.
+            # Live sessions gate them via "auto" (see make_bsl_helpers).
             register_git_search="force",
         )
         registry = helpers.get("_registry") or {}
@@ -671,9 +672,10 @@ def make_bsl_helpers(
     extension objects. The generic sandbox resolver (helpers.make_helpers) is
     NOT touched — extension files stay invisible to read_file/grep/glob_files.
 
-    ``register_git_search`` controls the opt-in full-text ``git_search`` helper:
-    ``"auto"`` (live sessions) registers it only when *base_path* is under a git
-    work-tree and ``git`` is reachable; ``"force"`` always registers it (used by
+    ``register_git_search`` gates ALL git-backed helpers (``git_search`` plus
+    history: ``git_log`` / ``git_commit`` / ``git_pickaxe``):
+    ``"auto"`` (live sessions) registers them only when *base_path* is under a git
+    work-tree and ``git`` is reachable; ``"force"`` always registers them (used by
     the rlm_help doc snapshot, independent of cwd/git); ``"never"`` never does.
     """
 
@@ -2051,6 +2053,110 @@ def make_bsl_helpers(
                         "таймауту (git_search работает ТОЛЬКО в git-репозитории)."
                         + (f" git ответил: {git_msg}." if git_msg else "")
                         + f" {_FALLBACK_HINT}"
+                    ),
+                }
+            ]
+        return res
+
+    def git_log(
+        path: str = "",
+        author: str = "",
+        since: str = "",
+        until: str = "",
+        grep: str = "",
+        limit: int = 20,
+    ) -> list[dict]:
+        """List commits that touched the 1C sources (opt-in, git work-tree only).
+
+        Compact history: sha/date/author/subject/body (body truncated). Does NOT
+        search file contents — that is ``git_search`` (current snapshot) or
+        ``git_pickaxe`` (which commit added/removed a string). Empty *path*
+        scopes to the configuration root, not the whole git repo.
+        """
+        from rlm_tools_bsl.bsl_index import _git_log
+
+        res = _git_log(
+            base_path,
+            path=path,
+            author=author,
+            since=since,
+            until=until,
+            grep=grep,
+            limit=limit,
+        )
+        if res is None:
+            return [
+                {
+                    "error": "git log failed or timed out",
+                    "hint": (
+                        "проверьте path (литеральное поддерево, без glob), since/until/author; "
+                        "для содержимого коммита — git_commit(sha), для строки в diff — git_pickaxe."
+                    ),
+                }
+            ]
+        return res
+
+    def git_commit(sha: str, path: str = "", mode: str = "names", max_files: int = 80) -> dict:
+        """What one commit changed under the 1C sources.
+
+        Default *mode* ``"names"`` is ``--name-status`` (A/M/D/R + path), not a
+        full patch. *mode* ``"stat"`` adds added/deleted line counts via ``--numstat``.
+        Returns ``{sha, short, date, author, subject, body, files, mode}`` or
+        ``{"error": ..., "hint": ...}``.
+        """
+        if not sha or not str(sha).strip():
+            return {
+                "error": "empty revision",
+                "hint": "передайте sha из git_log (4-40 hex) либо HEAD / HEAD~N.",
+            }
+        if mode not in ("names", "stat"):
+            return {
+                "error": "invalid mode",
+                "hint": "mode='names' (status+path) или mode='stat' (added/deleted counts).",
+            }
+        from rlm_tools_bsl.bsl_index import _git_commit, _sanitize_git_rev
+
+        if _sanitize_git_rev(sha) is None:
+            return {
+                "error": "invalid revision",
+                "hint": "sha — 4-40 hex, или HEAD / HEAD~N / HEAD^N (без имён веток).",
+            }
+        res = _git_commit(base_path, sha, path=path, mode=mode, max_files=max_files)
+        if res is None:
+            return {
+                "error": "git commit lookup failed or timed out",
+                "hint": "коммит не найден, path-фильтр отсёк все файлы, или git недоступен.",
+            }
+        return res
+
+    def git_pickaxe(pattern: str, path: str = "", regex: bool = False, limit: int = 20) -> list[dict]:
+        """Which commits added or removed *pattern* (git pickaxe)."""
+        if not pattern or not str(pattern).strip():
+            return [
+                {
+                    "error": "empty pattern",
+                    "hint": (
+                        "задайте строку, которая появилась/исчезла в diff "
+                        "(имя процедуры, префикс, GUID). Для текущего кода — git_search."
+                    ),
+                }
+            ]
+        from rlm_tools_bsl.bsl_index import _git_log
+
+        res = _git_log(
+            base_path,
+            path=path,
+            limit=limit,
+            pickaxe=pattern,
+            pickaxe_regex=bool(regex),
+        )
+        if res is None:
+            return [
+                {
+                    "error": "git pickaxe failed or timed out",
+                    "hint": (
+                        "сузьте path до объекта (find_module → git_pickaxe(pat, path=...)); "
+                        "timeout настраивается RLM_GIT_HISTORY_TIMEOUT."
                     ),
                 }
             ]
@@ -13167,6 +13273,80 @@ def make_bsl_helpers(
             "  # Mind max_results / the {'_truncated': True} sentinel; regex=True is POSIX ERE\n"
             "  #   (end-of-line anchor on CRLF files needs '[[:space:]]*$', not '$').\n"
             "  # Failure -> [{'error': ..., 'hint': ...}] (NOT []): follow hint for safe_grep/grep pattern semantics.",
+        )
+        _reg(
+            "git_log",
+            git_log,
+            "git_log(path='', author='', since='', until='', grep='', limit=20)"
+            " -> [{sha,short,date,author,subject,body}]. HISTORY of commits touching the 1C sources."
+            " Only available when sources are under git.",
+            "navigation",
+            [
+                "история",
+                "коммит",
+                "коммиты",
+                "git log",
+                "git_log",
+                "кто менял",
+                "когда меняли",
+                "changelog",
+                "история изменений",
+            ],
+            "COMMIT HISTORY — who/when changed a path (only under git):\n"
+            "  mods = find_module('АвансовыйОтчет')\n"
+            "  log = git_log(path=mods[0]['path'] if mods else 'Documents/АвансовыйОтчет', limit=15)\n"
+            "  for c in log:\n"
+            "      print(c['short'], c['date'][:10], c['author'], c['subject'])\n"
+            "  # gitsync: автор хранилища 1С часто в body, не в git author.\n"
+            "  # Empty path = whole configuration (not the git repo root).\n"
+            "  # grep= filters COMMIT MESSAGES; for a string in the DIFF use git_pickaxe.\n"
+            "  # Drill-down: git_commit(c['sha']) → files of one commit (no patch by default).",
+        )
+        _reg(
+            "git_commit",
+            git_commit,
+            "git_commit(sha, path='', mode='names', max_files=80)"
+            " -> {sha,short,date,author,subject,body,files}. One commit's files (name-status or numstat)."
+            " Only available when sources are under git.",
+            "navigation",
+            [
+                "git show",
+                "git_commit",
+                "что изменил коммит",
+                "состав коммита",
+                "diff коммита",
+            ],
+            "ONE COMMIT — files changed (no full patch; 1C dumps are huge):\n"
+            "  info = git_commit(sha)                    # mode='names' → [{status,file}]\n"
+            "  info = git_commit(sha, mode='stat')       # [{file,added,deleted}]\n"
+            "  info = git_commit(sha, path='Documents/X')  # only that subtree\n"
+            "  for f in info.get('files', []):\n"
+            "      print(f.get('status', ''), f.get('file'), f.get('added', ''), f.get('deleted', ''))\n"
+            "  # sha: 4-40 hex from git_log, or HEAD / HEAD~N. Branches (main) are rejected.\n"
+            "  # On error returns {error, hint} (a dict, not a list).",
+        )
+        _reg(
+            "git_pickaxe",
+            git_pickaxe,
+            "git_pickaxe(pattern, path='', regex=False, limit=20)"
+            " -> [{sha,short,date,author,subject,body}]. Commits that added/removed a string (git log -S/-G)."
+            " Only available when sources are under git.",
+            "navigation",
+            [
+                "pickaxe",
+                "git_pickaxe",
+                "когда появилось",
+                "когда добавили",
+                "кто добавил",
+                "git log -S",
+            ],
+            "PICKAXE — which commit introduced or removed a string:\n"
+            "  hits = git_pickaxe('МояПроцедура', path='CommonModules/МойМодуль')\n"
+            "  hits = git_pickaxe('ВИН-', regex=False, limit=10)\n"
+            "  # Default -S (occurrence count changed). regex=True → -G over the patch.\n"
+            "  # ALWAYS pass path when possible — whole-config pickaxe on ERP can time out.\n"
+            "  # Current snapshot (not history) → git_search. Commit message search → git_log(grep=...).\n"
+            "  # On failure returns [{'error': ...}] (NOT []).",
         )
 
     # ── Return all helpers (auto-generated from registry) ────────

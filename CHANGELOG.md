@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.34.0] — 2026-08-21
+
+История git-коммитов по исходникам 1С. Схема SQLite и `BUILDER_VERSION` (15) не менялись — **пересборка индексов не требуется**.
+
+### Добавлено
+- **История git-коммитов по исходникам 1С.** Три хелпера, opt-in вместе с `git_search` (только когда исходники — git-рабочее-дерево): `git_log` / `git_commit` / `git_pickaxe`. Закрывают дыру «что сделано каким коммитом»: агент видел только текущий снимок на диске (`git_search` = `git grep`), а `git log`/`show`/`-S` в песочнице недоступны.
+  - `git_log(path='', author='', since='', until='', grep='', limit=20)` — компактный список коммитов `[{sha, short, date, author, subject, body}]`. Пустой `path` ограничен корнем конфигурации, а не всем репозиторием. `grep` ищет по *сообщению* коммита (комментарии gitsync).
+  - `git_commit(sha, path='', mode='names'|'stat', max_files=80)` — метаданные + файлы одного коммита. По умолчанию `--name-status` (без патча). SHA: 4–40 hex либо `HEAD`/`HEAD~N`/`HEAD^N` (имена веток отклоняются).
+  - `git_pickaxe(pattern, path='', regex=False, limit=20)` — `git log -S` / `-G`: в каком коммите строка появилась или исчезла. `path` желателен — pickaxe по всей ERP может упереться в таймаут.
+  - Вызовы git идут через `run_git` (тот же Windows Job/файловый capture, что у `git_search`). Таймаут `RLM_GIT_HISTORY_TIMEOUT` (по умолчанию 30с).
+  - `rlm_help(topic='история')`, пара disambiguation `git_search` vs `git_log`.
+
+### Тесты
+- `tests/test_git_history.py`: path-scoping (коммит только у корня git не виден из `src/`), grep по сообщению, pickaxe add+remove, name-status/numstat, guard ревизий, регистрация/snapshot/routing, error-dicts.
+
 ## [1.33.1] — 2026-08-16
 
 Hotfix таймаута вызовов `git` на Windows. Схема SQLite и `BUILDER_VERSION` (15) не тронуты — **при переходе с 1.33.0 пересборка индексов не требуется**; при обновлении с версий ниже 1.33.0 обязательная пересборка на v15 остаётся в силе. Контракты хелперов, состав MCP-тулов и поведение на Linux/macOS не меняются вовсе.
