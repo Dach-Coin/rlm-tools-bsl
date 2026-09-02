@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import io
 import importlib.util
+import logging
 import os
 import sys
 import threading
 import traceback
 
 from rlm_tools_bsl._sandbox_protocol import (
+    LOG_RECORDS_MAX,
     PROTOCOL_VERSION,
     WORKER_FATAL_REQUEST_ID,
     SandboxProtocolError,
@@ -32,8 +34,123 @@ from rlm_tools_bsl._sandbox_protocol import (
     decode_frame,
     encode_frame,
     make_message,
+    sanitize_log_record,
     validate_message,
 )
+
+
+class _BoundedLogCollector(logging.Handler):
+    """Ограниченная очередь WARNING+ пакета ``rlm_tools_bsl`` внутри worker.
+
+    Чинит ВСЕ потерянные предупреждения пакета разом, а не только ``_warn_bound``:
+    в дефолтном process-режиме у воркера нет своих обработчиков логирования, и до
+    ``server.log`` не доходило ничего — половина арг-гардов диагностировалась
+    только чтением кода. DEBUG намеренно НЕ мостится: обычная сессия начала бы
+    раздувать IPC и лог.
+
+    Список ПОЛНОЙ длины ``LOG_RECORDS_MAX``: до ``MAX-1`` предупреждений плюс, при
+    переполнении, ровно одна финальная строка о подавлении.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self._lock_records = threading.Lock()
+        self._records: list[str] = []
+        self._suppressed = 0
+
+    def emit(self, record) -> None:  # pragma: no cover - вызывается logging
+        try:
+            # getMessage(), а НЕ format(): traceback в IPC не тащим.
+            text = sanitize_log_record(record.getMessage())
+        except Exception:
+            return
+        with self._lock_records:
+            if len(self._records) >= LOG_RECORDS_MAX - 1:
+                self._suppressed += 1
+                return
+            self._records.append(text)
+
+    def drain(self) -> list[str]:
+        """Атомарно скопировать И очистить очередь: init-warning не повторяется в
+        первом execute, execute-warning — в следующем."""
+        with self._lock_records:
+            out = list(self._records)
+            suppressed = self._suppressed
+            self._records.clear()
+            self._suppressed = 0
+        if suppressed:
+            out.append(sanitize_log_record(f"…(ещё {suppressed} подавлено)"))
+        return out
+
+
+def _install_log_collector() -> "_BoundedLogCollector":
+    """Навесить collector на логгер пакета.
+
+    ВНУТРИ ``sandbox_worker_main``, а не на уровне модуля: этот модуль
+    импортируется В РОДИТЕЛЕ (``sandbox_process`` тянет ``sandbox_worker_main``),
+    и в inline-режиме — через ``server``. Handler, навешенный на импорте, немедленно
+    повис бы на РОДИТЕЛЬСКОМ логгере ``rlm_tools_bsl``: вечно растущая очередь,
+    никем не сбрасываемая, плюс ровно та двойная запись, которую inline-режим
+    запрещает.
+    """
+    collector = _BoundedLogCollector()
+    logging.getLogger("rlm_tools_bsl").addHandler(collector)
+    return collector
+
+
+def _fit_optional_log_records_to_frame(message: dict, ipc_max_bytes: int) -> None:
+    """Уместить OPTIONAL ``log_records`` в РЕАЛЬНЫЙ frame-budget.
+
+    Минимально разрешённый IPC cap — 256 KiB, а ``variables`` не ограничены, поэтому
+    «≈6 KiB против мегабайтного frame» безопасности near-cap success НЕ доказывает.
+    Порядок строгий: сначала снимаем логи и проверяем BASELINE-frame (если он сам
+    oversized — логи остаются сняты, а прочий payload сохраняет прежнюю
+    protocol-error семантику); затем бинарным поиском берём максимальный
+    сохраняющий порядок prefix. Ни одна ОБЯЗАТЕЛЬНАЯ часть payload ради
+    диагностики не удаляется.
+    """
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return
+    records = payload.get("log_records")
+    if not records:
+        payload.pop("log_records", None)
+        return
+    payload.pop("log_records", None)
+    try:
+        encode_frame(message, ipc_max_bytes)
+    except SandboxProtocolError:
+        return  # baseline сам не помещается — логи не возвращаем
+
+    def _fits(prefix: list[str]) -> bool:
+        payload["log_records"] = prefix
+        try:
+            encode_frame(message, ipc_max_bytes)
+            return True
+        except SandboxProtocolError:
+            return False
+
+    if _fits(list(records)):
+        return
+    lo, hi, best = 0, len(records) - 1, 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _fits(records[:mid]):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best == 0:
+        payload.pop("log_records", None)
+        return
+    dropped = len(records) - best
+    # Frame-marker ЗАМЕЩАЕТ отброшенный хвост (включая возможный queue-marker), а не
+    # становится 21-й строкой: итог по-прежнему <= LOG_RECORDS_MAX. Текст говорит о
+    # числе опущенных IPC-ЗАПИСЕЙ и не притворяется точным числом исходных warning-ов.
+    marker = sanitize_log_record(f"…({dropped} IPC-записей опущено по размеру фрейма)")
+    if _fits([*records[: best - 1], marker]):
+        return
+    payload["log_records"] = records[:best]
 
 
 class SharedStdoutWriter(io.TextIOBase):
@@ -422,6 +539,13 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
     """Top-level spawn target. ``boot`` — только примитивы (trusted bootstrap);
     вся конфигурация сессии приходит первым ``init``-frame по JSON IPC."""
     stdio_detached, stdio_detail = _detach_stdio()
+    # Предупреждения, испущенные ДО первого execute, решаются явно: handler ставится
+    # ДО `_build_session`, очередь живёт с этого момента и сбрасывается в `init_ok`
+    # сразу после успешных `_build_session` + `_compute_prefixes` (именно там рождается
+    # самое ценное из теряемых — warning extension-pass'а). Очистить очередь перед init
+    # либо отложить drain до execute нельзя: первый вариант теряет запись, второй снова
+    # ломает `start -> end` и timeout первого execute.
+    log_collector = _install_log_collector()
     expected_parent_pid = int(boot.get("expected_parent_pid", 0))
     isolation_ready, group_detail = _isolate_process_group(expected_parent_pid)
     ipc_max_bytes = int(boot.get("ipc_max_bytes", 4 * 1024 * 1024))
@@ -495,33 +619,40 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
             )
             return
 
-        _send(
-            conn,
-            make_message(
-                "init_ok",
-                request_id,
-                generation,
-                {
-                    "registry_snapshot": registry_snapshot,
-                    "detected_prefixes": detected_prefixes,
-                    "prefixes_source": prefixes_source,
-                    "index_loaded": index_loaded,
-                    "index_warning": index_warning,
-                    "has_llm_tools": llm_tools is not None,
-                    "extension_paths_count": len(payload.get("extension_paths") or []),
-                    "python_version": sys.version.split()[0],
-                    "pid": os.getpid(),
-                    # Диагностика фактически применённых платформенных гарантий:
-                    # оператор не должен догадываться, стоит ли потолок памяти (§11.2).
-                    "process_group_detail": group_detail,
-                    "memory_limit_applied": memory_limit_applied,
-                    "memory_limit_detail": memory_limit_detail,
-                },
-            ),
-            ipc_max_bytes,
+        # v1.34.0 — OPTIONAL-логи ужимаются под РЕАЛЬНЫЙ frame-budget у ОБОИХ
+        # frame-type, не только у `execute_result`. Минимально разрешённый
+        # IPC cap — 256 KiB, а `detected_prefixes` ничем не ограничены, поэтому
+        # baseline-`init_ok`, который сам бы поместился, мог упасть
+        # `SandboxProtocolError` из-за ДИАГНОСТИКИ — то есть старт сессии терял бы
+        # обязательную часть ради необязательной.
+        init_ok = make_message(
+            "init_ok",
+            request_id,
+            generation,
+            {
+                "registry_snapshot": registry_snapshot,
+                "detected_prefixes": detected_prefixes,
+                "prefixes_source": prefixes_source,
+                "index_loaded": index_loaded,
+                "index_warning": index_warning,
+                "has_llm_tools": llm_tools is not None,
+                "extension_paths_count": len(payload.get("extension_paths") or []),
+                "python_version": sys.version.split()[0],
+                "pid": os.getpid(),
+                # Диагностика фактически применённых платформенных гарантий:
+                # оператор не должен догадываться, стоит ли потолок памяти (§11.2).
+                "process_group_detail": group_detail,
+                "memory_limit_applied": memory_limit_applied,
+                "memory_limit_detail": memory_limit_detail,
+                # additive-ключ в УЖЕ существующем frame-type: новый тип не
+                # заводится, направленный allowlist и версия протокола не меняются.
+                "log_records": log_collector.drain(),
+            },
         )
+        _fit_optional_log_records_to_frame(init_ok, ipc_max_bytes)
+        _send(conn, init_ok, ipc_max_bytes)
 
-        _command_loop(conn, sandbox, ipc_max_bytes, generation)
+        _command_loop(conn, sandbox, ipc_max_bytes, generation, log_collector)
     except SandboxProtocolError as exc:
         try:
             _send(
@@ -575,6 +706,16 @@ def _build_session(payload: dict, out_buf, out_published, out_truncated, out_loc
             metadata_categories_found=list(fi_payload.get("metadata_categories_found") or []),
         )
 
+    # Топология корней проверяется ДО открытия собственного reader-а воркера:
+    # ошибочный root не имеет права оставить частично построенный backend.
+    # Только на активном BSL-пути — generic-режим provenance не использует.
+    enable_bsl_helpers = bool(payload.get("enable_bsl_helpers", True))
+    worker_extension_paths = list(payload.get("extension_paths") or [])
+    if format_info is not None and enable_bsl_helpers:
+        from rlm_tools_bsl.extension_detector import validate_root_topology
+
+        validate_root_topology(payload["base_path"], worker_extension_paths)
+
     idx_reader = None
     index_warning = None
     db_path = payload.get("db_path")
@@ -601,10 +742,16 @@ def _build_session(payload: dict, out_buf, out_published, out_truncated, out_loc
         format_info=format_info,
         idx_reader=idx_reader,
         idx_zero_callers_authoritative=bool(payload.get("idx_zero_callers_authoritative")),
-        extension_paths=list(payload.get("extension_paths") or []),
+        extension_paths=worker_extension_paths,
         output_capture_factory=lambda: writer,
         # Отсутствие ключа = прежнее поведение (BSL-хелперы включены).
-        enable_bsl_helpers=bool(payload.get("enable_bsl_helpers", True)),
+        enable_bsl_helpers=enable_bsl_helpers,
+        # v1.34.0 foundation: отсутствие ключей в старом synthetic payload
+        # читается через .get как совместимый default (current root == base).
+        current_config_role=payload.get("current_config_role"),
+        current_config_name=payload.get("current_config_name") or "",
+        current_config_root=payload.get("current_config_root") or "",
+        extension_name_by_root=dict(payload.get("extension_name_by_root") or {}),
     )
     # reset() на каждый execute делает command loop; сохранить ссылку.
     sandbox._shared_stdout_writer = writer
@@ -643,7 +790,7 @@ def _compute_prefixes(sandbox, idx_reader) -> tuple[list[str], str]:
     return [], "none"
 
 
-def _command_loop(conn, sandbox, ipc_max_bytes: int, generation: int) -> None:
+def _command_loop(conn, sandbox, ipc_max_bytes: int, generation: int, log_collector=None) -> None:
     """Последовательный command loop: execute / ping / shutdown (§8.1.12)."""
     writer = getattr(sandbox, "_shared_stdout_writer", None)
     while True:
@@ -673,6 +820,7 @@ def _command_loop(conn, sandbox, ipc_max_bytes: int, generation: int) -> None:
                 "variables": list(result.variables),
                 "helper_calls": _serialize_helper_calls(result.helper_calls),
                 "efficiency_hints": result.efficiency_hints,
+                "log_records": log_collector.drain() if log_collector is not None else [],
             }
         except Exception:
             # Ошибка вне пользовательского exec (инфраструктура Sandbox) —
@@ -684,6 +832,10 @@ def _command_loop(conn, sandbox, ipc_max_bytes: int, generation: int) -> None:
             )
             return
         response = make_message("execute_result", request_id, generation, result_payload)
+        # Optional-логи ужимаются ПЕРВЫМИ и по фактическому encode_frame; после этого
+        # `_fit_execute_error_to_frame` режет только непустой traceback, но получает
+        # уже frame-safe optional diagnostics.
+        _fit_optional_log_records_to_frame(response, ipc_max_bytes)
         _fit_execute_error_to_frame(response, ipc_max_bytes)
         _send(conn, response, ipc_max_bytes)
 

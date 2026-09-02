@@ -45,8 +45,10 @@ from rlm_tools_bsl.extension_detector import (
     ConfigRole,
     _ext_list_cap,
     detect_extension_context,
+    filter_alias_extension_infos,
     find_extension_overrides,
     resolve_config_root,
+    validate_root_topology,
 )
 from rlm_tools_bsl.bsl_knowledge import (
     EFFORT_LEVELS,
@@ -544,6 +546,10 @@ def _create_session_backend(
     ext_paths_for_sandbox: list[str],
     registry_epoch: int,
     enable_bsl_helpers: bool = True,
+    current_config_role: str | None = None,
+    current_config_name: str = "",
+    current_config_root: str = "",
+    extension_name_by_root: dict[str, str] | None = None,
 ):
     """Фабрика backend по режиму (§5.2): выбор делается один раз при rlm_start,
     дальше server не ветвится по типу backend.
@@ -551,7 +557,16 @@ def _create_session_backend(
     Возвращает ``(backend, parent_reader_still_owned)``: в inline режиме reader
     переходит во владение backend (закрывается его finish_close); в process
     режиме reader остаётся временным parent-объектом и его закрывает вызывающий
-    сразу после успешного init (§8.3)."""
+    сразу после успешного init (§8.3).
+
+    Роль/имя/current-root/карта имён расширений (v1.34.0) уже вычислены сервером
+    через ``detect_extension_context`` и едут JSON-safe примитивами — внутри
+    сессии detector не повторяется."""
+    # Защитная проверка топологии корней ДО создания backend: на активном
+    # BSL-пути пересекающиеся base/ext дали бы двойной учёт одного дерева.
+    # В generic-режиме валидация не выполняется — provenance там не используется.
+    if format_info is not None and enable_bsl_helpers:
+        validate_root_topology(resolved, list(ext_paths_for_sandbox or []))
     if sandbox_mode == "process":
         from rlm_tools_bsl.sandbox_process import (
             ProcessBackendConfig,
@@ -571,11 +586,27 @@ def _create_session_backend(
             enable_bsl_helpers=enable_bsl_helpers,
             max_llm_calls=session.max_llm_calls,
             llm_calls_used=session.llm_calls_used,
+            current_config_role=current_config_role,
+            current_config_name=current_config_name,
+            current_config_root=current_config_root,
+            extension_name_by_root=dict(extension_name_by_root or {}),
         )
+
+        def _startup_unregister(candidate) -> None:
+            # Сначала ДИАГНОСТИКА, затем ОБЯЗАТЕЛЬНО передача в reaper. Lifecycle-
+            # cleanup живёт в `finally`: исключение drain-а ловится и логируется, но
+            # не пропускает reaper-transfer и не подменяет исходный SandboxClosedError.
+            try:
+                _drain_startup_log_records(session.session_id, candidate)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("sandbox: session=%s startup drain failed", session.session_id, exc_info=True)
+            finally:
+                _reap_failed_starting_backend(candidate)
+
         backend = ProcessSandboxBackend(
             config,
             startup_register=lambda candidate: _track_starting_backend(candidate, registry_epoch),
-            startup_unregister=_reap_failed_starting_backend,
+            startup_unregister=_startup_unregister,
         )
         return backend, True
 
@@ -588,6 +619,10 @@ def _create_session_backend(
         idx_zero_callers_authoritative=callers_authoritative,
         extension_paths=ext_paths_for_sandbox,
         enable_bsl_helpers=enable_bsl_helpers,
+        current_config_role=current_config_role,
+        current_config_name=current_config_name,
+        current_config_root=current_config_root,
+        extension_name_by_root=dict(extension_name_by_root or {}),
     )
     backend = InlineSandboxBackend(
         sandbox,
@@ -596,6 +631,23 @@ def _create_session_backend(
         llm_calls_used=session.llm_calls_used,
     )
     return backend, False
+
+
+def _drain_startup_log_records(session_id: str, backend) -> None:
+    """Записать startup-предупреждения воркера в ``server.log`` (v1.34.0).
+
+    Читает READ-ONCE свойство backend и пишет каждую запись ПАРАМЕТРИЗОВАННЫМ
+    вызовом логгера (не format-string из worker), сохраняя связь с сессией.
+    В inline-backend свойство всегда пусто — там логгер и так родительский.
+    В public JSON-ответ строки НЕ копируются: это диагностика оператора.
+    """
+    try:
+        records = getattr(backend, "startup_log_records", None) or []
+    except Exception:  # pragma: no cover - диагностика не имеет права ломать lifecycle
+        logger.warning("sandbox: session=%s startup log drain failed", session_id, exc_info=True)
+        return
+    for record in records:
+        logger.warning("sandbox: session=%s %s", session_id, record)
 
 
 def _session_warnings(source_support: SourceSupport, ext_warnings: list[str]) -> list[str]:
@@ -908,9 +960,20 @@ def _rlm_start(
         _callers_authoritative = idx_status == IndexStatus.FRESH and idx_reader is not None and idx_reader.has_calls
 
         t_step = time.monotonic()
-        ext_paths_for_sandbox = (
-            [e.path for e in ext_context.nearby_extensions] if ext_context.current.role == ConfigRole.MAIN else []
+        # Foundation-фильтр (v1.34.0): directory symlink/junction рядом с базой
+        # может указывать ВНУТРЬ current root. Такой alias — не соседний
+        # source-root, а второй путь к уже учтённому дереву: пропустив его в BSL
+        # transport, мы получили бы либо topology-отказ штатного rlm_start, либо
+        # двойной учёт тех же файлов. Публичный ext_context НЕ меняется —
+        # index-builder и override-consumers видят прежний состав.
+        _current_root_for_bsl = ext_context.current.path or resolved
+        _nearby_for_bsl = (
+            filter_alias_extension_infos(_current_root_for_bsl, ext_context.nearby_extensions)
+            if ext_context.current.role == ConfigRole.MAIN
+            else []
         )
+        ext_paths_for_sandbox = [e.path for e in _nearby_for_bsl]
+        ext_name_by_root = {e.path: e.name for e in _nearby_for_bsl if e.path and e.name}
         backend, parent_owns_reader = _create_session_backend(
             sandbox_mode=sandbox_mode,
             resolved=resolved,
@@ -924,7 +987,12 @@ def _rlm_start(
             ext_paths_for_sandbox=ext_paths_for_sandbox,
             registry_epoch=registry_epoch,
             enable_bsl_helpers=not generic_mode,
+            current_config_role=ext_context.current.role.value,
+            current_config_name=ext_context.current.name or "",
+            current_config_root=_current_root_for_bsl,
+            extension_name_by_root=ext_name_by_root,
         )
+        _drain_startup_log_records(session_id, backend)
         if not parent_owns_reader:
             # inline: reader теперь во владении backend — не закрывать вторично.
             idx_reader = None
@@ -1396,7 +1464,13 @@ def _rlm_execute(
 
         session.execute_calls += 1
         try:
-            result = backend.execute(code)
+            try:
+                result = backend.execute(code)
+            finally:
+                # На успешном пути этот finally выполняется ДО _finish_rlm_execute,
+                # поэтому startup-записи идут перед runtime-записями, а повторный
+                # drain видит пустой read-once буфер.
+                _drain_startup_log_records(session_id, backend)
         except SandboxClosedError:
             return json.dumps(
                 {"error": f"Session '{session_id}' was closed during execution (rlm_end/eviction/shutdown)"},
@@ -1431,6 +1505,11 @@ def _rlm_execute(
 
 def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0) -> str:
     session_id = session.session_id
+    # Runtime WARNING+ из воркера — ПОСЛЕ возврата валидированного результата, но ДО
+    # сериализации public response. Параметризованный вызов логгера; в ответ агенту
+    # строки не уезжают.
+    for record in getattr(result, "log_records", None) or []:
+        logger.warning("sandbox: session=%s %s", session_id, record)
     elapsed = time.monotonic() - t0
     # Log helper calls with timing (grouped by name)
     helpers_summary = ""
@@ -1752,7 +1831,9 @@ def _rlm_help_dispatch(
                 "rlm_help(topic='проведение'|'печать'|'обмен'|...) → recipe for a domain. "
                 "rlm_help(category='discovery'|'code'|...) → list helpers in a category. "
                 "rlm_help(helpers=['name1','name2']) → details. "
-                "rlm_help(section='workflow'|'disambiguation'|'performance'|'batching'|'io'|'critical')."
+                "rlm_help(section='workflow'|'disambiguation'|'performance'|'batching'|'io'|'critical'). "
+                "Не уверен, что означают source/owner/extensions_included/total_exact/partial/"
+                "index_coverage/truncated/scope → rlm_help(section='coverage')."
             ),
         }
         return json.dumps({"mode": "menu", "result": result, "warnings": warnings}, ensure_ascii=False)
@@ -1897,11 +1978,13 @@ if get_strategy_mode() == "slim":
             Field(description="Helper category to list (one-line entries: name+sig, no recipes)"),
         ] = None,
         section: Annotated[
-            Literal["workflow", "disambiguation", "performance", "batching", "io", "critical"] | None,
+            Literal["workflow", "disambiguation", "performance", "batching", "io", "critical", "coverage"] | None,
             Field(
                 description=(
                     "Strategy section to fetch. 'disambiguation' returns a structured array of "
                     "overlapping-helper pairs (use with helpers=[a,b] to narrow to one pair). "
+                    "'coverage' — как читать полноту ответа (source/owner/extensions_included/"
+                    "total_exact/partial/index_coverage/truncated/scope). "
                     "Other values return raw text."
                 )
             ),

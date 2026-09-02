@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from multiprocessing.sharedctypes import RawArray, RawValue
 
 from rlm_tools_bsl._sandbox_protocol import (
+    LOG_RECORD_MAX_CHARS,
+    LOG_RECORDS_MAX,
     WORKER_FATAL_REQUEST_ID as _WORKER_FATAL_REQUEST_ID,
     SandboxProtocolError,
     bounded_text,
@@ -292,6 +294,15 @@ class ProcessBackendConfig:
     max_code_chars: int = 1_000_000
     memory_mb: int = 1024
     max_processes: int = 16
+    # Role-aware provenance foundation (v1.34.0). Поля добавлены В КОНЕЦ
+    # dataclass, а НЕ рядом с логически похожим extension_paths: прямые
+    # positional-конструкторы являются совместимым test/embedding API.
+    # Wire-тип роли — str|None (ConfigRole наследуется от обычного Enum и в
+    # JSON-frame не сериализуется).
+    current_config_role: str | None = None
+    current_config_name: str = ""
+    current_config_root: str = ""
+    extension_name_by_root: dict = field(default_factory=dict)
 
     @classmethod
     def from_env(cls, **overrides) -> "ProcessBackendConfig":
@@ -506,6 +517,11 @@ class ProcessSandboxBackend:
         self._index_loaded = False
         self.index_warning: str | None = None
         self._has_llm_tools = False
+        # Read-once буфер startup-предупреждений (v1.34.0). Создаётся ДО
+        # startup_register: конструктор после ПРИНЯТОГО init_ok ещё проверяет
+        # параллельный shutdown и может бросить до присваивания backend в
+        # `_rlm_start` — тогда запись забирает startup_unregister-callback.
+        self._startup_log_records: list[str] = []
         tracked = False
         if startup_register is not None:
             if not startup_register(self):
@@ -531,6 +547,20 @@ class ProcessSandboxBackend:
             if tracked and startup_unregister is not None:
                 startup_unregister(self)
             raise
+
+    @property
+    def startup_log_records(self) -> list[str]:
+        """READ-ONCE копия startup-предупреждений воркера.
+
+        Копирующее чтение под существующим ``_state_lock``: повторное обращение
+        (и первый execute) отдают пустой список, поэтому одна запись не может
+        уехать в лог дважды. В inline-backend свойства нет — там логгер и так
+        родительский, и двойной записи быть не должно.
+        """
+        with self._state_lock:
+            out = list(self._startup_log_records)
+            self._startup_log_records.clear()
+        return out
 
     # -- metadata -----------------------------------------------------------
 
@@ -730,6 +760,13 @@ class ProcessSandboxBackend:
                 "memory_mb": cfg.memory_mb,
                 "test_llm_provider": cfg.test_llm_provider,
                 "test_init_delay_seconds": cfg.test_init_delay_seconds,
+                # v1.34.0: additive JSON-примитивы; версия протокола не меняется,
+                # отсутствие ключей у старого synthetic payload читается как
+                # совместимый default (current root == base).
+                "current_config_role": cfg.current_config_role,
+                "current_config_name": cfg.current_config_name,
+                "current_config_root": cfg.current_config_root,
+                "extension_name_by_root": dict(cfg.extension_name_by_root or {}),
             }
             init_frame = encode_frame(make_message("init", request_id, gen, init_payload), cfg.ipc_max_bytes)
             self._send_bytes_with_deadline(parent_conn, init_frame, deadline)
@@ -775,6 +812,10 @@ class ProcessSandboxBackend:
         self._index_loaded = bool(payload.get("index_loaded"))
         self.index_warning = payload.get("index_warning")
         self._has_llm_tools = bool(payload.get("has_llm_tools"))
+        startup_records = self._validate_log_records(payload, "init_ok")
+        if startup_records:
+            with self._state_lock:
+                self._startup_log_records.extend(startup_records)
         logger.info(
             "sandbox worker gen=%d pid=%s started in %.1fs (index_loaded=%s llm=%s python=%s group=%s memlimit=%s)",
             gen,
@@ -1087,6 +1128,39 @@ class ProcessSandboxBackend:
             except SandboxProtocolError as exc:
                 return self._handle_worker_loss("protocol_error", f"SandboxProtocolError: {exc}")
 
+    @staticmethod
+    def _validate_log_records(payload: dict, frame_type: str) -> list[str]:
+        """Родитель проверяет ВСЁ заново, а не «список строк».
+
+        Лимиты «20×300», наложенные в worker, — это гигиена, а НЕ граница доверия:
+        worker и есть та сторона, от компрометации которой защищает процессная
+        изоляция. Иначе скомпрометированный worker пришёл бы фреймом до 4 МиБ
+        произвольного текста С ПЕРЕВОДАМИ СТРОК прямо в ``server.log``, то есть
+        получил бы возможность ПОДДЕЛЫВАТЬ строки лога.
+
+        Одна функция на ОБА frame-type (``init_ok`` и ``execute_result``): две
+        копии правил недопустимы. Поскольку версия протокола не меняется и поле
+        additive, ОТСУТСТВИЕ ключа трактуется как ``[]``; явно переданный
+        ``null``/иной тип — уже нарушение.
+        """
+        if "log_records" not in payload:
+            return []
+        records = payload["log_records"]
+        if not isinstance(records, list):
+            raise SandboxProtocolError(f"{frame_type}.log_records is not a list")
+        if len(records) > LOG_RECORDS_MAX:
+            raise SandboxProtocolError(f"{frame_type}.log_records has {len(records)} entries (max {LOG_RECORDS_MAX})")
+        for rec in records:
+            if not isinstance(rec, str):
+                raise SandboxProtocolError(f"{frame_type}.log_records entry is not a string")
+            if len(rec) > LOG_RECORD_MAX_CHARS:
+                raise SandboxProtocolError(f"{frame_type}.log_records entry longer than {LOG_RECORD_MAX_CHARS}")
+            if not rec.isprintable():
+                # `str.isprintable()`, а не CR/LF-check: запрещён ЛЮБОЙ control /
+                # format / Unicode separator (ESC, U+0085, U+2028/29, bidi).
+                raise SandboxProtocolError(f"{frame_type}.log_records entry contains non-printable characters")
+        return list(records)
+
     def _build_result(self, payload: dict, gen: int) -> BackendExecutionResult:
         stdout, truncated = self._read_shared_stdout()
         if truncated:
@@ -1152,6 +1226,7 @@ class ProcessSandboxBackend:
             for hint in hints:
                 if not isinstance(hint, dict) or not isinstance(hint.get("id"), str):
                     raise SandboxProtocolError("execute_result.efficiency_hints entry malformed")
+        log_records = self._validate_log_records(payload, "execute_result")
         self._variables_snapshot = list(variables)
         marker, self._pending_restarted_marker = self._pending_restarted_marker, None
         return BackendExecutionResult(
@@ -1162,6 +1237,7 @@ class ProcessSandboxBackend:
             efficiency_hints=hints,
             sandbox_state=marker,
             generation=gen,
+            log_records=log_records,
         )
 
     # -- смерть worker: timeout/crash/protocol ------------------------------

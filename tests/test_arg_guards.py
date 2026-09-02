@@ -248,7 +248,11 @@ def test_family_b_none_still_unlimited(guarded_bsl):
 
     fo = guarded_bsl["find_functional_options"]("ТестовыйДокумент", False, None)
     assert set(fo) >= {"xml_options", "code_options"}
-    assert "total" not in fo  # limit=None → без per-bucket cap, а не усечение
+    # v1.34.0: totals в этой ветке появились (они тривиальны — длины списков),
+    # поэтому смысл «limit=None не включает ПАГИНАЦИЮ» проверяется по её ключам.
+    assert "returned" not in fo and "has_more" not in fo
+    assert fo["xml_total"] == len(fo["xml_options"])
+    assert fo["code_total"] == len(fo["code_options"])
 
 
 def test_safe_grep_max_files_none_is_normalized(guarded_bsl, caplog):
@@ -275,7 +279,7 @@ def test_safe_grep_result_cap_none_untouched(guarded_bsl, caplog):
     `max_files` по нему не должно быть НИ ОДНОГО предупреждения."""
     with caplog.at_level("WARNING"):
         rows = guarded_bsl["safe_grep"]("ЦелеваяПроцедура", "", 5, _result_cap=None)
-    assert isinstance(rows, list)
+    assert isinstance(rows, dict) and isinstance(rows["results"], list)
     assert not [r for r in caplog.records if "_result_cap" in r.getMessage()]
 
 
@@ -330,7 +334,11 @@ def test_bool_is_not_silently_treated_as_int(guarded_bsl):
             id="code_usages",
         ),
         pytest.param(lambda b: b["find_callers"]("ЦелеваяПроцедура", "", 0), list, id="find_callers"),
-        pytest.param(lambda b: b["safe_grep"]("ЦелеваяПроцедура", "", 0), list, id="safe_grep"),
+        pytest.param(
+            lambda b: b["safe_grep"]("ЦелеваяПроцедура", "", 0),
+            lambda r: r["results"],
+            id="safe_grep",
+        ),
         pytest.param(lambda b: b["search_regions"]("Служебные", 0), list, id="search_regions"),
         pytest.param(lambda b: b["search_methods"]("Обработать", 0), list, id="search_methods"),
     ],
@@ -384,13 +392,13 @@ def test_git_search_max_results_guarded(tmp_path, monkeypatch):
     )
     try:
         assert "git_search" in bsl, "фикстура не под git — тест выродился бы в пустышку"
-        # У git_search свой исторический контракт: при усечении он добавляет
-        # последним элементом sentinel {_truncated, shown}. Ноль уважён — реальных
-        # строк нет, а `shown: 0` это подтверждает.
+        # v1.34.0: sentinel снят на границе публичного хелпера, его значение
+        # переехало в `truncated`. Ноль уважён — реальных строк нет.
         zero = bsl["git_search"]("ЦелеваяПроцедура", max_results=0)
-        assert [r for r in zero if "_truncated" not in r] == [], zero
-        assert zero and zero[-1]["shown"] == 0, zero
-        assert len([r for r in bsl["git_search"]("ЦелеваяПроцедура", max_results=None) if "_truncated" not in r]) <= 200
+        assert zero["results"] == [] and zero["returned"] == 0, zero
+        assert zero["truncated"] is True, zero
+        assert zero["error"] is None, zero
+        assert len(bsl["git_search"]("ЦелеваяПроцедура", max_results=None)["results"]) <= 200
     finally:
         reader.close()
 
@@ -485,7 +493,12 @@ def test_mixed_ref_kinds_keep_filtering_by_valid_ones(guarded_bsl):
 def test_known_ref_kind_produces_no_meta_noise(guarded_bsl):
     """Без предупреждения ключа _meta у хелпера быть не должно — контракт прежний."""
     res = guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["attribute_type"])
-    assert "_meta" not in res
+    # v1.34.0: `_meta` стал БЕЗУСЛОВНЫМ (оси охвата Задачи 7) — раньше он рождался
+    # через setdefault только при arg-warning, и shape ответа зависел от аргумента.
+    # Исходный смысл теста сохранён: штатный вызов не порождает ШУМА предупреждений.
+    assert "arg_warning" not in res["_meta"]
+    assert res["_meta"]["source"] in {"index", "live", "unavailable"}
+    assert res["_meta"]["unsupported_kinds"] == []
 
 
 # ── две корзины find_functional_options ──────────────────────────────────────
@@ -499,7 +512,9 @@ def test_functional_options_without_limit_keep_legacy_key_set(guarded_bsl):
     """Ветка без limit — прежний контракт: ни total, ни разбивки, только списки."""
     res = guarded_bsl["find_functional_options"]("ТестовыйДокумент", include_code=False)
     assert len(res["xml_options"]) > 0, "фикстура обязана давать ФО, иначе проверка вакуумна"
-    assert set(res) == {"object", "xml_options", "code_options"}
+    # Freeze обновлён, а НЕ ослаблен до >=: смысл заморозки — ловить
+    # незапланированный рост формы, а totals здесь запланированы (Задача 5).
+    assert set(res) == {"object", "xml_options", "code_options", "total", "xml_total", "code_total"}
 
 
 def test_functional_options_bucket_totals_match_total_with_limit(guarded_bsl):

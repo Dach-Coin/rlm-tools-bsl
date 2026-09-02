@@ -83,7 +83,7 @@ INSTANT (индексный путь, OK для batch 5-10 в одном rlm_exe
   find_register_movements(doc_name)      → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса
   find_event_subscriptions(obj)          → подписки на события (event_filter + limit опционально)
   find_scheduled_jobs(name='')           → регламентные задания
-  find_roles(obj_name)                   → роли с правами на объект
+  find_roles(obj_name)                   → broad substring (члены/однокоренные); exact — qualified+index
   find_defined_types(name)               → раскрытие ОпределяемогоТипа
   find_enum_values(enum_name)            → INSTANT с индексом; LIVE fallback на чтение Enum.xml без индекса
   get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
@@ -124,6 +124,58 @@ File I/O:
 LLM (if available):
   llm_query(prompt, context='')            → str (keep context <3000 chars; '[EMPTY]/[ERROR]' prefix or '[TRUNCATED]' tail = incomplete answer)
   llm_query_batched(prompts, context)      → [str]""",
+    # Легенда осей охвата (v1.34.0). ON-DEMAND: в стартовую стратегию НЕ инлайнится —
+    # там стоит только имя секции. Текст — проекция контрактов docs/HELPERS.md
+    # («Две ортогональные оси охвата», `index_coverage`, `owner`), поэтому правка
+    # контракта обязана править и его: расхождение ловит тест секции.
+    "coverage": """\
+== COVERAGE: как читать полноту ответа ==
+Три анти-правила, из-за которых чаще всего делают неверный вывод:
+  source='index' НЕ означает «полный».
+  partial=False НЕ всегда означает «полный».
+  extensions_included=False НЕ означает «расширений нет».
+
+1. source — ОТКУДА данные. Это провенанс, а не доказательство полноты.
+   Значения index | live | index+live | unavailable — у ВЕРХНЕУРОВНЕВОГО source и
+   _meta.source тех хелперов, что объявляют coverage-контракт. Поле перегружено:
+   у секций get_object_profile это index|live|mixed|unknown, у строк code_registers
+   в find_register_movements — code|manager_code. Значения смотри у своего хелпера.
+2. owner — КОМУ принадлежит КОНКРЕТНАЯ строка: 'main' либо 'extension:<Имя>'.
+   Признак расширения — owner.startswith('extension:'), имя — хвост после ':'.
+   Ключ безусловен (в том числе на конфигурации БЕЗ расширений) в тех строковых
+   выдачах, где он объявлен контрактом хелпера; у прочих его нет вовсе —
+   например, строки git_search это {file, line, text}.
+3. extensions_included — учтён ли ФАКТИЧЕСКИ хотя бы один extension-source.
+   True = кандидат успешно обработан ЛИБО полный успешный обход доказал, что
+   релевантных кандидатов нет. False = НЕ доказано, что учтён (root с ошибкой
+   перечисления или не дошли по бюджету), а вовсе не «расширений нет».
+4. total_exact — доказан ли сам total в заявленном scope.
+   False = total либо нижняя оценка, либо полнота не доказана.
+5. partial=True — ответ ТОЧНО неполон. Обратное неверно: partial=False
+   универсальным доказательством полноты не является; для optional index-домена
+   (синонимы объектов, ссылки метаданных) полноту читают по index_coverage.
+6. index_coverage — что известно про OPTIONAL index-домен:
+     disabled           — домен при сборке не строился;
+     build_unproven     — строки пригодны, но полнота сборки не доказана;
+     wider_than_current — индекс построен шире текущего root (wrapper);
+     unavailable        — доказательство поколения недоступно; строки при этом
+                          МОГУТ сохраняться (это не отказ от них);
+     not_used           — optional index-домен не использовался; это НЕ синоним
+                          живого маршрута: фактический путь смотри в source, он
+                          может быть и 'unavailable' (ридера нет вовсе).
+7. truncated и has_more — РАЗНОЕ, и оба про выдачу, а не про домен:
+   truncated — выдача урезана КАКИМ-ТО из лимитов; если в ответе есть total, она
+               неполна относительно него. Но total может и НЕ БЫТЬ: git_search его
+               не даёт намеренно — при упоре в лимит настоящий итог неизвестен;
+   has_more  — есть СЛЕДУЮЩАЯ страница (offset + returned < total).
+   На последней странице пагинации has_more=False при truncated=True — это норма.
+   Неусечённая выдача ничего не говорит о полноте исходного домена.
+8. scope — legacy-композит, занят тремя разными смыслами и заморожен.
+   НЕ выводи из него ни источник, ни CFE-охват, ни полноту.
+
+ПУСТОЙ ОТВЕТ доказывает отсутствие только там, где это подтверждает контракт
+конкретного хелпера — обычно total_exact=True либо явный exact-статус секции.
+Сомневаешься по конкретному хелперу: rlm_help(helpers=['имя_хелпера']).""",
 }
 
 
@@ -177,8 +229,14 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "pair": ("parse_object_xml", "find_roles"),
         "summary": "raw Roles XML vs normalized rights-per-object",
         "when_a": "parse_object_xml('Roles/X') — не подходит для анализа прав: отдаёт сырую XML без нормализации право→объект.",
-        "when_b": "find_roles(object_name) — нормализованный список ролей с правами на объект.",
-        "rule": "Для прав доступа к объекту → ВСЕГДА find_roles, не parse_object_xml.",
+        "when_b": (
+            "find_roles(object_name) — нормализованный список ролей, но BROAD substring: включает права на "
+            "ЧЛЕНОВ объекта и на ОДНОКОРЕННЫЕ имена (match='substring')."
+        ),
+        "rule": (
+            "Обзор прав по объекту → find_roles, не parse_object_xml. Точный qualified object route "
+            "доступен ТОЛЬКО с индексом — см. пару find_roles vs find_references_to_object."
+        ),
         "tags": ["roles", "rights"],
     },
     {
@@ -202,7 +260,7 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "summary": "metadata-XML references vs in-code usages",
         "when_a": "find_references_to_object — ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов, владелец, основание ввода, подсистемы, права, ФО, ПВХ, DefinedType. Код модулей НЕ сканирует.",
         "when_b": 'find_code_usages — ОБРАЩЕНИЯ В КОДЕ: Документы.X (manager), "ДокументСсылка.X" (ref_type), запросы Документ.X.ТЧ (query, member=имя ТЧ). Метаданные-XML НЕ сканирует.',
-        "rule": "Это РАЗНЫЕ слои. «Где объявлен/связан» → find_references_to_object. «Где используется в коде» → find_code_usages. Нужны оба — find_references_to_object(obj, include_code=True). Доступ к реквизитам через локальные переменные и код расширений — вне охвата find_code_usages.",
+        "rule": "Это РАЗНЫЕ слои. «Где объявлен/связан» → find_references_to_object. «Где используется в коде» → find_code_usages. Нужны оба — find_references_to_object(obj, include_code=True). Доступ к реквизитам через локальные переменные — вне охвата find_code_usages; охват кода расширений зависит от маршрута и назван в _meta.extensions_included.",
         "tags": ["references", "code", "usages"],
     },
     {
@@ -212,6 +270,31 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "when_b": "analyze_object — читает ВСЕ тела процедур каждого модуля + parse_object_xml метаданных. Тяжёлый (на 10K+ конфигах >60с).",
         "rule": "Сначала get_object_modules (карта кода объекта). analyze_object — только когда реально нужны тела всех процедур сразу; иначе ныряй точечно read_procedure(path, name).",
         "tags": ["modules", "skeleton", "composite", "code"],
+    },
+    {
+        "pair": ("find_roles", "find_references_to_object"),
+        "summary": "broad substring lookup ролей vs точная ссылка на объект",
+        "when_a": (
+            "find_roles(object_name) — BROAD literal-substring по сырому object_name из Rights.xml: "
+            "в выдачу закономерно попадают права на ЧЛЕНОВ объекта (Command/Attribute/ТЧ) и на "
+            "ОДНОКОРЕННЫЕ имена (Заказ → ЗаказПоставщику). match='substring', case_sensitive "
+            "различается по веткам. Работает и без индекса (live-парсинг Rights.xml)."
+        ),
+        "when_b": (
+            "find_references_to_object('Документ.X', kinds=['role_rights']) — ТОЧНАЯ ссылка на САМ "
+            "объект, но только при индексной metadata_references и только для qualified ref. "
+            "Возвращает reference на роль, БЕЗ индивидуальных right_name. Без таблицы live-walker "
+            "этот вид не поддерживает: _meta.unsupported_kinds=['role_rights']."
+        ),
+        "rule": (
+            "Это ТРИ разных вопроса, а не расхождение. Обзор «кто вообще трогает объект и его члены» "
+            "→ find_roles. Факт точной ссылки/членства → find_references_to_object(qualified, "
+            "kinds=['role_rights']) при индексе. Точные ИМЕНА ПРАВ на объект и его члены → "
+            "get_object_profile('Документ.X', sections=['roles']) при индексе (right_names / "
+            "rights_by_object / details_truncated — bounded sample). Bare-name в двух точных "
+            "маршрутах запрещён; без индекса оба точных маршрута недоступны."
+        ),
+        "tags": ["roles", "rights", "references"],
     },
     {
         "pair": ("get_object_modules", "get_object_full_structure"),

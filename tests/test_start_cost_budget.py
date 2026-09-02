@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 
 import pytest
@@ -61,11 +62,49 @@ from rlm_tools_bsl.format_detector import detect_format
 # slim is NOT re-baselined: both slim cases are byte-for-byte what v1.29.1 emitted (the new
 # text lands in sections slim serves via rlm_help, not inline), so the default start path did
 # not grow at all — the cost is paid only in full mode.
+#
+# ВНИМАНИЕ (v1.34.0): фраза «byte-for-byte» выше относится к v1.28.0/v1.30.0 и с этим
+# релизом БОЛЬШЕ НЕ ВЕРНА. Slim вырос: "" 7146 → ~7391, "проведение" 7990 → ~8330.
+# Бэйслайны оставлены прежними СОЗНАТЕЛЬНО — они бэйслайн, а не потолок: потолок равен
+# int(baseline * _DRIFT), то есть 7503 и 8389, и обе ячейки под ним. Коэффициент _DRIFT
+# не ослаблялся. Заявлять «не дорожает» о slim нельзя — верное утверждение: slim удержан
+# под ПРЕЖНИМ потолком, а ре-бэйслайн (то есть выдача нового запаса +5%) получил только
+# full. Запас в "проведение" при этом съеден на ~85%, и следующая правка slim-текста
+# упрётся в гард — это и есть намеренное поведение.
+#
+# v1.34.0 ре-бэйслайн ТОЛЬКО full-режима (ОСОЗНАННО, тем же правилом, что v1.28.0 и
+# v1.30.0). Прецедент в этом же файле: «the cost is paid only in full mode».
+#
+# ПОЧЕМУ full, а не slim. `sig` лежит в payload ДВАЖДЫ: в `available_functions` И в
+# таблице хелперов full-стратегии, поэтому прирост подписей входит в full с
+# коэффициентом 2. Slim таблицу хелперов с подписями не инлайнит, и он ОСТАВЛЕН ПОД
+# ПРЕЖНИМ ПОТОЛКОМ: суммарный прирост подписей ужат до величины, укладывающейся в
+# прежний slim-ceiling. Не «не дорожает» — дорожает, но в пределах уже объявленного
+# запаса, без выдачи нового.
+#
+# ЧТО добавлено (agent-facing контракт релиза «честная форма ответа» — без него фиксы
+# для агента невидимы, а это ровно тот дефект, который релиз и чинит):
+#   * git_search / safe_grep → СЛОВАРНАЯ форма ответа (results/returned/truncated/error)
+#     и машинные оси охвата (scanned_files/candidates_total/failed_files/
+#     read_status_complete/catalog_complete);
+#   * find_definition        → работает БЕЗ индекса, домешивает nearby CFE, hint по
+#     объекту ТОЧНЫЙ, partial/total_exact;
+#   * search_objects / find_by_type → count_only (+ у find_by_type алиас `category`,
+#     который agent-facing sig обещал, а функция отвергала TypeError);
+#   * find_module            → limit (сигнал усечения стал исполнимым);
+#   * get_overrides          → пагинация offset/returned/has_more;
+#   * owner                  → провенанс строки в 8 списочных выдачах;
+#   * find_references_to_object / find_code_usages → оси охвата + index_coverage;
+#   * DISAMBIGUATION         → 12-я пара + дописанная пре-существующая пропущенная.
+#
+# Проза ужималась ПЕРВОЙ: длинные пояснения переехали в НЕбюджетируемый `recipe`
+# (rlm_help отдаёт его по запросу), из подписей убраны дубли и marketing-фразы.
+# Оставшееся неустранимо без удаления самих имён ключей.
 _BASELINES = {
     ("slim", ""): 7146,
     ("slim", "проведение"): 7990,
-    ("full", ""): 31508,
-    ("full", "проведение"): 33233,
+    ("full", ""): 33858,
+    ("full", "проведение"): 35597,
 }
 # Whole rlm_start payload baselines (strategy + available_functions + index +
 # extension_context) for a fixed minimal INDEXED config — the plan's real target.
@@ -78,7 +117,25 @@ _BASELINES = {
 # carries available_functions, i.e. every helper `sig` — after the sig trim it was back under
 # the old ceiling on its own, but at 98–99% of it; re-baselining restores the +5% margin so the
 # next edit trips the guard on its own merits rather than on inherited saturation.
-_PAYLOAD_BASELINES = {"slim": 20691, "full": 43482}
+# v1.34.0: slim НЕ ре-бэйслайнится (см. пояснение к _BASELINES) — прежний потолок
+# 21725 держится. full двигается на измеренную величину.
+_PAYLOAD_BASELINES = {"slim": 20691, "full": 48037}
+# Domain-matched whole-payload бэйслайны (v1.34.0). Заполняются измерением ниже —
+# см. test_domain_matched_rlm_start_payload_within_budget. «проведение» осознанно
+# фиксируется отдельно: там потолок +5% был превышен ещё ДО релиза.
+_DOMAIN_PAYLOAD_BASELINES: dict[tuple[str, str], int] = {
+    # «права» — рамка Задачи 8 (доменный рецепт инлайнится в стратегию и уезжает в
+    # payload). Ре-бэйслайн осознанный, по ИЗМЕРЕННОЙ serialized delta.
+    ("slim", "права"): 22308,
+    ("full", "права"): 48546,
+    # «проведение» фиксируется ОТДЕЛЬНО и осознанно: на этом маршруте объявленный
+    # +5% был превышен ещё ДО v1.34.0 (пре-существующее состояние вне изменяемого
+    # пути — Задачи 1/2 этот рецепт СОКРАЩАЮТ). Маскировать его общим ре-бэйслайном
+    # ячеек «права» нельзя.
+    ("slim", "проведение"): 22631,
+    ("full", "проведение"): 48864,
+}
+
 _DRIFT = 1.05  # allow ≤5% growth before failing
 
 # v1.32.0: бюджет меряется на ПОДДЕРЖИВАЕМОМ дереве. С гейтом чужих форматов
@@ -144,6 +201,29 @@ def test_full_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
     """The WHOLE rlm_start payload (strategy + available_functions + index + extension_context),
     not just the strategy, stays within +5% of the v1.23.0 baseline — so a future edit cannot
     silently balloon available_functions or the index block (R7 #4/#5)."""
+    _assert_payload_budget(monkeypatch, tmp_path, mode, query="", baselines=_PAYLOAD_BASELINES)
+
+
+@pytest.mark.parametrize("mode,query", sorted(_DOMAIN_PAYLOAD_BASELINES))
+def test_domain_matched_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode, query):
+    """v1.34.0: whole-payload мерился ТОЛЬКО на ``query=""``, поэтому инлайн доменного
+    рецепта в payload не видел ни один тест — а бьющая рамка Задачи 8 именно там.
+
+    Строки «проведение» получают СВОЙ осознанный бэйслайн: на них потолок +5% был
+    превышен ещё ДО этого релиза (пре-существующее состояние вне изменяемого пути),
+    и маскировать это общим ре-бэйслайном ячеек «права» нельзя."""
+    _assert_payload_budget(monkeypatch, tmp_path, mode, query=query, baselines=None)
+
+
+def _assert_payload_budget(monkeypatch, tmp_path, mode, query, baselines):
+    if baselines is None:
+        baseline = _DOMAIN_PAYLOAD_BASELINES[(mode, query)]
+    else:
+        baseline = baselines[mode]
+    _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline)
+
+
+def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_git_search=False):
     import rlm_tools_bsl.extension_detector as _ed
     from rlm_tools_bsl.bsl_index import IndexBuilder
     from rlm_tools_bsl.server import _rlm_end, _rlm_start
@@ -168,25 +248,60 @@ def test_full_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
 
     monkeypatch.setattr("rlm_tools_bsl.server.detect_extension_context", _clean_ctx)
 
-    raw = _rlm_start(path=str(tmp_path), query="")
+    raw = _rlm_start(path=str(tmp_path), query=query)
     data = json.loads(raw)
     try:
         assert not data["extension_context"]["nearby_extensions"], "budget config must be extension-free"
         # Бюджет обязан меряться на поддерживаемом дереве: на чужом формате
         # стратегия несёт лишний блок предупреждения, и число было бы не про то.
         assert data["source_support"] == "supported", "budget config must be a supported cf/edt tree"
-        ceiling = int(_PAYLOAD_BASELINES[mode] * _DRIFT)
+        ceiling = int(baseline * _DRIFT)
         assert len(raw) <= ceiling, (
-            f"{mode} rlm_start payload {len(raw)} > {ceiling} (+5% of {_PAYLOAD_BASELINES[mode]}). "
+            f"{mode}/{query or '(none)'} rlm_start payload {len(raw)} > {ceiling} (+5% of {baseline}). "
             "available_functions / index / strategy grew — trim or re-baseline intentionally."
         )
         # the new aggregate signature lives on available_functions — confirm it is present
         assert any("get_object_profile(name" in s for s in data["available_functions"])
+        if require_git_search:
+            assert any(s.startswith("git_search(") for s in data["available_functions"]), (
+                "фикстура деградировала в non-git — бюджетная защита git_search.sig стала бы ложной"
+            )
         # index discovery keys present so the agent skips get_index_info() on start
         assert data["index"]["loaded"] is True
         assert "has_object_attributes" in data["index"]
     finally:
         _rlm_end(data["session_id"])
+
+
+# v1.34.0: whole-payload фикстура выше работает НЕ под git, поэтому её
+# `available_functions` НЕ содержит `git_search` — вторая копия его `sig` (первую
+# защищает snapshot full-стратегии) не была защищена ничем. Добавляем git-backed
+# baseline; git — optional runtime capability, поэтому среда без него скипается тем
+# же способом, что и tests/test_sandbox_parity.py. Production coverage это не
+# ослабляет: там сама git-ветка недостижима, а non-git baseline выполняется всегда.
+_GIT_PAYLOAD_BASELINES = {"slim": 22814, "full": 49528}
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git недоступен")
+@pytest.mark.parametrize("mode", ["slim", "full"])
+def test_git_backed_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
+    """Whole-payload на РЕАЛЬНОМ git-репозитории: только здесь в
+    `available_functions` попадает `git_search`, и только здесь его `sig` виден
+    бюджету дважды (available_functions + таблица хелперов full-стратегии).
+
+    Проверяется и сам ФАКТ регистрации: иначе фикстура может тихо деградировать в
+    non-git и дать ложную защиту."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
+    _run_payload_budget(
+        monkeypatch,
+        tmp_path,
+        mode,
+        query="",
+        baseline=_GIT_PAYLOAD_BASELINES[mode],
+        require_git_search=True,
+    )
 
 
 # ── v1.33.0: длинные пояснения переехали из sig в recipe ────────────────────

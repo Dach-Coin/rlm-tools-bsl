@@ -1426,8 +1426,8 @@ include_code, has_metadata_code_usages, metadata_code_usages_count, и выво�
 ## ВАЖНЫЕ ПРАВИЛА
 1. Один rlm_execute должен батчить связанные вызовы find_code_usages.
 2. НЕ ловит (документировано, не считать ошибкой): доступ к реквизитам через
-   локальные переменные (Док = Документы.X; Док.Товары) и код расширений
-   (только основная конфигурация).
+   локальные переменные (Док = Документы.X; Док.Товары). Охват кода расширений
+   зависит от МАРШРУТА и назван в _meta.extensions_included.
 3. В конце вызови rlm_end.
 ```
 
@@ -1460,8 +1460,12 @@ include_code, has_metadata_code_usages, metadata_code_usages_count, и выво�
 | `find_references_to_object(..., include_code=True)` | присутствуют ключи `code_total` / `code_by_kind` / `code_usages` |
 | Скорость `find_code_usages` | мгновенно (indexed exact-lookup) |
 
-**Граница покрытия:** index fast-path покрывает модули основной конфигурации.
-Локальные переменные (`Док.Товары`) и код расширений — вне охвата v1.14.0.
+**Граница покрытия:** index fast-path покрывает модули ТЕКУЩЕГО корня — в
+MAIN-сессии основную конфигурацию, в EXTENSION-сессии текущий CFE; соседние
+расширения индекс не покрывает. Живой фолбэк идёт по CFE-aware каталогу, поэтому
+строки из соседних расширений там возможны. Фактический охват в каждом ответе
+называет `_meta.extensions_included`. Локальные переменные (`Док.Товары`) — вне
+охвата на любом маршруте.
 
 ---
 
@@ -1581,7 +1585,7 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Contract: roles | `find_roles()` | `rights` = list[str] |
 | Contract: doc flow | `analyze_document_flow()` | dict with documented keys |
 | Contract: form attrs | `parse_form()` | attribute key `types` (not `attr_type`) |
-| Contract: grep | `safe_grep(pattern, name_hint=...)` | param `name_hint` accepted; пустой результат НЕ доказывает отсутствие — срез `max_files` действует всегда, `name_hint` меняет лишь ЧТО режется. Исчерпывающий поиск — `git_search` |
+| Contract: grep | `safe_grep(pattern, name_hint=...)` | ответ — СЛОВАРЬ: строки в `res['results']`, число в `res['returned']`; пустой `results` НЕ доказывает отсутствие — срез `max_files` действует всегда, `name_hint` меняет лишь ЧТО режется. Охват виден по `candidates_total`/`scanned_files`/`failed_files`/`catalog_complete`/`read_status_complete`. Исчерпывающий поиск — `git_search` |
 | Contract: count_only | `search_regions(q, count_only=True)` | при настроенных расширениях и непустом `q` — `{total, total_main, total_extensions, source:"index+live"\|"live", truncated, scope:"main_index+live_extensions"}` и `total == len(list)`; без расширений или при пустом/пробельном `q` — прежний main-only dict |
 | Contract: functional options | `find_functional_options(obj, include_code=False)` | `xml_options` — ТОЧНОЕ совпадение: typed-ввод category-aware (включая member-ссылки), bare — по точному имени объекта; чужой глубокий `...Attribute.<Имя>` больше не засчитывается. Совпадает с `get_object_profile(...).functional_options` |
 | Contract: queries | `extract_queries(path)` | находит `Запрос.Текст = "..."` (в т.ч. с литералом на СЛЕДУЮЩЕЙ строке), `Новый Запрос("...")`/`New Query("...")`; разбор source-aware — вхождения в комментариях и внутри текста самого запроса ложных записей не дают. У конструктора и перенесённой формы `НСтр`/переменная/конкатенация не извлекаются; однострочное присваивание намеренно мягче — `Запрос.Текст = "..." + Хвост;` извлекается вместе с хвостом строки |
@@ -1665,28 +1669,35 @@ Use this prompt to verify the three navigation primitives added in v1.20.0:
      агрегаты, тогда как extract_procedures — плоский список процедур.
 
 4. git_search с exclude_path — полнотекст без шумовых зон (только если источник под git):
+   ФОРМА ОТВЕТА — СЛОВАРЬ (v1.34.0): строки в res['results'], их ЧИСЛО в res['returned'],
+   ошибка в постоянном res['error'] (None при успехе). len(res) считает КЛЮЧИ, не находки.
    - Выбери бизнес-токен (имя справочника/документа). git_search(token, mode='files') → сколько ВСЕГО
-     файлов; сколько из них в путях с сегментом /Forms/ и /Templates/.
+     файлов (res['returned']); сколько из них в путях с сегментом /Forms/ и /Templates/.
    - git_search(token, mode='files', exclude_path='Forms,Templates') → подтверди, что файлы из
      */Forms/* и */Templates/* ИСЧЕЗЛИ (на любой глубине вложенности!), а прочие на месте. Покажи
-     число файлов до и после и процент сокращения.
+     число файлов до и после (по res['returned']) и процент сокращения.
    - git_search(token, mode='files', exclude_path='ConfigDumpInfo.xml') → отсечение конкретного файла
      на любой глубине.
    - Валидация: git_search(token, exclude_path='a*') (glob-метасимвол во входе) → должно вернуть
-     [{error: ...}] (вход exclude_path — литеральный, поиск НЕ расширяется молча).
+     res['error'] непустым при res['results'] == [] (вход exclude_path — литеральный, поиск НЕ
+     расширяется молча).
    - Если git_search недоступен (в Navigation нет git_search, источник не под git) — явно сообщи и
      пропусти пункт 4.
 
 5. Связка примитивов — реальный навигационный сценарий (новое дополняет старое):
-   - git_search(бизнес-токен, exclude_path='Forms,Templates') → найди упоминание в .bsl-коде, возьми
-     имя метода и путь модуля. (Если git_search недоступен — стартуй цепочку с search_methods.)
-   - find_definition(метод) → где он определён (file, line, object_name).
+   - git_search(бизнес-токен, exclude_path='Forms,Templates') → найди упоминание в .bsl-коде
+     (res['results']), возьми имя метода и путь модуля. (Если git_search недоступен — стартуй
+     цепочку с search_methods.)
+   - find_definition(метод) → где он определён (file, line, object_name, owner). С v1.34.0 работает
+     и БЕЗ индекса (живой скан объявлений); неполнота видна по partial и _meta.total_exact.
    - get_module_outline(file) → в какой #Область лежит этот метод и какие у него соседи по области.
    - read_procedure(file, метод) → тело; find_callers_context(метод) → кто его зовёт.
    - Покажи цельную цепочку: полнотекст → определение → область модуля → тело → вызывающие.
 
 6. Статистика и сводка:
-   - find_definition: total у самого «многоместного» метода; сработал ли slow_fallback на кириллице.
+   - find_definition: total у самого «многоместного» метода; сработал ли slow_fallback на кириллице
+     (он означает ТОЛЬКО кириллический py_lower-rescan индекса, на live-ветке всегда False);
+     partial/_meta.total_exact и _meta.source.
    - get_module_outline: у выбранного модуля methods/exports/regions/loc и максимальная глубина
      вложенности областей; выигрыш include_methods=False (компактнее).
    - git_search: эффект exclude_path (на сколько % сократилась выдача), сколько Forms/Templates отсечено.
@@ -1722,7 +1733,7 @@ Use this prompt to verify the three navigation primitives added in v1.20.0:
 | Источник данных дерева | `_meta.index_used` / `fallback_reason` |
 | Полнотекст без шума (любая глубина) | `git_search(exclude_path='Forms,Templates')` |
 | Отсечение файла на глубине | `exclude_path='ConfigDumpInfo.xml'` |
-| Валидация exclude (литерал) | `exclude_path='a*'` → `[{error}]` |
+| Валидация exclude (литерал) | `exclude_path='a*'` → `{results: [], returned: 0, truncated: False, error, hint}` |
 | Связка примитивов | `git_search` → `find_definition` → `get_module_outline` → `read_procedure` → `find_callers_context` |
 
 ## Expected results
@@ -1739,7 +1750,7 @@ Use this prompt to verify the three navigation primitives added in v1.20.0:
 | `get_module_outline(big_module)` | `totals.regions` ≥ 2, дерево с вложенностью (`children`), `_meta.index_used=True` |
 | `include_methods=False` | нет ключей `methods`/`orphan_methods`, есть `totals` |
 | `git_search(token, exclude_path='Forms,Templates')` | файлы из `*/Forms/*` и `*/Templates/*` отсутствуют; число файлов уменьшается |
-| `git_search(token, exclude_path='a*')` | `[{error: ...}]` (без молчаливого расширения) |
+| `git_search(token, exclude_path='a*')` | `res['error']` непустой при `res['results'] == []` (без молчаливого расширения) |
 | git_search недоступен | источник не под git → пункт 4 пропущен (это нормально) |
 
 ---

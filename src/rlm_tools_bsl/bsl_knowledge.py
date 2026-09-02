@@ -11,11 +11,35 @@ from rlm_tools_bsl.bsl_strategy_data import (
 )
 
 
+# --- Грамматика объявления метода: ОДИН источник альтернатив, ДВЕ композиции ---
+# Вынесены именно АЛЬТЕРНАТИВЫ, а не готовая capturing-композиция. Подставить
+# `(?:(?:Асинх|Async)\s+)?(?:Процедура|…)` целиком в ``procedure_def`` нельзя:
+# это сдвинуло бы нумерацию групп и достижимо сломало бы всех потребителей
+# ``m.group(1..4)``. Поэтому вид объявления в ``procedure_def`` остаётся
+# CAPTURING, а поисковый префикс использует те же альтернативы non-capturing.
+BSL_ASYNC_PREFIX_ALT = r"Асинх|Async"
+BSL_DECL_KIND_ALT = r"Процедура|Функция|Procedure|Function"
+# Префикс объявления ДО ИМЕНИ: годится для ПОСТРОЧНОГО grep, где полная форма
+# ``procedure_def`` не подходит — она требует ЗАКРЫВАЮЩУЮ скобку на той же
+# строке, и многострочная сигнатура не совпала бы вовсе.
+BSL_DECL_PREFIX_RE = rf"^\s*(?:(?:{BSL_ASYNC_PREFIX_ALT})\s+)?(?:{BSL_DECL_KIND_ALT})\s+"
+
+
+def bsl_declaration_search_pattern(method_name: str) -> str:
+    """Построчный regex поиска ОБЪЯВЛЕНИЯ метода *method_name* (case-insensitive).
+
+    Ищется только НАЧАЛО объявления — до имени и границы слова. Скобки,
+    параметры и ``Экспорт`` разбирает полноценный парсер по найденным файлам;
+    дублировать его в grep-паттерне не нужно и вредно.
+    """
+    return rf"(?i){BSL_DECL_PREFIX_RE}{re.escape(method_name)}\b"
+
+
 BSL_PATTERNS = {
     # Заякорен на начало строки (v1.33.0): неякорный поиск ловил объявления из
     # комментариев и строковых литералов. Префикс Асинх/Async — non-capturing,
     # нумерация групп 1..4 сохранена, поэтому call-site'ы правки не требуют.
-    "procedure_def": r"^\s*(?:(?:Асинх|Async)\s+)?(Процедура|Функция|Procedure|Function)\s+(\w+)\s*\(([^)]*)\)\s*(Экспорт|Export)?",
+    "procedure_def": rf"^\s*(?:(?:{BSL_ASYNC_PREFIX_ALT})\s+)?({BSL_DECL_KIND_ALT})\s+(\w+)\s*\(([^)]*)\)\s*(Экспорт|Export)?",
     "procedure_end": r"^\s*(КонецПроцедуры|КонецФункции|EndProcedure|EndFunction)",
     "export_marker": r"\)\s*(Экспорт|Export)\s*$",
     "module_call": r"(\w+)\.(\w+)\s*\(",
@@ -425,6 +449,14 @@ Large configs have 23,000+ files. grep on broad paths WILL timeout. ALWAYS:
   2. Then read_file(path) or grep(pattern, path=specific_file)
 If a helper returns an error, read the HINT at the end — it tells you what to do next.
 
+== COVERAGE (кратко) ==
+source='index' НЕ означает «полный»; partial=False НЕ всегда означает «полный»;
+extensions_included=False НЕ означает «расширений нет» (означает «не доказано, что учтён»).
+Полнота: partial=True — точно неполно; total_exact=True — total доказан; для optional
+index-домена (синонимы, ссылки метаданных) полноту читай по _meta.index_coverage
+(disabled|build_unproven|wider_than_current|unavailable|not_used). owner ('main' |
+'extension:<Имя>') — провенанс СТРОКИ. scope — legacy-композит, полноту по нему не судят.
+
 == WORKFLOW ==
 BEFORE YOU START: check rlm_start response — warnings, extension_context, detected_custom_prefixes.
 
@@ -475,7 +507,7 @@ INSTANT (индексный путь, OK для batch 5-10 в одном rlm_exe
   find_register_movements(doc_name)      → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса
   find_event_subscriptions(obj)          → подписки на события (event_filter + limit опционально)
   find_scheduled_jobs(name='')           → регламентные задания
-  find_roles(obj_name)                   → роли с правами на объект
+  find_roles(obj_name)                   → broad substring (члены/однокоренные); exact — qualified+index
   find_defined_types(name)               → раскрытие ОпределяемогоТипа
   find_enum_values(enum_name)            → INSTANT с индексом; LIVE fallback на чтение Enum.xml без индекса
   get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
@@ -559,8 +591,10 @@ parse_object_xml(path) — путь к ДИРЕКТОРИИ объекта (не
 
 parse_object_xml для Roles vs find_roles(object_name):
   - parse_object_xml('Roles/X')      → не подходит для анализа прав: отдаёт сырую XML без нормализации право→объект.
-  - find_roles(object_name)          → нормализованный список ролей с правами на объект.
-  Для прав доступа к объекту → ВСЕГДА find_roles, не parse_object_xml.
+  - find_roles(object_name)          → BROAD substring lookup ролей: включает права на ЧЛЕНОВ
+                                       объекта и на ОДНОКОРЕННЫЕ имена (match='substring').
+  Обзор прав по объекту → find_roles, не parse_object_xml. Точный qualified object route
+  доступен ТОЛЬКО с индексом (см. пару find_roles vs find_references_to_object).
 
 find_event_subscriptions(event_filter=...) — list[str], НЕ голая строка:
   - event_filter=['BeforeWrite']         → правильно, один substring-matcher по 'beforewrite'.
@@ -584,6 +618,29 @@ find_register_movements(doc) vs find_register_writers(reg):
   - find_register_writers: регистр → статические ссылки документов (runtime_filtered=False).
   find_register_movements применяет Posting/CFE, но main-строки берет из снимка индекса;
   после изменения main-кода проверь живое тело файла кандидата.
+
+find_roles(object_name) vs find_references_to_object(ref, kinds=['role_rights']):
+  - find_roles → BROAD literal-substring по сырому object_name из Rights.xml: в выдачу
+    закономерно попадают права на ЧЛЕНОВ объекта (Command/Attribute/ТЧ) и на ОДНОКОРЕННЫЕ
+    имена (Заказ → ЗаказПоставщику). match='substring'; case_sensitive различается по
+    веткам (index — регистронезависимо, live-парсинг Rights.xml — регистрозависимо).
+  - find_references_to_object(qualified, kinds=['role_rights']) → ТОЧНАЯ ссылка на САМ
+    объект, но ТОЛЬКО при индексной metadata_references и ТОЛЬКО для qualified ref
+    ('Документ.X'); отдаёт reference на роль, БЕЗ индивидуальных right_name. Без таблицы
+    live-walker этот вид не поддерживает: _meta.unsupported_kinds=['role_rights'].
+  - Точные ИМЕНА ПРАВ на объект и его члены → get_object_profile('Документ.X',
+    sections=['roles']) при индексе: right_names / matched_objects / rights_by_object —
+    BOUNDED sample, details_truncated=True означает «сузь qualified object».
+  Это ТРИ разных вопроса, а не расхождение хелперов. Bare-name в точных маршрутах запрещён.
+
+find_references_to_object(ref) vs find_code_usages(ref):
+  - find_references_to_object → ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов,
+    владелец, основание ввода, подсистемы, права, ФО, ПВХ, DefinedType. Код НЕ сканирует.
+  - find_code_usages → ОБРАЩЕНИЯ В КОДЕ: Документы.X (manager), "ДокументСсылка.X"
+    (ref_type), запросы Документ.X.ТЧ (query, member=имя ТЧ). Метаданные-XML НЕ сканирует.
+  Это РАЗНЫЕ слои. Нужны оба — find_references_to_object(obj, include_code=True).
+  Доступ через локальные переменные — вне охвата find_code_usages; охват кода
+  расширений зависит от маршрута и назван в _meta.extensions_included.
 
 search(q, scope='X') vs search_X(q):
   - search() — broad-first, отдаёт unified [{source_type, text, path, path_kind, detail}].
@@ -665,7 +722,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "find_register_movements('ДокИмя') → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса",
             "сигналы: is_postable=False -> нет движений; suppressed_main_code_registers -> handler-only main не active; posting_handler_present при code_registers=0 -> прямых Движения.X нет, возможны делегаты",
             "ТРАССИРОВКА: исполняй result['hint']: сервер вернул регистр, делегата (получатель может быть НЕ РАЗРЕШЕН), dotless local-global или «не пишет»; CFE через read_file недоступен",
-            "ЛОВУШКИ: (1) точка НЕ доказывает модуль: слева бывает ПЕРЕМЕННАЯ/РЕКВИЗИТ; одноименный модуль молча отдаст ЧУЖОЕ тело — верь метке hint. (2) category=='CommonModules' при 'ОбщийМодуль.' — ТАВТОЛОГИЯ: это фильтр module_hint. (3) проверяй d.get('definitions'): пусто = definitions=[], без индекса ключа нет. (4) ПУСТО — исполни live safe_grep-маршрут из hint; _truncated = остановка на 50 кандидатах, без него каталог пройден",
+            "ЛОВУШКИ: (1) точка НЕ доказывает модуль: слева бывает ПЕРЕМЕННАЯ/РЕКВИЗИТ; одноименный модуль молча отдаст ЧУЖОЕ тело — верь метке hint. (2) category=='CommonModules' при 'ОбщийМодуль.' — ТАВТОЛОГИЯ: это фильтр module_hint. (3) find_definition работает и БЕЗ индекса: пусто = definitions=[], неполнота — в partial. (4) ПУСТО — исполни live safe_grep-маршрут из hint: строки в res['results'], res['truncated'] = остановка на 50 кандидатах",
             "НАШЕЛ Движения.X: find_register_writers('Регистр') даст static-кандидатов; Posting/CFE проверь forward, измененный после build main-файл — живьем. Набор записей helper не найдет — ищи регистр через git_search, иначе safe_grep",
             "ОбработкаПроведения зовет ПЛАТФОРМА: callers=0 норма, но ЯВНЫЙ BSL-вызов хелперы покажут. Движения ищи через hint, call-хелперами трассируй ДЕЛЕГАТА; include_triggers — лишь CFE-перехват",
             "analyze_document_flow('ДокИмя') → проводки + подписки + регзадания",
@@ -711,11 +768,13 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('ОбъектИмя') → найти объект по бизнес-имени",
             "get_object_profile('ОбъектИмя') → за 1 вызов: роли (roles) + функц.опции (functional_options) + структура",
-            "детальнее: find_roles('ОбъектИмя') по ролям; find_functional_options('ОбъектИмя', limit=10) по опциям (limit= ИМЕНОВАННО — per-bucket cap + total/returned/has_more; без него на «жирных» объектах обрыв по max_output_chars)",
+            "find_roles('ОбъектИмя') — BROAD substring (вкл. членов/однокоренные), не exact; точные имена прав — get_object_profile(...,sections=['roles']) при индексе; find_functional_options('ОбъектИмя', limit=10) по опциям (limit= ИМЕНОВАННО — per-bucket cap + total/returned/has_more; без него на «жирных» объектах обрыв по max_output_chars)",
         ],
         "full": [
             "search_objects('ОбъектИмя') → найти объект по бизнес-имени",
-            "find_roles('ОбъектИмя') → роли с правами на объект (чтение, запись, и т.д.)",
+            "find_roles('ОбъектИмя') → BROAD substring lookup ролей: включает права на ЧЛЕНОВ объекта и однокоренные имена (match='substring'), это НЕ exact",
+            "точное МЕМБЕРСТВО: find_references_to_object('Документ.X', kinds=['role_rights']) — требует индексной metadata_references и qualified ref; без неё _meta.unsupported_kinds=['role_rights'], без right_name",
+            "точные ИМЕНА ПРАВ: get_object_profile('Документ.X', sections=['roles']) — right_names / matched_objects / rights_by_object — BOUNDED sample, при details_truncated=True сужай объект, а не считай список полным",
             "find_by_type('Roles') → полный список ролей конфигурации",
             "find_functional_options('ОбъектИмя', limit=10) → функциональные опции; limit= (именованно!) режет xml_options и code_options КАЖДЫЙ до N + total/returned/has_more — без него обрыв по max_output_chars",
             "search_methods('ПравоДоступа') → проверки прав в коде",
@@ -1174,7 +1233,7 @@ def _git_search_routing(registry: dict | None) -> str:
         "  - inside a KNOWN module → safe_grep(pattern, name_hint)   (scoped, fast)\n"
         "  - ANY substring ANYWHERE, incl. XML/forms/query text → git_search(pattern[, path, file_types])\n"
         "Anti-noise on common tokens: git_search(tok, mode='files') first (which files), or narrow\n"
-        "file_types/path, then drill down. Mind max_results / the {'_truncated': True} sentinel."
+        "file_types/path, then drill down. Answer is a DICT: rows in res['results'], res['truncated']."
     )
 
 
@@ -1514,7 +1573,7 @@ you MUST call rlm_help(...) BEFORE running rlm_execute on non-trivial queries.
   rlm_help(topic='проведение'|'печать'|'права'|'ссылки'|...)  → готовый план для домена
   rlm_help(category='discovery'|'code'|'xml'|'composite'|'business'|'extension'|'navigation')  → группа хелперов
   rlm_help(helpers=['name1','name2'])  → детальные рецепты для конкретных хелперов
-  rlm_help(section='workflow'|'disambiguation'|'performance'|'batching'|'io')  → справочные секции
+  rlm_help(section='workflow'|'disambiguation'|'performance'|'io'|'coverage')  → справочные секции
   rlm_help()  → меню всех topic/category/section
 NOTE: in-sandbox help('keyword') (the BSL helper) still works inside rlm_execute for
 quick recipe lookup at code-time — that is separate from the rlm_help MCP tool above."""
@@ -1525,9 +1584,12 @@ Step 0 UNDERSTAND → Step 1 DISCOVER → Step 2 READ → Step 3 TRACE → Step 
 Full Step 0..5 with helper menu per step → rlm_help(section='workflow').
 INSTANT/HYBRID/LIVE breakdown for Step 4 perf → rlm_help(section='performance')."""
 
-_SLIM_DISAMBIGUATION_POINTER = """\
+# Число пар подставляется ИЗ ДАННЫХ: зашитый литерал уже протухал (в проде стояло
+# «8» при 11 фактических парах), и агент получал заведомо неверный счёт в дефолтном
+# slim-старте. Это ТРЕТЬЯ точка синхронизации DISAMBIGUATION — см. docs/MODULE_MAP.md.
+_SLIM_DISAMBIGUATION_POINTER = f"""\
 == DISAMBIGUATION (pointer) ==
-8 overlapping helper pairs are documented separately. Examples:
+{len(DISAMBIGUATION_PAIRS)} overlapping helper pairs are documented separately. Examples:
   get_object_full_structure vs analyze_object | find_call_hierarchy vs find_callers_context
   find_callers vs find_callers_context | find_register_movements vs analyze_document_flow
   parse_object_xml vs find_attributes | parse_object_xml vs find_roles
@@ -1897,7 +1959,7 @@ def list_sections() -> list[str]:
     """Section names valid for `rlm_help(section=...)` (excluding 'disambiguation',
     which is fetched separately as structured data — but listed here so the
     enum and the menu agree)."""
-    return ["workflow", "performance", "batching", "io", "critical", "disambiguation"]
+    return ["workflow", "performance", "batching", "io", "critical", "coverage", "disambiguation"]
 
 
 def list_categories() -> list[str]:

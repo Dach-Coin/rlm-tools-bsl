@@ -385,8 +385,10 @@ def test_git_grep_z_parsing_colon_in_path(tmp_path):
 def test_git_search_registered_and_finds_xml(repo):
     bsl = _make_bsl(repo)
     assert "git_search" in bsl["_registry"]
-    hits = bsl["git_search"](TOK, file_types="xml")
-    assert any(h["file"].endswith("Form.xml") for h in hits)
+    res = bsl["git_search"](TOK, file_types="xml")
+    assert res["error"] is None
+    assert res["returned"] == len(res["results"])
+    assert any(h["file"].endswith("Form.xml") for h in res["results"])
 
 
 def test_git_search_error_dict_on_failure(repo, monkeypatch):
@@ -400,10 +402,12 @@ def test_git_search_error_dict_on_failure(repo, monkeypatch):
     bsl = _make_bsl(repo)
     monkeypatch.setattr(bsl_index_mod, "_git_grep", lambda *a, **k: None)
     out = bsl["git_search"](TOK)
-    assert len(out) == 1
-    assert out[0]["error"] == "git grep failed or timed out"
-    assert set(out[0]) == {"error", "hint"}, f"форма ошибки разъехалась с аргументными: {out[0]}"
-    assert "safe_grep" in out[0]["hint"], f"hint отказа git не дает замену: {out[0]['hint']}"
+    assert out["results"] == [] and out["returned"] == 0 and out["truncated"] is False
+    assert out["error"] == "git grep failed or timed out"
+    assert set(out) == {"results", "returned", "truncated", "error", "hint"}, (
+        f"форма ошибки разъехалась с аргументными: {out[0]}"
+    )
+    assert "safe_grep" in out["hint"], f"hint отказа git не дает замену: {out['hint']}"
 
 
 def test_git_search_fallback_hint_does_not_oversell_safe_grep(repo, monkeypatch):
@@ -416,7 +420,7 @@ def test_git_search_fallback_hint_does_not_oversell_safe_grep(repo, monkeypatch)
     отдельный маршрут для не-BSL/широкого поиска."""
     bsl = _make_bsl(repo)
     monkeypatch.setattr(bsl_index_mod, "_git_grep", lambda *a, **k: None)
-    hint = bsl["git_search"](TOK, file_types="xml")[0]["hint"]
+    hint = bsl["git_search"](TOK, file_types="xml")["hint"]
     assert "BSL" in hint, f"hint не говорит, что safe_grep ограничен BSL: {hint}"
     assert "max_files" in hint, f"hint не говорит про потолок кандидатов у safe_grep: {hint}"
     assert "grep(" in hint, f"hint не даёт маршрут для не-BSL/широкого поиска: {hint}"
@@ -432,17 +436,17 @@ def test_git_search_names_broken_regex_instead_of_blaming_git(repo):
     bsl = _make_bsl(repo)
     for pat in ("(", "a[b", "*x", "a{2,1}"):
         out = bsl["git_search"](pat, regex=True)
-        assert len(out) == 1 and "error" in out[0], (pat, out)
-        assert "pattern" in out[0]["error"], out[0]["error"]
-        assert "git grep failed" not in out[0]["error"], f"снова валим на git: {out[0]['error']}"
-        assert out[0].get("hint"), out[0]
+        assert out["error"] and out["results"] == [], (pat, out)
+        assert "pattern" in out["error"], out["error"]
+        assert "git grep failed" not in out["error"], f"снова валим на git: {out['error']}"
+        assert out["hint"], out
 
     # Контроль: валидное выражение НЕ отвергается, поиск идёт как обычно.
     ok = bsl["git_search"](TOK, regex=True)
-    assert not (ok and "error" in ok[0]), ok
+    assert ok["error"] is None, ok
     # И в fixed-string режиме (git grep -F) «битый» regex — обычная подстрока, не ошибка.
     fixed = bsl["git_search"]("(", regex=False)
-    assert not (fixed and "error" in fixed[0]), fixed
+    assert fixed["error"] is None, fixed
 
 
 def test_git_search_classifies_python_only_regex_by_gits_own_verdict(repo):
@@ -460,16 +464,17 @@ def test_git_search_classifies_python_only_regex_by_gits_own_verdict(repo):
     bsl = _make_bsl(repo)
     for pat in ("(?=a)", "(?P<x>a)", "(?<=a)b"):
         out = bsl["git_search"](pat, regex=True)
-        assert len(out) == 1 and "error" in out[0], (pat, out)
-        assert "pattern" in out[0]["error"], f"{pat!r}: причина снова не названа: {out[0]['error']}"
-        assert "git grep failed" not in out[0]["error"], f"{pat!r}: снова валим на git: {out[0]['error']}"
+        assert out["error"] and out["results"] == [], (pat, out)
+        assert "pattern" in out["error"], f"{pat!r}: причина снова не названа: {out['error']}"
+        assert "git grep failed" not in out["error"], f"{pat!r}: снова валим на git: {out['error']}"
         # Подлинное сообщение git долетает до агента — оно точнее любой нашей формулировки.
-        assert "regular expression" in out[0]["error"].lower() or "unmatched" in out[0]["error"].lower(), out[0]
-        assert "POSIX ERE" in out[0]["hint"], out[0]["hint"]
-        assert "regex=False" in out[0]["hint"], out[0]["hint"]
+        assert "regular expression" in out["error"].lower() or "unmatched" in out["error"].lower(), out
+        assert "POSIX ERE" in out["hint"], out["hint"]
+        assert "regex=False" in out["hint"], out["hint"]
 
     # Контроль: те же конструкции как ЛИТЕРАЛЬНАЯ подстрока (-F) — не ошибка, просто нет совпадений.
-    assert bsl["git_search"]("(?=a)", regex=False) == []
+    literal = bsl["git_search"]("(?=a)", regex=False)
+    assert literal["error"] is None and literal["results"] == []
 
 
 def test_git_search_names_the_broken_filter_instead_of_blaming_git(repo):
@@ -494,19 +499,19 @@ def test_git_search_names_the_broken_filter_instead_of_blaming_git(repo):
         ({"mode": "bogus"}, "mode"),
     ):
         out = bsl["git_search"](TOK, **kwargs)
-        assert len(out) == 1 and "error" in out[0], (kwargs, out)
-        err = out[0]["error"]
+        assert out["error"] and out["results"] == [], (kwargs, out)
+        err = out["error"]
         assert culprit in err, f"ошибка не называет виновный аргумент {culprit!r}: {err}"
         assert "git grep failed" not in err, f"снова валим на git: {err}"
-        assert out[0].get("hint"), f"нет actionable-подсказки: {out[0]}"
+        assert out["hint"], f"нет actionable-подсказки: {out}"
 
     # NL/NUL в pattern — git трактовал бы их как несколько -e паттернов; тоже НЕ вина git.
     for pat in ("a\nb", "a\x00b"):
         out = bsl["git_search"](pat)
-        assert len(out) == 1 and "error" in out[0], (pat, out)
-        assert "pattern" in out[0]["error"], out[0]["error"]
-        assert "git grep failed" not in out[0]["error"], out[0]["error"]
-        assert out[0].get("hint"), out[0]
+        assert out["error"] and out["results"] == [], (pat, out)
+        assert "pattern" in out["error"], out["error"]
+        assert "git grep failed" not in out["error"], out["error"]
+        assert out["hint"], out
 
 
 def test_git_search_does_not_blame_the_pattern_for_a_real_git_failure(repo, monkeypatch):
@@ -531,11 +536,11 @@ def test_git_search_does_not_blame_the_pattern_for_a_real_git_failure(repo, monk
     monkeypatch.setattr(bsl_index_mod, "_git_grep", _fake)
     for regex in (True, False):
         out = bsl["git_search"]("валидный.*ERE", regex=regex)
-        assert len(out) == 1 and "error" in out[0], (regex, out)
-        err = out[0]["error"]
+        assert out["error"] and out["results"] == [], (regex, out)
+        err = out["error"]
         assert "pattern" not in err.lower(), f"regex={regex}: обвиняем корректный pattern: {err}"
         assert err == "git grep failed or timed out", f"regex={regex}: настоящий отказ git назван иначе: {err}"
-        assert out[0].get("hint"), out[0]
+        assert out["hint"], out
 
 
 def test_git_search_fallback_hint_warns_that_pattern_semantics_change(repo, monkeypatch):
@@ -555,14 +560,14 @@ def test_git_search_fallback_hint_warns_that_pattern_semantics_change(repo, monk
     namespace БЕЗ `re` и `pattern`."""
     bsl = _make_bsl(repo)
     monkeypatch.setattr(bsl_index_mod, "_git_grep", lambda *a, **k: None)
-    hint = bsl["git_search"]("(", regex=False)[0]["hint"]
+    hint = bsl["git_search"]("(", regex=False)["hint"]
     assert "re.escape" in hint, f"hint не называет применённое экранирование: {hint}"
     frags = re.findall(r"safe_grep\([^)]*\)", hint)
     assert frags, f"hint не даёт исполнимого safe_grep-эквивалента: {hint}"
     ns = dict(bsl)  # ни 're', ни 'pattern' — ровно как в свежей песочнице
     for frag in frags:
         res = eval(compile(frag, "<fallback-hint>", "eval"), {"__builtins__": {}}, ns)  # noqa: S307
-        assert isinstance(res, list), (frag, res)
+        assert isinstance(res, dict) and "results" in res, (frag, res)
     assert "'\\\\('" in hint, f"экранированный сервером литерал не вставлен: {hint}"
 
     grep_frags = re.findall(r"(?<!safe_)grep\([^)]*\)", hint)
@@ -577,12 +582,12 @@ def test_git_search_fallback_hint_warns_that_pattern_semantics_change(repo, monk
         assert isinstance(res, list), (executable, res)
         assert "\\\\(" in executable, f"grep получил сырой некомпилируемый литерал: {executable}"
 
-    hint_re = bsl["git_search"]("a.*b", regex=True)[0]["hint"]
+    hint_re = bsl["git_search"]("a.*b", regex=True)["hint"]
     assert "ERE" in hint_re and "re" in hint_re, f"hint не разводит диалекты ERE и Python re: {hint_re}"
     assert "'a.*b'" in hint_re, f"regex-вариант не вставлен как готовый литерал: {hint_re}"
     for frag in re.findall(r"safe_grep\([^)]*\)", hint_re):
         res = eval(compile(frag, "<fallback-hint>", "eval"), {"__builtins__": {}}, dict(bsl))  # noqa: S307
-        assert isinstance(res, list), (frag, res)
+        assert isinstance(res, dict) and "results" in res, (frag, res)
 
 
 def test_git_search_long_pattern_fallback_respects_the_regex_flag(repo, monkeypatch):
@@ -594,11 +599,11 @@ def test_git_search_long_pattern_fallback_respects_the_regex_flag(repo, monkeypa
     monkeypatch.setattr(bsl_index_mod, "_git_grep", lambda *a, **k: None)
     long_pattern = "a" * 301
 
-    hint_re = bsl["git_search"](long_pattern, regex=True)[0]["hint"]
+    hint_re = bsl["git_search"](long_pattern, regex=True)["hint"]
     assert "re.escape(" not in hint_re, f"длинному regex советуют экранирование: {hint_re}"
     assert "БЕЗ re.escape" in hint_re, f"нет явного запрета экранирования для regex: {hint_re}"
 
-    hint_lit = bsl["git_search"](long_pattern, regex=False)[0]["hint"]
+    hint_lit = bsl["git_search"](long_pattern, regex=False)["hint"]
     assert "import re" in hint_lit and "re.escape(" in hint_lit, (
         f"длинный литерал потерял маршрут с явным import re: {hint_lit}"
     )
@@ -621,8 +626,12 @@ def test_helpers_doc_git_fallback_example_executes_without_hidden_names(repo):
 
 def test_git_search_truncation_contract(repo):
     bsl = _make_bsl(repo)
-    hits = bsl["git_search"](TOK, max_results=1)
-    assert hits[-1].get("_truncated") is True
+    res = bsl["git_search"](TOK, max_results=1)
+    assert res["truncated"] is True
+    assert res["returned"] == 1 == len(res["results"])
+    # sentinel снят на границе публичного хелпера: он больше не элемент списка
+    assert all("_truncated" not in h for h in res["results"])
+    assert res["error"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -632,22 +641,30 @@ def test_git_search_truncation_contract(repo):
 
 def test_safe_grep_strict_contract_no_sentinel(repo):
     bsl = _make_bsl(repo)
-    results = bsl["safe_grep"](TOK, max_files=50)
-    assert results  # found something
-    for r in results:
+    res = bsl["safe_grep"](TOK, max_files=50)
+    assert res["results"]  # found something
+    assert res["returned"] == len(res["results"])
+    assert res["truncated"] is False
+    for r in res["results"]:
         assert set(r.keys()) == {"file", "line", "text"}
+    # охват виден машинно и согласован
+    assert res["scanned_files"] <= res["candidates_total"]
+    assert res["catalog_complete"] is True and res["catalog_errors"] == 0
+    # Литерал под git целиком ушёл в status-aware git-ветку: legacy grep_fn не исполнялся ни разу,
+    # поэтому статус чтения ДОКАЗУЕМ (ноль legacy-попыток тоже оставляет True).
+    assert res["read_status_complete"] is True
 
 
 def test_safe_grep_git_parity_literal(repo, monkeypatch):
     """safe_grep literal results identical with and without the git backend."""
     bsl_git = _make_bsl(repo)
-    with_git = bsl_git["safe_grep"](TOK, max_files=50)
+    with_git = bsl_git["safe_grep"](TOK, max_files=50)["results"]
 
     # Force the no-git path by making availability return False on a fresh closure.
     bsl_nogit = _make_bsl(repo)
     monkeypatch.setattr(bsl_index_mod, "_git_available", lambda _p: False)
     # New closure's cache is unset; the patched _git_available is imported lazily.
-    without_git = bsl_nogit["safe_grep"](TOK, max_files=50)
+    without_git = bsl_nogit["safe_grep"](TOK, max_files=50)["results"]
 
     def _key(rs):
         return sorted((r["file"], r["line"], r["text"]) for r in rs)
@@ -678,7 +695,7 @@ def test_safe_grep_normalizes_file_separators_to_posix(repo):
         format_info=format_info,
     )
     # regex-паттерн (метасимвол '.') → git-литерал fast-path пропущен → Python grep_fn.
-    results = bsl["safe_grep"]("hi.")
+    results = bsl["safe_grep"]("hi.")["results"]
     assert results, "ожидались результаты из Python-ветки (grep_fn)"
     assert all("\\" not in r["file"] for r in results), [r["file"] for r in results]
     assert all(r["file"] == "CommonModules/МойМодуль/Ext/Module.bsl" for r in results)
@@ -707,7 +724,7 @@ def test_safe_grep_does_not_mutate_grep_fn_results(repo):
         glob_files_fn=helpers["glob_files"],
         format_info=format_info,
     )
-    results = bsl["safe_grep"]("hi.")
+    results = bsl["safe_grep"]("hi.")["results"]
     assert all(r["file"] == "CommonModules/МойМодуль/Ext/Module.bsl" for r in results)
     # Backend-строки остались нетронутыми (safe_grep вернул КОПИИ).
     assert backend_rows[0]["file"] == "CommonModules\\МойМодуль\\Ext\\Module.bsl"
@@ -716,7 +733,7 @@ def test_safe_grep_does_not_mutate_grep_fn_results(repo):
 def test_safe_grep_regex_stays_on_python(repo):
     """A regex pattern (metachars) must still work via safe_grep (Python re)."""
     bsl = _make_bsl(repo)
-    results = bsl["safe_grep"]("Контр.гент", max_files=50)
+    results = bsl["safe_grep"]("Контр.гент", max_files=50)["results"]
     assert any(r["file"].endswith("Module.bsl") for r in results)
 
 
@@ -902,7 +919,8 @@ def test_git_search_exclude_path_helper(repo):
     bsl = _make_bsl(repo)
     nested = _add_nested_form(repo)
     out = bsl["git_search"](TOK, exclude_path="Forms")
-    files = {h.get("file") for h in out if "file" in h}
+    assert out["error"] is None
+    files = {h.get("file") for h in out["results"] if "file" in h}
     assert nested not in files
     assert any(str(f).endswith("Module.bsl") for f in files)
 
@@ -912,15 +930,16 @@ def test_git_search_exclude_malformed_error(repo):
     (раньше валили на git: «git grep failed or timed out»)."""
     bsl = _make_bsl(repo)
     out = bsl["git_search"](TOK, exclude_path="a*")
-    assert len(out) == 1 and "error" in out[0], out
-    assert "exclude_path" in out[0]["error"], out[0]["error"]
-    assert "git grep failed" not in out[0]["error"], out[0]["error"]
+    assert out["error"] and out["results"] == [], out
+    assert "exclude_path" in out["error"], out["error"]
+    assert "git grep failed" not in out["error"], out["error"]
 
 
 def test_git_search_positional_compat_unchanged(repo):
     """exclude_path added at the END → the 4th positional is still ``regex`` (Codex #1)."""
     bsl = _make_bsl(repo)
     hits = bsl["git_search"]("VIN.OKEN", "CommonModules", "bsl", True, mode="files")
-    assert any(str(h.get("file", "")).endswith("Module.bsl") for h in hits)
+    assert any(str(h.get("file", "")).endswith("Module.bsl") for h in hits["results"])
     # Same positional call with regex=False → the metachar pattern matches nothing literally.
-    assert bsl["git_search"]("VIN.OKEN", "CommonModules", "bsl", False, mode="files") == []
+    literal = bsl["git_search"]("VIN.OKEN", "CommonModules", "bsl", False, mode="files")
+    assert literal["error"] is None and literal["results"] == []

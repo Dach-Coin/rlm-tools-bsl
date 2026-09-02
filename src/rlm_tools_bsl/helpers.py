@@ -68,7 +68,89 @@ def _walk_files(root: pathlib.Path):
             yield pathlib.Path(dirpath) / fname
 
 
-def make_helpers(base_path: str, idx_reader=None) -> tuple[dict, callable]:
+def scan_bsl_tree(root: pathlib.Path) -> tuple[list[str], int]:
+    """Канон ``walk``: прямой обход дерева *root* поверх ``os.scandir``.
+
+    Семантика повторяет прежний обход внутри live-каталога BSL-хелперов (резолв
+    directory redirect ВНУТРЬ root + ``seen_dirs``), но дополнительно считает
+    ошибки перечисления: молча выпавший каталог раньше был неотличим от каталога
+    без модулей, и «пусто» выглядело как доказанный ноль.
+
+    Обход СВОИМ стеком, а не ``os.walk``: тот дёргает ``islink`` на КАЖДЫЙ
+    элемент (на боевой ЕРП-конфигурации 106 000 системных вызовов), тогда как
+    ``DirEntry`` отдаёт тип из уже прочитанного каталога бесплатно.
+
+    Returns: ``(absolute_paths, enumeration_errors)``.
+    """
+    errors = 0
+    found: list[str] = []
+    root_str = str(root)
+    stack = [root_str]
+    # normcase, а НЕ casefold: на Windows он приводит регистр (там `Alpha` и
+    # `alpha` — один каталог), на регистрозависимой ФС оставляет строку как есть
+    # (безусловный casefold схлопнул бы два РАЗНЫХ каталога Linux в один).
+    seen_dirs: set[str] = {os.path.normcase(root_str)}
+    while stack:
+        try:
+            scan = list(os.scandir(stack.pop()))
+        except OSError:
+            errors += 1
+            continue
+        for entry in scan:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name in _SKIP_DIRS or entry.name.startswith("."):
+                        continue
+                    target = entry.path
+                    # КАТАЛОГ-ПЕРЕНАПРАВЛЕНИЕ: на Windows это не только симлинк,
+                    # но и junction, у которого ``is_symlink()`` == False.
+                    # Резолвим ОДИН раз на каталог и дальше идём по РАЗРЕШЁННОМУ
+                    # пути: цель вне root даст ValueError и будет пропущена, цель
+                    # внутри root перечислится ровно как при прямом проходе.
+                    if entry.is_symlink() or getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0):
+                        resolved_dir = pathlib.Path(target).resolve()
+                        resolved_dir.relative_to(root)
+                        target = str(resolved_dir)
+                    key = os.path.normcase(target)
+                    if key in seen_dirs:
+                        continue
+                    seen_dirs.add(key)
+                    stack.append(target)
+                    continue
+                if not entry.name.lower().endswith(".bsl"):
+                    continue
+                path = entry.path
+                # realpath — ТОЛЬКО для симлинка: гард «файл не уводит за пределы»
+                # обязан остаться, но платить им за каждый обычный файл незачем.
+                if entry.is_symlink():
+                    # Симлинк на КАТАЛОГ с именем вида `X.bsl` сюда тоже попадает
+                    # (`is_dir(follow_symlinks=False)` у ссылки — False), а
+                    # os.walk такое клал в dirnames и модулем НИКОГДА не считал.
+                    if entry.is_dir():
+                        continue
+                    resolved = pathlib.Path(path).resolve()
+                    resolved.relative_to(root)
+                    path = str(resolved)
+            except ValueError:
+                # Намеренно исключённая цель вне root — не ошибка полноты.
+                continue
+            except OSError:
+                errors += 1
+                continue
+            found.append(path)
+    return found, errors
+
+
+def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = None) -> tuple[dict, callable]:
+    """Generic (non-BSL) sandbox toolbox.
+
+    ``_private_io`` (v1.34.0) — opt-in sink для ПРИВАТНЫХ status-aware каналов.
+    Возвращаемая пара ``(public_helpers, resolve_safe)`` не меняется, приватные
+    ключи в namespace/registry не попадают: их забирает только production
+    ``Sandbox`` и передаёт напрямую в ``make_bsl_helpers``. Публичный
+    ``grep(pattern, path=".")`` остаётся двухаргументным — служебный kwarg из
+    кода песочницы по-прежнему даёт ``TypeError``.
+    """
     base = pathlib.Path(base_path).resolve()
     _file_cache: collections.OrderedDict[str, str] = collections.OrderedDict()
     _file_cache_lock = threading.Lock()
@@ -135,13 +217,22 @@ def make_helpers(base_path: str, idx_reader=None) -> tuple[dict, callable]:
                 continue
         return False
 
-    def grep(pattern: str, path: str = ".") -> list[dict]:
-        """Search for regex pattern in files. Returns list of dicts {file, line, text}."""
+    def _grep_impl(pattern: str, path: str, status: dict | None) -> list[dict]:
+        """Общее ядро публичного ``grep`` и приватного ``grep_with_status``.
+
+        Failure-count ведётся ВСЕГДА, даже когда публичная оболочка его не
+        отдаёт: иначе публичный вызов первым закешировал бы ошибочный ``[]``, а
+        последующий приватный принял бы его за доказанный ноль.
+        """
         # Finding #2 (v1.26.0): отсечь явные catastrophic-backtracking паттерны ПЕРВЫМ
         # оператором — до cache-lookup и re.compile. C-движок _sre повиснет на (a+)+b,
         # а Windows-таймаут песочницы (PyThreadState_SetAsyncExc) его не прерывает.
         if has_catastrophic_nesting(pattern):
             raise ValueError(NESTED_QUANTIFIER_ERROR)
+        # Статус инициализируется ДО cache lookup: cache-hit — это заведомо
+        # безошибочный проход (неуспешные в кеш не кладутся), и его ноль честен.
+        if status is not None:
+            status["failed_files"] = 0
         cache_key = (pattern, path)
         with _grep_cache_lock:
             if cache_key in _grep_cache:
@@ -151,8 +242,16 @@ def make_helpers(base_path: str, idx_reader=None) -> tuple[dict, callable]:
         target = _resolve_safe(path)
         compiled = re.compile(pattern)
         results = []
+        failed = 0
 
-        if target.is_file():
+        try:
+            is_dir = target.is_dir()
+        except OSError:
+            is_dir = False
+        if not is_dir:
+            # Конкретный файл (в т.ч. нечитаемый по ACL: is_file() глотает OSError
+            # и вернул бы False, после чего путь молча выпадал из области).
+            explicit_file = True
             search_paths = [target]
         elif _is_broad_directory(target):
             raise ValueError(
@@ -162,10 +261,17 @@ def make_helpers(base_path: str, idx_reader=None) -> tuple[dict, callable]:
                 "then grep(pattern, 'path/to/specific/file.bsl')."
             )
         else:
+            explicit_file = False
             search_paths = _walk_files(target)
 
         for file_path in search_paths:
-            if not file_path.is_file():
+            try:
+                readable = file_path.is_file()
+            except OSError:
+                readable = False
+            if not readable:
+                if explicit_file:
+                    failed += 1
                 continue
             ext = file_path.suffix.lower()
             if ext in _BINARY_EXTENSIONS:
@@ -181,13 +287,25 @@ def make_helpers(base_path: str, idx_reader=None) -> tuple[dict, callable]:
                             }
                         )
             except (OSError, UnicodeDecodeError):
+                failed += 1
                 continue
 
-        with _grep_cache_lock:
-            _grep_cache[cache_key] = results
-            if len(_grep_cache) > _GREP_CACHE_MAX_SIZE:
-                _grep_cache.popitem(last=False)
+        if failed == 0:
+            with _grep_cache_lock:
+                _grep_cache[cache_key] = results
+                if len(_grep_cache) > _GREP_CACHE_MAX_SIZE:
+                    _grep_cache.popitem(last=False)
+        if status is not None:
+            status["failed_files"] = failed
         return results
+
+    def grep(pattern: str, path: str = ".") -> list[dict]:
+        """Search for regex pattern in files. Returns list of dicts {file, line, text}."""
+        return _grep_impl(pattern, path, None)
+
+    def grep_with_status(pattern: str, path: str, status: dict) -> list[dict]:
+        """ПРИВАТНЫЙ вариант ``grep``: тот же результат + доказуемый failure-count."""
+        return _grep_impl(pattern, path, status)
 
     def grep_summary(pattern: str, path: str = ".") -> str:
         """Grep with compact output grouped by file. Returns a formatted string."""
@@ -432,6 +550,29 @@ def make_helpers(base_path: str, idx_reader=None) -> tuple[dict, callable]:
         _build_file_index()
         needle = name.lower()
         return [f for f in _file_index if needle in f.lower()][:100]
+
+    def _scan_main_bsl_catalog_status(route_canon: str) -> tuple[list[str], int]:
+        """ПРИВАТНЫЙ status-aware producer списка BSL-путей основной конфигурации.
+
+        ``route_canon`` — только ``"glob"`` либо ``"walk"``. Каноны намеренно
+        РАЗНЫЕ и не сливаются: ``glob`` обязан сохранить порядок и состав
+        прежнего ``glob_files("**/*.bsl")`` (его порядок наблюдаем — он решает,
+        какие именно 50 строк отдадут ``find_module``/``find_by_type``), а
+        ``walk`` — состав прежнего прямого обхода live-каталога (там порядок не
+        наблюдаем, каталог всё равно сортируется сам).
+        """
+        if route_canon == "glob":
+            try:
+                return list(glob_files("**/*.bsl")), 0
+            except OSError:
+                return [], 1
+        if route_canon == "walk":
+            return scan_bsl_tree(base)
+        raise ValueError(f"unknown route_canon: {route_canon!r}")
+
+    if _private_io is not None:
+        _private_io["grep_with_status"] = grep_with_status
+        _private_io["scan_bsl_catalog_status"] = _scan_main_bsl_catalog_status
 
     return {
         "read_file": read_file,

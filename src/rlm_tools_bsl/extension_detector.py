@@ -472,6 +472,95 @@ def detect_extension_context(base_path: str) -> ExtensionContext:
     )
 
 
+# ---------------------------------------------------------------------------
+# Root topology foundation (v1.34.0)
+# ---------------------------------------------------------------------------
+# Единственный способ построить ключ корня. Обе стороны провода (server и
+# make_bsl_helpers) обязаны звать ИМЕННО его: иначе Windows-регистр либо
+# разделитель превратят переданное metadata-имя в basename-fallback, а
+# переданная карта имён — в мёртвый груз.
+
+
+def root_key(path) -> str:
+    """Нормализованный ключ корня: ``normcase(fspath(Path(path).resolve()))``."""
+    return os.path.normcase(os.fspath(Path(path).resolve()))
+
+
+def _safe_resolved(path) -> Path | None:
+    try:
+        return Path(path).resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def path_within_root(candidate: Path, root: Path) -> bool:
+    """True, если *candidate* равен *root* либо лежит под ним.
+
+    Сравнение идёт по УЖЕ разрешённым путям и покомпонентно (``relative_to``),
+    поэтому ``.../Ext`` не совпадает с ``.../Ext2``.
+    """
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_root_topology(base_path, extension_paths) -> None:
+    """Проверить, что base и все extension-roots — попарно непересекающиеся деревья.
+
+    Равенство и containment в ЛЮБУЮ сторону запрещены: иначе один физический
+    файл попал бы в каталог дважды (main-строкой и ext-строкой), а
+    ``total``/``unique``/owner стали бы недостоверными молча. Нерезолвящийся
+    extension-root пропускается — его судьбу решает обычный runtime-путь
+    (``_ext_metadata_scan_failed``), а не topology-гард.
+
+    Raises:
+        ValueError: при equality либо containment любой пары корней.
+    """
+    base_resolved = _safe_resolved(base_path)
+    if base_resolved is None:
+        return
+    resolved: list[tuple[str, Path]] = []
+    for raw in extension_paths or []:
+        ext_resolved = _safe_resolved(raw)
+        if ext_resolved is None:
+            continue
+        if ext_resolved == base_resolved:
+            raise ValueError(f"extension root coincides with the sandbox base: {raw!r}")
+        if path_within_root(ext_resolved, base_resolved):
+            raise ValueError(f"extension root is nested inside the sandbox base: {raw!r}")
+        if path_within_root(base_resolved, ext_resolved):
+            raise ValueError(f"sandbox base is nested inside the extension root: {raw!r}")
+        for other_raw, other in resolved:
+            if ext_resolved == other or path_within_root(ext_resolved, other) or path_within_root(other, ext_resolved):
+                raise ValueError(f"extension roots overlap: {other_raw!r} and {raw!r}")
+        resolved.append((raw, ext_resolved))
+
+
+def filter_alias_extension_infos(current_path, nearby: list[ExtensionInfo]) -> list[ExtensionInfo]:
+    """Убрать из *nearby* alias-кандидатов, физически лежащих внутри current root.
+
+    Детектор ходит по СОСЕДНИМ каталогам, и directory symlink/junction рядом с
+    базой может указывать внутрь самой базы. Такой кандидат — не соседний
+    source-root, а второй путь к уже учтённому дереву: пропустив его в BSL
+    transport, мы получили бы либо topology-отказ штатного ``rlm_start``, либо
+    двойной учёт тех же файлов. Публичный return ``detect_extension_context`` и
+    его index-builder/override consumers НЕ меняются — фильтр применяется только
+    на границе BSL-хелперов.
+    """
+    current_resolved = _safe_resolved(current_path)
+    if current_resolved is None:
+        return list(nearby or [])
+    kept: list[ExtensionInfo] = []
+    for info in nearby or []:
+        info_resolved = _safe_resolved(getattr(info, "path", "") or "")
+        if info_resolved is not None and path_within_root(info_resolved, current_resolved):
+            continue
+        kept.append(info)
+    return kept
+
+
 def _ext_list_cap() -> int:
     """Порог числа расширений, выше которого агент-facing представления списка
     (warnings / response-поле / strategy-текст) ужимаются до top-N по overrides.

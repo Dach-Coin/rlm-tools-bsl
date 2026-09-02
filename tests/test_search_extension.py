@@ -146,6 +146,9 @@ def helpers_with_ext(tmp_path, monkeypatch):
         reader.close()
 
 
+# v1.34.0 (Задача 6): в строку добавлен ЗАПЛАНИРОВАННЫЙ additive-ключ `owner`
+# ("main" | "extension:<Имя>"). Константы обновлены на `<старый набор> | {"owner"}`,
+# а НЕ ослаблены до `>=`: смысл freeze'а — ловить НЕЗАПЛАНИРОВАННЫЙ рост строки.
 SEARCH_METHODS_KEYS = {
     "name",
     "type",
@@ -156,13 +159,13 @@ SEARCH_METHODS_KEYS = {
     "module_path",
     "object_name",
     "rank",
-}
+} | {"owner"}
 
-SEARCH_OBJECTS_KEYS = {"object_name", "category", "synonym", "file"}
+SEARCH_OBJECTS_KEYS = {"object_name", "category", "synonym", "file"} | {"owner"}
 
-SEARCH_REGIONS_KEYS = {"name", "line", "end_line", "module_path", "object_name", "category"}
+SEARCH_REGIONS_KEYS = {"name", "line", "end_line", "module_path", "object_name", "category"} | {"owner"}
 
-SEARCH_HEADERS_KEYS = {"module_path", "object_name", "category", "header_comment"}
+SEARCH_HEADERS_KEYS = {"module_path", "object_name", "category", "header_comment"} | {"owner"}
 
 
 class TestSearchMethodsLive:

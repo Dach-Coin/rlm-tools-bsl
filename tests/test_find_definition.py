@@ -239,9 +239,16 @@ def test_broken_core_index_routes_to_fallback(built, monkeypatch):
     d = bsl["find_definition"]("ОбработкаПроведения", "Документ.Док1")
     assert d["_meta"]["index_used"] is False
     assert d["total"] == 1
-    # No hint → explicit 'no index' error (not a silent empty index result).
+    # v1.34.0: ветка `res is None` (сломанные core-таблицы) уходит в тот же
+    # status-aware live-путь, что и «индекса нет вовсе»: ключа `error` больше нет,
+    # выполняется живой поиск объявления.
     d2 = bsl["find_definition"]("ОбработкаПроведения")
-    assert "error" in d2
+    assert "error" not in d2
+    assert d2["_meta"]["index_used"] is False
+    assert d2["_meta"]["source"] == "live"
+    assert d2["_meta"]["slow_fallback"] is False
+    assert d2["total"] >= 1
+    assert any(row["file"].endswith(".bsl") for row in d2["definitions"])
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +277,26 @@ def test_fallback_object_name(live):
     assert all("Док1" in x["file"] for x in d["definitions"])
 
 
-def test_fallback_no_hint_error(live):
+def test_fallback_no_hint_runs_a_live_declaration_scan(live):
+    """v1.34.0: без индекса и без hint хелпер больше НЕ отвечает
+    ``{'error': 'no index'}`` — он выполняет живой поиск объявления по BSL-каталогу.
+
+    Это НЕ additive-изменение: ключ `error` с этого маршрута ИСЧЕЗАЕТ, и код агента
+    вида ``if res.get('error'): ...`` меняет ветку."""
     d = live["find_definition"]("ОбработкаПроведения")
-    assert d.get("error") == "no index"
+    assert "error" not in d
+    assert d["_meta"]["index_used"] is False
+    assert d["_meta"]["source"] == "live"
+    # Старая семантика поля сохранена: slow_fallback — только кириллический
+    # py_lower-rescan индексного ридера, на live-ветке всегда False.
+    assert d["_meta"]["slow_fallback"] is False
+    assert d["total"] == len(d["definitions"]) >= 1
+    assert isinstance(d["partial"], bool)
+    assert d["_meta"]["total_exact"] is not d["partial"]
+
+
+def test_fallback_missing_name_is_not_an_error(live):
+    """Заведомо отсутствующее имя — пустая выдача, а не ошибка."""
+    d = live["find_definition"]("ЗаведомоОтсутствующийМетод")
+    assert "error" not in d
+    assert d["definitions"] == [] and d["total"] == 0

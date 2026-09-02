@@ -553,7 +553,7 @@ def test_find_callers_context_fs_fallback_offset_overshoot_hint(bsl_env):
 
 
 def test_git_search_empty_pattern_returns_error_hint(bsl_env):
-    """Пустой/пробельный паттерн -> внятный [{error, hint}] (не таймаут-заглушка).
+    """Пустой/пробельный паттерн -> внятный {results: [], error, hint} (не таймаут-заглушка).
 
     git_search регистрируем через register_git_search='force' (без реального
     git-репо) — guard пустого паттерна срабатывает ДО вызова git.
@@ -580,12 +580,12 @@ def test_git_search_empty_pattern_returns_error_hint(bsl_env):
     )
 
     res = bsl["git_search"]("")
-    assert isinstance(res, list) and res, "контракт git_search — список"
-    assert "error" in res[0]
-    assert "hint" in res[0]
+    assert isinstance(res, dict), "контракт git_search — словарь (v1.34.0)"
+    assert res["results"] == [] and res["returned"] == 0
+    assert res["error"] and res["hint"]
 
     res2 = bsl["git_search"]("   ")
-    assert isinstance(res2, list) and res2 and "error" in res2[0]
+    assert isinstance(res2, dict) and res2["error"] and res2["results"] == []
 
 
 # ============================================================================

@@ -175,7 +175,7 @@ def test_disambiguation_full(dispatch):
     res = dispatch(section="disambiguation")
     assert res["mode"] == "disambiguation"
     assert isinstance(res["result"], list)
-    assert len(res["result"]) == 11
+    assert len(res["result"]) == 12
 
 
 def test_disambiguation_filter_by_helpers(dispatch):
@@ -202,6 +202,22 @@ def test_section_workflow(dispatch):
     text = res["result"]["text"]
     assert "Step 0 — UNDERSTAND" in text
     assert "Step 5 — EXTENSIONS" in text
+
+
+def test_section_coverage(dispatch):
+    """Легенда осей охвата (v1.34.0) — единственное место, где они описаны целиком."""
+    res = dispatch(section="coverage")
+    assert res["mode"] == "section"
+    text = res["result"]["text"]
+    assert "== COVERAGE" in text
+    assert "index_coverage" in text and "extensions_included" in text
+
+
+def test_menu_points_to_the_coverage_section(dispatch):
+    """Меню обязано вести к легенде: иначе о ней узнает только тот, кто уже знает."""
+    res = dispatch()
+    assert "coverage" in res["result"]["available_sections"]
+    assert "section='coverage'" in res["result"]["hint"]
 
 
 def test_section_performance(dispatch):

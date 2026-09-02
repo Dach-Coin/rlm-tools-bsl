@@ -294,7 +294,7 @@ def test_find_exports(bsl_env):
 
 
 def test_safe_grep_with_hint(bsl_env):
-    results = bsl_env.bsl["safe_grep"]("ЗаполнитьДанные", name_hint="АвансовыйОтчет")
+    results = bsl_env.bsl["safe_grep"]("ЗаполнитьДанные", name_hint="АвансовыйОтчет")["results"]
     assert len(results) >= 1
 
 
@@ -350,7 +350,7 @@ def test_safe_grep_invalid_regex_clean_error(tmp_path):
 
 def test_safe_grep_literal_unaffected(bsl_env):
     """Литералы (в т.ч. git fast-path) guard'ом не затронуты."""
-    results = bsl_env.bsl["safe_grep"]("ЗаполнитьДанные", name_hint="АвансовыйОтчет")
+    results = bsl_env.bsl["safe_grep"]("ЗаполнитьДанные", name_hint="АвансовыйОтчет")["results"]
     assert len(results) >= 1
 
 
@@ -361,8 +361,9 @@ def test_safe_grep_without_hint(bsl_env):
 
 def test_safe_grep_parallel_order(bsl_env):
     """Parallel safe_grep returns results sorted by (file, line)."""
-    results = bsl_env.bsl["safe_grep"]("Процедура", max_files=50)
-    assert len(results) >= 1
+    res = bsl_env.bsl["safe_grep"]("Процедура", max_files=50)
+    results = res["results"]
+    assert res["returned"] == len(results) >= 1
     # Verify sort order: (file, line) ascending
     for i in range(1, len(results)):
         prev = (results[i - 1].get("file", ""), results[i - 1].get("line", 0))
@@ -1455,7 +1456,22 @@ def test_find_functional_options_limit_per_bucket(tmp_path):
 
     # Дефолт (limit=None) — прежний контракт байт-в-байт, без пагинационных полей.
     default = bsl["find_functional_options"]("ПриобретениеТоваров")
-    assert set(default.keys()) == {"object", "xml_options", "code_options"}
+    # v1.34.0: totals есть и без limit (Задача 5); пагинации в этой ветке по-прежнему нет.
+    assert set(default.keys()) == {
+        "object",
+        "xml_options",
+        "code_options",
+        "total",
+        "xml_total",
+        "code_total",
+        # прямая фабрика без grep_status_fn → статус чтения недоказуем
+        "partial",
+        "_meta",
+    }
+    assert "returned" not in default and "has_more" not in default
+    assert default["_meta"]["reason"] == "read_status_unavailable"
+    assert default["_meta"]["read_status_complete"] is False
+    assert default["_meta"]["failed_files"] == 0  # выдуманных отказов нет
     xt, ct = len(default["xml_options"]), len(default["code_options"])
     assert xt == 1 and ct == 1, (xt, ct)  # оба бакета непусты → тест различит per-bucket от global
 
@@ -1463,8 +1479,8 @@ def test_find_functional_options_limit_per_bucket(tmp_path):
     limited = bsl["find_functional_options"]("ПриобретениеТоваров", limit=1)
     # v1.33.0: к пагинационным полям добавлены xml_total/code_total. `total` — сумма
     # корзин РАЗНОЙ точности (xml — exact, code — подстрочный grep), и два e2e-прогона
-    # подряд агент читал её как «столько ФО у объекта». Ветка БЕЗ limit при этом
-    # осталась байт-в-байт прежней (проверено выше).
+    # подряд агент читал её как «столько ФО у объекта». v1.34.0: те же totals уехали
+    # и в ветку БЕЗ limit — различает ветки теперь отсутствие returned/has_more.
     assert set(limited.keys()) == {
         "object",
         "xml_options",
@@ -1474,7 +1490,10 @@ def test_find_functional_options_limit_per_bucket(tmp_path):
         "code_total",
         "returned",
         "has_more",
+        "partial",
+        "_meta",
     }
+    assert limited["_meta"]["reason"] == "read_status_unavailable"
     assert len(limited["xml_options"]) == 1
     assert len(limited["code_options"]) == 1
     assert limited["returned"] == 2  # global-cap дал бы 1
@@ -5838,7 +5857,8 @@ def test_posting_hint_route_survives_real_index_states():
     (а) ОМОНИМ: одноимённые методы в 1С — норма; без категорийного module_hint `[0]` вернул бы
         тело ЧУЖОГО модуля (порядок строк не гарантирован — это монетка).
     (б) ДЕЛЕГАТ НОВЕЕ ИНДЕКСА: definitions=[] → голый [0] дал бы IndexError; guard отдаёт None.
-    (в) ИНДЕКСА НЕТ: с категорийным hint find_definition читает модуль живьём и маршрут работает.
+    (в) ИНДЕКСА НЕТ: и с категорийным hint, и БЕЗ hint find_definition читает модули живьём
+        (v1.34.0), и маршрут работает.
     """
     # (а) омоним
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -5875,7 +5895,11 @@ def test_posting_hint_route_survives_real_index_states():
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_posting_env(tmpdir, {"ТестДок": _DELEGATED}, no_index=True)
         no_hint = bsl["find_definition"](_DELEGATE)
-        assert "definitions" not in no_hint and "error" in no_hint, no_hint  # контракт no-index
+        # v1.34.0: контракт no-index ОТМЕНЁН — вместо {"error": "no index"} идёт
+        # живой поиск объявления по BSL-каталогу с явным бюджетом модулей.
+        assert "error" not in no_hint, no_hint
+        assert no_hint["_meta"]["source"] == "live" and no_hint["_meta"]["index_used"] is False
+        assert no_hint["total"] == len(no_hint["definitions"]) >= 1, no_hint
 
         code = _hint_steps(bsl["find_register_movements"]("ТестДок")["hint"])
         ns = dict(bsl)
@@ -5961,7 +5985,7 @@ def test_posting_hint_no_git_register_search_covers_all_bsl_candidates():
             assert all(matches), f"в hint остался второй bare safe_grep с default cap=20: {hint}"
             limit = int(matches[0])
             assert limit > 20, f"маршрут остался на старом потолке: {hint}"
-            hits = bsl["safe_grep"](register_name, max_files=limit)
+            hits = bsl["safe_grep"](register_name, max_files=limit)["results"]
             assert any("ЯПоследнийПисатель" in hit["file"] for hit in hits), hits
         finally:
             reader.close()
@@ -6039,7 +6063,7 @@ def test_posting_hint_live_declaration_route_handles_cyrillic_case_difference():
             assert len(live_steps) == 1, hint
             assert "(?i)" in live_steps[0] and "max_files=" in live_steps[0]
             hits = eval(compile(live_steps[0], "<hint:live-decl>", "eval"), dict(bsl))  # noqa: S307
-            assert any(method_decl in hit.get("text", "") for hit in hits), hits
+            assert any(method_decl in hit.get("text", "") for hit in hits["results"]), hits
             assert "ЛЮБОЙ регистр" not in hint
         finally:
             reader.close()
@@ -6048,8 +6072,8 @@ def test_posting_hint_live_declaration_route_handles_cyrillic_case_difference():
 def test_posting_hint_live_declaration_route_caps_common_method_results():
     """A common declaration cannot make the generated route unbounded.
 
-    The final sentinel says the live catalog search stopped early; it is not a
-    declaration candidate itself.
+    v1.34.0: усечение больше НЕ элемент списка — оно живёт в ``res['truncated']``,
+    поэтому ни одна строка выдачи не притворяется кандидатом объявления.
     """
     method = "ЧастыйМетодПроведения"
     body = (
@@ -6072,11 +6096,12 @@ def test_posting_hint_live_declaration_route_caps_common_method_results():
             live_steps = _decl_search_fragments(hint)
             assert len(live_steps) == 1, hint
             hits = eval(compile(live_steps[0], "<hint:capped-decl>", "eval"), dict(bsl))  # noqa: S307
-            assert hits[-1] == {"_truncated": True, "shown": 50}, hits[-1]
-            candidates = [hit for hit in hits if not hit.get("_truncated")]
-            assert len(candidates) == 50
+            assert hits["truncated"] is True, hits
+            candidates = hits["results"]
+            assert hits["returned"] == len(candidates) == 50
+            assert all("_truncated" not in hit for hit in candidates)
             assert all(method in hit["text"] for hit in candidates)
-            assert "_truncated" in hint and "досрочно" in hint
+            assert "res['truncated']" in hint and "досрочно" in hint
         finally:
             reader.close()
 
@@ -6819,7 +6844,7 @@ def test_fork_declaration_search_covers_functions_and_is_executable():
             live_steps = _decl_search_fragments(hint)
             assert len(live_steps) == 1, hint
             fn_hits = eval(compile(live_steps[0], "<hint:decl-search>", "eval"), dict(bsl))  # noqa: S307
-            assert any("CommonModules" in hit.get("file", "") for hit in fn_hits), fn_hits
+            assert any("CommonModules" in hit.get("file", "") for hit in fn_hits["results"]), fn_hits
         finally:
             reader.close()
 
@@ -6884,8 +6909,8 @@ def test_fork_declaration_search_fragments_are_executable_and_cover_english():
             found = [
                 hit
                 for res in results
-                if isinstance(res, list)
-                for hit in res
+                if isinstance(res, dict)
+                for hit in res["results"]
                 if isinstance(hit, dict) and "CommonModules" in str(hit.get("file", ""))
             ]
             assert found, f"live-поиск не нашел Function-делегата: {fragments}"
@@ -7360,13 +7385,15 @@ def test_posting_hint_only_recommends_registered_helpers():
         finally:
             reader.close()
 
-    # (б) НЕ под git и БЕЗ индекса: исчерпывающего маршрута нет — hint называет ограничение и
-    # даёт живой safe_grep-маршрут вместо нумерованного шага с несуществующим хелпером.
+    # (б) НЕ под git и БЕЗ индекса: с v1.34.0 исчерпывающий маршрут ПОЯВИЛСЯ —
+    # find_definition сам выполняет живой скан объявлений, поэтому hint больше не
+    # обязан отправлять агента через find_module + ручной safe_grep. Проверяется
+    # то же, что и раньше: маршрут ИСПОЛНИМ и не зовёт незарегистрированный хелпер.
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_posting_env(tmpdir, {"ТестДок": body}, no_index=True)
         hint = bsl["find_register_movements"]("ТестДок")["hint"]
         assert "git_search(" not in hint, hint
-        assert "find_module" in hint and "safe_grep(" in hint, f"нет честного ограничения с живым маршрутом: {hint}"
+        assert "find_definition('ОтразитьДвижения')" in hint, f"нет исполнимого маршрута: {hint}"
         ns = dict(bsl)
         for label, src in sorted(_hint_steps(hint).items()):
             exec(compile(src, f"<hint:{label}>", "exec"), ns)  # noqa: S102
@@ -7472,7 +7499,8 @@ def test_stale_deleted_common_module_is_not_reported_as_a_live_fact():
             live_steps = [src for src in _hint_steps(hint).values() if src.startswith("safe_grep(")]
             assert live_steps, hint
             result = eval(compile(live_steps[0], "<hint:live-search>", "eval"), dict(bsl))  # noqa: S307
-            assert result == [], result
+            assert result["results"] == [], result
+            assert result["returned"] == 0 and result["truncated"] is False
         finally:
             reader.close()
 
@@ -8392,13 +8420,21 @@ def test_empty_functional_option_overview_keeps_twenty_module_budget(tmp_path):
     assert page["total"] == 20  # lower bound over the scanned code slice
     assert page["has_more"] is False  # no more rows inside that known slice
     assert page["partial"] is True
-    assert page["_meta"] == {
-        "reason": "code_scan_budget",
-        "code_modules_scanned": 20,
-        "code_modules_total": 30,
-        "total_scope": "all_xml_plus_scanned_code",
-        "hint": "Пустой обзор проверяет первые 20 BSL-модулей; укажи object_name для полного code-скана.",
-    }
+    # Прежний контракт причины сохранён БАЙТ-В-БАЙТ, когда причина только бюджет.
+    # Токены причины идут ФИКСИРОВАННЫМ порядком; прямая фабрика добавляет
+    # read_status_unavailable к бюджетной причине.
+    assert page["_meta"]["reason"] == "code_scan_budget_and_read_status_unavailable"
+    assert page["_meta"]["code_modules_scanned"] == 20
+    assert page["_meta"]["code_modules_total"] == 30
+    assert page["_meta"]["code_modules_total_exact"] is False  # read-status недоказуем
+    assert page["_meta"]["total_scope"] == "all_xml_plus_scanned_code"
+    assert page["_meta"]["failed_files"] == 0
+    assert page["_meta"]["catalog_complete"] is True and page["_meta"]["catalog_errors"] == 0
+    assert "scan_error" not in page["_meta"]
+    # Та же неполнота теперь видна и в бесlimit-ветке — иначе фикс публиковал бы
+    # нижнюю оценку как точный итог.
+    assert result["partial"] is True and result["code_total"] == 20
+    assert result["_meta"]["reason"] == "code_scan_budget_and_read_status_unavailable"
 
 
 def test_english_register_records_and_record_factory_are_recognized():
@@ -8527,7 +8563,7 @@ def test_no_git_register_route_counts_post_index_live_catalog():
             hint = bsl["find_register_movements"]("ТестДок")["hint"]
             match = re.search(r"safe_grep\('ИмяРегистра', max_files=(\d+)\)", hint)
             assert match, hint
-            hits = bsl["safe_grep"](register_name, max_files=int(match.group(1)))
+            hits = bsl["safe_grep"](register_name, max_files=int(match.group(1)))["results"]
             assert any("СвежийПисатель" in row["file"] for row in hits), hits
         finally:
             reader.close()

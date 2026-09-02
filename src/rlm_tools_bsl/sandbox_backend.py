@@ -57,6 +57,12 @@ class BackendExecutionResult:
     efficiency_hints: list[dict] | None = None
     sandbox_state: dict | None = None
     generation: int = 1
+    # WARNING+ пакета, испущенные в worker (v1.34.0). ОБЯЗАТЕЛЬНО с
+    # ``default_factory``: результат конструируют и inline-backend, и аварийные
+    # ветки process-backend, и они об этом поле знать не должны — поле без дефолта
+    # либо уронило бы inline, либо потребовало правки всех конструкторов.
+    # В public JSON-ответ агенту НЕ копируется: это диагностика оператора.
+    log_records: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -141,6 +147,13 @@ class InlineSandboxBackend:
     def registry_names(self) -> tuple[str, ...]:
         # Вычисляемое представление ключей snapshot — не второй источник истины (§5.2).
         return tuple(self._registry_snapshot.keys())
+
+    @property
+    def startup_log_records(self) -> list[str]:
+        """Inline-режим МОСТ НЕ ИСПОЛЬЗУЕТ: логгер здесь и так родительский, и
+        двойной записи быть не должно. Свойство существует ради единого
+        server-контракта и всегда пусто."""
+        return []
 
     @property
     def detected_prefixes(self) -> list[str]:

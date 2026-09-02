@@ -31,6 +31,49 @@ WORKER_FATAL_REQUEST_ID = -1
 # Защита от патологически глубоких структур в decoded payload.
 _MAX_DEPTH = 32
 
+# --- Мост предупреждений воркера (v1.34.0) ---------------------------------
+# Константы объявлены ЗДЕСЬ ОДИН раз и импортируются ОБЕИМИ сторонами: разъехавшись,
+# они дали бы расхождение между тем, что накладывает worker, и тем, что проверяет
+# родитель, а расхождение там читается как нарушение протокола.
+#
+# `_LOG_RECORDS_MAX` — ПОЛНАЯ длина списка: до 19 предупреждений ПЛЮС, при
+# переполнении, ровно одна финальная строка «…(ещё N подавлено)». Формулировка
+# «20 записей И отдельная строка о подавлении» дала бы 21 при родительской
+# проверке «≤20».
+LOG_RECORDS_MAX = 20
+# Длина ОДНОЙ записи ВКЛЮЧАЯ маркер усечения. Намеренно НЕ `bounded_text(s, 300)`:
+# тот дописывает маркер и отдаёт до 313 символов, то есть «лимит 300» и фактическая
+# длина разъехались бы — и разъехались бы ровно между worker и проверкой родителя.
+LOG_RECORD_MAX_CHARS = 300
+LOG_RECORD_TRUNCATION_MARKER = "…"
+
+
+def sanitize_log_record(text: str) -> str:
+    """Одна печатная строка ≤ ``LOG_RECORD_MAX_CHARS`` символов.
+
+    Экранируется КАЖДЫЙ code point с ``not ch.isprintable()``: BMP как ``\\uXXXX``,
+    astral как ``\\UXXXXXXXX``. Это включает CR/LF/tab/NUL, весь C0/C1, ESC,
+    Unicode line/paragraph separators и bidi/format controls — пары
+    ``replace("\\r", …)/replace("\\n", …)`` против ANSI- и bidi-подделки лога
+    недостаточно. Escape выполняется ДО обрезки, поэтому итог гарантированно
+    ≤ лимита и не может оборваться посреди escape-последовательности.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    out: list[str] = []
+    for ch in text:
+        if ch.isprintable():
+            out.append(ch)
+        elif ord(ch) <= 0xFFFF:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(f"\\U{ord(ch):08x}")
+    escaped = "".join(out)
+    if len(escaped) <= LOG_RECORD_MAX_CHARS:
+        return escaped
+    keep = LOG_RECORD_MAX_CHARS - len(LOG_RECORD_TRUNCATION_MARKER)
+    return escaped[:keep] + LOG_RECORD_TRUNCATION_MARKER
+
 
 class SandboxProtocolError(RuntimeError):
     """Нарушение IPC-протокола: worker подлежит уничтожению, сессия получает controlled error."""

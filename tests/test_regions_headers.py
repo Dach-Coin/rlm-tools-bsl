@@ -846,7 +846,17 @@ class TestSearchRegionsGroupBy:
         try:
             rows = bsl["search_regions"]("", limit=10)
             assert isinstance(rows, list) and len(rows) == 8
-            assert set(rows[0]) == {"name", "line", "end_line", "module_path", "object_name", "category"}
+            # v1.34.0 (Задача 6): запланированный additive-ключ `owner` — freeze
+            # обновлён на `<старый набор> | {"owner"}`, а не ослаблен до `>=`.
+            assert set(rows[0]) == {
+                "name",
+                "line",
+                "end_line",
+                "module_path",
+                "object_name",
+                "category",
+                "owner",
+            }
             assert bsl["search_regions"]("", count_only=True) == {
                 "total": 8,
                 "source": "index",

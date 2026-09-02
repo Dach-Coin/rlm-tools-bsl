@@ -6,6 +6,7 @@ import contextlib
 import builtins
 import difflib
 import functools
+import math
 import pathlib
 import re
 import signal
@@ -240,7 +241,20 @@ class Sandbox:
         extension_paths: list[str] | None = None,
         output_capture_factory=None,
         enable_bsl_helpers: bool = True,
+        current_config_role: str | None = None,
+        current_config_name: str = "",
+        current_config_root: str = "",
+        extension_name_by_root: dict[str, str] | None = None,
     ):
+        # Топология корней (v1.34.0) проверяется ДО построения namespace и до
+        # любого обращения к ридеру/ФС, но ТОЛЬКО на активном BSL-пути:
+        # документированный generic-режим (enable_bsl_helpers=False) provenance
+        # и totals не использует и сохраняет прежнее право принимать эти поля
+        # без BSL-валидации.
+        if format_info is not None and enable_bsl_helpers:
+            from rlm_tools_bsl.extension_detector import validate_root_topology
+
+            validate_root_topology(base_path, list(extension_paths or []))
         self._base_path = base_path
         self._max_output_chars = max_output_chars
         self._execution_timeout_seconds = execution_timeout_seconds
@@ -251,6 +265,12 @@ class Sandbox:
         # независимыми вещами. Default True: прямые создания Sandbox
         # (тесты/встраивание) сохраняют прежнее поведение.
         self._enable_bsl_helpers = enable_bsl_helpers
+        # Role-aware provenance foundation (v1.34.0): server уже выполнил
+        # detect_extension_context, поэтому внутри сессии он не повторяется.
+        self._current_config_role = current_config_role
+        self._current_config_name = current_config_name or ""
+        self._current_config_root = current_config_root or ""
+        self._extension_name_by_root = dict(extension_name_by_root or {})
         self._idx_reader = idx_reader
         self._idx_zero_callers_authoritative = idx_zero_callers_authoritative
         self._extension_paths = list(extension_paths or [])
@@ -322,7 +342,10 @@ class Sandbox:
 
         self._namespace["__builtins__"] = safe_builtins
 
-        helpers, self._resolve_safe = make_helpers(self._base_path, idx_reader=self._idx_reader)
+        # Приватные status-aware каналы (v1.34.0): sink остаётся ЛОКАЛЬНЫМ, в
+        # namespace уезжает только публичный helper dict.
+        private_io: dict = {}
+        helpers, self._resolve_safe = make_helpers(self._base_path, idx_reader=self._idx_reader, _private_io=private_io)
         self._namespace.update(self._wrap_helpers(helpers))
 
         bsl_helpers: dict = {}
@@ -337,6 +360,12 @@ class Sandbox:
                 idx_reader=self._idx_reader,
                 idx_zero_callers_authoritative=self._idx_zero_callers_authoritative,
                 extension_paths=self._extension_paths,
+                grep_status_fn=private_io.get("grep_with_status"),
+                catalog_scan_fn=private_io.get("scan_bsl_catalog_status"),
+                current_config_role=self._current_config_role,
+                current_config_name=self._current_config_name,
+                current_config_root=self._current_config_root,
+                extension_name_by_root=self._extension_name_by_root,
             )
             self._namespace.update(self._wrap_helpers(bsl_helpers))
 
@@ -436,15 +465,21 @@ class Sandbox:
 
     # Списочные хелперы, у которых выдача молча режется по limit: {helper: (позиция
     # limit в позиционных аргументах, значение по умолчанию)}. Признака усечения в
-    # самом ответе нет и добавить его некуда — это list[dict], а параллельный
-    # count_only-контракт заморожен побайтно. Поэтому сигнал уходит в
-    # efficiency_hints конверта rlm_execute: возврат хелпера и stdout не меняются
+    # самом ответе нет и добавить его некуда — это list[dict]. Поэтому сигнал уходит
+    # в efficiency_hints конверта rlm_execute: возврат хелпера и stdout не меняются
     # (test_sandbox_helper_return_value_unchanged).
+    # v1.34.0: добавлены два хелпера с ЖЁСТКИМ cap, у которых сигнала не было вовсе;
+    # у `find_by_type` при этом появился и параллельный count_only-контракт (у
+    # `search_regions`/`search_module_headers` он по-прежнему заморожен побайтно).
+    # Нудж остаётся только для list-ответа (`isinstance(result, list)`), поэтому
+    # dict-`count_only` его закономерно не вызывает.
     _SATURATING_LIST_HELPERS = {
         "search_regions": (1, 200),
         "search_module_headers": (1, 200),
         "search_objects": (1, 50),
         "search_methods": (1, 30),
+        "find_by_type": (2, 50),
+        "find_module": (3, 50),
     }
 
     def _note_saturation(self, name: str, args: tuple, kwargs: dict, result) -> None:
@@ -466,6 +501,17 @@ class Sandbox:
         # так что подстановка дефолта 200 дала бы ложный хинт на 230 строках.
         if isinstance(limit, bool) or not isinstance(limit, (int, float)) or limit != limit:
             limit = default  # bool / не-число / NaN
+        elif isinstance(limit, float) and math.isinf(limit):
+            # ±inf: `int(inf)` бросает OverflowError, и зеркало падало ПОСЛЕ уже успешно
+            # выполненного хелпера — терялся весь rlm_execute вместе с готовым ответом.
+            # `_coerce_bound` на этом входе отдаёт `maximum` (если он задан) либо дефолт;
+            # НИ ОДИН из шести хелперов реестра `maximum` не передаёт, поэтому здесь
+            # дефолт — это ТОЧНОЕ значение, которым хелпер и ограничился.
+            # `isinstance(..., float)` обязателен и списан с того же `_coerce_bound`:
+            # `math.isinf` на БОЛЬШОМ int (`10**400`) сам бросает OverflowError, то есть
+            # без него зеркало меняло бы одно падение на другое — на входе, который до
+            # правки отрабатывал штатно (`int` в Python произвольной точности).
+            limit = default
         else:
             limit = int(limit)  # float усекается — как в _coerce_bound
             if limit < 0:
@@ -618,6 +664,20 @@ class Sandbox:
                 order_note = " Порядок выдачи — не релевантность."
             elif helper == "search_module_headers":
                 fix = "точное число — search_module_headers(query, count_only=True)['total']"
+                order_note = " Порядок выдачи — не релевантность."
+            elif helper == "find_by_type":
+                # v1.34.0: у хелпера появился count_only, и совет обязан назвать его,
+                # а не «подними limit». Порядок — прямой проход `_index_state`, то есть
+                # усекается произвольный по бизнес-смыслу срез, а не «хвост ранжирования».
+                fix = (
+                    "точное число — find_by_type(category, count_only=True): "
+                    "'total' это МОДУЛИ, 'unique_objects' — объекты"
+                )
+                order_note = " Порядок выдачи — не релевантность."
+            elif helper == "find_module":
+                # count_only здесь НЕ вводится (п.3 даёт только limit), поэтому прежний
+                # fix остаётся — но с оговоркой про порядок: это тот же прямой проход.
+                fix = "подними limit или сузь запрос"
                 order_note = " Порядок выдачи — не релевантность."
             else:
                 fix = "подними limit или сузь запрос"
@@ -883,6 +943,32 @@ class Sandbox:
                 "for name in m['params']: print(name). НЕ обращайся p['name'] / p.get('name') "
                 "к элементу params (extract_procedures / find_exports / search_methods)."
             )
+
+        # v1.34.0 — смена формы ответа git_search/safe_grep: список → словарь.
+        # Страховка на переходный период: агент со старой привычкой падает ГРОМКО и
+        # сразу получает исполнимую поправку. Гейт — по ИМЕНИ хелпера в коде execute:
+        # без него общий `KeyError: 0` был бы слишком широким.
+        # AttributeError здесь ОБЯЗАТЕЛЕН, а не «ещё один случай для полноты»: ровно
+        # его даёт СОБСТВЕННЫЙ рецепт сервера (`for h in hits: h.get('file')`).
+        # Соседняя ветка про `params` этот текст тоже ловит, но загейтена на
+        # `"params" in code` и говорит про ДРУГОЙ контракт — поэтому ветка отдельная;
+        # обе могут добавить свою строку в один ответ, они называют разные хелперы.
+        if "git_search" in code or "safe_grep" in code:
+            grep_dict_misuse = (
+                "string indices must be integers" in error
+                or ("AttributeError" in error and "'str' object has no attribute" in error)
+                or any(f"KeyError: '{k}'" in error for k in ("file", "line", "text"))
+                or "KeyError: 0" in error
+                or "KeyError: -1" in error
+            )
+            if grep_dict_misuse:
+                hints.append(
+                    "HINT: git_search/safe_grep возвращают СЛОВАРЬ (v1.34.0), а не список: "
+                    "строки лежат в res['results'], их число — в res['returned'], признак "
+                    "усечения — res['truncated']. Итерируй: "
+                    "for r in res['results']: print(r['file'], r['line'], r['text']). "
+                    "У git_search ошибка — в постоянном res['error'] (None при успехе)."
+                )
 
         # v1.19.0 — tolerant-contract hints for deterministic agent guesses (e2e).
         # Wrong kwarg name on a helper (observed: safe_grep(path=...) / safe_grep(hint=...);

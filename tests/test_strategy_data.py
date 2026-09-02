@@ -11,7 +11,85 @@ from rlm_tools_bsl.bsl_strategy_data import DISAMBIGUATION_PAIRS, STRATEGY_SECTI
 
 
 def test_disambiguation_pairs_count():
-    assert len(DISAMBIGUATION_PAIRS) == 11
+    assert len(DISAMBIGUATION_PAIRS) == 12
+
+
+_PAIR_ALIASES = {
+    # Структурированная запись использует search_methods как ПРЕДСТАВИТЕЛЯ семейства
+    # search_X; в full-блоке заголовок написан обобщённо.
+    "search_X": "search_methods",
+}
+
+
+def _local_pair_headings() -> set[frozenset[str]]:
+    """Нормализованные unordered пары из ЗАГОЛОВКОВ блока ``== DISAMBIGUATION ==``.
+
+    Проверяется именно ЛОКАЛЬНАЯ пара, а не «оба имени где-нибудь в блоке»: наивная
+    проверка ложно зеленела бы, потому что ``find_references_to_object`` уже
+    встречается в другой паре, а ``find_roles`` — рядом с ``parse_object_xml``.
+    """
+    import re
+
+    from rlm_tools_bsl.bsl_knowledge import _STRATEGY_HEADER
+
+    block = _STRATEGY_HEADER.split("== DISAMBIGUATION ==", 1)[1]
+    # Блок кончается на следующем маркере секции.
+    for marker in ("\n== ",):
+        idx = block.find(marker)
+        if idx != -1:
+            block = block[:idx]
+
+    pairs: set[frozenset[str]] = set()
+    ident_re = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+    for raw in block.splitlines():
+        line = raw.strip()
+        # Заголовок пары — строка вида "A ... vs B ...:" на нулевом отступе блока.
+        if not line.endswith(":") or " vs " not in line or raw.startswith((" ", "	", "-")):
+            continue
+        left, _, right = line.partition(" vs ")
+        a_m = ident_re.search(left)
+        b_m = ident_re.search(right)
+        if not a_m or not b_m:
+            continue
+        a = _PAIR_ALIASES.get(a_m.group(0), a_m.group(0))
+        b = _PAIR_ALIASES.get(b_m.group(0), b_m.group(0))
+        if a != b:
+            pairs.add(frozenset({a, b}))
+    return pairs
+
+
+def test_full_strategy_block_covers_every_structured_pair():
+    """Каждая structured pair обязана иметь ОДИН локальный heading в full-блоке.
+
+    Теста синхронности двух копий DISAMBIGUATION раньше НЕ БЫЛО: сверялись только
+    счётчики, поэтому пару можно было добавить в slim, поправить два числа — и
+    получить полностью зелёный прогон при том, что full уехал без пары. Именно так
+    и уехала пре-существующая пара find_references_to_object / find_code_usages.
+    Дополнительные full-only пары разрешены.
+    """
+    headings = _local_pair_headings()
+    missing = [tuple(sorted(e["pair"])) for e in DISAMBIGUATION_PAIRS if frozenset(e["pair"]) not in headings]
+    assert not missing, f"structured pairs без локального heading в _STRATEGY_HEADER: {missing}"
+
+
+def test_full_strategy_pair_tripwire_is_not_vacuous():
+    """Negative-control: подмена ИМЕНИ в direct heading обязана уронить проверку,
+    даже когда оба helper-name остаются в блоке в других парах."""
+    headings = _local_pair_headings()
+    target = frozenset({"find_roles", "find_references_to_object"})
+    assert target in headings
+    weakened = {h for h in headings if h != target}
+    assert target not in weakened  # именно локальная пара, а не «имена где-то есть»
+
+
+def test_slim_disambiguation_pointer_count_matches_data():
+    """Число в slim-указателе считается ИЗ ДАННЫХ, а не зашито литералом.
+
+    Ассерт по вычисленному числу: литерал протухал бы так же, как протухла «8».
+    """
+    from rlm_tools_bsl.bsl_knowledge import _SLIM_DISAMBIGUATION_POINTER
+
+    assert f"{len(DISAMBIGUATION_PAIRS)} overlapping helper pairs" in _SLIM_DISAMBIGUATION_POINTER
 
 
 def test_disambiguation_pair_shape():
@@ -29,7 +107,7 @@ def test_strategy_sections_keys():
     # The dispatcher routes section='disambiguation' separately to the
     # structured DISAMBIGUATION_PAIRS list — that key must NOT live in
     # STRATEGY_SECTIONS.
-    assert set(STRATEGY_SECTIONS.keys()) == {"workflow", "performance", "batching", "io", "critical"}
+    assert set(STRATEGY_SECTIONS.keys()) == {"workflow", "performance", "batching", "io", "critical", "coverage"}
 
 
 def test_strategy_sections_values_nonempty():
