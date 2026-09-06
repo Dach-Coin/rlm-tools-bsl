@@ -8,6 +8,9 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "rlm-tools-bsl"
 SERVICE_JSON = CONFIG_DIR / "service.json"
+# Private service-to-child marker.  The public RLM_NO_ENV setting controls the
+# installer; this one records the resulting service configuration at runtime.
+SERVICE_NO_ENV_VAR = "_RLM_SERVICE_NO_ENV"
 
 
 def get_projects_path() -> Path:
@@ -28,6 +31,9 @@ def load_project_env() -> str | None:
     3. ``~/.config/rlm-tools-bsl/.env``  (user-level fallback)
     4. ``find_dotenv(usecwd=True)``  (CWD-based, original behaviour)
     """
+    if os.environ.get(SERVICE_NO_ENV_VAR) == "1":
+        return None
+
     try:
         from dotenv import find_dotenv, load_dotenv
     except ImportError:
@@ -67,6 +73,14 @@ def _env_file_from_service_json() -> str | None:
 
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        return data.get("env_file")
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, OSError):
+        # ValueError covers JSONDecodeError AND UnicodeDecodeError: a config saved in
+        # another encoding must not crash the server before argparse even runs.
         return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("env_file")
+    if not isinstance(value, str):
+        return None
+    path = Path(value)
+    return value if path.is_absolute() else str((p.absolute().parent / path).absolute())

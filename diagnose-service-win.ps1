@@ -83,6 +83,39 @@ if (-not $isAdmin) {
 }
 Add-Summary ""
 
+# --- Config path actually in use ---
+# The SERVICE reads the path from its own registry Environment value, so a diagnostic
+# that always looks in %USERPROFILE% would collect a different service.json and a
+# different server.log than the ones the service is using.
+function Get-RlmConfigPath {
+    $fromRegistry = $null
+    try {
+        $key = Get-Item "HKLM:\SYSTEM\CurrentControlSet\Services\rlm-tools-bsl" -ErrorAction Stop
+        foreach ($entry in @($key.GetValue("Environment"))) {
+            if ($entry -and $entry -match '^(?i)RLM_CONFIG_FILE=(.+)$') { $fromRegistry = $Matches[1] }
+        }
+    } catch {
+        $fromRegistry = $null
+    }
+    if ($fromRegistry) {
+        if ([System.IO.Path]::IsPathRooted($fromRegistry)) { return $fromRegistry }
+        # Releases before 1.35.0 could store the override verbatim. SCM starts the
+        # service from the Windows system directory, so resolve a legacy relative value
+        # from the same base instead of the diagnostic script's current directory.
+        return (Join-Path ([System.Environment]::SystemDirectory) $fromRegistry)
+    }
+    if ($env:RLM_CONFIG_FILE) {
+        if ([System.IO.Path]::IsPathRooted($env:RLM_CONFIG_FILE)) { return $env:RLM_CONFIG_FILE }
+        return (Join-Path (Get-Location).Path $env:RLM_CONFIG_FILE)
+    }
+    return (Join-Path $env:USERPROFILE ".config" | Join-Path -ChildPath "rlm-tools-bsl" | Join-Path -ChildPath "service.json")
+}
+
+$rlmConfigPath = Get-RlmConfigPath
+$rlmConfigDir = Split-Path -Parent $rlmConfigPath
+$rlmLogPath = Join-Path $rlmConfigDir "logs" | Join-Path -ChildPath "server.log"
+Add-Summary ("Config path in use:        " + $rlmConfigPath)
+
 # --- 01 System info ---
 Save-Section "01-system" {
     "PSVersion:      $($PSVersionTable.PSVersion)"
@@ -414,7 +447,7 @@ for name in ('python3.dll', f'python{sys.version_info.major}{sys.version_info.mi
 
 # --- 08 service.json ---
 Save-Section "08-service-json" {
-    $cfg = Join-Path $env:USERPROFILE ".config\rlm-tools-bsl\service.json"
+    $cfg = $rlmConfigPath
     "Path:   $cfg"
     "Exists: $(Test-Path $cfg)"
     if (Test-Path $cfg) {
@@ -426,7 +459,7 @@ Save-Section "08-service-json" {
 
 # --- 09 server.log tail ---
 Save-Section "09-server-log" {
-    $logPath = Join-Path $env:USERPROFILE ".config\rlm-tools-bsl\logs\server.log"
+    $logPath = $rlmLogPath
     "Path:   $logPath"
     "Exists: $(Test-Path $logPath)"
     if (Test-Path $logPath) {
@@ -505,7 +538,7 @@ if ($RunDebug) {
             (Join-Path $sp "win32\lib"),
             (Join-Path $sp "Pythonwin")
         ) -join ";"
-        $env:RLM_CONFIG_FILE = Join-Path $env:USERPROFILE ".config\rlm-tools-bsl\service.json"
+        $env:RLM_CONFIG_FILE = $rlmConfigPath
         $stdout = Join-Path $workDir "_debug-stdout.txt"
         $stderr = Join-Path $workDir "_debug-stderr.txt"
         $proc = Start-Process -FilePath $ps -ArgumentList "-debug","rlm-tools-bsl" `
@@ -553,7 +586,7 @@ if ($imagePath) {
     }
 }
 
-$cfg = Join-Path $env:USERPROFILE ".config\rlm-tools-bsl\service.json"
+$cfg = $rlmConfigPath
 Add-Summary ("service.json exists:       " + (Test-Path $cfg))
 
 # Version consistency: uv tool env Python vs service-runtime Python
@@ -596,7 +629,7 @@ if ($servicePyExe) {
     Add-Summary "Service-runtime Python:    (not resolved -- see section 07b)"
 }
 
-$logPath = Join-Path $env:USERPROFILE ".config\rlm-tools-bsl\logs\server.log"
+$logPath = $rlmLogPath
 if (Test-Path $logPath) {
     $len = (Get-Item $logPath).Length
     Add-Summary ("server.log size (bytes):   " + $len)

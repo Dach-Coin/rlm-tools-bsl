@@ -21,12 +21,23 @@ import win32event
 import win32service
 import win32serviceutil
 
+from rlm_tools_bsl._config import SERVICE_NO_ENV_VAR
 from rlm_tools_bsl._git_process import CAPTURE_FILE_GLOB, GIT_CAPTURE_DIR_ENV, SERVICE_CAPTURE_DIRNAME
 from rlm_tools_bsl._service_env import build_service_env_vars
-from rlm_tools_bsl.service import _config_path, load_config, save_config
+from rlm_tools_bsl.service import (
+    _absolute_env_file,
+    _config_path,
+    _restore_file,
+    _snapshot_file,
+    installer_leftovers,
+    load_config,
+    save_config,
+)
 
 SERVICE_NAME = "rlm-tools-bsl"
 SERVICE_DISPLAY = "RLM Tools BSL (MCP HTTP Server)"
+# ERROR_SERVICE_DOES_NOT_EXIST: removing an already-removed service is not a failure.
+ERROR_SERVICE_DOES_NOT_EXIST = 1060
 _SERVICE_DESC_BASE = "RLM-инструменты для анализа 1C BSL-кода. Предназначены для экономии расхода токенов и контекста при анализе BSL-проектов"
 
 
@@ -41,6 +52,21 @@ def _get_service_desc() -> str:
 
 
 SERVICE_DESC = _get_service_desc()
+
+
+def health_probe_host(host: str) -> str:
+    """Turn a BIND address into one the watchdog can actually connect to.
+
+    A wildcard bind is not a connectable address: ``http://:::3000/health`` does not
+    even parse, so every probe would fail and the watchdog would keep killing a
+    perfectly healthy server until it ran out of restarts.
+    """
+    value = (host or "").strip().strip("[]")
+    if value in ("", "0.0.0.0", "*"):
+        return "127.0.0.1"
+    if value in ("::", "0:0:0:0:0:0:0:0"):
+        return "[::1]"
+    return f"[{value}]" if ":" in value else value
 
 
 class RlmWindowsService(win32serviceutil.ServiceFramework):
@@ -84,16 +110,48 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         win32event.WaitForSingleObject(self._stop_event, win32event.INFINITE)
 
     def _run_server(self) -> None:
+        """Thread body.  Nothing may escape it.
+
+        A dying thread would leave the SCM at SERVICE_RUNNING with no server behind it:
+        `net start` succeeds, the service shows as running, and every request fails.
+        An unusable service.json (wrong encoding, broken JSON) reaches exactly this
+        path, because the settings cannot be guessed -- so say so in the log and stop
+        the service for real.
+        """
+        try:
+            self._serve()
+        except BaseException as exc:  # noqa: BLE001 - see the docstring
+            self._log_fatal("Fatal: %s: %s. Service is stopping (check %s).", type(exc).__name__, exc, _config_path())
+        else:
+            # A normal return means the watchdog is done: the server shut down cleanly
+            # or the restart budget ran out. Either way there is no server any more, so
+            # the service must stop instead of sitting at SERVICE_RUNNING forever.
+            self._log_fatal("Watchdog finished: no server process left. Service is stopping.")
+        finally:
+            try:
+                win32event.SetEvent(self._stop_event)
+            except Exception:
+                pass
+
+    def _log_fatal(self, msg: str, *args) -> None:
+        """Best-effort note in server.log. Never raises: this runs on the way out."""
+        try:
+            log_dir = _config_path().parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "server.log", "a", encoding="utf-8") as f:
+                _log_watchdog(f, msg, *args)
+        except Exception:
+            pass
+
+    def _serve(self) -> None:
         cfg = load_config()
         exe = cfg.get("exe_path") or "rlm-tools-bsl"
         host = cfg["host"]
         port = str(cfg["port"])
-        health_url = f"http://{host}:{port}/health"
+        health_url = f"http://{health_probe_host(host)}:{port}/health"
 
-        env = os.environ.copy()
         env_file = cfg.get("env_file")
-        if env_file and pathlib.Path(env_file).exists():
-            _load_env_file(env_file, env)
+        env = _service_child_environment(env_file)
         # Force line-buffered stdout/stderr in the subprocess so log records
         # (which go to stderr via basicConfig and get redirected here) appear
         # in server.log immediately, not in 4-8 KB block-buffered chunks.
@@ -114,6 +172,7 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         # требует `RLM_UNDER_SERVICE=1` И точного совпадения маркера). Поэтому
         # выставляются регистронезависимо — см. `_set_service_env_var`.
         _set_service_env_var(env, "RLM_UNDER_SERVICE", "1")
+        _set_service_env_var(env, SERVICE_NO_ENV_VAR, "1" if cfg.get("no_env") is True else None)
         # Маркер capture-каталога — приватный канал служба→ребёнок. Любое
         # унаследованное значение (в т.ч. из `.env`, загруженного выше)
         # вычищается: подставленный извне путь обошёл бы и mkdir, и
@@ -266,6 +325,20 @@ def _set_service_env_var(env: dict, name: str, value: str | None) -> None:
         del env[key]
     if value is not None:
         env[name] = value
+
+
+def _service_child_environment(env_file: str | None) -> dict:
+    """Build the child environment without letting ``.env`` redirect its config."""
+    env = os.environ.copy()
+    env_file = _absolute_env_file(env_file, base_dir=_config_path().parent)
+    if env_file and pathlib.Path(env_file).exists():
+        _load_env_file(env_file, env)
+    # Windows environment names are case-insensitive, while `env` is now an ordinary
+    # case-sensitive dict. A `.env` entry such as `rlm_config_file=...` would coexist
+    # with the registry's uppercase key and win when CreateProcess builds the child
+    # environment. Remove every spelling and pin the path the wrapper just read.
+    _set_service_env_var(env, "RLM_CONFIG_FILE", str(_config_path()))
+    return env
 
 
 def _current_user_sid():
@@ -501,12 +574,17 @@ def _set_service_environment(service_name: str, site_packages: str, config_file:
         for ev in env_vars:
             print(f"Service env set: {ev}")
     except Exception as exc:
-        print(f"Warning: could not set Environment in registry: {exc}")
+        # NOT swallowed: without this key pythonservice.exe cannot import rlm_tools_bsl
+        # and LocalSystem cannot find the config, i.e. the service is registered but
+        # cannot start.  The caller rolls the registration back.
+        raise RuntimeError(f"could not set Environment in the service registry key: {exc}") from exc
 
 
-def install(host: str, port: int, env_file: str | None) -> None:
+def install(host: str, port: int, env_file: str | None, *, no_env: bool = False) -> None:
     import shutil
     import sys
+
+    env_file = _absolute_env_file(env_file)
 
     # Locate rlm-tools-bsl.exe in the current (uv tool) Python environment.
     # We try two strategies: PATH lookup and sibling of sys.executable.
@@ -555,7 +633,15 @@ def install(host: str, port: int, env_file: str | None) -> None:
             shutil.copy2(dll, dest)
             print(f"Copied {dll.name} -> {svc_dir}")
 
-    save_config(host, port, env_file, exe_path=exe_path)
+    try:
+        config_snapshot = _snapshot_file(_config_path())
+    except OSError as exc:
+        # An explicit set of install flags may let the facade continue past an
+        # unreadable old config, but this backend still must be able to put its exact
+        # bytes back if the registry write fails after save_config() succeeds.
+        print(f"Install error: cannot prepare config rollback: {exc}")
+        raise SystemExit(1)
+
     try:
         win32serviceutil.InstallService(
             pythonClassString="rlm_tools_bsl._service_win.RlmWindowsService",
@@ -564,29 +650,71 @@ def install(host: str, port: int, env_file: str | None) -> None:
             description=SERVICE_DESC,
             startType=win32service.SERVICE_AUTO_START,
         )
-        # Allow pythonservice.exe (system Python) to find rlm_tools_bsl at runtime
-        # and locate the config file (LocalSystem has a different home dir)
-        _set_service_environment(SERVICE_NAME, site_packages, str(_config_path()))
-        print(f"Service '{SERVICE_NAME}' installed.")
-        print("Start with: rlm-tools-bsl service start")
     except Exception as exc:
+        # Nothing has been written yet: a failed registration (already installed, no
+        # admin rights) leaves the previous configuration exactly as it was.
         print(f"Install error: {exc}")
         print("Make sure you are running as Administrator.")
         raise SystemExit(1)
 
+    try:
+        # Saved only after the service really exists, so an install that fails cannot
+        # leave the config pointing somewhere the running service is not.
+        save_config(host, port, env_file, exe_path=exe_path, no_env=no_env)
+        # Allow pythonservice.exe (system Python) to find rlm_tools_bsl at runtime
+        # and locate the config file (LocalSystem has a different home dir)
+        _set_service_environment(SERVICE_NAME, site_packages, str(_config_path()))
+    except Exception as exc:
+        # Registered but unconfigured is the worst of both worlds: the service cannot
+        # start AND the next attempt is blocked by "service already exists".
+        print(f"Install error after registration: {exc}")
+        try:
+            win32serviceutil.RemoveService(SERVICE_NAME)
+            print(f"Rolled back: service '{SERVICE_NAME}' removed.")
+        except Exception as rollback_exc:
+            print(f"Rollback failed, remove it manually: {rollback_exc}")
+        try:
+            _restore_file(config_snapshot)
+            print(f"Rolled back: service config restored: {_config_path()}")
+        except Exception as rollback_exc:
+            print(f"Config rollback failed, restore it manually: {rollback_exc}")
+        raise SystemExit(1)
 
-def uninstall() -> None:
+    print(f"Service '{SERVICE_NAME}' installed.")
+    print("Start with: rlm-tools-bsl service start")
+
+
+def uninstall(purge: bool = False) -> None:
+    """Remove the service.  The config survives unless *purge* is asked for.
+
+    Update scripts call uninstall + install back to back; deleting service.json
+    here used to throw away the user's host/port/.env on every upgrade -- and on
+    Windows it is that very file the running service reads its bind address from.
+    """
     try:
         win32serviceutil.StopService(SERVICE_NAME)
     except Exception:
         pass
     try:
         win32serviceutil.RemoveService(SERVICE_NAME)
-        _config_path().unlink(missing_ok=True)
         print(f"Service '{SERVICE_NAME}' removed.")
     except Exception as exc:
-        print(f"Error: {exc}")
-        raise SystemExit(1)
+        # An already-removed service must not block --purge: after a plain uninstall
+        # that is the only way left to delete the config, and on Linux it works.
+        if getattr(exc, "winerror", None) != ERROR_SERVICE_DOES_NOT_EXIST:
+            print(f"Error: {exc}")
+            raise SystemExit(1)
+        print(f"Service '{SERVICE_NAME}' is not installed.")
+    config = _config_path()
+    if purge:
+        # Copies FIRST, config last: if removing a copy fails (read-only, locked), the
+        # config is still there, and nothing can be resurrected from a half-purge.
+        for leftover in installer_leftovers(config):
+            leftover.unlink(missing_ok=True)
+        config.unlink(missing_ok=True)
+        print(f"Service config removed: {config}")
+    elif config.exists():
+        print(f"Settings kept: {config} (remove them too: service uninstall --purge)")
 
 
 def start() -> None:

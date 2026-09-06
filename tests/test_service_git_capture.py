@@ -81,7 +81,7 @@ class _FakeProc:
         return 0
 
 
-def _run_server_once(mod, monkeypatch, tmp_path, *, capture_dir, env_file=None, swept=0) -> dict:
+def _run_server_once(mod, monkeypatch, tmp_path, *, capture_dir, env_file=None, no_env=False, swept=0) -> dict:
     """Прогнать реальный `_run_server` один круг и вернуть env, ушедший ребёнку."""
     captured: dict = {}
 
@@ -107,7 +107,13 @@ def _run_server_once(mod, monkeypatch, tmp_path, *, capture_dir, env_file=None, 
     monkeypatch.setattr(
         mod,
         "load_config",
-        lambda: {"host": "127.0.0.1", "port": 9000, "env_file": env_file, "exe_path": "rlm-tools-bsl"},
+        lambda: {
+            "host": "127.0.0.1",
+            "port": 9000,
+            "env_file": env_file,
+            "no_env": no_env,
+            "exe_path": "rlm-tools-bsl",
+        },
     )
 
     svc = mod.RlmWindowsService.__new__(mod.RlmWindowsService)
@@ -395,6 +401,24 @@ class TestMarkerCaseInsensitiveScrub:
         result = _run_server_once(service_mod, monkeypatch, tmp_path, capture_dir=prepared, env_file=str(env_file))
 
         assert _variants(result["env"], "RLM_UNDER_SERVICE") == {"RLM_UNDER_SERVICE": "1"}
+
+    def test_no_env_configuration_is_forwarded_to_the_server_child(self, service_mod, monkeypatch, tmp_path):
+        result = _run_server_once(service_mod, monkeypatch, tmp_path, capture_dir=None, env_file=None, no_env=True)
+
+        assert _variants(result["env"], "_RLM_SERVICE_NO_ENV") == {"_RLM_SERVICE_NO_ENV": "1"}
+
+    def test_legacy_null_env_does_not_disable_fallbacks(self, service_mod, monkeypatch, tmp_path):
+        result = _run_server_once(service_mod, monkeypatch, tmp_path, capture_dir=None, env_file=None, no_env=False)
+
+        assert _variants(result["env"], "_RLM_SERVICE_NO_ENV") == {}
+
+    def test_configured_env_clears_an_inherited_no_env_marker(self, service_mod, monkeypatch, tmp_path):
+        env_file = tmp_path / "service.env"
+        env_file.write_text("_rlm_service_no_env=1\n", encoding="utf-8")
+
+        result = _run_server_once(service_mod, monkeypatch, tmp_path, capture_dir=None, env_file=str(env_file))
+
+        assert _variants(result["env"], "_RLM_SERVICE_NO_ENV") == {}
 
     @windows_only
     def test_child_process_really_sees_no_marker(self, service_mod, monkeypatch, tmp_path):

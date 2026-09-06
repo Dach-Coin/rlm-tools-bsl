@@ -3080,6 +3080,12 @@ def main():
         except (AttributeError, OSError, ValueError):
             pass
 
+    # A service command must keep the config selected by the CALLER. The .env loaded
+    # below may legitimately contain RLM_CONFIG_FILE for ordinary server/CLI work, but
+    # allowing it to redirect `service install` means we stop reading the very config
+    # whose settings are supposed to survive the reinstall.
+    config_file_was_set = "RLM_CONFIG_FILE" in os.environ
+    config_file_before_env = os.environ.get("RLM_CONFIG_FILE")
     load_project_env()
 
     parser = argparse.ArgumentParser(description="rlm-tools-bsl MCP server")
@@ -3100,10 +3106,18 @@ def main():
         default=os.environ.get("RLM_HOST", "127.0.0.1"),
         help="Bind host for HTTP transport (env: RLM_HOST, default: 127.0.0.1)",
     )
+    # Parsed defensively: this default is computed while the parser is BUILT, so a
+    # RLM_PORT of "not-a-number" used to abort every invocation -- `--version` and
+    # `service install --help` included -- before argparse could say anything useful.
+    from rlm_tools_bsl.service import DEFAULT_PORT, _first_port
+
+    env_port = _first_port(os.environ.get("RLM_PORT"))
+    if env_port is None and os.environ.get("RLM_PORT"):
+        logger.warning("RLM_PORT=%r is not a valid port, using %d", os.environ["RLM_PORT"], DEFAULT_PORT)
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("RLM_PORT", "9000")),
+        default=env_port or DEFAULT_PORT,
         help="Bind port for HTTP transport (env: RLM_PORT, default: 9000)",
     )
 
@@ -3112,16 +3126,56 @@ def main():
     service_sub = service_parser.add_subparsers(dest="service_action")
 
     install_p = service_sub.add_parser("install", help="Install and enable the service")
-    install_p.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
-    install_p.add_argument("--port", type=int, default=9000, help="Bind port (default: 9000)")
-    install_p.add_argument("--env", default=None, metavar="PATH", help="Path to .env file")
+    # Defaults are resolved in service.resolve_install_settings(), NOT here: an omitted
+    # flag means "keep what the previous installation used", so that re-running the
+    # installer to upgrade cannot silently reset the service to 127.0.0.1:9000.
+    install_p.add_argument(
+        "--host",
+        default=None,
+        help="Bind host (default: saved value, then env RLM_HOST, then 127.0.0.1)",
+    )
+    install_p.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port (default: saved value, then env RLM_PORT, then 9000)",
+    )
+    # --env and --no-env answer the same question, so let argparse reject the pair
+    # instead of silently letting one of them win.
+    env_group = install_p.add_mutually_exclusive_group()
+    env_group.add_argument(
+        "--env",
+        default=None,
+        metavar="PATH",
+        help="Path to .env file (default: keep the saved one)",
+    )
+    env_group.add_argument(
+        "--no-env",
+        action="store_true",
+        dest="no_env",
+        help="Start the SERVICE without any .env file (drops the saved path). "
+        "Does not affect the environment of this install command itself",
+    )
 
-    for _action in ("start", "stop", "status", "uninstall"):
+    for _action in ("start", "stop", "status"):
         service_sub.add_parser(_action)
+
+    uninstall_p = service_sub.add_parser("uninstall", help="Stop and remove the service")
+    uninstall_p.add_argument(
+        "--purge",
+        action="store_true",
+        help="Also delete service.json (host/port/.env settings)",
+    )
 
     args = parser.parse_args()
 
     if args.command == "service":
+        if config_file_was_set:
+            # Membership above also covers an explicitly empty value. Keep it exact;
+            # _config_path() deliberately treats empty as the default path.
+            os.environ["RLM_CONFIG_FILE"] = config_file_before_env or ""
+        else:
+            os.environ.pop("RLM_CONFIG_FILE", None)
         from rlm_tools_bsl.service import handle_service_command
 
         handle_service_command(args)

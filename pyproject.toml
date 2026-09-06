@@ -1,6 +1,6 @@
 [project]
 name = "rlm-tools-bsl"
-version = "1.34.0"
+version = "1.35.0"
 description = "MCP server for token-efficient 1C BSL codebase analysis"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -80,11 +80,13 @@ per-file-ignores = {"src/rlm_tools_bsl/bsl_helpers.py" = ["E402"], "src/rlm_tool
 
 [tool.coverage.run]
 source = ["src/rlm_tools_bsl"]
+# Модули службы исключались, пока под них не было ни одного теста. Сейчас они
+# покрыты (service.py 93%, _service_linux.py 80%, _service_win.py 62% на Linux),
+# и исключение только прятало ~730 протестированных строк. `_service_win.py`
+# измеряется и на Linux: тесты подкладывают заглушки `win32*` в `sys.modules`.
+# `__main__.py` остаётся — это одна строка точки входа.
 omit = [
     "src/rlm_tools_bsl/__main__.py",
-    "src/rlm_tools_bsl/_service_win.py",
-    "src/rlm_tools_bsl/_service_linux.py",
-    "src/rlm_tools_bsl/service.py",
 ]
 
 [tool.coverage.report]
