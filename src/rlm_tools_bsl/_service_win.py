@@ -24,6 +24,7 @@ import win32serviceutil
 from rlm_tools_bsl._config import SERVICE_NO_ENV_VAR
 from rlm_tools_bsl._git_process import CAPTURE_FILE_GLOB, GIT_CAPTURE_DIR_ENV, SERVICE_CAPTURE_DIRNAME
 from rlm_tools_bsl._service_env import build_service_env_vars
+from rlm_tools_bsl._service_watchdog import RestartPolicy
 from rlm_tools_bsl.service import (
     _absolute_env_file,
     _config_path,
@@ -79,10 +80,38 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
     _git_capture_dir: pathlib.Path | None = None
     _git_capture_error: str | None = None
     _git_capture_swept: int = 0
+    # Stop intent, up from the FIRST line of SvcStop -- everything it does after that
+    # takes time, and the loop must not read those seconds as ordinary work.
+    _stopping: bool = False
+    # Serialises publishing `_proc` against SvcStop reading it. Replaced per instance
+    # in __init__; the class-level one keeps `_serve` callable on its own.
+    _proc_lock = threading.Lock()
+
+    def __init__(self, args) -> None:
+        """Build everything SvcStop touches BEFORE the control handler can fire.
+
+        `ServiceFramework.__init__` is what registers that handler, and `SvcRun`
+        reports SERVICE_RUNNING before it ever calls `SvcDoRun` -- so an ordinary
+        quick `net start && net stop` can deliver a STOP while `SvcDoRun` has not
+        run a single line. Reaching for `_proc` or `_stop_event` from there would
+        raise inside the SCM's own callback, and creating this state in `SvcDoRun`
+        instead would silently overwrite a stop the SCM had already accepted.
+        """
+        # Manual-reset (second argument): ONE SetEvent releases BOTH waiters --
+        # SvcDoRun and the watchdog thread. An auto-reset event hands it to exactly
+        # one of them. The service stopped either way -- the loser of that race was
+        # either torn down with the process or set the event again on its own way
+        # out -- but WHICH path did it depended on the race, and the watchdog now
+        # waits up to 15 minutes at a time. Manual reset makes the stop the same
+        # every time. Nothing relies on the event resetting itself: it is set once.
+        self._stop_event = win32event.CreateEvent(None, 1, 0, None)
+        self._stopping = False
+        self._proc_lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        super().__init__(args)
 
     def SvcDoRun(self) -> None:
-        self._stop_event = win32event.CreateEvent(None, 0, 0, None)
-        self._proc: subprocess.Popen | None = None
+        # Стоп-состояние живёт в __init__ — см. там; пересоздавать его здесь нельзя.
         # Приватный capture-каталог для git-вызовов сервера. Best-effort: отказ
         # выключает ТОЛЬКО Git-ускорение, а не службу, поэтому watchdog-поток
         # стартует и SERVICE_RUNNING сообщается в любом случае.
@@ -104,9 +133,18 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
                 self._git_capture_swept = _sweep_git_capture_dir(self._git_capture_dir)
             except BaseException:  # noqa: BLE001 - уборка не критична вовсе
                 self._git_capture_swept = 0
+        if self._stopping:
+            # A stop was accepted while the SCM already believed us RUNNING. Starting a
+            # server now would leave one running behind a service that is stopping.
+            return
         self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
-        self.ReportServiceStatus(win32service.SERVICE_RUNNING)
+        # No status is reported here on purpose. `ServiceFramework.SvcRun` reports
+        # SERVICE_RUNNING immediately before calling us, so a second report says
+        # nothing new -- and a stop delivered while the thread is starting is past the
+        # check above, which would let that report paint RUNNING over the STOP_PENDING
+        # SvcStop had just sent. Reporting readiness later would mean overriding
+        # SvcRun, not duplicating one of its lines here.
         win32event.WaitForSingleObject(self._stop_event, win32event.INFINITE)
 
     def _run_server(self) -> None:
@@ -123,11 +161,19 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         except BaseException as exc:  # noqa: BLE001 - see the docstring
             self._log_fatal("Fatal: %s: %s. Service is stopping (check %s).", type(exc).__name__, exc, _config_path())
         else:
-            # A normal return means the watchdog is done: the server shut down cleanly
-            # or the restart budget ran out. Either way there is no server any more, so
-            # the service must stop instead of sitting at SERVICE_RUNNING forever.
+            # A normal return means the watchdog is done: either the server shut down
+            # cleanly or SvcStop was requested. The budget can no longer run out -- it
+            # backs off instead -- so there is no server any more and the service must
+            # stop instead of sitting at SERVICE_RUNNING forever.
             self._log_fatal("Watchdog finished: no server process left. Service is stopping.")
         finally:
+            # The exception exit is an exit too: without this the loop's own child
+            # outlives the service that was watching it and keeps the port. Before
+            # SetEvent, so the main thread cannot tear the process down first.
+            try:
+                self._abandon_child()
+            except Exception:
+                pass
             try:
                 win32event.SetEvent(self._stop_event)
             except Exception:
@@ -222,21 +268,34 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             except OSError:
                 pass
 
-        max_restarts = 5
-        restart_count = 0
+        # Every "when do we kill / how long do we wait" decision lives in the policy;
+        # this loop only carries them out.  See _service_watchdog.py for why a single
+        # missed probe and a lifetime restart budget were both wrong.
+        policy = RestartPolicy()
 
-        while restart_count <= max_restarts:
-            log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-            _log_watchdog(log_file, "Starting subprocess: %s", exe)
-            self._proc = subprocess.Popen(
-                [exe, "--transport", "streamable-http", "--host", host, "--port", port],
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
+        while True:
+            # Under the lock, and only after re-reading the intent: a stop delivered
+            # while `Popen` runs would otherwise terminate the process SvcStop saw --
+            # the previous, already dead one -- and this brand new server would
+            # outlive the service that launched it, holding the port.
+            with self._proc_lock:
+                if self._stopping:
+                    return  # SvcStop was called: launch nothing more
+                log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+                _log_watchdog(log_file, "Starting subprocess: %s", exe)
+                self._proc = subprocess.Popen(
+                    [exe, "--transport", "streamable-http", "--host", host, "--port", port],
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+            policy.process_started(time.monotonic())
 
             # Grace period for startup
-            time.sleep(5)
+            if self._wait_for_stop(5):
+                self._abandon_child()
+                log_file.close()
+                return  # SvcStop was called
 
             # Health-check loop: check every 30s, poll stop_event every 1s
             health_failed = False
@@ -244,23 +303,54 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             while self._proc.poll() is None:
                 for _ in range(30):
                     if win32event.WaitForSingleObject(self._stop_event, 1000) != win32event.WAIT_TIMEOUT:
+                        self._abandon_child()
                         log_file.close()
                         return  # SvcStop was called
                     if self._proc.poll() is not None:
                         break
                 else:
-                    if _check_health(health_url):
+                    answered = _check_health(health_url)
+                    # The probe takes up to 10 s and never looks at the stop event, so a
+                    # `net stop` delivered inside it arrives here as a dead child. Read
+                    # as a missed probe, it would put a wrong reason in the log.
+                    if self._wait_for_stop(0):
+                        self._abandon_child()
+                        log_file.close()
+                        return  # SvcStop was called
+                    if answered:
+                        if policy.consecutive_failures:
+                            _log_watchdog(
+                                log_file,
+                                "Health check recovered after %d missed probe(s) (%s)",
+                                policy.consecutive_failures,
+                                health_url,
+                            )
+                        policy.probe_succeeded(time.monotonic())
                         if first_health_ok:
                             _log_watchdog(log_file, "Health check OK (%s)", health_url)
                             first_health_ok = False
-                    else:
-                        _log_watchdog(log_file, "Health check failed (%s), terminating process", health_url)
+                    elif policy.probe_failed(time.monotonic()):
+                        _log_watchdog(
+                            log_file,
+                            "Health check failed %d times in a row (%s), terminating process",
+                            policy.consecutive_failures,
+                            health_url,
+                        )
                         self._proc.terminate()
                         try:
                             self._proc.wait(timeout=10)
                         except subprocess.TimeoutExpired:
                             self._proc.kill()
                         health_failed = True
+                    else:
+                        # Logged, not acted on: a late answer under load is ordinary,
+                        # and this line is what makes an eventual kill explicable.
+                        _log_watchdog(
+                            log_file,
+                            "Health check missed %d time(s) in a row (%s), giving the server more time",
+                            policy.consecutive_failures,
+                            health_url,
+                        )
 
                 if health_failed:
                     break
@@ -271,22 +361,74 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             if exit_code == 0 and not health_failed:
                 break  # clean shutdown
 
-            restart_count += 1
-            if restart_count <= max_restarts:
-                with open(log_path, "a", encoding="utf-8") as f:
+            # SvcStop terminates the child, so the loop meets a dead process here and
+            # would announce a restart that is never coming: the probe it was inside
+            # does not look at the event, so this is the first chance to notice.
+            if self._wait_for_stop(0):
+                return  # SvcStop was called
+
+            delay = policy.note_restart(time.monotonic())
+            with open(log_path, "a", encoding="utf-8") as f:
+                _log_watchdog(
+                    f,
+                    "Process exited (code=%s health_fail=%s), restarting in %d s...",
+                    exit_code,
+                    health_failed,
+                    round(delay),
+                )
+                if policy.backing_off:
+                    # Without this the operator sees a long wait with no reason for it.
                     _log_watchdog(
                         f,
-                        "Process exited (code=%s health_fail=%s), restarting (%d/%d)...",
-                        exit_code,
-                        health_failed,
-                        restart_count,
-                        max_restarts,
+                        "%d starts in a row failed to stay healthy; backing off. The service "
+                        "keeps retrying and does not give up.",
+                        policy.failed_starts,
                     )
-                time.sleep(5)
+            # Interruptible on purpose: an uninterruptible sleep here would make
+            # `net stop` hang for the whole backoff — up to 15 minutes.
+            if self._wait_for_stop(delay):
+                self._abandon_child()
+                return  # SvcStop was called
+
+    def _abandon_child(self) -> None:
+        """Kill the server process on the way out of the loop.
+
+        Belt to the lock's braces, not the primary mechanism: `_proc_lock` already
+        makes SvcStop's snapshot the last word, so the process it terminates is the
+        one actually running. This covers the exits the lock says nothing about --
+        above all the exception one, where the thread body stops the service and
+        would otherwise leave the server it had just started holding the port.
+        """
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    def _wait_for_stop(self, seconds: float) -> bool:
+        """Wait up to `seconds`, returning True as soon as SvcStop is requested.
+
+        The flag is checked first: SvcStop raises it immediately but sets the event
+        only after terminating the child, which can take ten seconds.
+        """
+        if self._stopping:
+            return True
+        # Clamped at zero: WaitForSingleObject takes a DWORD, so a negative count would
+        # arrive as INFINITE and hang the watchdog on a restart that never comes.
+        milliseconds = max(0, int(seconds * 1000))
+        return win32event.WaitForSingleObject(self._stop_event, milliseconds) != win32event.WAIT_TIMEOUT
 
     def SvcStop(self) -> None:
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
-        proc = self._proc
+        # Intent first, and only then the process: raising the flag before taking the
+        # lock means the loop can never publish another child behind our back, so the
+        # snapshot below is the last one there will be.
+        self._stopping = True
+        with self._proc_lock:
+            proc = self._proc
         if proc is not None:
             proc.terminate()
             try:
@@ -541,11 +683,20 @@ def _check_health(url: str) -> bool:
 
 
 def _log_watchdog(f, msg: str, *args) -> None:
-    """Write a timestamped watchdog message to the log file."""
+    """Write a timestamped watchdog message to the log file.
+
+    A write failure costs a line, never the service. `server.log` is line-buffered
+    and shared with the child, so a full disk raises OSError right here -- inside
+    the watchdog loop, where it would escape to the thread body and stop a service
+    whose server is perfectly healthy.
+    """
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = msg % args if args else msg
-    f.write(f"[watchdog {ts}] {text}\n")
-    f.flush()
+    try:
+        f.write(f"[watchdog {ts}] {text}\n")
+        f.flush()
+    except OSError:
+        pass
 
 
 def _set_service_environment(service_name: str, site_packages: str, config_file: str) -> None:

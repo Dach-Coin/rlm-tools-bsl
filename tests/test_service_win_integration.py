@@ -425,8 +425,8 @@ def test_install_restores_previous_config_when_registry_write_fails(monkeypatch,
 
 def test_watchdog_returning_normally_also_stops_the_service(monkeypatch, tmp_path, request):
     """The thread reports SERVICE_RUNNING and then serves. It also RETURNS normally when
-    the child exits cleanly or the restart budget runs out -- without stopping the
-    service, the SCM would keep showing a running service with no server behind it."""
+    the child exits cleanly -- without stopping the service, the SCM would keep showing
+    a running service with no server behind it."""
     _install_stubs(monkeypatch)
     _service_win = _import_service_win(monkeypatch, request)
 
@@ -443,3 +443,55 @@ def test_watchdog_returning_normally_also_stops_the_service(monkeypatch, tmp_pat
     assert stopped == ["stop-event"]
     log = (tmp_path / "logs" / "server.log").read_text(encoding="utf-8")
     assert "Watchdog finished" in log
+
+
+def test_watchdog_wait_returns_as_soon_as_svcstop_is_signalled(monkeypatch, request):
+    """Backoff between restarts runs up to 15 minutes. An uninterruptible sleep there
+    would make `net stop` hang for the whole of it, so every watchdog wait must sit on
+    the stop event -- and must pass MILLISECONDS, or a 900 s backoff becomes 900 ms."""
+    _install_stubs(monkeypatch)
+    _service_win = _import_service_win(monkeypatch, request)
+
+    waited = []
+    win32event = sys.modules["win32event"]
+    win32event.WAIT_TIMEOUT = 258
+    win32event.WaitForSingleObject = lambda handle, ms: waited.append((handle, ms)) or 0
+
+    service = object.__new__(_service_win.RlmWindowsService)
+    service._stop_event = "stop-event"
+
+    assert service._wait_for_stop(900) is True
+    assert waited == [("stop-event", 900_000)]
+
+
+def test_watchdog_wait_reports_a_plain_timeout_as_no_stop(monkeypatch, request):
+    _install_stubs(monkeypatch)
+    _service_win = _import_service_win(monkeypatch, request)
+
+    win32event = sys.modules["win32event"]
+    win32event.WAIT_TIMEOUT = 258
+    win32event.WaitForSingleObject = lambda handle, ms: 258
+
+    service = object.__new__(_service_win.RlmWindowsService)
+    service._stop_event = "stop-event"
+
+    assert service._wait_for_stop(5) is False
+
+
+def test_watchdog_wait_never_turns_a_non_positive_delay_into_an_infinite_wait(monkeypatch, request):
+    """WaitForSingleObject takes a DWORD: a negative millisecond count arrives as
+    INFINITE, and the watchdog would wait for a restart that never comes."""
+    _install_stubs(monkeypatch)
+    _service_win = _import_service_win(monkeypatch, request)
+
+    waited = []
+    win32event = sys.modules["win32event"]
+    win32event.WAIT_TIMEOUT = 258
+    win32event.WaitForSingleObject = lambda handle, ms: waited.append(ms) or 258
+
+    service = object.__new__(_service_win.RlmWindowsService)
+    service._stop_event = "stop-event"
+
+    assert service._wait_for_stop(0) is False
+    assert service._wait_for_stop(-1) is False
+    assert all(ms >= 0 for ms in waited), waited

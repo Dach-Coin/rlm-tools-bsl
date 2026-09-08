@@ -102,7 +102,14 @@ def _run_server_once(mod, monkeypatch, tmp_path, *, capture_dir, env_file=None, 
             TimeoutExpired=subprocess.TimeoutExpired,
         ),
     )
-    monkeypatch.setattr(mod, "time", types.SimpleNamespace(sleep=lambda *_a: None))
+    # `monotonic` обязателен: петля watchdog отмечает им старт процесса и промахи
+    # проб. Без него первый же вызов ронял `_serve`, а `_run_server` глотал
+    # AttributeError и писал `Fatal` — тесты оставались зелёными, проверяя
+    # аварийную ветку вместо петли (сторож на "Fatal" ниже).
+    monkeypatch.setattr(mod, "time", types.SimpleNamespace(sleep=lambda *_a: None, monotonic=lambda: 0.0))
+    # Харнесс проверяет путь «ребёнок сразу штатно завершился» (см. _FakeProc), а не
+    # остановку службы: грейс-ожидание обязано истечь, а не сработать как SvcStop.
+    monkeypatch.setattr(mod.RlmWindowsService, "_wait_for_stop", lambda self, seconds: False)
     monkeypatch.setattr(mod, "_config_path", lambda: tmp_path / "service.json")
     monkeypatch.setattr(
         mod,
@@ -123,6 +130,10 @@ def _run_server_once(mod, monkeypatch, tmp_path, *, capture_dir, env_file=None, 
     svc._run_server()
 
     captured["log"] = (tmp_path / "logs" / "server.log").read_text(encoding="utf-8")
+    # Сторож: всё ниже проверяет то, что записано ПО ХОДУ петли. Если `_serve`
+    # падает, `_run_server` это глотает, и ассерты продолжают проходить на
+    # огрызке лога, ничего не проверяя.
+    assert "Fatal" not in captured["log"], captured["log"]
     return captured
 
 
@@ -146,6 +157,11 @@ def _neuter_service_loop(mod, monkeypatch) -> None:
 def _run_svcdorun(mod):
     """Прогнать реальный SvcDoRun и вернуть экземпляр службы."""
     svc = mod.RlmWindowsService.__new__(mod.RlmWindowsService)
+    # То, что в проде готовит `__init__` ДО регистрации control handler (см. его
+    # докстринг): SvcDoRun это состояние больше не создаёт, иначе принятый SCM
+    # стоп затирался бы. `_stopping`/`_proc_lock` берутся из классовых значений.
+    svc._stop_event = "event"
+    svc._proc = None
     svc.ReportServiceStatus = lambda _status: None
     svc.SvcDoRun()
     svc._thread.join(timeout=10)
@@ -466,6 +482,9 @@ class TestSvcDoRunDegradation:
 
         statuses: list[int] = []
         svc = service_mod.RlmWindowsService.__new__(service_mod.RlmWindowsService)
+        # Готовится в `__init__` ДО регистрации control handler — см. его докстринг.
+        svc._stop_event = "event"
+        svc._proc = None
         svc.ReportServiceStatus = statuses.append
         svc.SvcDoRun()
         svc._thread.join(timeout=10)
@@ -473,7 +492,11 @@ class TestSvcDoRunDegradation:
         assert svc._git_capture_dir is None
         assert svc._git_capture_error == "OSError"
         assert started == ["ran"], "watchdog-поток стартовал"
-        assert statuses == [fake_service.SERVICE_RUNNING], "служба сообщила SERVICE_RUNNING"
+        # SvcDoRun СВОЕГО статуса не шлёт: `ServiceFramework.SvcRun` сообщает
+        # SERVICE_RUNNING прямо перед вызовом, а повторный отчёт отсюда способен
+        # затереть STOP_PENDING, если стоп пришёл во время старта потока.
+        # Гарантия «служба всё равно поднялась» держится строкой выше.
+        assert statuses == [], f"SvcDoRun не должен слать статусы сам: {statuses}"
 
 
 @windows_only
