@@ -1754,6 +1754,178 @@ class TestIndexDirRootPrecedence:
         assert get_index_dir_root() == Path.home() / ".cache" / "rlm-tools-bsl"
 
 
+class TestDescribeIndexRoot:
+    """v1.35.2 (#34): корень И метка правила из ОДНОГО источника истины."""
+
+    def test_label_for_each_branch(self, _isolated_home, monkeypatch, tmp_path):
+        from pathlib import Path as _Path
+
+        from rlm_tools_bsl.bsl_index import describe_index_root
+
+        assert describe_index_root() == (_Path.home() / ".cache" / "rlm-tools-bsl", "по умолчанию")
+
+        config_file = tmp_path / "service.json"
+        config_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("RLM_CONFIG_FILE", str(config_file))
+        assert describe_index_root() == (tmp_path / "index", "RLM_CONFIG_FILE")
+
+        explicit = tmp_path / "explicit_index"
+        monkeypatch.setenv("RLM_INDEX_DIR", str(explicit))
+        assert describe_index_root() == (explicit, "RLM_INDEX_DIR")
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_blank_value_is_treated_as_unset(self, _isolated_home, monkeypatch, blank):
+        """Пустое/пробельное значение больше не даёт Path("   ") молча."""
+        from pathlib import Path as _Path
+
+        from rlm_tools_bsl.bsl_index import describe_index_root, index_root_diagnostics
+
+        monkeypatch.setenv("RLM_INDEX_DIR", blank)
+        root, label = describe_index_root()
+        assert root == _Path.home() / ".cache" / "rlm-tools-bsl"
+        assert label == "по умолчанию"
+        remarks = index_root_diagnostics()
+        assert remarks and "RLM_INDEX_DIR" in remarks[0], remarks
+
+    def test_surrounding_whitespace_is_stripped(self, _isolated_home, monkeypatch, tmp_path):
+        from rlm_tools_bsl.bsl_index import describe_index_root, index_root_diagnostics
+
+        target = tmp_path / "spaced_index"
+        monkeypatch.setenv("RLM_INDEX_DIR", f"  {target}  ")
+        assert describe_index_root() == (target, "RLM_INDEX_DIR")
+        assert index_root_diagnostics() == []
+
+    def test_absolute_value_produces_no_diagnostics(self, _isolated_home, monkeypatch, tmp_path):
+        from rlm_tools_bsl.bsl_index import index_root_diagnostics
+
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "abs_index"))
+        assert index_root_diagnostics() == []
+
+    def test_relative_value_is_reported(self, _isolated_home, monkeypatch):
+        from rlm_tools_bsl.bsl_index import index_root_diagnostics
+
+        monkeypatch.setenv("RLM_INDEX_DIR", "relative_index")
+        remarks = index_root_diagnostics()
+        assert len(remarks) == 1, remarks
+        assert "относительным" in remarks[0], remarks
+
+    def test_unset_produces_no_diagnostics(self, _isolated_home):
+        from rlm_tools_bsl.bsl_index import index_root_diagnostics
+
+        assert index_root_diagnostics() == []
+
+    def test_blank_value_matches_unset_for_legacy_migration(self, _isolated_home, monkeypatch, tmp_path):
+        """Шаг 1.2: две копии правила больше не расходятся на пробельном значении.
+
+        До правки migrate_legacy_index_root спрашивала окружение сама, без
+        strip(): "   " означало "не задана" для корня и "задана" для миграции.
+        """
+        from rlm_tools_bsl.bsl_index import migrate_legacy_index_root
+
+        legacy = _isolated_home / ".cache" / "rlm-tools-bsl"
+        (legacy / "hash1").mkdir(parents=True)
+        (legacy / "hash1" / "bsl_index.db").write_bytes(b"db1")
+
+        config_dir = tmp_path / "service-cfg"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_file = config_dir / "service.json"
+        config_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("RLM_CONFIG_FILE", str(config_file))
+        monkeypatch.setenv("RLM_INDEX_DIR", "   ")
+
+        assert migrate_legacy_index_root() == 1
+        assert (config_dir / "index" / "hash1" / "bsl_index.db").read_bytes() == b"db1"
+
+
+class TestBuildRefusesUnusableIndexRoot:
+    """v1.35.2 (#34-B): внятный отказ вместо голой трассировки PermissionError."""
+
+    def test_build_raises_runtime_error_naming_root_and_env(self, monkeypatch, tmp_path, tmp_bsl_project):
+        """Родитель каталога индекса подменён ФАЙЛОМ — mkdir невозможен на обеих ОС.
+
+        chmod 000 под root в CI mkdir не запрещает, поэтому приём ровно один.
+        """
+        blocker = tmp_path / "not_a_dir"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("RLM_INDEX_DIR", str(blocker / "index"))
+
+        builder = IndexBuilder()
+        with pytest.raises(RuntimeError) as exc_info:
+            builder.build(str(tmp_bsl_project))
+        text = str(exc_info.value)
+        assert "RLM_INDEX_DIR" in text, text
+        assert str(blocker) in text, text
+        assert "Не удалось создать каталог индекса" in text, text
+
+    def test_build_raises_runtime_error_when_lock_file_cannot_be_created(self, monkeypatch, tmp_path, tmp_bsl_project):
+        """Второй маршрут: каталог индекса ЕСТЬ, но lock-файл создать нельзя.
+
+        `mkdir(parents=True, exist_ok=True)` на существующем каталоге проходит и
+        там, где запись запрещена, поэтому первый отказ прилетает уже на
+        `os.open` lock-файла — а тот стоит ВЫШЕ собственного `except` в
+        `_BuildLock.acquire()` и уходил наверх голым `PermissionError`.
+
+        Приём без ACL: путь lock-файла ЗАНЯТ каталогом. Это даёт `OSError` на
+        обеих ОС (Windows — `PermissionError`, Linux — `IsADirectoryError`) и не
+        требует ни `icacls`, ни `chmod`, которые под root в CI не работают.
+        """
+        from rlm_tools_bsl.bsl_index import get_index_db_path
+
+        idx_root = tmp_path / "idx_root"
+        monkeypatch.setenv("RLM_INDEX_DIR", str(idx_root))
+        db_path = get_index_db_path(str(tmp_bsl_project))
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        (db_path.parent / "bsl_index.lock").mkdir()
+
+        with pytest.raises(RuntimeError) as exc_info:
+            IndexBuilder().build(str(tmp_bsl_project))
+        text = str(exc_info.value)
+        assert "RLM_INDEX_DIR" in text, text
+        assert "файл блокировки" in text, text
+        assert str(idx_root) in text, text
+        # Ветка "сборка уже идёт" — ДРУГОЙ отказ и не должна подменяться этой.
+        assert "already in progress" not in text, text
+
+
+class TestIndexDirRootRegressionAnchor:
+    """Регрессионный якорь под #34. Зелёный и ДО фикса — осознанно.
+
+    Он охраняет уже верное поведение: приоритет RLM_INDEX_DIR первый, и
+    непригодный домашний каталог на него не влияет. Заявленный в #34 откат в
+    ~/.cache при заданной переменной воспроизвести не удалось; этот тест
+    запирает то, что проверено, чтобы регресс не прошёл незамеченным. Поэтому
+    он сознательно опирается ТОЛЬКО на функции, существовавшие до v1.35.2, —
+    метка правила проверяется отдельно, в TestDescribeIndexRoot.
+    """
+
+    def test_rlm_index_dir_wins_over_unusable_home(self, monkeypatch, tmp_path):
+        import pathlib
+
+        from rlm_tools_bsl.bsl_index import get_index_db_path, get_index_dir_root
+
+        # Заведомо непригодный домашний каталог: .cache и .config — ФАЙЛЫ.
+        fake_home = tmp_path / "broken_home"
+        fake_home.mkdir()
+        (fake_home / ".cache").write_text("not a dir", encoding="utf-8")
+        (fake_home / ".config").write_text("not a dir", encoding="utf-8")
+        monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+        explicit = tmp_path / "explicit_root"
+        monkeypatch.setenv("RLM_INDEX_DIR", str(explicit))
+        # RLM_CONFIG_FILE задан ВТОРЫМ правилом — приоритет обязан остаться у первого.
+        config_file = tmp_path / "cfg" / "service.json"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("RLM_CONFIG_FILE", str(config_file))
+
+        assert get_index_dir_root() == explicit
+        db_path = get_index_db_path(str(tmp_path / "some_project"))
+        assert explicit in db_path.parents, db_path
+        assert fake_home not in db_path.parents, db_path
+
+
 class TestIndexDirMigration:
     """One-shot migration of legacy ~/.cache/rlm-tools-bsl/<hash>/ subdirs."""
 

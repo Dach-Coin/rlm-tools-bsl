@@ -1095,3 +1095,149 @@ def _fail_tree(backend):
 def _clear_tree(backend):
     backend._mark_tree_cleanup_confirmed(backend._tree_cleanup_target)
     return True
+
+
+# ---------------------------------------------------------------------------
+# v1.35.2 (#35): пролог _start_worker создаёт ИМЕНОВАННЫЕ объекты ядра (Pipe →
+# CreateNamedPipe, Lock → именованный семафор, RawArray/RawValue → mmap с
+# tagname) и стоял ВЫШЕ существующего try. Окружение с файловой песочницей
+# отказывает в них, и агент видел голый PermissionError без причины, без
+# обходного пути — и с утечкой уже созданных концов канала.
+# ---------------------------------------------------------------------------
+
+_ACCESS_DENIED_ARGS = (13, "Отказано в доступе", None, 5)
+_INLINE_HINT = "RLM_SANDBOX_MODE=inline"
+
+
+def _deny_access(*_args, **_kwargs):
+    raise PermissionError(*_ACCESS_DENIED_ARGS)
+
+
+class _SpyConn:
+    """Конец канала, который помнит, закрыли ли его."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _CtxProxy:
+    """Прокси над реальным spawn-контекстом с точечными подменами.
+
+    Сам контекст — синглтон stdlib, поэтому подменяются не его атрибуты, а
+    только то, что видит модуль под тестом.
+    """
+
+    def __init__(self, real, **overrides):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_overrides", overrides)
+
+    def __getattr__(self, name):
+        overrides = object.__getattribute__(self, "_overrides")
+        if name in overrides:
+            return overrides[name]
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+
+class _MpProxy:
+    """Прокси над модулем multiprocessing: подменяется ТОЛЬКО get_context."""
+
+    def __init__(self, **ctx_overrides):
+        self._ctx_overrides = ctx_overrides
+
+    def get_context(self, method):
+        return _CtxProxy(multiprocessing.get_context(method), **self._ctx_overrides)
+
+
+def test_pipe_denied_yields_inline_hint(cf_project, monkeypatch):
+    """Отказ ctx.Pipe → SandboxStartupError с подсказкой про inline."""
+    monkeypatch.setattr(sandbox_process_module, "multiprocessing", _MpProxy(Pipe=_deny_access))
+    with pytest.raises(SandboxStartupError) as exc_info:
+        ProcessSandboxBackend(_make_config(cf_project))
+    text = str(exc_info.value)
+    assert "PermissionError" in text, text
+    assert _INLINE_HINT in text, text
+
+
+def test_lock_denied_after_pipe_closes_both_ends(cf_project, monkeypatch):
+    """Отказ ctx.Lock ПОСЛЕ успешного Pipe: подсказка есть И оба конца закрыты.
+
+    До фикса пролог стоял выше try, и упавший Lock не закрывал ни одного конца
+    (воспроизведено: CLOSES пуст) — освобождение оставалось на подсчёте ссылок.
+    """
+    spies = []
+
+    def fake_pipe(duplex=True):
+        pair = (_SpyConn(), _SpyConn())
+        spies.extend(pair)
+        return pair
+
+    monkeypatch.setattr(
+        sandbox_process_module,
+        "multiprocessing",
+        _MpProxy(Pipe=fake_pipe, Lock=_deny_access),
+    )
+    with pytest.raises(SandboxStartupError) as exc_info:
+        ProcessSandboxBackend(_make_config(cf_project))
+    assert _INLINE_HINT in str(exc_info.value)
+    assert len(spies) == 2, "Pipe обязан был отдать пару концов"
+    assert all(s.closed for s in spies), "оба конца канала обязаны быть закрыты"
+
+
+def test_non_permission_prologue_failure_has_no_hint_and_no_tail(cf_project, monkeypatch):
+    """Конструктор Process бросает НЕ PermissionError → без подсказки и без хвоста '. '."""
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("synthetic prologue failure")
+
+    monkeypatch.setattr(sandbox_process_module, "multiprocessing", _MpProxy(Process=boom))
+    with pytest.raises(SandboxStartupError) as exc_info:
+        ProcessSandboxBackend(_make_config(cf_project))
+    text = str(exc_info.value)
+    assert "ValueError" in text and "synthetic prologue failure" in text, text
+    assert _INLINE_HINT not in text, text
+    assert not text.endswith(". "), f"висящий хвост: {text!r}"
+    # Без подсказки сообщение отдаётся КАК ЕСТЬ — ни хвоста, ни добавленной точки.
+    # Точка тут была бы асимметрией: общая ветка proc.start() для тех же
+    # не-PermissionError обязана остаться байт-в-байт прежней, то есть без неё.
+    assert text.endswith("synthetic prologue failure"), text
+
+
+def test_startup_error_text_glues_identically_in_both_branches():
+    """Обе ветки склеивают ОДНОЙ функцией — один отказ не может выглядеть двояко.
+
+    Раньше пролог дописывал точку при пустой подсказке, а общая ветка — нет, и
+    один и тот же отказ окружения читался по-разному в зависимости от шага.
+    """
+    glue = sandbox_process_module._startup_error_text
+    denied = PermissionError(*_ACCESS_DENIED_ARGS)
+    other = ValueError("boom")
+
+    for message in ("sandbox worker resources unavailable: X", "sandbox worker start failed: X"):
+        assert glue(message, other) == message
+        with_hint = glue(message, denied)
+        assert with_hint.startswith(f"{message}. "), with_hint
+        assert _INLINE_HINT in with_hint, with_hint
+        assert with_hint.count(f"{message}. ") == 1, with_hint
+
+
+def test_proc_start_denied_keeps_branch_prefix_and_adds_hint(cf_project, monkeypatch):
+    """proc.start() бросает PermissionError → подсказка есть, префикс ветки прежний.
+
+    На Windows Popen.__init__ сам делает CreatePipe/CreateProcess, поэтому тот же
+    отказ окружения приходит и в общую ветку except Exception. Для НЕ-PermissionError
+    текст этой ветки обязан остаться прежним — это проверяет соседний тест выше.
+    """
+
+    def deny_start(proc, child_conn, deadline):
+        raise PermissionError(*_ACCESS_DENIED_ARGS)
+
+    monkeypatch.setattr(sandbox_process_module, "_start_process", deny_start)
+    with pytest.raises(SandboxStartupError) as exc_info:
+        ProcessSandboxBackend(_make_config(cf_project))
+    text = str(exc_info.value)
+    assert text.startswith("sandbox worker start failed: "), text
+    assert "PermissionError" in text, text
+    assert _INLINE_HINT in text, text

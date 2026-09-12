@@ -727,3 +727,35 @@ def _can_unlink(path) -> bool:
         return False
     except FileNotFoundError:
         return True
+
+
+def test_rlm_start_pipe_denied_carries_inline_hint(process_mode, cf_project, monkeypatch):
+    """#35: отказ ctx.Pipe доезжает до агента подсказкой, а не голым WinError 5.
+
+    _rlm_start не правится — подсказка едет внутри текста SandboxStartupError.
+    """
+    from rlm_tools_bsl import sandbox_process as sandbox_process_module
+
+    real_get_context = sandbox_process_module.multiprocessing.get_context
+
+    class _Ctx:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def Pipe(self, duplex=True):
+            raise PermissionError(13, "Отказано в доступе", None, 5)
+
+    class _Mp:
+        def get_context(self, method):
+            return _Ctx(real_get_context(method))
+
+    monkeypatch.setattr(sandbox_process_module, "multiprocessing", _Mp())
+    sessions_before = len(server.session_manager._sessions)
+    resp = json.loads(_rlm_start(path=cf_project, query="pipe denied"))
+    assert "error" in resp, resp
+    assert "Session init failed" in resp["error"], resp
+    assert "RLM_SANDBOX_MODE=inline" in resp["error"], resp
+    assert len(server.session_manager._sessions) == sessions_before, "session не утёк"

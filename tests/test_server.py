@@ -3112,3 +3112,161 @@ def test_rlm_start_failure_path_closes_reader(tmp_path, monkeypatch):
     out = srv._rlm_start(query="q", path=str(tmp_path))
     assert "error" in out
     assert closed["v"] is True  # reader ЯВНО закрыт на failure-path
+
+
+# ---------------------------------------------------------------------------
+# v1.35.2 (#36): на ветке index_status="missing" агент видел loaded=false без
+# причины и без пути. Теперь там ОДИН из двух текстов — и только для нашего
+# формата (в generic сборка отвергается гейтом v1.32.0).
+# ---------------------------------------------------------------------------
+
+_NOT_FOUND_MARK = "Индекс не найден"
+_UNREADABLE_MARK = "есть, но прочитать его не удалось"
+
+
+def _index_warnings(result):
+    return list(result["index"]["warnings"])
+
+
+def _make_supported_cf(root: str) -> str:
+    obj = os.path.join(root, "Documents", "ТестовыйДокумент", "Ext")
+    os.makedirs(obj, exist_ok=True)
+    with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8-sig") as f:
+        f.write("Процедура Тест() Экспорт\nКонецПроцедуры\n")
+    _write_cf_descriptor(root)
+    return _canonicalize_path(root)
+
+
+def test_missing_index_on_supported_cf_explains_where_to_build(monkeypatch):
+    """Поддерживаемое CF без индекса → текст с путём БД и корнем индексов."""
+    from rlm_tools_bsl.bsl_index import get_index_db_path
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = _make_supported_cf(raw)
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(raw, ".empty_idx"))
+        result = json.loads(_rlm_start(path=base, query="no index"))
+        try:
+            assert result["index"]["index_status"] == "missing"
+            hints = [w for w in _index_warnings(result) if _NOT_FOUND_MARK in w]
+            assert len(hints) == 1, _index_warnings(result)
+            assert str(get_index_db_path(base)) in hints[0], hints[0]
+            assert "RLM_INDEX_DIR" in hints[0], hints[0]
+            assert _UNREADABLE_MARK not in hints[0], hints[0]
+        finally:
+            _rlm_end(result["session_id"])
+
+
+def test_corrupt_index_file_is_not_reported_as_missing(monkeypatch):
+    """Существующий, но нечитаемый bsl_index.db → второй текст, а не "не найден".
+
+    check_index_usable отдаёт MISSING и при meta is None, поэтому единственный
+    текст соврал бы про файл, который лежит на месте.
+    """
+    from rlm_tools_bsl.bsl_index import get_index_db_path
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = _make_supported_cf(raw)
+        idx_root = os.path.join(raw, ".broken_idx")
+        monkeypatch.setenv("RLM_INDEX_DIR", idx_root)
+        db_path = get_index_db_path(base)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"this is not a sqlite database")
+
+        result = json.loads(_rlm_start(path=base, query="broken index"))
+        try:
+            assert result["index"]["index_status"] == "missing"
+            warnings = _index_warnings(result)
+            assert any(_UNREADABLE_MARK in w for w in warnings), warnings
+            assert not any(_NOT_FOUND_MARK in w for w in warnings), warnings
+        finally:
+            _rlm_end(result["session_id"])
+
+
+def test_inaccessible_index_file_is_not_reported_as_missing(monkeypatch):
+    """Недоступный для stat индекс — ВТОРОЙ случай, а не "файла нет".
+
+    Развилка сознательно берётся по stat(), а не по exists(): Path.exists()
+    отвечает на этот вопрос по-разному в разных версиях. На 3.12 и 3.13 он
+    ПЕРЕБРАСЫВАЕТ PermissionError, а с 3.14 делегирует в os.path.exists() и на
+    том же ACL-запрещённом файле возвращает False — то есть существующий, но
+    нечитаемый индекс получил бы текст "не найден" ровно на той версии, где
+    сидят заявители (3.14). Граница именно 3.14, а не 3.13: тело Path.exists()
+    в 3.12 и 3.13 побайтно одно и то же (сверено исходником pathlib всех трёх
+    версий), поведение проверено исполнением на 3.12 и 3.14 под icacls.
+
+    Тест воспроизводит ФОРМУ 3.14 (exists() -> False, stat() -> PermissionError)
+    для ОДНОГО пути: icacls в тесте слишком хрупок и не переносится на Linux,
+    а на 3.12 настоящий ACL-отказ роняет ещё get_index_db_path, то есть ветку
+    вообще не даёт достичь. stat() не глотает OSError ни в одной версии,
+    поэтому классификация в коде однозначна на всех.
+    """
+    import pathlib
+
+    from rlm_tools_bsl.bsl_index import get_index_db_path
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = _make_supported_cf(raw)
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(raw, ".denied_idx"))
+        denied = str(get_index_db_path(base))
+
+        real_stat = pathlib.Path.stat
+        real_exists = pathlib.Path.exists
+
+        def fake_stat(self, *args, **kwargs):
+            if str(self) == denied:
+                raise PermissionError(13, "Отказано в доступе", None, 5)
+            return real_stat(self, *args, **kwargs)
+
+        def fake_exists(self, *args, **kwargs):
+            if str(self) == denied:
+                return False  # как ведёт себя Path.exists() с 3.14
+            return real_exists(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "stat", fake_stat)
+        monkeypatch.setattr(pathlib.Path, "exists", fake_exists)
+        result = json.loads(_rlm_start(path=base, query="denied index"))
+        try:
+            assert result["index"]["index_status"] == "missing"
+            warnings = _index_warnings(result)
+            assert any(_UNREADABLE_MARK in w for w in warnings), warnings
+            assert not any(_NOT_FOUND_MARK in w for w in warnings), warnings
+        finally:
+            _rlm_end(result["session_id"])
+
+
+def test_generic_project_gets_no_build_hint(monkeypatch):
+    """Generic-каталог: статус missing есть, подсказки "соберите индекс" НЕТ.
+
+    Там сборка отвергается гейтом чужих форматов — совет был бы вредным.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "example.py"), "w", encoding="utf-8") as f:
+            f.write("def f():\n    return 1\n")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".empty_idx"))
+        result = json.loads(_rlm_start(path=tmpdir, query="generic no index"))
+        try:
+            assert result["index"]["index_status"] == "missing"
+            warnings = _index_warnings(result)
+            assert not any(_NOT_FOUND_MARK in w for w in warnings), warnings
+            assert not any(_UNREADABLE_MARK in w for w in warnings), warnings
+        finally:
+            _rlm_end(result["session_id"])
+
+
+def test_loaded_index_gets_no_missing_hint(monkeypatch):
+    """Каталог с собранным индексом — ни одного из двух текстов."""
+    from rlm_tools_bsl.bsl_index import IndexBuilder
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = _make_supported_cf(raw)
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(raw, ".idx"))
+        IndexBuilder().build(base)
+
+        result = json.loads(_rlm_start(path=base, query="with index"))
+        try:
+            assert result["index"]["loaded"] is True, result["index"]
+            warnings = _index_warnings(result)
+            assert not any(_NOT_FOUND_MARK in w for w in warnings), warnings
+            assert not any(_UNREADABLE_MARK in w for w in warnings), warnings
+        finally:
+            _rlm_end(result["session_id"])

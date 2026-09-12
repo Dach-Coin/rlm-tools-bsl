@@ -304,6 +304,89 @@ def test_git_backed_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode)
     )
 
 
+# ── v1.35.2: ветка "индекса нет" получила СВОЙ бюджет ───────────────────────
+#
+# 26 существующих ячеек безусловно СТРОЯТ индекс, поэтому ветку `missing`
+# бюджетом не мерило ничто — а именно туда v1.35.2 добавляет строку с причиной.
+#
+# Ячейка обязана быть path-free, и наивная замена одного `resolved_path` для
+# этого НЕ годится: текст несёт путь четырежды (db_path, root, resolved×2) плюс
+# `resolved_path` самого payload, а допущение «db_path и root начинаются с
+# resolved_path» — свойство фикстуры, а не кода. Штатно корень индексов лежит ВНЕ
+# дерева проекта (так же в autouse-фикстуре conftest), и наивная замена схлопнула
+# бы 3 вхождения из 5. Поэтому заменяются ТРИ величины явно, от длинной к
+# короткой: db_path содержит root, и обратный порядок оставил бы хвосты.
+#
+# Бэйслайны сняты прогоном ЭТОГО ЖЕ теста на НЕТРОНУТОМ коде.
+_MISSING_INDEX_PAYLOAD_BASELINES = {"slim": 19995, "full": 47154}
+
+# Тот же однопроцедурный модуль, что и у фикстуры с индексом.
+_BUDGET_MODULE_BSL = "Процедура П() Экспорт\nКонецПроцедуры\n"
+
+
+def _esc(value: str) -> str:
+    """Значение так, как оно лежит ВНУТРИ JSON-строки payload (без кавычек)."""
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _normalize_paths(raw: str, resolved: str) -> str:
+    from rlm_tools_bsl.bsl_index import get_index_db_path, get_index_dir_root
+
+    normalized = raw
+    values = {str(get_index_db_path(resolved)), str(get_index_dir_root()), resolved}
+    for value in sorted(values, key=len, reverse=True):
+        normalized = normalized.replace(_esc(value), "<P>")
+    return normalized
+
+
+@pytest.mark.parametrize("mode", ["slim", "full"])
+def test_missing_index_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
+    """Payload ветки `missing` на ПОДДЕРЖИВАЕМОМ дереве, нормализованный по путям.
+
+    `_run_payload_budget` не переиспользуется намеренно: он безусловно строит
+    индекс, а здесь предмет измерения — ровно его отсутствие.
+    """
+    import rlm_tools_bsl.extension_detector as _ed
+    from rlm_tools_bsl.server import _rlm_end, _rlm_start
+
+    project = tmp_path / "cfg"
+    obj = project / "Documents" / "БюджетТест" / "Ext"
+    obj.mkdir(parents=True)
+    (obj / "ObjectModule.bsl").write_text(_BUDGET_MODULE_BSL, encoding="utf-8")
+    (project / "Configuration.xml").write_text(_CF_DESCRIPTOR, encoding="utf-8")
+    # Корень индексов — ВНЕ дерева проекта: так он лежит штатно, и именно там
+    # наивная нормализация схлопнула бы 3 вхождения из 5.
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
+
+    _real_single = _ed._detect_single
+
+    def _clean_ctx(p):
+        cur = _real_single(p) or _ed.ExtensionInfo(path=p, role=_ed.ConfigRole.UNKNOWN)
+        return _ed.ExtensionContext(current=cur, nearby_extensions=[], nearby_main=None, warnings=[])
+
+    monkeypatch.setattr("rlm_tools_bsl.server.detect_extension_context", _clean_ctx)
+
+    raw = _rlm_start(path=str(project), query="")
+    data = json.loads(raw)
+    try:
+        assert data["source_support"] == "supported", "бюджет мерится на поддерживаемом дереве"
+        assert data["index"]["loaded"] is False
+        assert data["index"]["index_status"] == "missing"
+        assert not data["extension_context"]["nearby_extensions"], "budget config must be extension-free"
+
+        baseline = _MISSING_INDEX_PAYLOAD_BASELINES[mode]
+        ceiling = int(baseline * _DRIFT)
+        normalized = len(_normalize_paths(raw, data["resolved_path"]))
+        assert normalized <= ceiling, (
+            f"{mode}/missing rlm_start payload {normalized} > {ceiling} (+5% of {baseline}). "
+            "Строка причины / available_functions / стратегия выросли — подрежьте или "
+            "ре-бэйслайньте осознанно."
+        )
+    finally:
+        _rlm_end(data["session_id"])
+
+
 # ── v1.33.0: длинные пояснения переехали из sig в recipe ────────────────────
 #
 # `sig` уходит агенту на КАЖДОМ старте и лежит в бюджете, `recipe` — нет

@@ -152,8 +152,13 @@ def save_index(
             )
         except OSError as exc:
             _logger.debug("save_index: marker stamp for %s failed: %s", cache_dir, exc)
-    except OSError:
-        pass
+    except OSError as exc:
+        # v1.35.2 (#34-C): раньше причина пропадала бесследно, и «кеш не там /
+        # кеш не пишется» диагностировалось только чтением кода. DEBUG, а не
+        # WARNING, намеренно: мост worker->server.log ограничен WARNING+, а
+        # save_index исполняется ВНУТРИ worker, то есть дал бы строку на каждую
+        # сессию. Семантика не меняется — исключение по-прежнему гасится.
+        _logger.debug("save_index: cache write for %s failed: %s", base_path, exc)
 
 
 # ---------------------------------------------------------------------------

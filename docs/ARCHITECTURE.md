@@ -49,6 +49,8 @@ Worker живёт от успешного `rlm_start` до `rlm_end`/TTL-эви�
 
 IPC parent↔worker — только UTF-8 JSON-фреймы с protocol version/allowlist типов/request id/generation и лимитом размера (`send_bytes`/`recv_bytes(maxlength)`); pickle для runtime-сообщений от запущенного worker не используется. Raw fd 0/1/2 worker отвязаны от родителя до выполнения любых команд — escaped-код не может испортить MCP stdio framing.
 
+Отдельный случай — окружения, где режим `process` недоступен **физически**: пролог запуска worker создает именованный канал, разделяемую память и семафоры, и MCP-клиент с файловой песочницей может запретить дочернему процессу любой из них — тогда `rlm_start` отказывает с `PermissionError` еще до создания сессии, и `inline` там не «аварийный fallback», а единственный рабочий режим (диагностика — в [INSTALL.md](INSTALL.md)).
+
 Режим `inline` (`RLM_SANDBOX_MODE=inline`) сохраняет прежнее выполнение в основном процессе — только для диагностики и аварийного восстановления. stdout-гонка закрыта и там (глобальная сериализация всех inline-execute), но hard-kill НЕ гарантируется: используется прежний fallback-таймаут — `SIGALRM` на Unix, `threading.Timer` + `PyThreadState_SetAsyncExc` на Windows/не-main-thread, — который код может пережить. Автоматического fallback `process` → `inline` нет; невалидный `RLM_SANDBOX_MODE` — ошибка старта сервера.
 
 ### Параллельность и бюджет памяти

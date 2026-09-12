@@ -1903,12 +1903,24 @@ class IndexStatus(Enum):
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
-def get_index_dir_root() -> Path:
-    """Return the root directory under which per-project BSL index folders live.
+INDEX_ROOT_RULE_ENV = "RLM_INDEX_DIR"
+INDEX_ROOT_RULE_CONFIG = "RLM_CONFIG_FILE"
+INDEX_ROOT_RULE_DEFAULT = "по умолчанию"
+
+
+def describe_index_root() -> tuple[Path, str]:
+    """Return the index root **and** the label of the rule that produced it.
+
+    Single source of truth for the precedence chain: :func:`get_index_dir_root`
+    is a thin wrapper over it, and :func:`migrate_legacy_index_root` asks it
+    instead of re-reading the environment with its own (previously divergent)
+    truthiness test.
 
     Precedence (mirrors :func:`rlm_tools_bsl.cache._cache_base`):
 
-    1. ``RLM_INDEX_DIR`` set → that path verbatim (explicit user override).
+    1. ``RLM_INDEX_DIR`` set to a non-blank value → that path verbatim
+       (explicit user override). Surrounding whitespace is stripped first, so a
+       blank value counts as "not set" instead of silently yielding ``Path(" ")``.
     2. ``RLM_CONFIG_FILE`` set → ``dirname(RLM_CONFIG_FILE)/index``. Fixes the
        Windows-service LocalSystem case where ``Path.home()`` resolves to
        ``system32/config/systemprofile``. Index lives under a dedicated
@@ -1921,12 +1933,48 @@ def get_index_dir_root() -> Path:
     expensive to build and are managed manually via ``rlm_index(action='drop')``.
     """
     env_dir = os.environ.get("RLM_INDEX_DIR")
-    if env_dir:
-        return Path(env_dir)
+    if env_dir and env_dir.strip():
+        return Path(env_dir.strip()), INDEX_ROOT_RULE_ENV
     config_override = os.environ.get("RLM_CONFIG_FILE")
     if config_override:
-        return Path(config_override).parent / "index"
-    return Path.home() / ".cache" / "rlm-tools-bsl"
+        return Path(config_override).parent / "index", INDEX_ROOT_RULE_CONFIG
+    return Path.home() / ".cache" / "rlm-tools-bsl", INDEX_ROOT_RULE_DEFAULT
+
+
+def get_index_dir_root() -> Path:
+    """Return the root directory under which per-project BSL index folders live.
+
+    Thin wrapper over :func:`describe_index_root` — see its docstring for the
+    full precedence chain.
+    """
+    return describe_index_root()[0]
+
+
+def index_root_diagnostics() -> list[str]:
+    """Return human-readable remarks on how ``RLM_INDEX_DIR`` was applied.
+
+    Computed **once at startup** (server start / CLI command), never on a hot
+    path. Total by contract: any failure yields an empty list rather than
+    breaking the caller.
+    """
+    try:
+        raw = os.environ.get("RLM_INDEX_DIR")
+        if raw is None:
+            return []
+        if not raw.strip():
+            root, label = describe_index_root()
+            return [f"RLM_INDEX_DIR задана пустым значением и не применяется; корень выбран по правилу {label}: {root}"]
+        value = raw.strip()
+        path = Path(value)
+        if not path.is_absolute():
+            return [
+                f"RLM_INDEX_DIR задана относительным путем {value}; она считается "
+                f"от текущего каталога процесса и резолвится в {path.resolve()}. "
+                "Для запуска дочерним процессом MCP-клиента задавайте абсолютный путь"
+            ]
+        return []
+    except Exception:  # pragma: no cover - diagnostics must never break a caller
+        return []
 
 
 def get_index_dir(base_path: str) -> Path:
@@ -1948,18 +1996,19 @@ def migrate_legacy_index_root() -> int:
     and would otherwise be silently abandoned. This helper moves each subdir
     that contains ``bsl_index.db`` or ``method_index.db`` to the new root.
 
-    Triggered only when ``RLM_INDEX_DIR`` is unset (otherwise the user
+    Triggered only when ``RLM_INDEX_DIR`` did not win the precedence chain in
+    :func:`describe_index_root` — i.e. unset or blank (otherwise the user
     explicitly chose a path and we do not touch anything). Idempotent:
     repeated calls are NOOP because the legacy dir is empty after the first
     successful run, or the target already exists.
 
     Returns the number of subdirectories successfully moved.
     """
-    if os.environ.get("RLM_INDEX_DIR"):
+    new_root, root_rule = describe_index_root()
+    if root_rule == INDEX_ROOT_RULE_ENV:
         return 0
 
     legacy_root = Path.home() / ".cache" / "rlm-tools-bsl"
-    new_root = get_index_dir_root()
 
     try:
         if legacy_root.resolve() == new_root.resolve():
@@ -6497,10 +6546,40 @@ class IndexBuilder:
             Path to the created database file.
         """
         db_path = get_index_db_path(base_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # v1.35.2 (#34-B): раньше отсюда уходил голый PermissionError с путём
+        # внутри ~/.cache, и человек не мог понять, ни почему корень оказался
+        # там, ни какой переменной его двигать. Второй mkdir в _build_locked
+        # бьёт по тому же родителю уже после успешного первого — своей обёртки
+        # не требует.
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            root, root_rule = describe_index_root()
+            raise RuntimeError(
+                f"Не удалось создать каталог индекса {db_path.parent}: {exc}. "
+                f"Корень индексов — {root} ({root_rule}). "
+                "Задайте RLM_INDEX_DIR на каталог с правом записи и повторите."
+            ) from exc
 
         lock = _BuildLock(db_path)
-        lock.acquire()
+        # v1.35.2 (#34-B, ВТОРОЙ маршрут к той же голой трассировке): mkdir выше
+        # ничего не доказывает про право записи — на СУЩЕСТВУЮЩЕМ каталоге
+        # mkdir(exist_ok=True) проходит и при запрете записи, и тогда первый
+        # отказ прилетает уже на lock-файле. os.open(O_CREAT|O_RDWR) в acquire()
+        # стоит ВЫШЕ её собственного except, поэтому OSError уходил наверх как
+        # есть, и человек снова получал трассировку с путём внутри ~/.cache
+        # вместо указания на переменную. RuntimeError "сборка уже идёт" из
+        # acquire() сюда не попадает: он не OSError и проходит насквозь.
+        try:
+            lock.acquire()
+        except OSError as exc:
+            root, root_rule = describe_index_root()
+            raise RuntimeError(
+                f"Не удалось создать файл блокировки индекса {lock.lock_path}: {exc}. "
+                f"Каталог индекса существует, но недоступен для записи. "
+                f"Корень индексов — {root} ({root_rule}). "
+                "Задайте RLM_INDEX_DIR на каталог с правом записи и повторите."
+            ) from exc
         try:
             return self._build_locked(base_path, db_path, build_calls, build_metadata, build_fts, build_synonyms)
         finally:

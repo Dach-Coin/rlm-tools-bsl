@@ -471,6 +471,43 @@ else:
     _WindowsJob = None  # type: ignore[assignment]
 
 
+def _access_denied_hint(exc: BaseException) -> str:
+    """Подсказка про RLM_SANDBOX_MODE=inline для отказа в доступе (#35).
+
+    Пролог запуска worker создаёт ИМЕНОВАННЫЕ объекты ядра: ``ctx.Pipe`` ->
+    ``CreateNamedPipe``, ``ctx.Lock`` -> именованный семафор, ``RawArray`` /
+    ``RawValue`` -> ``mmap`` с tagname. Окружение с файловой песочницей может
+    запретить любой из них, и тогда сессия не поднимается вовсе.
+
+    Формулировка "Похоже" сознательна: подсказка ДИАГНОСТИЧЕСКАЯ, а не
+    доказательство причины — PermissionError на ``proc.start()`` может означать
+    и запрет запуска исполняемого файла. Для не-PermissionError возвращает
+    пустую строку; склейкой занимается :func:`_startup_error_text`.
+    """
+    if isinstance(exc, PermissionError):
+        return (
+            "Похоже, окружение запрещает дочернему процессу создавать каналы и "
+            "разделяемую память (типично для MCP-клиентов с файловой песочницей). "
+            "Обходной путь: RLM_SANDBOX_MODE=inline — сессия поднимется, но "
+            "процессная изоляция и hard-kill таймаута будут отключены."
+        )
+    return ""
+
+
+def _startup_error_text(message: str, exc: BaseException) -> str:
+    """Склеить текст отказа старта с подсказкой — ОДНА реализация на оба места.
+
+    Обе ветки (пролог создания ресурсов и общая ветка отказа ``proc.start()``)
+    обязаны склеивать одинаково, иначе один и тот же отказ окружения выглядел бы
+    по-разному в зависимости от того, на каком шаге он случился. Без подсказки
+    сообщение возвращается КАК ЕСТЬ: ни хвоста ". ", ни добавленной точки —
+    последнее существенно, потому что текст общей ветки для не-PermissionError
+    обязан остаться байт-в-байт прежним.
+    """
+    hint = _access_denied_hint(exc)
+    return f"{message}. {hint}" if hint else message
+
+
 class ProcessSandboxBackend:
     """Backend одной сессии: один долгоживущий worker-процесс (§5.3)."""
 
@@ -678,38 +715,60 @@ class ProcessSandboxBackend:
         gen = self.generation + 1
         t0 = time.monotonic()
         deadline = t0 + cfg.start_timeout_seconds
-        ctx = multiprocessing.get_context("spawn")
-        parent_conn, child_conn = ctx.Pipe(duplex=True)
-        capacity = cfg.max_output_chars * 4 + 64
-        out_buf = RawArray(ctypes.c_char, capacity)
-        out_published = RawValue(ctypes.c_uint32, 0)
-        out_truncated = RawValue(ctypes.c_uint8, 0)
-        out_lock = ctx.Lock()
-        # Новый counter И новый lock на каждое поколение: lock аварийно
-        # завершённого поколения мог остаться захваченным (§12.2.7).
-        quota_value = RawValue(ctypes.c_int32, self._llm_used)
-        quota_lock = ctx.Lock()
-        proc = ctx.Process(
-            target=sandbox_worker_main,
-            args=(
-                child_conn,
-                out_buf,
-                out_published,
-                out_truncated,
-                out_lock,
-                quota_value,
-                quota_lock,
-                {
-                    "ipc_max_bytes": cfg.ipc_max_bytes,
-                    "generation": gen,
-                    "expected_parent_pid": os.getpid(),
-                },
-            ),
-            # daemon — только страховочный пояс к явному shutdown-циклу (§13.6);
-            # mp-daemon не мешает subprocess-детям вроде git.
-            daemon=True,
-            name=f"rlm-sandbox-worker-gen{gen}",
-        )
+        # #35: весь пролог стоял ВЫШЕ try, поэтому отказ ядра в создании канала,
+        # разделяемой памяти или семафора уходил наверх голым PermissionError —
+        # агент видел "Session init failed: PermissionError: [WinError 5]" и не
+        # мог узнать ни причины, ни обходного пути. Плюс: упавший Lock после
+        # успешного Pipe не закрывал ни одного конца канала — освобождение
+        # зависело от подсчёта ссылок и от того, что никто не удерживает
+        # traceback упавшего кадра (при удержанном замерено +2 хэндла на попытку).
+        # Граница обёртки кончается СТРОГО перед `job = None` и существующим
+        # try — иначе обработчики наложились бы и _cleanup_failed_start получил
+        # бы proc, которого нет.
+        parent_conn = child_conn = None
+        try:
+            ctx = multiprocessing.get_context("spawn")
+            parent_conn, child_conn = ctx.Pipe(duplex=True)
+            capacity = cfg.max_output_chars * 4 + 64
+            out_buf = RawArray(ctypes.c_char, capacity)
+            out_published = RawValue(ctypes.c_uint32, 0)
+            out_truncated = RawValue(ctypes.c_uint8, 0)
+            out_lock = ctx.Lock()
+            # Новый counter И новый lock на каждое поколение: lock аварийно
+            # завершённого поколения мог остаться захваченным (§12.2.7).
+            quota_value = RawValue(ctypes.c_int32, self._llm_used)
+            quota_lock = ctx.Lock()
+            proc = ctx.Process(
+                target=sandbox_worker_main,
+                args=(
+                    child_conn,
+                    out_buf,
+                    out_published,
+                    out_truncated,
+                    out_lock,
+                    quota_value,
+                    quota_lock,
+                    {
+                        "ipc_max_bytes": cfg.ipc_max_bytes,
+                        "generation": gen,
+                        "expected_parent_pid": os.getpid(),
+                    },
+                ),
+                # daemon — только страховочный пояс к явному shutdown-циклу (§13.6);
+                # mp-daemon не мешает subprocess-детям вроде git.
+                daemon=True,
+                name=f"rlm-sandbox-worker-gen{gen}",
+            )
+        except Exception as exc:
+            for _conn in (parent_conn, child_conn):
+                if _conn is None:
+                    continue
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+            message = f"sandbox worker resources unavailable: {type(exc).__name__}: {exc}"
+            raise SandboxStartupError(_startup_error_text(message, exc)) from None
         job = None
         try:
             _start_process(proc, child_conn, deadline)
@@ -799,7 +858,12 @@ class ProcessSandboxBackend:
         except Exception as exc:
             self._cleanup_failed_start(proc, parent_conn, job)
             self._discard_failed_start_runtime(proc, parent_conn, job)
-            raise SandboxStartupError(f"sandbox worker start failed: {type(exc).__name__}: {exc}") from None
+            # proc.start() — первый оператор этого try, а на Windows
+            # Popen.__init__ сам делает CreatePipe/CreateProcess, поэтому тот же
+            # отказ окружения приходит и сюда. Для PermissionError текст ветки
+            # ДОПОЛНЯЕТСЯ подсказкой; для прочих исключений остаётся прежним.
+            message = f"sandbox worker start failed: {type(exc).__name__}: {exc}"
+            raise SandboxStartupError(_startup_error_text(message, exc)) from None
 
         # Runtime was made lifecycle-visible immediately after spawn; init_ok
         # only promotes its generation and metadata to executable state.

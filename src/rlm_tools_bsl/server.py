@@ -72,8 +72,10 @@ from rlm_tools_bsl.bsl_index import (
     IndexReader,
     IndexStatus,
     check_index_usable,
+    describe_index_root,
     get_index_db_path,
     index_incomplete,
+    index_root_diagnostics,
     stats_indicate_load_failure,
 )
 from rlm_tools_bsl.sandbox import HelperCall
@@ -1187,6 +1189,56 @@ def _rlm_start(
                 "Предыдущая пересборка индекса не была завершена. Повторите "
                 "'rlm-bsl-index index update' — это доведет сборку до конца."
             )
+        elif source_support is SourceSupport.SUPPORTED:
+            # v1.35.2 (#36): агент видел только loaded=false без причины и без пути.
+            # Гейт на SUPPORTED обязателен: ветка "missing" достижима и для чужих
+            # форматов, где сборка отвергается гейтом v1.32.0 — совет "соберите
+            # индекс" там был бы вредным.
+            #
+            # Два текста, а не один: check_index_usable отдаёт MISSING и при
+            # meta is None, то есть на СУЩЕСТВУЮЩЕМ, но нечитаемом файле. Сказать
+            # про него "не найден" значит соврать про файл, который лежит на месте.
+            #
+            # Развилка берётся по stat(), а НЕ по exists(), и это существенно:
+            # Path.exists() отвечает на нужный вопрос по-разному в разных версиях.
+            # На 3.12 и 3.13 он ПЕРЕБРАСЫВАЕТ PermissionError (ERROR_ACCESS_DENIED
+            # не входит в _IGNORED_WINERRORS), а с 3.14 делегирует в
+            # os.path.exists() и на том же файле возвращает False — то есть
+            # существующий, но нечитаемый индекс получил бы текст "не найден"
+            # ровно на той версии, где сидят заявители. Граница именно 3.14:
+            # тело Path.exists() в 3.12 и 3.13 побайтно одно и то же, замена на
+            # os.path.exists() появляется только в 3.14 (сверено исходником
+            # pathlib всех трёх версий; поведение проверено под icacls-deny).
+            #
+            # stat() не глотает OSError ни в одной версии, поэтому классификация
+            # однозначна: FileNotFoundError — файла действительно нет; любой другой
+            # OSError — файл есть, но недоступен, и это ВТОРОЙ случай, а не "нет".
+            # Заодно сохраняется исходное требование: этот блок стоит ВНЕ try/except
+            # самого _rlm_start (тот кончается выше), поэтому исключение обязано быть
+            # погашено здесь — незащищённый вызов уронил бы тул там, где до правки
+            # поднималась рабочая сессия со статусом missing.
+            try:
+                db_path.stat()
+                _db_exists = True
+            except FileNotFoundError:
+                _db_exists = False
+            except OSError:
+                _db_exists = True
+            if _db_exists:
+                idx_warnings.append(
+                    f"Индекс по пути {db_path} есть, но прочитать его не удалось: "
+                    "файл поврежден или недоступен. Пересоберите: "
+                    f"rlm_index(action='build', path='{resolved}')."
+                )
+            else:
+                _root, _root_rule = describe_index_root()
+                idx_warnings.append(
+                    f"Индекс не найден: {db_path}. Корень индексов — {_root} "
+                    f"({_root_rule}). Собрать: rlm_index(action='build', "
+                    f"path='{resolved}') или в терминале 'rlm-bsl-index index "
+                    f"build {resolved}'. Корень индексов определяется переменной "
+                    "RLM_INDEX_DIR в конфигурации MCP-сервера."
+                )
         index_block = {
             "loaded": index_loaded,
             "index_check": "quick",
@@ -2833,18 +2885,35 @@ def _install_asyncio_conn_reset_filter() -> None:
     asyncio_logger.addFilter(_AsyncioConnResetFilter())
 
 
-def _setup_file_logging():
-    """Add rotating file handler for HTTP transport mode."""
-    from logging.handlers import RotatingFileHandler
+def _server_log_path() -> pathlib.Path:
+    """Return the path of ``server.log`` for the HTTP transport.
 
-    # Use RLM_CONFIG_FILE-derived path if set (Windows service / Session 0)
+    Single owner of the rule "RLM_CONFIG_FILE → dirname/logs, else
+    ~/.config/rlm-tools-bsl/logs" **inside this module**: both
+    :func:`_setup_file_logging` (which creates the directory) and
+    :func:`_log_effective_env` (which only reports the path) ask here.
+
+    Honest boundary: this is NOT a project-wide single source of truth — the
+    same rule independently lives in ``_service_win.py``. Merging them would
+    touch the service module, so the tripwire test in
+    ``tests/test_server_logging.py`` locks the ``server`` ↔ ``service`` edge and
+    the full merge is backlogged. The directory is NOT created here.
+    """
     config_override = os.environ.get("RLM_CONFIG_FILE")
     if config_override:
         log_dir = pathlib.Path(config_override).parent / "logs"
     else:
         log_dir = pathlib.Path.home() / ".config" / "rlm-tools-bsl" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "server.log"
+    return log_dir / "server.log"
+
+
+def _setup_file_logging():
+    """Add rotating file handler for HTTP transport mode."""
+    from logging.handlers import RotatingFileHandler
+
+    # Use RLM_CONFIG_FILE-derived path if set (Windows service / Session 0)
+    log_path = _server_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Time-based retention: drop entries older than RLM_LOG_RETENTION_DAYS (default 20)
     # so server.log doesn't grow unbounded. Skipped under the Windows service
@@ -3055,6 +3124,67 @@ def _prepare_stdio_transport():
     return hardening.restore, lambda: anyio.run(_serve)
 
 
+def _env_display(name: str) -> str:
+    """Render an environment variable for the startup line.
+
+    "Not set" and "set to an empty value" are DIFFERENT states: the second one
+    silently shadows the value from ``.env`` (``load_dotenv(override=False)``
+    sees the key as already present), so it must be distinguishable in the log.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return "not set"
+    if not raw.strip():
+        return "(blank)"
+    return raw
+
+
+def _log_effective_env(transport: str) -> None:
+    """Log ONE line describing where this server keeps its state.
+
+    Emitted for BOTH transports — under stdio there is no ``server.log`` at all,
+    so stderr is the only place a human can see the effective configuration.
+    Carries no secrets: four variable NAMES plus two derived roots.
+    """
+    try:
+        from rlm_tools_bsl.cache import _cache_base
+
+        try:
+            version = importlib.metadata.version("rlm-tools-bsl")
+        except Exception:
+            version = "?"
+        index_root, index_rule = describe_index_root()
+        try:
+            cache_root: object = _cache_base()
+        except Exception as exc:
+            cache_root = f"<недоступен: {exc}>"
+        if transport == "stdio":
+            log_target: object = "stderr"
+        else:
+            try:
+                log_target = _server_log_path()
+            except Exception as exc:
+                log_target = f"<неизвестен: {exc}>"
+        logger.info(
+            "startup: version=%s transport=%s sandbox_mode=%s strategy_mode=%s "
+            "RLM_CONFIG_FILE=%s RLM_INDEX_DIR=%s index_root=%s (%s) cache_root=%s log=%s",
+            version,
+            transport,
+            get_sandbox_mode(),
+            get_strategy_mode(),
+            _env_display("RLM_CONFIG_FILE"),
+            _env_display("RLM_INDEX_DIR"),
+            index_root,
+            index_rule,
+            cache_root,
+            log_target,
+        )
+        for remark in index_root_diagnostics():
+            logger.warning("%s", remark)
+    except Exception as exc:  # pragma: no cover - diagnostics must not break startup
+        logger.warning("startup env snapshot failed: %s", exc)
+
+
 def main():
     global session_manager
     from rlm_tools_bsl._config import load_project_env
@@ -3199,7 +3329,9 @@ def main():
         logger.warning(
             "RLM_SANDBOX_MODE=inline задан ЯВНО: hard process isolation ОТКЛЮЧЕНА — "
             "код агента выполняется в основном MCP-процессе; timeout не является hard-kill. "
-            "Inline предназначен только для диагностики/аварийного восстановления."
+            "Inline предназначен только для диагностики/аварийного восстановления, "
+            "а также для клиентов, запрещающих дочерним процессам каналы и "
+            "разделяемую память, — там это единственный рабочий режим."
         )
 
     session_manager = build_session_manager_from_env()
@@ -3225,6 +3357,15 @@ def main():
             getattr(mcp.settings, "host", "?"),
             getattr(mcp.settings, "port", "?"),
         )
+
+    # Стартовый снимок окружения. Место выбрано намеренно: ПОСЛЕ
+    # _setup_file_logging() (иначе при HTTP-запуске строка не попала бы в
+    # server.log), после load_project_env() (иначе не увидели бы значения из
+    # .env) и после validate_sandbox_env() (режим песочницы уже разобран).
+    # Вызывается БЕЗУСЛОВНО для обоих транспортов: под stdio server.log не
+    # ведётся вовсе, и stderr — единственное место, где человек может увидеть
+    # фактические корни.
+    _log_effective_env(args.transport)
 
     # Проверка env-настроек sub-LLM. Место выбрано намеренно: ПОСЛЕ
     # _setup_file_logging() (иначе предупреждение при HTTP-запуске не попало бы в

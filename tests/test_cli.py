@@ -868,3 +868,106 @@ def test_cli_parser_exposes_flag_only_on_build(monkeypatch):
         with pytest.raises(SystemExit) as excinfo:
             cli.main()
         assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# v1.35.2 (#34, #36): CLI печатает корень индексов и внятно отказывает, когда
+# каталог индекса создать нельзя.
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_build_refuses_unusable_index_root(_cli_cf_project, monkeypatch, capsys):
+    """Родитель каталога индекса — ФАЙЛ → 'Error:' с именем переменной, exit 1, без трассировки."""
+    from rlm_tools_bsl import cli
+
+    project_path, _ = _cli_cf_project
+    blocker = project_path / "blocker_file"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("RLM_INDEX_DIR", str(blocker / "index"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli._cmd_build(_make_cmd_args(path=str(project_path)))
+
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: "), err
+    # Вхождение подстроки, а не равенство: через MCP тот же текст приезжает с
+    # префиксом "RuntimeError: ".
+    assert "RLM_INDEX_DIR" in err, err
+    assert "Traceback" not in err, err
+
+
+def test_cmd_build_prints_index_root(_cli_cf_project, capsys):
+    from rlm_tools_bsl import cli
+
+    project_path, idx_dir = _cli_cf_project
+    args = _make_cmd_args(path=str(project_path))
+
+    with (
+        patch("rlm_tools_bsl.bsl_index.IndexBuilder") as BuilderMock,
+        patch("rlm_tools_bsl.bsl_index.IndexReader") as ReaderMock,
+    ):
+        BuilderMock.return_value.build.return_value = _mock_db(project_path)
+        ReaderMock.return_value.get_statistics.return_value = _stats_fixture()
+        cli._cmd_build(args)
+
+    out = capsys.readouterr().out
+    assert f"Index root: {idx_dir} (RLM_INDEX_DIR)" in out, out
+
+
+def test_cmd_info_prints_index_root_in_not_found_branch(_cli_cf_project, capsys):
+    """Ветка 'Index not found' — там корень нужен больше всего."""
+    from rlm_tools_bsl import cli
+
+    project_path, idx_dir = _cli_cf_project
+    args = _make_cmd_args(path=str(project_path))
+    fake_db = MagicMock(spec=Path)
+    fake_db.exists.return_value = False
+    fake_db.__str__.return_value = str(project_path / "bsl_index.db")
+
+    with patch("rlm_tools_bsl.bsl_index.get_index_db_path", return_value=fake_db):
+        with pytest.raises(SystemExit) as excinfo:
+            cli._cmd_info(args)
+
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "Index not found" in out, out
+    assert f"Index root: {idx_dir} (RLM_INDEX_DIR)" in out, out
+
+
+def test_cmd_info_prints_index_root_with_index(tmp_path, monkeypatch, capsys):
+    from rlm_tools_bsl import cli
+
+    _build_real_cli_index(tmp_path, monkeypatch)
+    cli._cmd_info(_make_cmd_args(path=str(tmp_path)))
+    out = capsys.readouterr().out
+    assert "Index root: " in out, out
+    assert "(RLM_INDEX_DIR)" in out, out
+
+
+def test_index_root_diagnostics_printed_only_by_index_subcommands(monkeypatch, capsys, tmp_path):
+    """Отрицательная проверка С ВЫСТАВЛЕННЫМ триггером.
+
+    Без триггера index_root_diagnostics() молчит везде, и тест был бы зелен по
+    причине, не связанной с правкой.
+    """
+    from rlm_tools_bsl import cli
+    from rlm_tools_bsl.bsl_index import index_root_diagnostics
+
+    monkeypatch.setenv("RLM_INDEX_DIR", "   ")
+    assert index_root_diagnostics(), "триггер не выставлен — проверка была бы вакуумной"
+
+    # --version: диагностика печататься НЕ должна
+    monkeypatch.setattr(sys, "argv", ["rlm-bsl-index", "--version"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "RLM_INDEX_DIR" not in capsys.readouterr().err
+
+    # drop: тоже НЕ должна
+    (tmp_path / "Configuration.xml").write_text(_CF_MAIN_XML_FOR_CLI, encoding="utf-8")
+    cli._cmd_drop(_make_cmd_args(path=str(tmp_path)))
+    assert "RLM_INDEX_DIR" not in capsys.readouterr().err
+
+    # build: печатается
+    cli._cmd_build(_make_cmd_args(path=str(tmp_path)))
+    assert "RLM_INDEX_DIR" in capsys.readouterr().err

@@ -33,6 +33,26 @@ def _maybe_migrate_legacy_index_root() -> None:
         pass
 
 
+def _index_root_label() -> str:
+    """Return ``<root> (<rule label>)`` for the ``Index root:`` CLI line."""
+    from rlm_tools_bsl.bsl_index import describe_index_root
+
+    root, rule = describe_index_root()
+    return f"{root} ({rule})"
+
+
+def _print_index_root_diagnostics() -> None:
+    """Print remarks about how ``RLM_INDEX_DIR`` was applied, to stderr.
+
+    Called from the index subcommands only — NOT from :func:`main`, where it
+    would also fire on ``--version`` and on ``drop``.
+    """
+    from rlm_tools_bsl.bsl_index import index_root_diagnostics
+
+    for remark in index_root_diagnostics():
+        print(remark, file=sys.stderr)
+
+
 def _resolve_path(raw: str) -> str:
     """Resolve, validate and cf-normalize a base path argument.
 
@@ -144,6 +164,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     from rlm_tools_bsl.bsl_index import IndexBuilder
 
     _maybe_migrate_legacy_index_root()
+    _print_index_root_diagnostics()
     base_path = _resolve_path(args.path)
     _gate_unsupported_format(
         base_path,
@@ -183,6 +204,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         print(f"\nIndex build did NOT finish cleanly in {elapsed:.1f}s — index is incomplete.")
         print("  Status:   incomplete/building — rebuild required")
         print(f"  DB path:  {db_path}")
+        print(f"  Index root: {_index_root_label()}")
 
     if index_incomplete(db_path):
         _print_incomplete()
@@ -234,12 +256,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
         print(f"  FilePaths:  {stats['file_paths']}")
     print(f"  DB size:  {_fmt_size(db_size)}")
     print(f"  DB path:  {db_path}")
+    print(f"  Index root: {_index_root_label()}")
 
 
 def _cmd_update(args: argparse.Namespace) -> None:
     from rlm_tools_bsl.bsl_index import IndexBuilder, get_index_db_path
 
     _maybe_migrate_legacy_index_root()
+    _print_index_root_diagnostics()
     base_path = _resolve_path(args.path)
     db_path = get_index_db_path(base_path)
 
@@ -308,8 +332,13 @@ def _cmd_info(args: argparse.Namespace) -> None:
     from rlm_tools_bsl.cache import _paths_hash
 
     _maybe_migrate_legacy_index_root()
+    _print_index_root_diagnostics()
     base_path = _resolve_path(args.path)
     db_path = get_index_db_path(base_path)
+
+    # Before the fork on purpose: in the "not found" branch this is the line that
+    # matters most — it says WHERE the index was looked for.
+    print(f"Index root: {_index_root_label()}")
 
     if not db_path.exists():
         print(f"Index not found: {db_path}")
