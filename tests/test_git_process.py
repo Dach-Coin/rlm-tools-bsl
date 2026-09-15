@@ -142,6 +142,22 @@ if WINDOWS:
             time.sleep(0.05)
         return [pid_alive(p) for p in pids]
 
+    def wait_all_gone(handles: list, seconds: float = 10.0) -> list[bool]:
+        """Дождаться, что auto-delete снял capture-файлы. ЖДАТЬ обязательно.
+
+        `delete-on-close` применяется при закрытии ПОСЛЕДНЕГО handle на file
+        object, а последний handle держит потомок и отдаёт его в rundown —
+        ПОЗЖЕ, чем процесс отчитался мёртвым через `GetExitCodeProcess`.
+        Замер: удаление отстаёт от смерти процесса всегда, на единицы мс, и
+        на загруженном раннере этот зазор больше посторонней работы теста.
+        Проверка не слабеет: настоящая утечка handle пережила бы и дедлайн.
+        """
+        paths = [Path(h.name) for h in handles]
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and any(path.exists() for path in paths):
+            time.sleep(0.05)
+        return [path.exists() for path in paths]
+
 
 def _capture_spy(monkeypatch) -> list:
     """Записать все открытые capture-файлы, не меняя поведения."""
@@ -455,8 +471,7 @@ class TestDescendantScenario:
             assert elapsed < 10.0, "caller не ждёт EOF от потомка"
             assert set(pids) <= set(snapshot["pids"]), "root и потомок обязаны быть в creation-time Job"
             assert wait_all_dead(pids) == [False, False], "Job обязан снести всё дерево"
-            for handle in opened:
-                assert not Path(handle.name).exists(), "auto-delete сработал после закрытия последнего handle"
+            assert wait_all_gone(opened) == [False, False], "auto-delete снял оба capture-файла"
         finally:
             for pid in pids:
                 hard_kill(pid)
@@ -484,9 +499,7 @@ class TestDescendantScenario:
             for pid in pids:
                 hard_kill(pid)
             # capture исчезает только после закрытия ЕГО handle осиротевшим потомком
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline and any(Path(h.name).exists() for h in opened):
-                time.sleep(0.05)
+            wait_all_gone(opened)
 
     def test_parallel_calls_do_not_share_capture_or_serialize(self, monkeypatch):
         opened = _capture_spy(monkeypatch)
