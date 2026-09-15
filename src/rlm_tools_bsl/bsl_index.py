@@ -1659,6 +1659,12 @@ def _sanitize_grep_excludes(exclude_path) -> list[str] | None:
     return out
 
 
+# Пофайловый потолок `git grep -m` — ЕДИНЫЙ источник истины для backend-а и для
+# публичной диагностики `git_search._meta.per_file_cap`. Разъехавшись, они
+# сообщали бы агенту не тот предел, который реально срезал строки.
+_GIT_GREP_DEFAULT_MAX_PER_FILE = 50
+
+
 def _git_grep(
     base_path: str,
     pattern: str,
@@ -1671,7 +1677,7 @@ def _git_grep(
     ignore_case: bool = False,
     mode: str = "lines",
     max_results: int = 200,
-    max_per_file: int = 50,
+    max_per_file: int = _GIT_GREP_DEFAULT_MAX_PER_FILE,
     include_truncation_sentinel: bool = False,
     timeout: int | None = None,
     err: dict | None = None,
@@ -1847,7 +1853,9 @@ def _git_grep(
     results: list[dict] = []
     # Единый внутренний флаг усечения: per-file ИЛИ global. Публичная обёртка
     # снимает sentinel и переносит значение в ``truncated``.
-    capped = False
+    capped_per_file = False
+    capped_global = False
+    capped_files: set[str] = set()
     per_file_counts: dict[str, int] = {}
     if mode == "files":
         # ``-l -z`` → NUL-separated paths (printed verbatim).
@@ -1875,15 +1883,31 @@ def _git_grep(
                 if seen > max_per_file:
                     # Probe-строка: число обычных строк файла остаётся прежним
                     # (max_per_file), но упор теперь ВИДЕН.
-                    capped = True
+                    capped_per_file = True
+                    capped_files.add(f)
                     continue
             results.append({"file": f, "line": ln, "text": text.strip()})
 
     if len(results) > max_results:
         results = results[:max_results]
-        capped = True
-    if capped and include_truncation_sentinel:
-        results.append({"_truncated": True, "shown": len(results)})
+        capped_global = True
+    if (capped_per_file or capped_global) and include_truncation_sentinel:
+        results.append(
+            {
+                "_truncated": True,
+                "shown": len(results),
+                # Два потолка РАЗНЫЕ, и лечатся они разными аргументами. Слитый
+                # в один булев признак, упор заставлял агента поднимать
+                # max_results там, где он не помогает вовсе: на боевой выдаче
+                # max_results=200 и max_results=5000 давали ОДНИ И ТЕ ЖЕ 183
+                # строки (три файла ровно по 50).
+                "per_file": capped_per_file,
+                "global": capped_global,
+                # Список ограничен здесь же: он уезжает в agent-facing ответ.
+                "files_capped": sorted(capped_files)[:10],
+                "files_capped_count": len(capped_files),
+            }
+        )
     return results
 
 
@@ -11132,6 +11156,221 @@ class IndexReader:
                 }
                 for name, info in grouped.items()
             ]
+
+    @_transient_safe(lambda: None)
+    def get_subsystem_lookup(self, query: str) -> dict | None:
+        """ОБА вопроса за ОДИН полный проход по ``subsystem_content`` плюс
+        кандидаты пустых подсистем из существующих каталогов.
+
+        * ``direct`` — «состав подсистемы X»: ``subsystem_name`` равен запросу;
+          точный ``subsystem_synonym`` сохраняется только для файла, basename
+          которого уже был достижим прежним query-bearing live-glob;
+        * ``containing`` — «в какие подсистемы входит объект X»: хотя бы один
+          ``object_ref`` СОДЕРЖИТ запрос (подстрока — зеркало ``LIKE %q%`` из
+          ``get_subsystems_for_object``); подсистемы из ``direct`` не дублируются.
+
+        До v1.36.0 второй вопрос выдавался за первый: состав подменялся списком
+        ссылок, ТЕКСТ которых содержал имя подсистемы (на боевой конфигурации —
+        4 элемента вместо 124).
+
+        Нормализация — ``str.lower()``, буквально как у UDF ``py_lower``, а не
+        ``casefold``: два нормализатора одного проекта не должны расходиться на
+        экзотических символах.
+
+        Почему полный проход, а не индексный ``COLLATE NOCASE``: тот складывает
+        регистр только для ASCII, и при ``Почта`` (файл A) и ``почта`` (файл B)
+        вернул бы ОДНУ строку, выдав её за все. Цена — 26-39 мс на ЕРП-масштабе
+        (33-40 K строк), платится ОДИН раз на вызов ``analyze_subsystem``: обе
+        группы и весь сохранённый в таблице состав собираются этим же проходом,
+        второго запроса нет. ``has_metadata`` означает включённую build-опцию, а
+        не успешный parse каждого metadata-файла; поэтому полнота здесь
+        относится к строкам ``subsystem_content``, а не служит сертификатом
+        всего current-root.
+
+        Порядок ``content`` — порядок вставки (``id``) = порядок ``<Content>`` в
+        XML; он наблюдаем и закреплён ``ORDER BY id``.
+
+        Три таблицы читаются ТРЕМЯ операторами, то есть тремя неявными
+        транзакциями: in-place пересборка (``_begin_inplace_rebuild``) СОХРАНЯЕТ
+        ``has_metadata``, но опустошает таблицы, и её окно видно читателю. Поэтому
+        чтение обрамлено снимком ``(build_in_progress, PRAGMA data_version)`` до и
+        после: выставленный маркер либо смена поколения дают ``None``, а не
+        частичный состав, выданный за полный.
+
+        Returns:
+            ``{"direct": [...], "containing": [...], "direct_candidates": [...],
+            "synonym_candidates_supported": bool}``; ``None`` — нужных таблиц нет /
+            идёт пересборка / поколение сменилось между чтениями / транзиентный
+            сбой. Пустые группы окончательны в домене успешно
+            индексированных metadata-строк только когда одновременно пуст
+            ``direct_candidates`` и ``synonym_candidates_supported=True``; malformed
+            XML build штатно пропускает, и этот метод не выдаёт его отсутствие за
+            доказательство полноты всего корня.
+        """
+        q = (query or "").lower()
+
+        def _generation() -> tuple:
+            """Маркер незавершённой in-place пересборки + поколение данных.
+
+            Зовётся ТОЛЬКО под уже взятым ``self._lock`` (он не реентерабельный).
+            ``PRAGMA data_version`` меняется, когда ЧУЖОЕ соединение закоммитило, —
+            тем же способом, что и ``get_build_capabilities``.
+            """
+            marker_row = self._conn.execute("SELECT value FROM index_meta WHERE key = 'build_in_progress'").fetchone()
+            version_row = self._conn.execute("PRAGMA data_version").fetchone()
+            return (
+                marker_row["value"] if marker_row is not None else None,
+                version_row[0] if version_row is not None else None,
+            )
+
+        def _legacy_synonym_candidate(file: str) -> bool:
+            """Не превращать сохранение старого synonym-match в новый глобальный поиск."""
+            basename = (file or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+            return bool(q) and q in basename
+
+        grouped: dict[tuple[str, str], dict] = {}
+        with self._lock:
+            generation_pre = _generation()
+            if generation_pre[0] not in (None, "0"):
+                # Идёт in-place пересборка: `has_metadata` уже переписан НАМЕРЕНИЕМ
+                # новой сборки, а таблицы пусты либо заполняются. Строгое `== "1"`
+                # не используется намеренно: здесь безопасная сторона — уйти в live
+                # на ЛЮБОМ нераспознанном значении маркера, а не опубликовать состав.
+                return None
+            feature_rows = self._conn.execute(
+                "SELECT key, value FROM index_meta WHERE key IN ('has_metadata', 'has_synonyms')"
+            ).fetchall()
+            features = {r["key"]: str(r["value"]) == "1" for r in feature_rows}
+            # Таблица физически есть и при build_metadata=False, но пустой ответ
+            # тогда не является обратным поиском. None переводит helper в честную
+            # live-ветку с reverse_lookup_supported=False.
+            #
+            # Дефолты РАЗНЫЕ намеренно. `has_metadata` при отсутствии ключа —
+            # False, как у `get_build_capabilities`: безопасная сторона здесь —
+            # уйти в live, а не объявить пустые группы окончательными.
+            # `has_synonyms` — True, как у легаси-ветки: там отсутствие ключа
+            # исторически означает «синонимы есть». Новый v15 build пишет оба
+            # ключа; старый индекс server может ОТКРЫТЬ до явного
+            # `rlm_index update`, поэтому defaults — реальный compatibility-путь.
+            if not features.get("has_metadata", False):
+                return None
+            synonyms_supported = features.get("has_synonyms", True)
+            if not q:
+                return {
+                    "direct": [],
+                    "containing": [],
+                    "direct_candidates": [],
+                    "synonym_candidates_supported": synonyms_supported,
+                }
+            rows = self._conn.execute(
+                "SELECT subsystem_name, subsystem_synonym, object_ref, file FROM subsystem_content ORDER BY id"
+            ).fetchall()
+            # subsystem_content не представляет пустой <Content>. Используем
+            # существующие каталоги только как список кандидатов; содержимое XML
+            # и точный Name либо legacy-достижимый Synonym повторно проверит helper.
+            # ТРИ раскладки: CF-sibling кладёт XML НЕПОСРЕДСТВЕННО в `Subsystems`,
+            # EDT — в собственный подкаталог (`Subsystems/<Имя>/<Имя>.mdo`),
+            # CF-Ext — в `Subsystems/<Имя>/Ext/<любой>.xml`. Отбор делает Python
+            # ниже; SQL лишь сужает до поддерева `Subsystems` любой глубины.
+            path_rows = self._conn.execute(
+                "SELECT rel_path, filename FROM file_paths "
+                "WHERE extension IN ('.xml', '.mdo') "
+                "AND (rel_path LIKE 'Subsystems/%' OR rel_path LIKE '%/Subsystems/%')"
+            ).fetchall()
+            synonym_rows = self._conn.execute(
+                "SELECT object_name, synonym, file FROM object_synonyms WHERE category='Subsystems'"
+            ).fetchall()
+            if _generation() != generation_pre:
+                # Между тремя чтениями чужое соединение закоммитило (началась либо
+                # завершилась пересборка). Три набора строк могут относиться к
+                # РАЗНЫМ поколениям — склеивать их в один «состав» нельзя.
+                return None
+        for r in rows:
+            key = (r["subsystem_name"], r["file"] or "")
+            entry = grouped.get(key)
+            if entry is None:
+                name_l = (r["subsystem_name"] or "").lower()
+                syn_l = (r["subsystem_synonym"] or "").lower()
+                entry = {
+                    "name": r["subsystem_name"],
+                    "synonym": r["subsystem_synonym"] or "",
+                    "file": r["file"] or "",
+                    "content": [],
+                    "matched_by": (
+                        "name"
+                        if name_l == q
+                        else "synonym"
+                        if syn_l == q and _legacy_synonym_candidate(r["file"])
+                        else None
+                    ),
+                    "matched_refs": [],
+                }
+                grouped[key] = entry
+            ref = r["object_ref"]
+            entry["content"].append(ref)
+            if q in (ref or "").lower():
+                entry["matched_refs"].append(ref)
+        direct, containing = [], []
+        for e in grouped.values():
+            if e["matched_by"] is not None:
+                e.pop("matched_refs")
+                direct.append(e)
+            elif e["matched_refs"]:
+                e.pop("matched_by")
+                containing.append(e)
+
+        # Каталог нужен только для строк, которых subsystem_content не может
+        # представить (пустой <Content>). `_collect_subsystems_recursive` знает
+        # три раскладки, и reader обязан дать кандидата для каждой:
+        #   1. CF-sibling  `Subsystems/<Имя>.xml`;
+        #   2. EDT         `Subsystems/<Имя>/<Имя>.mdo`;
+        #   3. CF-Ext      `Subsystems/<Имя>/Ext/<любой>.xml`.
+        # Это current-root lookup, НЕ merge nearby CFE.
+        known = {(e["name"], e["file"]) for e in direct}
+        candidates: set[str] = set()
+        for r in path_rows:
+            rel = (r["rel_path"] or "").replace("\\", "/")
+            parts = rel.split("/")
+            stem = Path(r["filename"] or "").stem
+            is_cf_sibling = len(parts) >= 2 and parts[-2] == "Subsystems"
+            is_edt = (
+                len(parts) >= 3 and parts[-3] == "Subsystems" and parts[-2] == stem and rel.lower().endswith(".mdo")
+            )
+            is_cf_ext = (
+                len(parts) >= 4 and parts[-4] == "Subsystems" and parts[-2] == "Ext" and rel.lower().endswith(".xml")
+            )
+            candidate_name = parts[-3] if is_cf_ext else stem
+            if (
+                (is_cf_sibling or is_edt or is_cf_ext)
+                and candidate_name.lower() == q
+                and (candidate_name, rel) not in known
+            ):
+                candidates.add(rel)
+
+        # object_synonyms строится из `_iter_metadata_xml_files`, которая знает ВСЕ
+        # раскладки, — поэтому здесь матчим ИМЯ как второй, независимый от раскладки
+        # источник. Синоним матчим только на прежнем basename-кандидате: иначе
+        # read-time bugfix незаметно становится новым глобальным synonym-search.
+        # Одного его мало: строка появляется ТОЛЬКО при НЕПУСТОМ <Synonym>, то
+        # есть на подсистеме без синонима второй источник молчит.
+        synonym_prefix = f"{_CATEGORY_RU['Subsystems']}: "
+        for r in synonym_rows:
+            stored = r["synonym"] or ""
+            raw = stored[len(synonym_prefix) :] if stored.startswith(synonym_prefix) else stored
+            obj = r["object_name"] or ""
+            key = (obj, r["file"] or "")
+            synonym_hit = raw.lower() == q and _legacy_synonym_candidate(key[1])
+            if (synonym_hit or obj.lower() == q) and key not in known:
+                candidates.add(key[1])
+
+        return {
+            "direct": direct,
+            "containing": containing,
+            "direct_candidates": sorted(p for p in candidates if p),
+            # build_synonyms=False делает каталог полным по имени, но не по
+            # синониму; helper в этом редком режиме обязан сохранить live fallback.
+            "synonym_candidates_supported": synonyms_supported,
+        }
 
     @_transient_safe(lambda: None)
     def get_http_services(self, name: str = "") -> list[dict] | None:

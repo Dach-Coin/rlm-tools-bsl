@@ -244,14 +244,21 @@ def _release_session_resources(session_id: str, reason: str = "ttl_eviction") ->
             backend.request_close(reason)
         except Exception:
             logger.warning("request_close failed for session %s", session_id, exc_info=True)
-        # Inline: процесса нет, единственный ресурс — IndexReader, его закрытие
-        # мгновенно. Закрываем СИНХРОННО, потому что асинхронная сдача в reaper
-        # ломала внешний инвариант: на Windows открытый handle bsl_index.db не
-        # даёт сразу после rlm_end пересобрать/удалить индекс (WinError 32).
-        # Deadline здесь НЕ ожидание, а маркер «не форсировать под работающим
-        # кодом»: если execute в полёте, finish_close вернёт residual и доводит
-        # уже reaper. Для process-backend путь остаётся асинхронным — там ждать
-        # пришлось бы kill_grace/join, что запрещено (§9.3).
+        # Inline: процесса нет. IndexReader закрывается СИНХРОННО — асинхронная
+        # сдача в reaper ломала внешний инвариант: на Windows открытый handle
+        # bsl_index.db не даёт сразу после rlm_end пересобрать/удалить индекс
+        # (WinError 32). Ресурс, однако, уже НЕ единственный (v1.36.0): inline
+        # backend владеет ещё и фоновым прогревом живого каталога, поэтому
+        # секундный deadline ниже может быть использован целиком — bounded join
+        # этого потока идёт ПОСЛЕ закрытия reader-а. Пока поток жив и бюджет не
+        # исчерпан, finish_close честно возвращает residual, и сессию доводит
+        # reaper; это ПРОМЕЖУТОЧНОЕ состояние, а не вечное — на исчерпанном
+        # бюджете (force_abort / последняя попытка reaper-а) закрытие
+        # доводится, а незавершённый поток-демон отцепляется.
+        # Deadline здесь по-прежнему НЕ ожидание для ветки активного execute, а
+        # маркер «не форсировать под работающим кодом». Для process-backend путь
+        # остаётся асинхронным — там ждать пришлось бы kill_grace/join, что
+        # запрещено (§9.3).
         finished = False
         if getattr(backend, "mode", None) == "inline":
             try:

@@ -302,6 +302,12 @@ class Sandbox:
         # {helper: (returned, limit)}. Очищается вместе с _helper_calls, потому что
         # подсказка обязана прийти в ТОМ ЖЕ ответе, где агент получил срез.
         self._execute_saturated: dict[str, tuple[int, int]] = {}
+        # v1.36.0: прогрев живого каталога. Конструктор его НЕ запускает —
+        # между возвратом `Sandbox(...)` и появлением backend есть достижимая
+        # init-failure граница, на которой поток остался бы без владельца и
+        # `_rlm_start` не смог бы передать его reaper-у.
+        self._prewarm_thread = None
+        self._prewarm_start = None
         self._setup_namespace()
 
     def _setup_namespace(self) -> None:
@@ -349,6 +355,7 @@ class Sandbox:
         self._namespace.update(self._wrap_helpers(helpers))
 
         bsl_helpers: dict = {}
+        prewarm = None
         if self._format_info is not None and self._enable_bsl_helpers:
             bsl_helpers = make_bsl_helpers(
                 base_path=self._base_path,
@@ -362,11 +369,17 @@ class Sandbox:
                 extension_paths=self._extension_paths,
                 grep_status_fn=private_io.get("grep_with_status"),
                 catalog_scan_fn=private_io.get("scan_bsl_catalog_status"),
+                glob_files_fs_fn=private_io.get("glob_files_fs"),
                 current_config_role=self._current_config_role,
                 current_config_name=self._current_config_name,
                 current_config_root=self._current_config_root,
                 extension_name_by_root=self._extension_name_by_root,
             )
+            # Прогреватель — не хелпер: он не должен ни попасть в namespace
+            # агента, ни считаться вызовом хелпера. `_wrap_helpers` приватные
+            # ключи НЕ фильтрует (он оборачивает ВСЁ callable), поэтому изымаем
+            # ДО него, а не рассчитываем на фильтр.
+            prewarm = bsl_helpers.pop("_prewarm_live_catalog", None)
             self._namespace.update(self._wrap_helpers(bsl_helpers))
 
         if self._format_info is not None:
@@ -412,6 +425,25 @@ class Sandbox:
                 numbered_overrides.append(("read_procedure", _numbered_read_procedure))
             for name, fn in numbered_overrides:
                 self._namespace[name] = self._wrap_helpers({name: fn})[name]
+
+        # Namespace собран полностью — сохраняем callable, но НЕ запускаем:
+        # старт делает session-владелец через `_start_owned_prewarm()`.
+        self._prewarm_start = prewarm
+
+    def _start_owned_prewarm(self) -> None:
+        """Приватный one-shot: вызывается ТОЛЬКО session-владельцем после init.
+
+        Владелец (``InlineSandboxBackend`` либо sandbox-worker) зовёт его последней
+        строкой успешной инициализации: после неё падающих стадий конструктора уже
+        нет, и поток гарантированно кому-то принадлежит. Прямой ownerless
+        ``Sandbox`` фон не начинает вовсе.
+        """
+        prewarm = self._prewarm_start
+        if prewarm is None:
+            return
+        self._prewarm_start = None
+        prewarm()  # RuntimeError Thread.start поглощён внутри best-effort prewarm
+        self._prewarm_thread = prewarm.thread()  # handle либо None; lazy сохранён
 
     def _wrap_helpers(self, helpers: dict) -> dict:
         """Wrap callable helpers with timing + session-wide duplicate-call detection."""
@@ -1057,9 +1089,17 @@ class Sandbox:
                 "truncated, source}. Сверь ключи: print(list(result.keys())) или rlm_help(helpers=['имя'])."
             )
 
+        # Текст обязан называть ФАКТИЧЕСКОЕ правило. Прежний ("only standard library
+        # modules are allowed") был неверен: `time`, `os`, `datetime` — ровно stdlib, и они
+        # заблокированы. Агент читал подсказку, делал единственный возможный из неё вывод и
+        # упирался снова, теряя вызов (поймано приёмо-сдаточным e2e v1.36.0). Состав берётся
+        # из самой константы, чтобы текст не мог разъехаться с гейтом.
         if "import" in error.lower() and "restricted" in error.lower():
             hints.append(
-                "HINT: Only standard library modules are allowed. Use built-in helpers instead of external libraries."
+                "HINT: импорт ограничен БЕЛЫМ СПИСКОМ, а не «стандартной библиотекой». "
+                "Доступны только: " + ", ".join(sorted(ALLOWED_MODULES)) + ". Всё остальное "
+                "недоступно, включая stdlib (time, os, sys, datetime, pathlib) — это граница "
+                "песочницы, а не сбой. Нужные данные бери готовыми хелперами."
             )
 
         if hints:

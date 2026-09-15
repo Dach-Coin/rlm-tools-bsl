@@ -579,3 +579,78 @@ def test_reaper_slow_retry_does_not_block_new_backends():
         )
     finally:
         reaper.stop()
+
+
+# ---------------------------------------------------------------------------
+# v1.36.0 — inline-сессия владеет ещё и фоновым прогревом живого каталога
+# ---------------------------------------------------------------------------
+def test_inline_finish_close_waits_for_owned_prewarm_within_deadline(tmp_path):
+    # with_bsl=False: сам тест управляет потоком; реальный wiring Sandbox ->
+    # _prewarm_thread отдельно держит TestLiveCatalogPrewarm в test_v1_36_0.py.
+    sandbox = _make_sandbox(tmp_path, with_bsl=False)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_prewarm():
+        started.set()
+        release.wait(timeout=30)
+
+    prewarm = threading.Thread(target=blocked_prewarm, daemon=True)
+    sandbox._prewarm_thread = prewarm
+    backend = InlineSandboxBackend(sandbox, None, install_llm_tools=False)
+    try:
+        prewarm.start()
+        assert started.wait(timeout=5)
+        backend.request_close("test")
+        report = backend.finish_close(time.monotonic() + 0.2)
+        assert report.closed is False and report.residual is True
+        assert backend.state == "closing"
+    finally:
+        release.set()
+        prewarm.join(timeout=5)
+
+    final = backend.finish_close(time.monotonic() + 5)
+    assert final.closed is True and final.residual is False
+    assert backend.state == "closed"
+
+
+@pytest.mark.parametrize("entry", ["force_abort", "expired_finish_close"])
+def test_inline_expired_deadline_detaches_live_prewarm_instead_of_asking_retry(tmp_path, entry):
+    """R125: на ИСЧЕРПАННОМ бюджете закрытие доводится, а не просит повтор.
+
+    Оба входа реальны и оба передают заведомо истёкший deadline: `force_abort()`
+    и последняя попытка reaper-а. Если бы prewarm и здесь возвращал residual,
+    backend стал бы незакрываемым: force_abort — вечный False, reaper — вечный
+    `pending` с сообщением о возможной утечке процесса.
+    """
+    sandbox = _make_sandbox(tmp_path, with_bsl=False)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_prewarm():
+        started.set()
+        release.wait(timeout=30)
+
+    prewarm = threading.Thread(target=blocked_prewarm, daemon=True)
+    sandbox._prewarm_thread = prewarm
+    backend = InlineSandboxBackend(sandbox, None, install_llm_tools=False)
+    try:
+        prewarm.start()
+        assert started.wait(timeout=5)
+        backend.request_close("test")
+        # Предусловие: с ЖИВЫМ бюджетом контракт по-прежнему просит повтор.
+        assert backend.finish_close(time.monotonic() + 0.2).residual is True
+        if entry == "force_abort":
+            assert backend.force_abort() is True
+        else:
+            report = backend.finish_close(time.monotonic() - 1.0)
+            assert report.closed is True and report.residual is False
+            assert report.forced is True
+            assert any("prewarm" in e for e in report.errors)
+        assert backend.state == "closed"
+        assert prewarm.is_alive(), "поток не убивали — его отцепили, а не ждали"
+    finally:
+        release.set()
+        prewarm.join(timeout=5)
+    # Повторное закрытие идемпотентно и reader второй раз не трогает.
+    assert backend.finish_close(time.monotonic() + 5).closed is True

@@ -36,7 +36,11 @@ from rlm_tools_bsl.bsl_index import (
     _scan_module,
 )
 from rlm_tools_bsl.cache import load_index, save_index
-from rlm_tools_bsl.helpers import _SKIP_DIRS as _GENERIC_SKIP_DIRS, scan_bsl_tree as _scan_bsl_tree
+from rlm_tools_bsl.helpers import (
+    _BINARY_EXTENSIONS,
+    _SKIP_DIRS as _GENERIC_SKIP_DIRS,
+    scan_bsl_tree as _scan_bsl_tree,
+)
 from rlm_tools_bsl.regex_safety import NESTED_QUANTIFIER_ERROR, has_catastrophic_nesting
 
 logger = logging.getLogger(__name__)
@@ -696,6 +700,7 @@ def make_bsl_helpers(
     *,
     grep_status_fn=None,
     catalog_scan_fn=None,
+    glob_files_fs_fn=None,
     current_config_role: str | None = None,
     current_config_name: str = "",
     current_config_root: str = "",
@@ -724,6 +729,15 @@ def make_bsl_helpers(
     отсутствие молча проглоченного отказа чтения/перечисления нельзя, и
     потребители честно получают ``read_status_complete=False``. Публичный
     ``grep_fn`` ВСЕГДА вызывается прежней двухаргументной формой.
+
+    ``glob_files_fs_fn`` (v1.36.0) — такой же приватный канал: FS-only реализация
+    ``glob_files`` ТЕКУЩЕГО корня. Нужна там, где ответ объявлен живым
+    (``_meta.source="live"``), а ридер подключён: публичный ``glob_files_fn`` в
+    этом случае сам index-backed и перечислил бы ``file_paths`` ридера — чужого
+    (foreign base) либо устаревшего. Наружу как helper или пользовательский
+    параметр не выходит; без него live-ветка при подключённом ридере честно
+    возвращает пустой current-root результат, но НИКОГДА не выдаёт индексный
+    каталог за живое перечисление.
 
     ``current_config_role`` / ``current_config_name`` / ``current_config_root`` /
     ``extension_name_by_root`` (v1.34.0, role-aware provenance foundation) —
@@ -910,6 +924,24 @@ def make_bsl_helpers(
             comps = ()
         _current_prefix_cache[0] = comps
         return comps
+
+    def _rel_within_current_root(rel_path: str) -> bool:
+        """Путь ИНДЕКСА (относительно base) лежит внутри ТЕКУЩЕГО корня?
+
+        Индекс строится от base, а при поддержанном wrapper-входе base ШИРЕ
+        ``current_config_root``: соседний ``wrapper/Other/...`` — ДРУГАЯ
+        конфигурация, и её строки не являются составом текущей. Пустой prefix
+        (``current == base``) совпадает с любой строкой, то есть на штатном
+        direct-входе предикат — no-op.
+
+        Сравнение КОМПОНЕНТНОЕ и normcase-ное, как у ``_owner_root_for``: сырой
+        ``startswith`` считал бы ``MyExtra/...`` частью ``MyExt``.
+        """
+        prefix = _current_rel_prefix()
+        if not prefix:
+            return True
+        comps = tuple(os.path.normcase(p) for p in str(rel_path or "").replace("\\", "/").split("/") if p and p != ".")
+        return len(comps) > len(prefix) and comps[: len(prefix)] == prefix
 
     # Компонентные relative-prefix'ы nearby ext-корней: закрывают trusted строки,
     # которых НЕТ в BSL-карте (`search_objects` несёт путь к metadata XML).
@@ -1205,19 +1237,25 @@ def make_bsl_helpers(
     # может выдать один файл ДВАЖДЫ). Поэтому канон задаётся ПО-МАРШРУТНО, по
     # замещаемому потребителю, а требовать эквивалентности одной проекции сразу
     # обоим нынешним маршрутам невыполнимо.
-    # Замок — ОТДЕЛЬНЫЙ leaf: под ним не берётся ни `_index_lock`, ни
-    # `_live_bsl_catalog_lock`. Переиспользовать последний нельзя — нынешний порядок
-    # захвата `_live_bsl_catalog_lock` → `_index_lock`, и путь `_ensure_index`
-    # (держит `_index_lock`) → `_load_main_into_index_state` → scanner дал бы
-    # обратный порядок и достижимый deadlock.
+    # Замки — ОТДЕЛЬНЫЕ leaf'ы, ПО ОДНОМУ НА КАНОН (v1.36.0): под ними не берётся
+    # ни `_index_lock`, ни `_live_bsl_catalog_lock`. Переиспользовать последний
+    # нельзя: если бы любой `_main_scan_locks[...]` был тем же объектом, что
+    # `_live_bsl_catalog_lock`, путь `_ensure_index` (держит `_index_lock`) →
+    # `_load_main_into_index_state` → scanner дал бы `_index_lock` →
+    # `_live_bsl_catalog_lock`; обратного порядка в коде нет, и появляться он не
+    # должен.
+    # Замок РАЗДЕЛЁН по канонам потому, что фоновый прогрев (v1.36.0) держит
+    # `walk` секундами: общий leaf заставил бы независимый `glob`-fallback ждать
+    # чужой обход, после чего первый же обычный helper заплатил бы ОБА.
+    # Внутри канона single-flight сохраняется: каждый строится не более раза.
     _main_scan_cache: dict[str, tuple[list[str], int]] = {}
-    _main_scan_lock = threading.Lock()
+    _main_scan_locks = {canon: threading.Lock() for canon in ("glob", "walk")}
 
     def _scan_main_paths(route_canon: str) -> tuple[list[str], int]:
         cached = _main_scan_cache.get(route_canon)
         if cached is not None:
             return cached
-        with _main_scan_lock:
+        with _main_scan_locks[route_canon]:
             cached = _main_scan_cache.get(route_canon)
             if cached is not None:
                 return cached
@@ -1730,6 +1768,112 @@ def make_bsl_helpers(
             _live_bsl_catalog.extend(sorted(unique.values(), key=lambda item: item[0].casefold()))
             _live_bsl_catalog_built[0] = True
             return _live_bsl_catalog
+
+    # --- Фоновый прогрев живого каталога (v1.36.0) ---------------------------------
+    _prewarm_thread: list = [None]
+    _prewarm_thread_lock = threading.Lock()
+
+    def _prewarm_enabled() -> bool:
+        """Default-on; выключение совпадает с контрактом ENV_REFERENCE."""
+        value = os.environ.get("RLM_PREWARM_LIVE_CATALOG", "1")
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+
+    def _prewarm_body() -> None:
+        """Тело фонового прогрева. Ошибка ТЕЛА гасится ЗДЕСЬ и только здесь.
+
+        Контракт отличается от scan-worker-а НАМЕРЕННО. У scan-worker-а есть
+        caller, который ждёт результат, поэтому его ошибка обязана дойти до
+        caller-а и не превратиться в частичный успех. У фонового прогрева
+        caller-а нет вовсе: результат никем не ожидается, а сама операция —
+        необязательная оптимизация. Поэтому:
+
+        * частичного каталога не возникает по конструкции:
+          ``_live_bsl_catalog_built[0] = True`` ставится ПОСЛЕДНЕЙ строкой
+          ``_ensure_live_bsl_catalog``, и до неё в общий список ничего не
+          публикуется. Отказ оставляет флаг ``False``;
+        * исходная ошибка не теряется для ПОТРЕБИТЕЛЯ: первый же live-хелпер
+          выполняет ровно тот же маршрут синхронно и получает её сам — так же,
+          как получил бы её без прогрева вовсе. Исходники 1С во время сессии
+          статичны, поэтому это та же ошибка, а не другая;
+        * приватного exception-state НЕ заводим: у него не было бы ни одного
+          потребителя, а это уже новый механизм, а не починка;
+        * handle завершившегося потока НЕ сбрасывается: фон однократен, и
+          повторный автоматический обход после отказа был бы новым поведением.
+
+        Без этого ``try`` необработанное исключение уходило бы в
+        ``threading.excepthook``, то есть печаталось бы сырым traceback-ом в
+        stderr мимо ``logger`` и мимо любого контракта ошибки.
+        """
+        try:
+            _ensure_live_bsl_catalog()
+        except Exception:  # noqa: BLE001 — best-effort оптимизация, см. докстринг
+            logger.warning(
+                "live catalog prewarm failed; lazy path will rebuild and surface the error",
+                exc_info=True,
+            )
+
+    def _prewarm_live_catalog(block: bool = False) -> None:
+        """Фоновое построение reader-backed живого BSL-каталога.
+
+        Цена перечисления дерева (16-20 с на ЕРП-масштабе, из них 99 % —
+        ``os.scandir`` по ~115K каталогов) платится ОДИН раз за сессию, но платит
+        её первый live-хелпер, то есть она стоит в клоке агента. Прогрев уводит
+        её в фон: пока агент читает стратегию и составляет первый вызов, каталог
+        строится. Если вызов успел раньше — он встанет на ТОТ ЖЕ
+        ``_live_bsl_catalog_lock`` и заплатит ровно ту цену, что платил бы сам;
+        для того же walk-маршрута ухудшения нет. Независимый glob-fallback
+        защищён отдельным route-lock и фонового walk не ждёт.
+
+        Греется ТОЛЬКО reader-backed ``walk``-перечисление BSL. Общий
+        ``_ensure_index()`` (metadata XML + синонимы расширений) отсюда НЕ
+        вызывается ни прямо, ни косвенно. Без reader штатный путь — glob с
+        записью no-index cache; его не запускаем daemon-потоком, он остаётся
+        ленивым.
+
+        Порядок замков: ``_live_bsl_catalog_lock`` (составной) → ЛИСТЬЯ
+        (``_main_scan_locks['walk']``, ``_main_rows_lock``, ``_ext_bsl_lock``).
+        ``_index_lock`` отсюда не берётся вовсе, поэтому цикла нет и прогрев
+        deadlock не создаёт.
+
+        Lazy restart воркера (process-режим после terminated/OOM) пересоздаёт
+        ``Sandbox``, поэтому прогрев там запустится ПОВТОРНО. Это корректно:
+        каталог сессии жил в воркере и умер вместе с ним.
+        """
+        if idx_reader is None:
+            return
+        if not _prewarm_enabled():
+            return
+        if block:
+            # `block=True` — синхронный вызов с настоящим caller-ом, поэтому он
+            # НЕ оборачивается `_prewarm_body`: ошибка обязана дойти до
+            # вызывающего ровно так же, как из обычного live-хелпера.
+            _ensure_live_bsl_catalog()
+            return
+        # Отдельный короткий lock защищает стык «single start -> stable handle»:
+        # два близких вызова не должны породить два обхода, а завершившийся
+        # поток не заменяется новым объектом до конца жизни этой фабрики.
+        with _prewarm_thread_lock:
+            if _prewarm_thread[0] is not None:
+                return
+            t = threading.Thread(
+                target=_prewarm_body,  # НЕ сам _ensure_live_bsl_catalog
+                name="rlm-prewarm-live-catalog",
+                daemon=True,  # process не держит; inline-владелец ждёт bounded
+            )
+            # Handle публикуется ДО start: lifecycle-владелец сразу после
+            # успешного вызова забирает именно тот поток, который обязан закрыть.
+            _prewarm_thread[0] = t
+            try:
+                t.start()
+            except RuntimeError:
+                # Prewarm — только оптимизация. В среде, где новый поток создать
+                # нельзя, Sandbox остаётся рабочим, а первый live-helper лениво
+                # выполнит ту же `_ensure_live_bsl_catalog`. Не ловим Exception:
+                # реальные дефекты настройки/кода не должны стать тихим fallback.
+                _prewarm_thread[0] = None
+                logger.warning("live catalog prewarm thread could not be started")
+
+    _prewarm_live_catalog.thread = lambda: _prewarm_thread[0]
 
     # --- Auto-detect custom prefixes from object names ---
     _detected_prefixes: list[str] = []
@@ -2744,8 +2888,10 @@ def make_bsl_helpers(
             max_results: глобальный потолок выдачи. Флаг ``truncated`` учитывает
                 ВСЕ внутренние потолки, а не только его: в режиме ``lines`` есть
                 ещё per-file cap ``-m 50``, поэтому 51 совпадение в ОДНОМ файле
-                при ``max_results=200`` возвращается как 50 строк и теперь честно
-                помечается ``truncated=True``.
+                при ``max_results=200`` возвращается как 50 строк и честно
+                помечается ``truncated=True``. КАКОЙ именно потолок сработал,
+                отвечает ``truncated_by`` (v1.36.0): поднимать ``max_results`` при
+                ``"per_file"`` бессмысленно.
             exclude_path: optional comma-separated list of **literal** directory/
                 file names to drop from the search (e.g. ``"Forms,Templates"`` or
                 ``"ConfigDumpInfo.xml"``). Matched at **any depth** — a nested
@@ -2756,9 +2902,20 @@ def make_bsl_helpers(
                 search. Applied on top of the positive scope; with no positive
                 scope the exclusion spans the whole tree.
 
-        **v1.34.0 — форма ответа СЛОВАРЬ:**
-        ``{"results": [...], "returned": int, "truncated": bool, "error": None|str,
-        "hint"?: str}``. ``results`` есть ВСЕГДА, в том числе на ошибочной ветке
+        **v1.34.0 — форма ответа СЛОВАРЬ; v1.36.0 — упор НАЗВАН машинно:**
+        ``{"results": [...], "returned": int, "truncated": bool,
+        "truncated_by": None|"max_results"|"per_file"|"both", "error": None|str,
+        "_meta"?: {...}, "hint"?: str}``.
+        ``truncated_by`` — ПОСТОЯННЫЙ ключ (есть и на ошибочной ветке, там ``None``):
+        потолка ДВА, и лечатся они разными действиями. ``per_file`` означает упор в
+        пофайловый ``git grep -m`` — его не двигают ни ``max_results``, ни сужение
+        ``path``: на боевой выдаче ``max_results=200`` и ``max_results=5000`` давали
+        ОДНИ И ТЕ ЖЕ 183 строки (три файла ровно по 50), и объяснить это было
+        нечем. При ``per_file``/``both`` дополнительно едут условный ``_meta``
+        (``per_file_cap``, ``files_capped_count``, ``files_capped`` — до 10 путей) и
+        ``hint`` с выходом в построчный ``grep``. При остальных значениях
+        ``truncated_by`` условного ``_meta`` нет: он описывает именно пофайловый упор.
+        ``results`` есть ВСЕГДА, в том числе на ошибочной ветке
         (там ``[]``), поэтому ``res["results"]`` не может дать ``KeyError`` —
         это и есть лечение наблюдённого падения. Ключ ``error`` ПОСТОЯННЫЙ
         (``None`` при успехе): иначе «ошибка» и «ничего не найдено» снова стали бы
@@ -2801,7 +2958,16 @@ def make_bsl_helpers(
         def _gs_error(error: str, hint: str) -> dict:
             """Ошибочная ветка собирается ТЕМ ЖЕ конструктором, что успешная:
             ``results`` присутствует всегда, ``error``/``hint`` названы явно."""
-            return {"results": [], "returned": 0, "truncated": False, "error": error, "hint": hint}
+            return {
+                "results": [],
+                "returned": 0,
+                "truncated": False,
+                # Ключ ПОСТОЯНЕН на ВСЕХ путях, как `error` с v1.34.0: иначе
+                # `res["truncated_by"]` давал бы KeyError ровно на аварийной ветке.
+                "truncated_by": None,
+                "error": error,
+                "hint": hint,
+            }
 
         # v1.18.0 Фикс 4a: пустой/пробельный паттерн -> внятный {error, hint}
         # (та же словарная форма, что у любого результата), а не таймаут-заглушка.
@@ -2812,11 +2978,20 @@ def make_bsl_helpers(
                 "find_by_type(...), по имени метода — search_methods(...).",
             )
         from rlm_tools_bsl.bsl_index import (
+            _GIT_GREP_DEFAULT_MAX_PER_FILE,
             _git_grep,
             _sanitize_grep_excludes,
             _sanitize_grep_file_types,
             _sanitize_grep_path,
         )
+
+        # Пофайловый потолок остаётся ВНУТРЕННЕЙ константой backend-а: он и есть
+        # ресурсный предохранитель (git отдаёт весь stdout, Python разбирает его
+        # целиком, и max_results применяется уже ПОСЛЕ). Наружу он не рычаг, а
+        # объявленный факт — см. truncated_by / _meta.per_file_cap ниже. Тот же
+        # объект уезжает и в backend: разъехавшись, ответ сообщал бы 50, а
+        # срезал бы другое число.
+        _PER_FILE_CAP = _GIT_GREP_DEFAULT_MAX_PER_FILE
 
         # РАЗВОДИМ ПРИЧИНЫ. ``_git_grep`` отдаёт None на ВСЁ подряд: битый фильтр
         # (path/file_types/exclude_path), неподдерживаемый ``mode``, NL/NUL в ``pattern`` — и на
@@ -2943,6 +3118,7 @@ def make_bsl_helpers(
             ignore_case=ignore_case,
             mode=mode,
             max_results=max_results,
+            max_per_file=_PER_FILE_CAP,
             include_truncation_sentinel=True,
             err=err,
         )
@@ -2985,13 +3161,81 @@ def make_bsl_helpers(
                 + (f" git ответил: {git_msg}." if git_msg else "")
                 + f" {_FALLBACK_HINT}",
             )
-        # Публичная обёртка СНИМАЕТ sentinel и переносит его значение в `truncated`:
-        # sentinel означает объединение global и per-file усечения.
+        # Публичная обёртка СНИМАЕТ sentinel и НАЗЫВАЕТ упор машинно: два потолка
+        # РАЗНЫЕ и лечатся разными действиями. Слитый в один `truncated`, упор
+        # заставлял агента поднимать `max_results` там, где он не помогает вовсе.
         rows = list(res)
-        truncated = bool(rows and rows[-1].get("_truncated"))
-        if truncated:
+        sentinel = rows[-1] if rows and rows[-1].get("_truncated") else None
+        if sentinel is not None:
             rows = rows[:-1]
-        return {"results": rows, "returned": len(rows), "truncated": truncated, "error": None}
+        per_file = bool(sentinel and sentinel.get("per_file"))
+        global_cap = bool(sentinel and sentinel.get("global"))
+        truncated_by = (
+            "both" if per_file and global_cap else "per_file" if per_file else "max_results" if global_cap else None
+        )
+        out = {
+            "results": rows,
+            "returned": len(rows),
+            "truncated": sentinel is not None,
+            "truncated_by": truncated_by,
+            "error": None,
+        }
+        if per_file:
+            capped_files = sentinel.get("files_capped", [])
+            first_capped = capped_files[0] if capped_files else None
+            # Ready-route допустим только на пересечении двух контрактов. Git -I
+            # решает binary по СОДЕРЖИМОМУ; generic grep заранее исключает суффикс.
+            # Git -i и Python IGNORECASE также не эквивалентны на всём Unicode.
+            grep_reads_file = bool(first_capped and Path(first_capped).suffix.lower() not in _BINARY_EXTENSIONS)
+            grep_pattern = re.escape(pattern) if not regex and not ignore_case and grep_reads_file else None
+            grep_call = (
+                f"grep({grep_pattern!r}, {first_capped!r})"
+                if grep_pattern is not None and len(pattern) <= 300
+                else None
+            )
+            out["_meta"] = {
+                "per_file_cap": _PER_FILE_CAP,
+                "files_capped_count": sentinel.get("files_capped_count", 0),
+                "files_capped": capped_files,
+            }
+            if regex:
+                route = (
+                    "Диалекты РАЗНЫЕ: git использует POSIX ERE, а grep — Python re; "
+                    "для произвольного ERE семантически эквивалентного готового "
+                    "grep-вызова нет. Путь ограниченного файла возьми из "
+                    "_meta.files_capped; выражение переводится только явно, без "
+                    "обещания полной эквивалентности."
+                )
+            elif ignore_case:
+                route = (
+                    "Точный готовый grep-вызов не предлагается: git -i и Python "
+                    "re.IGNORECASE имеют разные Unicode case-folding semantics. "
+                    "Путь ограниченного файла возьми из _meta.files_capped."
+                )
+            elif first_capped and not grep_reads_file:
+                route = (
+                    f"Точный готовый grep-вызов не предлагается: generic grep "
+                    f"исключает суффикс {Path(first_capped).suffix.lower()!r}, хотя "
+                    "git -I признал содержимое текстовым. Путь доступен в "
+                    "_meta.files_capped."
+                )
+            elif grep_call:
+                route = (
+                    f"Полная выдача первого ограниченного файла: {grep_call}. "
+                    "Case-sensitive литерал уже экранирован сервером для Python re."
+                )
+            else:
+                route = (
+                    "Литерал слишком длинный для готовой команды; возьми путь из "
+                    "_meta.files_capped и вызови grep с явно экранированным литералом."
+                )
+            out["hint"] = (
+                f"Упор ПОФАЙЛОВЫЙ: не больше {_PER_FILE_CAP} совпадений на ОДИН файл. "
+                "Ни max_results, ни сужение path этот потолок НЕ двигают — git_search "
+                "физически не отдаст больше по одному файлу. Смотри, какие файлы "
+                f"уперлись: _meta.files_capped. {route}"
+            )
+        return out
 
     def _read_procedure_one(
         path: str, proc_name: str, include_overrides: bool = False, numbered: bool = False
@@ -5090,92 +5334,590 @@ def make_bsl_helpers(
 
     # ── Composite helpers (wrappers over existing functions) ────────
 
-    def analyze_subsystem(name: str) -> dict:
-        """Find a subsystem by name, parse its XML composition,
-        classify objects as custom (non-standard prefix) or standard.
+    _SUBSYSTEM_LIMIT_DEFAULT = 200
+    _SUBSYSTEM_QUERY_MAX = 512  # 1C identifier/ref сюда помещается с большим запасом
+    # Не публичный параметр: страховка штатного max_output_chars=15_000 с запасом
+    # на окружающий print/маркер транспорта. Считаются Unicode-символы ровно тем
+    # же json.dumps, которым проверяется agent-facing ответ.
+    _SUBSYSTEM_JSON_BUDGET = 14_000
 
-        Returns: dict with subsystems_found, subsystems list."""
-        name = _strip_meta_prefix(name)
+    def _subsystem_glob_patterns() -> tuple[str, str]:
+        """Якорные паттерны XML/MDO подсистем ТЕКУЩЕГО корня.
 
-        # --- Fast path: SQLite index ---
-        if idx_reader is not None:
-            matches = idx_reader.get_subsystems_for_object(name)
-            if matches is not None:
-                # matches is [] or list of dicts
-                results = []
-                for m in matches:
-                    results.append(
-                        {
-                            "file": m["file"],
-                            "name": m["name"],
-                            "synonym": m["synonym"],
-                            "total_objects": len(m["matched_refs"]),
-                            "matched_refs": m["matched_refs"],
-                        }
-                    )
-                if not results:
-                    return {
-                        "error": f"Подсистема с '{name}' не найдена",
-                        "hint": "Объект не входит ни в одну подсистему",
-                    }
-                return {"subsystems_found": len(results), "subsystems": results}
+        Оба канала перечисления (``glob_files`` и приватный FS-only
+        ``glob_files_fs``) работают ОТ base, а при поддержанном wrapper-входе
+        base шире ``current_config_root``. Без префикса голый ``Subsystems/**``
+        промахивается мимо фактической конфигурации целиком.
+        """
+        prefix = _current_rel_prefix_raw()
+        head = f"{prefix}/Subsystems" if prefix else "Subsystems"
+        return (f"{head}/**/*.xml", f"{head}/**/*.mdo")
 
-        # --- Fallback: glob + XML parse ---
-        patterns = [
-            f"**/Subsystems/**/*{name}*",
-            f"**/Subsystems/*{name}*",
-            # REMOVED: f"**/*{name}*.mdo" — scans entire tree, useless for subsystems
-        ]
-        found_files: list[str] = []
-        for p in patterns:
-            found_files.extend(glob_files_fn(p))
+    def _subsystem_glob_hint() -> str:
+        """Тот же паттерн, но как ИСПОЛНИМЫЙ агентом вызов: совет обязан работать
+        в той же сессии, в которой выдан.
 
-        subsystem_files = list(
-            dict.fromkeys(f for f in found_files if "Subsystem" in f and (f.endswith(".xml") or f.endswith(".mdo")))
+        Ведётся ОПРЕДЕЛЁННЫМ форматом дампа: на EDT-выгрузке подсистем в ``.xml``
+        НЕТ вовсе (проверено на боевой: 719 ``.mdo`` против 0 ``.xml``), поэтому
+        всегда-CF-первый совет возвращал бы там ЛОЖНЫЙ НОЛЬ — неотличимый от
+        честного «подсистем нет». Префикс current root подставляется обоими
+        паттернами одинаково.
+
+        Ветвление НЕ совпадает с соседней подсказкой ``_resolve_object_xml``, и
+        это намеренно: та ветвится по ``== "cf"`` и на ``unknown`` ставит EDT
+        первым, но там ОБА варианта печатаются рядом, поэтому порядок косметичен.
+        Здесь же первый вариант — единственный ИСПОЛНИМЫЙ, второй лишь назван,
+        так что ``unknown`` уходит в консервативный CF-первый порядок: он был
+        прежним поведением, и смешанное дерево ломать им нечего.
+
+        Известный предел: ``_dump_format`` определён от BASE, а не от текущего
+        корня (``detect_format`` обходит контейнер до глубины 4 и ``Ext/`` из
+        CF-подкаталога уже даёт ``cf``). В СМЕШАННОМ контейнере — CF-конфигурация
+        рядом с EDT-расширением, выбранным текущим корнем, — первым будет назван
+        ``.xml``. Второй формат подсказка называет всегда, поэтому выход у агента
+        остаётся; отдельного перечисления ради этого случая тут не делается —
+        оно стоило бы I/O на КАЖДОМ пустом ответе.
+        """
+        xml_pattern, mdo_pattern = _subsystem_glob_patterns()
+        primary = mdo_pattern if _dump_format == "edt" else xml_pattern
+        return f"glob_files({primary!r})"
+
+    def _subsystem_glob_alt() -> str:
+        """Второй формат — одним словом, чтобы подсказка не удваивалась в длине."""
+        return "'*.xml'" if _dump_format == "edt" else "'*.mdo'"
+
+    def _subsystem_git_path() -> str | None:
+        """Литеральный git-pathspec подсистем ТЕКУЩЕГО корня либо ``None``.
+
+        ``git grep`` запускается с ``-C base_path``, поэтому pathspec резолвится
+        от BASE, а не от current root: на wrapper-входе голый ``Subsystems``
+        указывает в несуществующий ``wrapper/Subsystems``, и РЕКОМЕНДОВАННЫЙ
+        хинтом вызов возвращает ЛОЖНЫЙ ноль — худший вид отказа, потому что он
+        неотличим от честного «кандидатов нет».
+
+        ``None`` означает «git-маршрут не предлагать»: ``path`` у ``git_search``
+        ЛИТЕРАЛЕН (glob-метасимволы и `..`-сегменты отвергаются), и предлагать
+        заведомо отказной вызов не лучше, чем ложный ноль. Судит сам санитайзер
+        ``git_search``, а не локальная копия его правил, — иначе два списка
+        метасимволов разъехались бы. Остаётся исполнимая glob-альтернатива.
+        """
+        from rlm_tools_bsl.bsl_index import _sanitize_grep_path
+
+        prefix = _current_rel_prefix_raw()
+        candidate = f"{prefix}/Subsystems" if prefix else "Subsystems"
+        return _sanitize_grep_path(candidate) or None
+
+    def _subsystem_output_hint(query: str) -> str:
+        """Bounded fallback использует уже существующие helpers, нового API нет."""
+        git_path = _subsystem_git_path() if _want_git_search else None
+        if git_path:
+            candidates_hint = (
+                "Если часть reverse-строк не показана, получи файлы-кандидаты через "
+                f"git_search({query!r},path={git_path!r},file_types='xml,mdo',mode='files'); "
+                f"альтернатива — {_subsystem_glob_hint()} (другой формат — {_subsystem_glob_alt()}) с точечной проверкой Content."
+            )
+        else:
+            candidates_hint = (
+                "Если часть reverse-строк не показана, получи файлы-кандидаты через "
+                f"{_subsystem_glob_hint()} (другой формат — {_subsystem_glob_alt()}) с точечной проверкой Content."
+            )
+        return (
+            "Ответ ограничен внутренним бюджетом размера — 14 000 символов: "
+            "subsystems_found — полное число найденных строк, а subsystems — "
+            "direct-first префикс. Полный состав показанной строки с "
+            "content_truncated=True читай из XML по file. "
+            f"{candidates_hint}"
         )
 
-        if not subsystem_files:
-            return {
-                "error": f"Подсистема '{name}' не найдена",
-                "hint": "Попробуйте glob_files('**/Subsystems/**') для просмотра всех подсистем",
-            }
+    def _classify_subsystem_content(content: list[str], limit: int, *, total_objects: int | None = None) -> dict:
+        """Общий классификатор состава для ОБЕИХ веток — именно он и сводит форму.
 
-        results = []
+        Раньше классификация жила ТОЛЬКО в живой ветке, поэтому индексная не
+        могла отдать те же ключи даже теоретически. ``content`` — именно
+        показываемая часть: полный состав для прямой строки и совпавшие refs для
+        обратной. ``total_objects`` при этом остаётся размером полного состава.
+        """
+        custom, standard, raw = [], [], []
+        total = len(content) if total_objects is None else total_objects
+        shown = 0
+        for item in content:
+            if shown >= limit:
+                break
+            parts = item.split(".", 1)
+            obj_type = parts[0] if parts else ""
+            obj_name = parts[1] if len(parts) > 1 else item
+            is_custom = bool(obj_name) and obj_name[0].islower()
+            entry = {"type": obj_type, "name": obj_name, "is_custom": is_custom}
+            (custom if is_custom else standard).append(entry)
+            raw.append(item)
+            shown += 1
+        return {
+            "total_objects": total,
+            "custom_objects": custom,
+            "standard_objects": standard,
+            "raw_content": raw,
+            "objects_returned": shown,
+            "content_truncated": shown < total,
+        }
+
+    def _subsystem_path_candidate(path: str, q: str) -> tuple[str, bool]:
+        """(структурное имя, был ли путь достижим прежним query-bearing glob)."""
+        rel = (path or "").replace("\\", "/")
+        parts = rel.split("/")
+        basename = parts[-1] if parts else ""
+        stem = Path(basename).stem
+        is_cf_sibling = len(parts) >= 2 and parts[-2] == "Subsystems"
+        is_edt = len(parts) >= 3 and parts[-3] == "Subsystems" and parts[-2] == stem and rel.lower().endswith(".mdo")
+        is_cf_ext = (
+            len(parts) >= 4 and parts[-4] == "Subsystems" and parts[-2] == "Ext" and rel.lower().endswith(".xml")
+        )
+        structural_name = parts[-3] if is_cf_ext else stem
+        if not (is_cf_sibling or is_edt or is_cf_ext):
+            structural_name = ""
+        return structural_name, bool(q and q in basename.lower())
+
+    def _analyze_subsystem_live(
+        name: str,
+        candidate_files: list[str] | None = None,
+        *,
+        force_current_root_fs: bool = False,
+    ) -> list[dict]:
+        """Живой путь: перечисление XML подсистем через штатный glob + разбор.
+
+        При любом подключённом ридере, чей subsystem-lookup неприменим, берётся
+        приватная FS-only реализация ТОГО ЖЕ glob текущего корня:
+        ``source='live'`` не имеет права маскировать индексный каталог кандидатов
+        под живое перечисление.
+
+        Обратный вопрос здесь недостижим: XML подсистемы ищется по ИМЕНИ ФАЙЛА,
+        поэтому имя входящего объекта соответствующего файла не найдёт никогда.
+
+        ``candidate_files`` — внутренний точечный маршрут для XML, которые не
+        могут иметь строку ``subsystem_content`` (в частности, пустой Content).
+        ``None`` означает перечисление всех структурных ПУТЕЙ с обязательным
+        prefilter ДО XML-разбора; ``[]`` — доказанно нет кандидатов.
+        """
+        q = name.lower()
+        if not q:
+            return []  # public guard выше; defense-in-depth против empty synonym/path
+
+        if candidate_files is None:
+            found_files: list[str] = []
+            enumerate_glob = glob_files_fn
+            if force_current_root_fs:
+                # Публичный glob_files_fn при переданном ридере сам index-backed.
+                # Его нельзя вызывать на ЛЮБОМ live-fallback: при foreign reader
+                # он перечислил бы чужой корень, а при no-metadata/legacy/transient
+                # ридере — stale file_paths текущего корня, и выдал бы это за live.
+                enumerate_glob = glob_files_fs_fn
+                if not callable(enumerate_glob):
+                    return []
+            # Паттерны ЯКОРНЫЕ (`Subsystems/**`), а НЕ `**/Subsystems/**`: форма
+            # `**/Dir/**/*.ext` уходит в индексную стратегию `under_prefix_ext` с
+            # предикатом `dir_path LIKE '%/Subsystems/%'`, который требует слэш И
+            # перед, И после имени каталога, — поэтому подсистемы ВЕРХНЕГО уровня
+            # (`dir_path='Subsystems'`) не проходят. `Subsystems/**/*.ext` идёт
+            # стратегией `prefix_recursive_ext` и на ОБОИХ маршрутах — индексном и
+            # ФС — даёт ОДНО И ТО ЖЕ множество, включая вложенные
+            # `Subsystems/Родитель/Subsystems/X.xml` и EDT `Subsystems/X/X.mdo`.
+            # Паттерн якорится на ТЕКУЩЕМ корне, а не на base: оба glob-канала
+            # (FS и индексный) работают ОТ base, и на поддержанном wrapper-входе
+            # голый `Subsystems/**` не увидел бы НИ ОДНОЙ подсистемы фактической
+            # конфигурации (`wrapper/MyExt/Subsystems/...`). До v1.36.0 живая
+            # ветка ходила рекурсивным `**/Subsystems/**` и такие файлы видела —
+            # префикс возвращает потерянное покрытие, не расширяя его на соседей.
+            for pattern in _subsystem_glob_patterns():
+                found_files.extend(enumerate_glob(pattern))
+            # Фильтр ОСТАВЛЕН ДОСЛОВНО прежним (`"Subsystem" in f`): на этом
+            # маршруте он no-op (паттерн уже якорится на каталоге `Subsystems`),
+            # и трогать его в bugfix-релизе незачем.
+            subsystem_files = sorted(
+                dict.fromkeys(f for f in found_files if "Subsystem" in f and f.lower().endswith((".xml", ".mdo")))
+            )
+        else:
+            subsystem_files = sorted(dict.fromkeys(candidate_files))
+
+        rows: list[dict] = []
         for sf in subsystem_files:
+            structural_name, legacy_candidate = _subsystem_path_candidate(sf, q)
+            # glob обязан быть case-insensitive по смыслу, но это не разрешение
+            # парсить каждый XML. Старый маршрут допускал basename, новый
+            # structural exact нужен только для поддержанных layout, особенно
+            # CF-Ext с basename `Subsystem.xml`.
+            if not legacy_candidate and structural_name.lower() != q:
+                continue
             try:
                 meta = parse_object_xml(sf)
             except Exception:
                 continue
             if not meta or meta.get("object_type") != "Subsystem":
                 continue
-
-            content = meta.get("content", [])
-            custom_objects = []
-            standard_objects = []
-            for item in content:
-                parts = item.split(".", 1)
-                obj_type = parts[0] if parts else ""
-                obj_name = parts[1] if len(parts) > 1 else item
-                is_custom = bool(obj_name) and obj_name[0].islower()
-                entry = {"type": obj_type, "name": obj_name, "is_custom": is_custom}
-                if is_custom:
-                    custom_objects.append(entry)
-                else:
-                    standard_objects.append(entry)
-
-            results.append(
+            # Отбор — ТОЧНЫЙ регистронезависимый. Подстрока по имени файла
+            # (прежнее поведение) помечала бы `match='name'` чужие подсистемы: на
+            # боевом ДО3 запрос `Почта` давал 4 кандидата, из них `ВстроеннаяПочта`
+            # и `ЛегкаяПочта` — не совпадения ни по имени, ни по синониму. Синоним
+            # сохранён намеренно только для прежнего basename-кандидата.
+            sub_name = meta.get("name") or ""
+            sub_syn = meta.get("synonym") or ""
+            if sub_name.lower() == q:
+                match = "name"
+            elif legacy_candidate and sub_syn and sub_syn.lower() == q:
+                match = "synonym"
+            else:
+                continue
+            content = meta.get("content", []) or []
+            rows.append(
                 {
+                    "name": sub_name,
+                    "synonym": sub_syn,
                     "file": sf,
-                    "name": meta.get("name", ""),
-                    "synonym": meta.get("synonym", ""),
-                    "total_objects": len(content),
-                    "custom_objects": custom_objects,
-                    "standard_objects": standard_objects,
-                    "raw_content": content,
+                    "match": match,
+                    # До финализатора обе ссылки внутренние: наружу они не уезжают.
+                    # Для direct видимая часть равна полному составу; общий budget
+                    # будет применён позже вместе с индексными строками.
+                    "_full_content": list(content),
+                    "_visible_content": list(content),
                 }
             )
+        return rows
 
-        return {"subsystems_found": len(results), "subsystems": results}
+    def analyze_subsystem(name: str, limit: int = _SUBSYSTEM_LIMIT_DEFAULT) -> dict:
+        """Подсистема по имени: СОСТАВ подсистемы (match='name') и подсистемы,
+        СОДЕРЖАЩИЕ объект с таким именем (match='content') — в одной форме.
+
+        До v1.36.0 индексная и живая ветки отвечали РАЗНЫМИ наборами ключей и на
+        РАЗНЫЕ вопросы: на проиндексированной конфигурации (штатный боевой случай)
+        хелпер молча отвечал только на обратный вопрос, а ``total_objects`` был
+        длиной списка совпавших ссылок — на боевом ДО3 это давало 4 при реальном
+        составе 124. Обе ветки теперь строят строку одним классификатором
+        ``_classify_subsystem_content``, поэтому разъехаться заново они не могут.
+
+        Args:
+            name: имя подсистемы ИЛИ имя объекта (префикс типа снимается).
+            limit: общий потолок числа объектов во ВСЁМ ответе (default 200).
+                Расходуется после сортировки direct-first; ``total_objects``
+                limit-ом НЕ режется. Независимый приватный JSON-бюджет может
+                вернуть меньше объектов/строк; это видно по ``content_truncated``,
+                ``subsystems_found > len(subsystems)`` и ``hint``.
+
+        Returns: см. docs/HELPERS.md — форма едина на обеих ветках.
+        """
+        name = _strip_meta_prefix(name)
+        limit, _w = _coerce_bound(limit, _SUBSYSTEM_LIMIT_DEFAULT, "limit", "analyze_subsystem(name, limit=200)")
+        _warn_bound(_w)
+
+        def _current_root_scope_hint() -> str:
+            """Объяснить границу, не выполняя новый detector и не делая CFE merge."""
+            role = str(current_config_role or "").strip().lower()
+            if role == "extension":
+                return (
+                    "Текущий корень — расширение: его состав включен, но nearby main "
+                    "и другие CFE не наложены; _meta.extensions_included=False означает "
+                    "отсутствие наложения соседних extension roots."
+                )
+            if _ext_paths_raw:
+                return "Текущий корень — main; nearby расширения (CFE) не наложены: _meta.extensions_included=False."
+            return ""
+
+        def _available_route_meta() -> dict:
+            """Единый bounded ``_meta`` для validation до subsystem lookup."""
+            # Прямой idx_reader.get_build_capabilities() здесь запрещён: его
+            # реальный sqlite3.OperationalError намеренно пробрасывается ридером,
+            # а validation обязан остаться bounded. Существующая helper-обёртка
+            # деградирует любой capability-отказ в None.
+            native_reader = idx_reader is not None and not _optional_index_is_foreign()
+            caps = _read_build_capabilities() if native_reader else None
+            reverse_lookup_supported = bool(native_reader and caps and caps.get("has_metadata"))
+            return {
+                "source": "index" if reverse_lookup_supported else "live",
+                "limit": limit,
+                "reverse_lookup_supported": reverse_lookup_supported,
+                "extensions_included": False,
+            }
+
+        if not name.strip():
+            hint = "Передай непустое имя подсистемы либо объекта."
+            scope_hint = _current_root_scope_hint()
+            if scope_hint:
+                hint = f"{hint} {scope_hint}"
+            return {
+                "error": "Пустой запрос analyze_subsystem",
+                "hint": hint,
+                "_meta": _available_route_meta(),
+            }
+
+        # Иначе один пользовательский аргумент длиннее output-budget сделал бы
+        # невыполнимым даже пустой bounded-ответ и превратил финальный assert в
+        # достижимый crash. Полное значение намеренно не эхоится.
+        if len(name) > _SUBSYSTEM_QUERY_MAX:
+            # Само наличие ридера ничего не доказывает: публичный build допускает
+            # build_metadata=False, а get_subsystem_lookup тогда штатно вернёт None.
+            meta = _available_route_meta()
+            hint = (
+                f"Имя/ссылка длиннее {_SUBSYSTEM_QUERY_MAX} символов; передай имя "
+                "подсистемы либо объекта, а не XML/код целиком."
+            )
+            scope_hint = _current_root_scope_hint()
+            if scope_hint:
+                hint = f"{hint} {scope_hint}"
+            return {"error": "Слишком длинный запрос analyze_subsystem", "hint": hint, "_meta": meta}
+
+        rows: list[dict] = []
+        source = "index"
+        # Production server выбирает БД по hash корня, но make_bsl_helpers
+        # поддерживает legacy/direct embedding. Там чужой статичный ридер уже
+        # признан достижимым и гейтится этим же предикатом в соседних optional
+        # index-доменах. Публиковать его строки как полный current-root нельзя.
+        reader_is_foreign = idx_reader is not None and _optional_index_is_foreign()
+        lookup = getattr(idx_reader, "get_subsystem_lookup", None)
+        if idx_reader is not None and not reader_is_foreign and callable(lookup):
+            # Новый reader-метод — optional fast path. Старый duck-typed adapter
+            # без него сохраняет live-поведение вместо AttributeError.
+            found = lookup(name)
+            if found is None:
+                # Таблицы нет / транзиентный сбой -> live, где семантика объявлена явно.
+                source = "live"
+            else:
+                # ОДИН вызов ридера, ОДИН проход по таблице: обе группы и весь
+                # СОХРАНЁННЫЙ состав доступны ВНУТРИ для total_objects. Для
+                # представленной строки состояние «часть состава недоступна»
+                # невозможно: всё сохранённое пришло одним проходом или не пришло
+                # ничего. Покрытие файлов самим metadata-builder здесь не выводится.
+                #
+                # Строки ридера отсекаются по ТЕКУЩЕМУ корню: индекс построен от
+                # base, а при wrapper-входе base шире `current_config_root`, и
+                # подсистема соседнего `wrapper/Other/...` — состав ДРУГОЙ
+                # конфигурации. Без этого ответ смешивал бы два корня, объявляя
+                # при этом `extensions_included=False`. На direct-входе (base ==
+                # current) предикат — no-op, и штатный ответ не меняется.
+                for r in found["direct"]:
+                    if not _rel_within_current_root(r["file"]):
+                        continue
+                    rows.append(
+                        {
+                            "name": r["name"],
+                            "synonym": r["synonym"],
+                            "file": r["file"],
+                            "match": r["matched_by"],  # "name" | "synonym"
+                            # Публичная форма строится только после сортировки; чистая
+                            # проекция может пересчитаться при подборе JSON-budget.
+                            "_full_content": list(r["content"]),
+                            "_visible_content": list(r["content"]),
+                        }
+                    )
+                for r in found["containing"]:
+                    if not _rel_within_current_root(r["file"]):
+                        continue
+                    rows.append(
+                        {
+                            "name": r["name"],
+                            "synonym": r["synonym"],
+                            "file": r["file"],
+                            "match": "content",
+                            "_full_content": list(r["content"]),
+                            # Обратная строка показывает только refs, ради которых
+                            # она найдена; весь состав берётся вторым точным вызовом
+                            # по name и не размножается по десяткам строк.
+                            "_visible_content": list(r["matched_refs"]),
+                        }
+                    )
+
+                # Пустой <Content> не создаёт строк subsystem_content. Ридер
+                # возвращает только пути-кандидаты из существующих каталогов;
+                # helper разбирает XML и ещё раз проверяет Name либо допустимый
+                # legacy Synonym, поэтому путь не превращается в ложную «пустую
+                # подсистему».
+                synonym_candidates_supported = found.get("synonym_candidates_supported", False)
+                # Кандидаты — тот же домен, что и строки выше: путь соседнего корня
+                # не имеет права попасть в точечный разбор XML текущего.
+                candidate_files = [c for c in found.get("direct_candidates", []) if _rel_within_current_root(c)]
+                if candidate_files or not synonym_candidates_supported:
+                    supplement = _analyze_subsystem_live(
+                        name,
+                        candidate_files=candidate_files if synonym_candidates_supported else None,
+                    )
+
+                    # Ключ НОРМАЛИЗУЕТСЯ по разделителю: строки ридера несут `file`
+                    # в POSIX, а живые приходят из `glob_files`, который приводит
+                    # разделитель к `os.sep`. На Windows сырой ключ дал бы
+                    # `Subsystems/Почта.xml` и `Subsystems\Почта.xml` как РАЗНЫЕ
+                    # строки — одна подсистема пришла бы дважды.
+                    def _key(r):
+                        return (r["name"].lower(), (r["file"] or "").replace("\\", "/"))
+
+                    existing = {_key(r) for r in rows}
+                    rows.extend(r for r in supplement if _key(r) not in existing)
+        else:
+            source = "live"
+
+        if source == "live":
+            # Живая ветка отвечает ТОЛЬКО на прямой вопрос. Набор ключей тот же,
+            # match — 'name' либо 'synonym'. Если ридер подключён, lookup уже
+            # признан непригодным (foreign, has_metadata=False, transient None либо
+            # старый duck-reader). Поэтому и КАТАЛОГ кандидатов обязан быть
+            # live/current-root: обычный glob_files_fn снова полез бы в file_paths
+            # того же ридера и мог бы молча пропустить файл, появившийся ДО старта
+            # этой сессии.
+            rows = _analyze_subsystem_live(name, force_current_root_fs=idx_reader is not None)
+
+        if not rows:
+            # Пустой ответ обязан объяснять СЕБЯ, а не общий контракт хелпера.
+            # Прежний текст обещал обратный поиск и на живой ветке, где его нет
+            # вовсе: агент, спросивший про объект без индекса, читал бы «объект ни
+            # в одну подсистему не входит» и получал бы подтверждение из hint.
+            meta = {
+                "source": source,
+                "limit": limit,
+                "reverse_lookup_supported": source == "index",
+                # Состав nearby CFE намеренно не накладывается в этом точечном
+                # bugfix; ложной полноты быть не должно.
+                "extensions_included": False,
+            }
+            if source == "index":
+                hint = (
+                    "Проверь имя: analyze_subsystem принимает и имя ПОДСИСТЕМЫ "
+                    "(match='name' — ее состав), и имя ОБЪЕКТА (match='content' — "
+                    "подсистемы, куда объект входит). Пусто означает отсутствие "
+                    "среди успешно разобранных строк индекса; has_metadata — "
+                    "build-опция, не сертификат каждого XML. Список подсистем — "
+                    f"{_subsystem_glob_hint()} (другой формат — {_subsystem_glob_alt()})."
+                )
+            else:
+                hint = (
+                    "Индексный subsystem-lookup недоступен или не применим: на живой "
+                    "ветке ищется ТОЛЬКО подсистема "
+                    "по ее ИМЕНИ. Если ты передал имя ОБЪЕКТА, пустой ответ ничего "
+                    "не доказывает — обратный поиск здесь не поддержан "
+                    "(_meta.reverse_lookup_supported=False). Собери индекс "
+                    "(rlm_index build) либо проверь имя подсистемы через "
+                    f"{_subsystem_glob_hint()} (другой формат — {_subsystem_glob_alt()})."
+                )
+            scope_hint = _current_root_scope_hint()
+            if scope_hint:
+                hint = f"{hint} {scope_hint}"
+            return {"error": f"Подсистема или объект '{name}' не найдены", "hint": hint, "_meta": meta}
+
+        _order = {"name": 0, "synonym": 1, "content": 2}
+        # Сначала окончательный наблюдаемый порядок, ПОТОМ единый бюджет. Иначе
+        # строки content могли бы съесть limit до прямого ответа, а одинаковые
+        # имена в двух файлах зависели бы от порядка SQLite.
+        rows.sort(key=lambda r: (_order[r["match"]], r["name"].lower(), (r["file"] or "").replace("\\", "/").lower()))
+        all_rows = rows
+        subsystems_found = len(all_rows)  # ДО count/output truncation
+        q = name.lower()
+        meta = {
+            "source": source,
+            "limit": limit,
+            # Живая ветка обратный вопрос не решает — это ОБЪЯВЛЕНО, а не
+            # обнаружено пустым ответом.
+            "reverse_lookup_supported": source == "index",
+            # Значение относится к overlay nearby CFE. Текущий root при роли
+            # extension всё равно читается.
+            "extensions_included": False,
+        }
+        base_hints: list[str] = []
+        if source == "live":
+            base_hints.append(
+                "Индексный subsystem-lookup недоступен или не применим: отвечен ТОЛЬКО "
+                "прямой вопрос (состав подсистемы по "
+                "ее точному имени; match='synonym' сохраняется только для прежнего "
+                "basename-кандидата). Обратный вопрос — в какие "
+                "подсистемы входит объект — на живой ветке не поддержан, см. "
+                "_meta.reverse_lookup_supported. Собери индекс (rlm_index build), чтобы "
+                "получить обе половины."
+            )
+        scope_hint = _current_root_scope_hint()
+        if scope_hint:
+            base_hints.append(scope_hint)
+
+        def _public_row(row: dict, shown_limit: int) -> dict:
+            """Проекция без pop: второй budget-pass обязан видеть те же internal rows."""
+            full_content = row["_full_content"]
+            visible_content = row["_visible_content"]
+            payload = _classify_subsystem_content(visible_content, shown_limit, total_objects=len(full_content))
+            shown = payload["raw_content"]
+            return {
+                **{k: v for k, v in row.items() if not k.startswith("_")},
+                # matched_refs — показанная часть, а не второй неограниченный
+                # список поверх raw_content.
+                "matched_refs": [c for c in shown if q in c.lower()],
+                **payload,
+            }
+
+        def _out(public_rows: list[dict], *, output_cut: bool) -> dict:
+            hints = list(base_hints)
+            if output_cut:
+                hints.append(_subsystem_output_hint(name))
+            result = {
+                "query": name,
+                "subsystems_found": subsystems_found,
+                "subsystems": public_rows,
+                "_meta": meta,
+            }
+            if hints:
+                result["hint"] = " ".join(hints)
+            return result
+
+        # Первый pass применяет только прежний общий object-limit. Если он уже
+        # помещается, форма и число строк не меняются вообще — соседние компактные
+        # ответы не платят за новый предохранитель.
+        remaining = limit
+        count_limited_rows: list[dict] = []
+        count_pass_overflow = False
+        for row in all_rows:
+            desired = min(remaining, len(row["_visible_content"]))
+            public = _public_row(row, desired)
+            count_limited_rows.append(public)
+            remaining -= public["objects_returned"]
+            # Не строим заведомо огромный промежуточный JSON: как только cap
+            # пересечен, переходим к bounded-pass. До 14K это десятки строк, так
+            # что повторная сериализация дешевле неограниченного временного буфера.
+            if len(json.dumps(_out(count_limited_rows, output_cut=False), ensure_ascii=False)) > _SUBSYSTEM_JSON_BUDGET:
+                count_pass_overflow = True
+                break
+        out = _out(count_limited_rows, output_cut=False)
+        if not count_pass_overflow and len(count_limited_rows) == len(all_rows):
+            return out
+
+        # Второй pass включается ТОЛЬКО на реально тяжелом ответе. Hint о срезе
+        # участвует в КАЖДОЙ пробной сериализации, поэтому сам hint не вытолкнет
+        # финальный результат за бюджет. Для каждой строки бинарным поиском берется
+        # максимальное число refs; если не помещается даже оболочка, останавливаемся.
+        remaining = limit
+        public_rows: list[dict] = []
+        for row in all_rows:
+            desired = min(remaining, len(row["_visible_content"]))
+
+            def _fits(n: int, _row=row, _public_rows=public_rows) -> tuple[bool, dict]:
+                candidate = _public_row(_row, n)
+                trial = _out([*_public_rows, candidate], output_cut=True)
+                return (
+                    len(json.dumps(trial, ensure_ascii=False)) <= _SUBSYSTEM_JSON_BUDGET,
+                    candidate,
+                )
+
+            fits_empty, best_row = _fits(0)
+            if not fits_empty:
+                break
+            lo, hi = 0, desired
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                fits, candidate = _fits(mid)
+                if fits:
+                    lo, best_row = mid, candidate
+                else:
+                    hi = mid - 1
+            if lo == 0:
+                _, best_row = _fits(0)
+            public_rows.append(best_row)
+            remaining -= best_row["objects_returned"]
+            if lo < desired:
+                break  # текущая строка уже заполнила доступный JSON-бюджет
+
+        out = _out(public_rows, output_cut=True)
+        # Это внутренний инвариант сборщика, а не тест «на глазок» одной CF.
+        assert len(json.dumps(out, ensure_ascii=False)) <= _SUBSYSTEM_JSON_BUDGET
+        return out
 
     def find_custom_modifications(
         object_name: str,
@@ -6006,23 +6748,30 @@ def make_bsl_helpers(
                 all_index_used = False
             if m_meta.get("skipped_live"):
                 any_skipped_live = True
-            module_entries.append(
-                {
-                    "path": rel,
-                    "module_type": info.module_type,
-                    "form_name": info.form_name,
-                    # Готовый owner ПРОЕЦИРУЕТСЯ, а не считается заново.
-                    "owner": outline.get("owner"),
-                    "totals": totals,
-                    "outline": outline.get("outline", []),
-                    "overrides": {"count": len(ov_methods), "methods": ov_methods},
-                    "_meta": {
-                        "index_used": bool(m_meta.get("index_used")),
-                        "fallback_reason": m_meta.get("fallback_reason"),
-                        "skipped_live": bool(m_meta.get("skipped_live")),
-                    },
-                }
-            )
+            entry = {
+                "path": rel,
+                "module_type": info.module_type,
+                "form_name": info.form_name,
+                # Готовый owner ПРОЕЦИРУЕТСЯ, а не считается заново.
+                "owner": outline.get("owner"),
+                "totals": totals,
+                "outline": outline.get("outline", []),
+                "overrides": {"count": len(ov_methods), "methods": ov_methods},
+                "_meta": {
+                    "index_used": bool(m_meta.get("index_used")),
+                    "fallback_reason": m_meta.get("fallback_reason"),
+                    "skipped_live": bool(m_meta.get("skipped_live")),
+                },
+            }
+            if include_methods:
+                # Ядро отдаёт orphan_methods РОВНО при include_methods (в т.ч. []
+                # на skipped/parse_failed ветках), поэтому .get с дефолтом здесь —
+                # защита от рассинхрона ядра, а не маскировка отсутствия данных.
+                # Без этой проекции на модуле без единой #Область агрегат отдавал
+                # верное totals.methods и НИ ОДНОГО имени: outline пуст, а класть
+                # имена было некуда (7 модулей из 9 на боевом ВходящееПисьмо).
+                entry["orphan_methods"] = outline.get("orphan_methods", [])
+            module_entries.append(entry)
             roll_methods += totals.get("methods", 0)
             roll_exports += totals.get("exports", 0)
             roll_overrides += len(ov_methods)
@@ -6078,10 +6827,19 @@ def make_bsl_helpers(
             ``{object_name, category,
                modules: [{path, module_type, form_name,
                           totals:{methods,exports,regions,loc}, outline:[...],
-                          overrides:{count, methods:[...]}, _meta:{index_used, fallback_reason}}],
+                          overrides:{count, methods:[...]}, orphan_methods?,
+                          _meta:{index_used, fallback_reason}}],
                totals: {modules, methods, exports, overrides},
                _meta: {index_used, modules_truncated}}``
             либо ``{error, _meta}`` если объект не найден.
+
+            ``orphan_methods`` присутствует в строке модуля ТОГДА И ТОЛЬКО ТОГДА,
+            когда ``include_methods=True``; форма элемента — та же, что у
+            ``get_module_outline``: ``{name, type, is_export, line, end_line, loc}``.
+            Это методы ВНЕ любой ``#Область``: на модуле без единой области там
+            лежат ВСЕ методы, а ``outline`` пуст. До v1.36.0 их имена не
+            проецировались вовсе, и «дешёвый скелет» приходилось добирать
+            вторым вызовом ``extract_procedures``.
 
         Дизамбигуация: метаданные → ``get_object_full_structure``; код-скелет →
         ``get_object_modules``; тяжёлый разбор тел → ``analyze_object``.
@@ -9711,33 +10469,46 @@ def make_bsl_helpers(
 
         # --- ManagerModule: ДобавитьКомандыСозданияНаОсновании ---
         mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
+        # Дедуп по (category, document): одна и та же команда, зарегистрированная
+        # дважды в одном модуле ИЛИ в main+CFE, — ОДНА логическая связь, а не две.
+        # Категория включена в identity ради согласованности с metadata-union ниже,
+        # который засевает свой `seen_keys` из ЭТИХ ЖЕ строк; у direct ManagerModule
+        # она всегда `Documents`. `file` — provenance первого вхождения, не identity.
+        cf_seen: dict[tuple[str, str], dict] = {}
         for mod in mgr_modules:
             path = mod["path"]
             body = read_procedure(path, "ДобавитьКомандыСозданияНаОсновании")
             if body:
                 create_re = re.compile(r"Документы\.(\w+)\.ДобавитьКоманду\w*НаОснован", re.IGNORECASE)
                 for m in create_re.finditer(body):
-                    result["can_create_from_here"].append(
-                        {
-                            "document": m.group(1),
-                            "file": path,
-                        }
+                    raw_document = m.group(1)
+                    # Ключ — по lower() (тот же нормализатор, что у metadata-union и
+                    # у `py_lower` индекса), но в ответ уезжает ПЕРВОЕ написание.
+                    cf_seen.setdefault(
+                        ("documents", raw_document.lower()),
+                        {"document": raw_document, "file": path},
                     )
+        result["can_create_from_here"] = list(cf_seen.values())
 
         # --- ObjectModule: ОбработкаЗаполнения ---
         obj_modules = [m for m in modules if m.get("module_type") == "ObjectModule"]
+        # Дедуп по type_lower: один и тот же тип, проверяемый в двух ветках
+        # обработчика ИЛИ в main+CFE, — ОДНО логическое основание, а не два.
+        # Порядок ПЕРВОГО появления сохраняется (dict сохраняет порядок вставки):
+        # он наблюдаем — агент читает список сверху вниз.
+        cb_seen: dict[str, dict] = {}
         for mod in obj_modules:
             path = mod["path"]
             body = read_procedure(path, "ОбработкаЗаполнения")
             if body:
                 type_re = re.compile(r'Тип\("(\w+Ссылка\.\w+)"\)', re.IGNORECASE)
                 for m in type_re.finditer(body):
-                    result["can_be_created_from"].append(
-                        {
-                            "type": m.group(1),
-                            "file": path,
-                        }
-                    )
+                    raw_type = m.group(1)
+                    # Ключ — по lower(), но в ответ уезжает ПЕРВОЕ написание:
+                    # 1С регистронезависима, однако агент увидит в коде именно
+                    # исходное написание, и подменять его нормализованным нельзя.
+                    cb_seen.setdefault(raw_type.lower(), {"type": raw_type, "file": path})
+        result["can_be_created_from"] = list(cb_seen.values())
 
         # --- Reverse scan для can_create_from_here ---
         # Только если прямой обход ничего не нашёл — иначе дёшево пропускаем.
@@ -10919,7 +11690,12 @@ def make_bsl_helpers(
                 return True
         return False
 
-    def find_functional_options(object_name: str, include_code: bool = True, limit: int | None = None) -> dict:
+    def find_functional_options(
+        object_name: str,
+        include_code: bool = True,
+        limit: int | None = None,
+        include_content: bool = True,
+    ) -> dict:
         """Find functional options that affect a given object.
         Also greps BSL modules for ПолучитьФункциональнуюОпцию("X") pattern.
         Uses SQLite index for XML options when available.
@@ -10936,6 +11712,17 @@ def make_bsl_helpers(
                 режутся КАЖДЫЙ независимо до ``limit`` (``limit=10`` → до 10+10, НЕ 10
                 суммарно) — зеркало ``find_event_subscriptions``. Защита от обрыва по
                 ``max_output_chars`` на объектах с сотнями опций.
+            include_content: ``True`` (default, backcompat) — строка ``xml_options``
+                несёт полный ``content`` опции. ``False`` — ``content`` в строку НЕ
+                сериализуется, вместо него едет ``content_size: int`` (число
+                элементов состава). Состав опции и есть основной вес обзора: на
+                боевой конфигурации 198 ФО дают ~105K символов при
+                ``max_output_chars`` 15000. ОДИН этот рычаг бюджета не спасает
+                (~48K на всех 198), как не спасает и ``limit=50`` в одиночку
+                (~29K); он делает ДОСТАТОЧНОЙ уже существующую пагинацию —
+                комбинация ``include_content=False, limit=50`` даёт ~12K.
+                Отбор строк от него не зависит: ``xml_total``/``code_total``
+                одинаковы при любом значении.
 
         **Матчинг ``xml_options`` — ТОЧНЫЙ (v1.30.0)**, а не подстрочный: typed-ввод
         (``Документ.X``/``Document.X``) матчится по канонической категории и включает
@@ -10951,7 +11738,19 @@ def make_bsl_helpers(
         непустого object_name), ``returned`` (len(xp)+len(cp)), ``has_more``
         (per-bucket). Пустой code-обзор сохраняет бюджет 20 модулей; если каталог
         больше, пагинированный ответ помечен ``partial=True`` и ``total`` считается
-        только по проверенному code-срезу."""
+        только по проверенному code-срезу.
+
+        **Имя опции — ОБЩИЙ ключ обеих корзин (v1.36.0):** и ``xml_options[i]["name"]``,
+        и ``code_options[i]["name"]`` — строка с именем ФО, поэтому общий цикл
+        ``for o in xml+code: o["name"]`` больше не получает ``None`` на половине
+        строк. ``code_options[i]["option_name"]`` СОХРАНЁН и равен ``name``.
+
+        **``content`` / ``content_size`` взаимоисключающи.** При
+        ``include_content=True`` (default) строка ``xml_options`` несёт ``content``
+        (всегда список) и НЕ несёт ``content_size``; при ``include_content=False`` —
+        наоборот. ``content_size == 0`` означает ДОКАЗАННО ПУСТОЙ ``<Content>``
+        опции, а НЕ «состав недоступен»: оба производителя строк (индексный ридер
+        и живой парсер XML) кладут в ``content`` список либо не отдают строку вовсе."""
         # Классификация typed/bare — по СЫРОМУ вводу, до strip (см. _canonical_fo_ref).
         canonical_ref = _canonical_fo_ref(object_name)
         # legacy-имя остаётся ЕДИНСТВЕННЫМ публичным/`name_hint` значением: strip
@@ -11041,9 +11840,16 @@ def make_bsl_helpers(
                     # Extract option name from ПолучитьФункциональнуюОпцию("OptionName")
                     m = re.search(r'ПолучитьФункциональнуюОпцию\(\s*"([^"]+)"', text, re.IGNORECASE)
                     if m:
+                        opt = m.group(1)
                         code_options.append(
                             {
-                                "option_name": m.group(1),
+                                # `name` — ОБЩИЙ ключ обеих корзин ОДНОГО ответа:
+                                # до v1.36.0 xml-строки звали имя `name`, code-строки
+                                # `option_name`, и общий цикл по xml+code получал
+                                # None на половине строк. `option_name` СОХРАНЁН:
+                                # он часть уже наблюдаемого контракта.
+                                "name": opt,
+                                "option_name": opt,
                                 "file": r.get("file", ""),
                                 "line": r.get("line", 0),
                             }
@@ -11138,6 +11944,19 @@ def make_bsl_helpers(
         # читает её как «столько функциональных опций у объекта». Два прогона подряд
         # (e2e 1.30.0 и 1.33.0) на этом давали 167 вместо точных 34. На вопрос
         # «сколько ФО у объекта» отвечает `xml_total`.
+        # Проекция состава — ОДНА точка на все ветки отбора (index-exact,
+        # index-overview, live). Иначе три ветки разъедутся, как разъехались
+        # формы analyze_subsystem. Строятся НОВЫЕ dict-ы, поэтому кеш
+        # `_ensure_functional_options()` живой ветки не мутируется.
+        # `or []` — defense-in-depth для duck-typed ридера: у обоих штатных
+        # производителей `content` всегда список, и `content_size == 0` означает
+        # ДОКАЗАННО пустой состав, а не недоступный.
+        if not include_content:
+            xml_options = [
+                {**{k: v for k, v in fo.items() if k != "content"}, "content_size": len(fo.get("content") or [])}
+                for fo in xml_options
+            ]
+
         xt, ct = len(xml_options), len(code_options)
         # Ветка без limit (v1.34.0): totals появляются ВСЕГДА, но пагинации в ней
         # по-прежнему нет — отсутствие `returned`/`has_more` само различает ветки.
@@ -14479,8 +15298,19 @@ def make_bsl_helpers(
     _reg(
         "find_by_type",
         find_by_type,
-        "find_by_type(meta_type|category, name='', limit=50, count_only=False) -> same | count_only: {total, unique_objects, source, extensions_included, ...}  # строка = МОДУЛЬ, не объект: объектов — unique_objects. Categories: Documents, Catalogs, CommonModules, InformationRegisters, AccumulationRegisters, Reports, DataProcessors",
+        "find_by_type(meta_type|category, name='', limit=50, count_only=False) -> same | count_only: {total, unique_objects, source, extensions_included, ...}  # строка = МОДУЛЬ, не объект: объектов — unique_objects",
         "discovery",
+        None,
+        "FIND BY TYPE:\n"
+        "  # Категории (канон): Documents, Catalogs, CommonModules, InformationRegisters,\n"
+        "  # AccumulationRegisters, Reports, DataProcessors и остальные каталоги выгрузки.\n"
+        "  # Принимаются и сокращенные/единственное число (Document, InformationRegister),\n"
+        "  # и русские (Документ, Справочник, РегистрСведений).\n"
+        "  docs = find_by_type('Documents', limit=50)\n"
+        "  # Строка выдачи — МОДУЛЬ, а не объект: «сколько документов» отвечает\n"
+        "  # count_only=True -> unique_objects (один проход, без break).\n"
+        "  census = find_by_type('Documents', count_only=True)\n"
+        "  print(census['total'], census['unique_objects'])",
     )
 
     _reg(
@@ -14540,7 +15370,7 @@ def make_bsl_helpers(
     _reg(
         "find_callers_context",
         find_callers_context,
-        "find_callers_context(proc(str|list), module_hint, 0, 50) -> {callers: [{file, caller_name, line, ...}], _meta: {total_callers, returned, offset, has_more, exact_available, target_exact, exact_rows, fallback_rows}}  # list имён → {proc: {callers,_meta}|{error}} (общий module_hint/offset/limit на все имена; {error} на упавшем элементе); exact_rows/fallback_rows: точные (по callee_key) vs эвристические (по имени) рёбра",
+        "find_callers_context(proc(str|list), module_hint, 0, 50) -> {callers: [{file, caller_name, line, ...}], _meta: {total_callers, returned, offset, has_more, exact_available, target_exact, exact_rows, fallback_rows}}  # list имён → {proc: {callers,_meta}|{error}} (общий module_hint/offset/limit на все имена; {error} на упавшем элементе)",
         "code",
         ["caller", "call graph", "граф", "вызов", "вызыва", "кто вызывает", "find_callers"],
         "BUILD CALL GRAPH:\n"
@@ -14562,7 +15392,11 @@ def make_bsl_helpers(
         "  by_name = find_callers_context([e['name'] for e in exports], '', 0, 50)\n"
         "  for name, data in by_name.items():\n"
         "      if 'error' in data: continue  # упавший элемент изолирован, батч цел\n"
-        "      print(name, '<-', len(data['callers']), 'callers')",
+        "      print(name, '<-', len(data['callers']), 'callers')\n"
+        "  # ДОВЕРИЕ к ребрам: _meta.exact_rows — ребра, привязанные ТОЧНО (по callee_key);\n"
+        "  # _meta.fallback_rows — эвристические, по ИМЕНИ метода (возможны однофамильцы).\n"
+        "  # _meta.exact_available — поддерживает ли схема индекса точный режим;\n"
+        "  # _meta.target_exact — разрешилась ли сама цель в один модуль (иначе передай module_hint).",
     )
     _reg(
         "find_call_hierarchy",
@@ -14847,10 +15681,12 @@ def make_bsl_helpers(
     _reg(
         "parse_form",
         parse_form,
-        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers:[{element, element_type, event, handler, data_path, scope}], commands:[{name, action}], attributes:[{name, types, main, main_table, query_text}]}]  # имя элемента — element (НЕ element_name: так называется колонка БД); НЕ attr_type (это поле find_attributes); types — list[str]; в CF элемент несет префикс пространства имен (cfg:/xs:/v8:), в EDT нет, поэтому `'DynamicList' in types` — сравнение по ЭЛЕМЕНТУ — на CF дает False: сверяй ХВОСТ t.rsplit(':',1)[-1]",
+        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers:[{element, element_type, event, handler, data_path, scope}], commands:[{name, action}], attributes:[{name, types, main, main_table, query_text}]}]  # имя элемента — element; types — list[str]; в CF элемент несет префикс пространства имен (cfg:/xs:/v8:), в EDT нет, поэтому `'DynamicList' in types` — сравнение по ЭЛЕМЕНТУ — на CF дает False: сверяй ХВОСТ t.rsplit(':',1)[-1]",
         "xml",
         kw=["parse_form", "события формы", "обработчики формы", "элементы формы", "form handler", "form event"],
         recipe=(
+            "# ИМЕНА ПОЛЕЙ: имя элемента — element (НЕ element_name: так называется\n"
+            "# колонка БД); НЕ attr_type — это поле find_attributes, а не parse_form.\n"
             "# Обработчики и команды формы объекта:\n"
             "forms = parse_form('БанковскиеСчетаОрганизаций')\n"
             "for f in forms:\n"
@@ -15044,9 +15880,8 @@ def make_bsl_helpers(
         "get_object_modules(name, include_methods=False, no_live=False) -> {object_name, category, "
         "modules:[{path, module_type, form_name, owner, totals:{methods,exports,regions,loc}, "
         "outline:[{region, line, end_line, totals, children, methods?}], "
-        "overrides:{count, methods:[...]}, _meta:{index_used, fallback_reason, skipped_live}}], "
-        "totals:{modules, methods, exports, overrides}, _meta:{index_used, modules_truncated, modules_skipped_live}} | {error, _meta}  "
-        "# ДЕШЕВЫЙ КОД-СКЕЛЕТ объекта за 1 вызов",
+        "overrides:{count, methods:[...]}, orphan_methods?, _meta:{index_used, fallback_reason, skipped_live}}], "
+        "totals:{modules, methods, exports, overrides}, _meta:{index_used, modules_truncated, modules_skipped_live}} | {error, _meta}",
         "composite",
         [
             "модули объекта",
@@ -15071,6 +15906,22 @@ def make_bsl_helpers(
         "          for r in m['outline']:\n"
         "              print(f\"    #Область {r['region']} {r['totals']}\")\n"
         "  # затем нырнуть: get_object_modules(name, include_methods=True) ИЛИ read_procedure(m['path'], 'Метод')\n"
+        "  # ИМЕНА МЕТОДОВ (v1.36.0): при include_methods=True у КАЖДОЙ строки модуля есть\n"
+        "  #   m['orphan_methods'] — методы ВНЕ любой #Область (форма как у get_module_outline:\n"
+        "  #   {name, type, is_export, line, end_line, loc}). На модуле БЕЗ единой области там\n"
+        "  #   лежат ВСЕ методы, а m['outline'] пуст — раньше имен не было вообще и приходилось\n"
+        "  #   добирать вторым вызовом extract_procedures:\n"
+        "  det = get_object_modules('РеализацияТоваров', include_methods=True)\n"
+        "  for m in det['modules']:\n"
+        "      queue, in_regions = list(m['outline']), []  # области ВЛОЖЕНЫ: обойти children,\n"
+        "      while queue:                                # плоский список ПОТЕРЯЛ бы их\n"
+        "          r = queue.pop(0)\n"
+        "          in_regions += [x['name'] for x in r.get('methods', [])]\n"
+        "          queue += r.get('children', [])\n"
+        "      outside = [x['name'] for x in m['orphan_methods']]\n"
+        "      # in_regions + outside покрывают m['totals']['methods'] целиком.\n"
+        "      print(m['module_type'], len(in_regions), '+', len(outside))\n"
+        "  # При include_methods=False ключа orphan_methods НЕТ вовсе (ответ остается компактным).\n"
         "  # ДИЗАМБИГУАЦИЯ: метаданные (реквизиты/ТЧ) → get_object_full_structure; код-скелет → get_object_modules;\n"
         "  #   тяжёлый разбор ВСЕХ тел + XML → analyze_object. Перехваты по имени метода — в m['overrides']['methods'].",
     )
@@ -15093,18 +15944,42 @@ def make_bsl_helpers(
     _reg(
         "analyze_subsystem",
         analyze_subsystem,
-        "analyze_subsystem(name) -> composition, custom vs standard objects",
+        "analyze_subsystem(name,limit=200) -> {query,subsystems_found,subsystems:[{name,synonym,file,"
+        "match:name|synonym|content,total_objects,custom_objects,standard_objects,raw_content,"
+        "objects_returned,content_truncated,matched_refs}],hint?,_meta:{source,limit,"
+        "reverse_lookup_supported,extensions_included}} | {error,hint,_meta} "
+        "# direct=row-full; content=matched(index); total_objects=row-total; "
+        "limit=objs;found>len(subsystems)=>14K.",
         "composite",
         ["subsystem", "подсистем", "состав подсистем"],
         "ANALYZE SUBSYSTEM:\n"
+        "  # ОДНА форма ответа на ДВА вопроса. Ветку читай по sub['match']:\n"
+        "  #   'name'/'synonym' — это ИСКОМАЯ подсистема, raw_content = ее СОСТАВ;\n"
+        "  #   'content'        — подсистема, СОДЕРЖАЩАЯ объект с таким именем;\n"
+        "  #                      у нее наружу идут ТОЛЬКО совпавшие ссылки.\n"
         "  result = analyze_subsystem('Спецодежда')\n"
+        "  if 'error' in result:\n"
+        "      print(result['error'], result['hint'])\n"
         "  for sub in result.get('subsystems', []):\n"
-        "      print(f\"Подсистема: {sub['name']} ({sub['synonym']})\")\n"
-        "      print(f\"Нетиповых: {len(sub['custom_objects'])}, типовых: {len(sub['standard_objects'])}\")\n"
-        "      for obj in sub['custom_objects']:\n"
-        "          print(f\"  [нетип] {obj['type']}.{obj['name']}\")\n"
-        "      for obj in sub['standard_objects']:\n"
-        "          print(f\"  [типов] {obj['type']}.{obj['name']}\")",
+        "      print(f\"[{sub['match']}] {sub['name']} ({sub['synonym']}) -> {sub['file']}\")\n"
+        "      # total_objects — ПОЛНЫЙ состав строки; objects_returned — сколько вернулось.\n"
+        "      print(f\"  объектов всего: {sub['total_objects']}, показано: {sub['objects_returned']}\")\n"
+        "      print(f\"  нетиповых: {len(sub['custom_objects'])}, типовых: {len(sub['standard_objects'])}\")\n"
+        "      if sub['content_truncated']:\n"
+        "          # Упор в общий limit либо во внутренний бюджет размера ответа.\n"
+        "          # Полный состав ЭТОЙ строки — из XML по sub['file'] (parse_object_xml),\n"
+        "          # либо повторный точный вызов analyze_subsystem(sub['name']).\n"
+        "          print('  состав показан не целиком')\n"
+        "  # limit — ОБЩИЙ потолок числа объектов во ВСЁМ ответе (не на строку):\n"
+        "  # расходуется direct-first, поэтому точный ответ не вытесняется обратным поиском.\n"
+        "  # Если subsystems_found > len(result['subsystems']), часть строк не\n"
+        "  # сериализована из-за бюджета размера — маршрут добора назван в result['hint'].\n"
+        "  # _meta.reverse_lookup_supported=False (живая ветка без индекса) означает,\n"
+        "  # что вопрос «в какие подсистемы входит объект» НЕ задавался: пустой ответ\n"
+        "  # там ничего не доказывает — собери индекс (rlm_index build).\n"
+        "  # _meta.extensions_included=False: соседние расширения (CFE) НЕ наложены.\n"
+        "  # Это не значит «только основная конфигурация»: текущий корень сам может\n"
+        "  # быть расширением, и тогда прочитан именно он.",
     )
     _reg(
         "find_custom_modifications",
@@ -15254,7 +16129,12 @@ def make_bsl_helpers(
         "  # документы, у которых наш doc_name упомянут как ДокументСсылка.<doc_name>.\n"
         "  # Записи back_scan помечены via='back_scan'; декларативные <BasedOn> из индекса\n"
         "  # (в т.ч. Catalog-основания, невидимые для FS-скана Documents/*) — via='metadata'\n"
-        "  # (несут d['category'] и canonical d['ref']).",
+        "  # (несут d['category'] и canonical d['ref']).\n"
+        "  # Строки УНИКАЛЬНЫ (v1.36.0): тип, проверяемый в двух ветках ОбработкаЗаполнения,\n"
+        "  #   приходит ОДНОЙ строкой — раньше он приходил дважды и агент завышал счет\n"
+        "  #   оснований (на боевом документе 10 строк на 5 типов).\n"
+        "  #   Identity — логическая связь: type либо (category,document); file — только\n"
+        "  #   provenance первого вхождения. Та же связь из main+CFE не дублируется.",
     )
     _reg(
         "find_print_forms",
@@ -15270,15 +16150,18 @@ def make_bsl_helpers(
     _reg(
         "find_functional_options",
         find_functional_options,
-        "find_functional_options(obj_name, include_code=True, limit=None) -> {xml_options, code_options}"
-        " | {…, total, xml_total, code_total, returned, has_more, partial?, _meta?}  # total = xml_total + code_total, но точность корзин РАЗНАЯ:"
-        " xml_total — exact-отбор (это и есть ответ «сколько ФО у объекта»), code_total — подстрочный grep; limit — per-bucket cap;"
-        " empty obj сканирует 20 BSL-модулей и при большем каталоге ставит partial=True;"
-        " вызывать limit= ИМЕНОВАННО (2-й позиционный — include_code)",
+        "find_functional_options(obj_name, include_code=True, limit=None, include_content=True) -> "
+        "{object,xml_options:[{name,synonym,location,file,content?|content_size?}],"
+        "code_options:[{name,option_name,file,line}],total,xml_total,code_total,returned?,has_more?,partial?,_meta?}"
+        "  # xml_total exact, code_total=substring grep; limit is per bucket and must be named; "
+        "include_content=False returns xml rows without content",
         "business",
         ["функциональн", "опци", "functional", "option", "включен", "выключен"],
         "FIND FUNCTIONAL OPTIONS:\n"
         "  # With index: XML options instant. Code grep still runs live.\n"
+        "  # xml_total — это и есть ответ на вопрос «сколько ФО у объекта».\n"
+        "  # Пустой obj_name (обзор) сканирует 20 BSL-модулей и при большем\n"
+        "  # каталоге ставит partial=True — ноль в code_options там ничего не доказывает.\n"
         "  result = find_functional_options('РеализацияТоваровУслуг')\n"
         "  for fo in result['xml_options']:\n"
         "      print(f\"  {fo['name']}: {fo['synonym']}\")\n"
@@ -15286,7 +16169,21 @@ def make_bsl_helpers(
         "      print(f\"  В коде: {co['option_name']} (стр.{co['line']})\")\n"
         "  # Опций сотни? — пагинация per-bucket (xml и code режутся КАЖДЫЙ до N):\n"
         "  page = find_functional_options('РеализацияТоваровУслуг', limit=10)  # limit= ИМЕНОВАННО\n"
-        "  # page: {..., total, returned, has_more}",
+        "  # page: {..., total, returned, has_more}\n"
+        "  # Имя опции — ОБЩИЙ ключ обеих корзин: и в xml_options, и в code_options это\n"
+        "  #   row['name'] (у code-строк сохранен и прежний option_name). Раньше общий\n"
+        "  #   цикл по xml+code получал None на половине строк.\n"
+        "  # Обзор всех ФО тяжелый: на боевой конфигурации 198 опций сериализуются в ~105K символов\n"
+        "  #   при max_output_chars 15000 — состав опции (content) и есть основной вес.\n"
+        "  # НУЖНЫ ОБА рычага: по отдельности не хватает ни того, ни другого\n"
+        "  #   (без content, но все 198 — ~48K; limit=50, но с content — ~29K).\n"
+        "  page = find_functional_options('', include_code=False, include_content=False, limit=50)\n"
+        "  # ~12K: строки без content, но с content_size — по нему видно, куда нырять за составом\n"
+        "  for fo in page['xml_options']:\n"
+        "      print(fo['name'], fo['content_size'])\n"
+        "  # состав КОНКРЕТНОЙ опции — по ее файлу из той же строки:\n"
+        "  detail = parse_object_xml(page['xml_options'][0]['file'])['content']\n"
+        "  #   (limit=1 вернул бы ПЕРВУЮ опцию обзора, а не выбранную тобой)",
     )
     _reg(
         "find_roles",
@@ -15704,11 +16601,11 @@ def make_bsl_helpers(
         _reg(
             "git_search",
             git_search,
-            "git_search(pattern, path='', file_types='', regex=False, ignore_case=False, mode='lines', max_results=200, exclude_path='')"
-            " -> {results:[{file,line,text}] | [{file}] (mode='files'), returned, truncated, error(None|str), hint?}."
-            " FULL-TEXT over ALL files incl. raw XML/forms/queries."
-            " exclude_path drops noisy zones (literal names at any depth, e.g. 'Forms,Templates')."
-            " Only available when sources are under git.",
+            "git_search(pattern,path='',file_types='',regex=False,ignore_case=False,mode='lines',max_results=200,exclude_path='')"
+            " -> {results,returned,truncated,truncated_by:None|max_results|per_file|both,error,_meta?,hint?}."
+            " lines cap=50/file; max_results/path do not lift it."
+            " Ready grep only for short case-sensitive literal with a readable suffix;"
+            " other modes get no-equivalence hint (ERE != Python re). Git repos only.",
             "navigation",
             [
                 "полнотекст",
@@ -15736,6 +16633,18 @@ def make_bsl_helpers(
             "  # Anti-noise on common tokens: start with mode='files' or a narrow file_types/path, then drill down.\n"
             "  # res['truncated'] covers BOTH caps: global max_results AND the per-file cap 50\n"
             "  #   (51 hits in one file come back as 50 rows with truncated=True).\n"
+            "  # КАКОЙ потолок сработал — res['truncated_by'] (v1.36.0):\n"
+            "  #   'max_results' — поднимай max_results; 'per_file'/'both' — поднимать БЕСПОЛЕЗНО:\n"
+            "  #   это пофайловый потолок git grep -m, и сужение path его тоже НЕ двигает.\n"
+            "  #   Упершиеся файлы — в res['_meta']['files_capped'], их число — files_capped_count.\n"
+            "  # Готовый grep-вызов сервер кладет в res['hint'] ТОЛЬКО для короткого\n"
+            "  #   case-sensitive литерала и суффикса, который generic grep читает (паттерн уже\n"
+            "  #   экранирован через re.escape). Для ignore_case=True, regex=True и суффикса из\n"
+            "  #   бинарного списка готовой команды НЕТ: у git -i и Python re.IGNORECASE разный\n"
+            "  #   Unicode case-folding, а POSIX ERE != Python re — hint честно называет границу.\n"
+            "  # НЕ сужай до одного файла как fallback: git_search(path=<файл>) все равно отдаст\n"
+            "  #   не больше 50 строк, а git_search(path=<файл>, file_types=...) вернет 0 при error=None.\n"
+            "  #   Полное содержимое одного файла — только grep(pattern, file).\n"
             "  # regex=True is POSIX ERE (end-of-line anchor on CRLF files needs '[[:space:]]*$', not '$').\n"
             "  # Failure -> results == [] with a non-None error: follow hint for safe_grep/grep pattern semantics.",
         )
@@ -15743,6 +16652,13 @@ def make_bsl_helpers(
     # ── Return all helpers (auto-generated from registry) ────────
     return {
         "_detected_prefixes": _ensure_prefixes,
+        # НЕ хелпер: lifecycle-владелец (inline backend / process worker) изымает
+        # его в `sandbox.py` ДО `_wrap_helpers` и запускает один раз после
+        # успешного init. `_wrap_helpers` приватные ключи НЕ фильтрует — он
+        # оборачивает КАЖДЫЙ callable, — поэтому изъятие обязано быть явным,
+        # иначе агент смог бы позвать прогрев как обычный хелпер и исказил бы
+        # счётчики вызовов и efficiency-hints.
+        "_prewarm_live_catalog": _prewarm_live_catalog,
         "_registry": _registry,
         **{k: v["fn"] for k, v in _registry.items()},
     }

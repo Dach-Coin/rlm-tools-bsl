@@ -1733,7 +1733,7 @@ Use this prompt to verify the three navigation primitives added in v1.20.0:
 | Источник данных дерева | `_meta.index_used` / `fallback_reason` |
 | Полнотекст без шума (любая глубина) | `git_search(exclude_path='Forms,Templates')` |
 | Отсечение файла на глубине | `exclude_path='ConfigDumpInfo.xml'` |
-| Валидация exclude (литерал) | `exclude_path='a*'` → `{results: [], returned: 0, truncated: False, error, hint}` |
+| Валидация exclude (литерал) | `exclude_path='a*'` → `{results: [], returned: 0, truncated: False, truncated_by: None, error, hint}` |
 | Связка примитивов | `git_search` → `find_definition` → `get_module_outline` → `read_procedure` → `find_callers_context` |
 
 ## Expected results
@@ -1794,8 +1794,12 @@ like a complete one. Both cases are now diagnosable.
      значение не-str или необработанное исключение
 
 2. **Сжатие большого контекста** (главный сценарий хелпера):
-   - Собери имена ВСЕХ методов крупного документа (get_object_modules(include_methods=True),
-     обойди outline рекурсивно — у областей есть children)
+   - Собери имена ВСЕХ методов крупного документа (get_object_modules(include_methods=True)):
+     обойди outline рекурсивно (у областей есть children) И добавь верхнеуровневый
+     module['orphan_methods'] каждого модуля — это методы ВНЕ любой #Область, и на модуле
+     без единой области там лежат ВСЕ его методы, а outline пуст. Проверь количество:
+     methods_из_outline + len(orphan_methods) == module['totals']['methods'].
+     Второй вызов extract_procedures для этого НЕ нужен
    - Одним llm_query попроси выбрать максимум 10 имён, относящихся к проведению
    - Посчитай и покажи: длину контекста, длину ответа, коэффициент сжатия, класс ответа
    - Если получен '[EMPTY]' — это НЕ провал теста: покажи текст маркера и переходи дальше,

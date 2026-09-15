@@ -419,6 +419,12 @@ def detect_extension_context(base_path: str) -> ExtensionContext:
     )
 
     siblings: list[ExtensionInfo] = []
+    # Resolved paths of everything already collected. Kept as a set because the
+    # dedup below used to re-`resolve()` every accumulated sibling for every new
+    # one: quadratic in the number of neighbouring directories, and each
+    # comparison a syscall. Measured on tmpfs: 100 neighbours 0.30s, 400 4.40s,
+    # 800 17.13s -- paid on every rlm_start.
+    seen_sibling_paths: set[Path] = set()
     base = Path(base_path).resolve()
 
     # Scan siblings at parent level (-1), then grandparent (-2) if needed
@@ -449,7 +455,9 @@ def detect_extension_context(base_path: str) -> ExtensionContext:
             infos = _detect_all(str(resolved_entry))
             for info in infos:
                 # Avoid duplicates (same resolved path)
-                if not any(Path(s.path).resolve() == Path(info.path).resolve() for s in siblings):
+                resolved_info = Path(info.path).resolve()
+                if resolved_info not in seen_sibling_paths:
+                    seen_sibling_paths.add(resolved_info)
                     siblings.append(info)
                     found_any = True
 

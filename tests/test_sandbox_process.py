@@ -1241,3 +1241,30 @@ def test_proc_start_denied_keeps_branch_prefix_and_adds_hint(cf_project, monkeyp
     assert text.startswith("sandbox worker start failed: "), text
     assert "PermissionError" in text, text
     assert _INLINE_HINT in text, text
+
+
+def test_reader_backed_process_default_prewarm_keeps_search_working(cf_project, monkeypatch, tmp_path):
+    """v1.36.0: статичный индекс + настоящий worker проходят default-on owner-path.
+
+    Сюитная фикстура гасит прогрев для всей сюиты; здесь ключ УДАЛЯЕТСЯ, то есть
+    воркер поднимается с production-дефолтом. Тест не пытается отличить prewarm
+    от lazy по ВРЕМЕНИ — это было бы флейком; он доказывает, что именно этот
+    reader-backed путь реально инициализируется, ищет и закрывается.
+    """
+    from rlm_tools_bsl.bsl_index import IndexBuilder
+
+    monkeypatch.delenv("RLM_PREWARM_LIVE_CATALOG", raising=False)
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx_prewarm"))
+    db_path = IndexBuilder().build(cf_project, build_calls=True)
+    backend = ProcessSandboxBackend(_make_config(cf_project, db_path=str(db_path), index_expected=True))
+    try:
+        assert backend.index_loaded is True
+        result = backend.execute(
+            "res = safe_grep('Процедура', max_files=500)\nprint(res['candidates_total'], res['returned'])"
+        )
+        assert result.error is None
+        candidates, returned = map(int, result.stdout.split())
+        assert candidates == 2
+        assert returned > 0
+    finally:
+        _close(backend)

@@ -283,7 +283,16 @@ def test_git_grep_regex(repo):
 def test_git_grep_truncation_sentinel(repo):
     hits = _git_grep(str(repo), TOK, mode="lines", max_results=1, include_truncation_sentinel=True)
     assert len(hits) == 2
-    assert hits[-1] == {"_truncated": True, "shown": 1}
+    # v1.36.0: sentinel РАСШИРЕН — два потолка разведены. Точное равенство
+    # здесь сверяло бы форму приватного sentinel, а смысл теста — «усечение
+    # видно и оно про ОДНУ показанную строку». Сверяем подмножество плюс
+    # НОВОЕ разведение потолков, иначе тест перестанет проверять то, ради
+    # чего писался.
+    assert hits[-1]["_truncated"] is True
+    assert hits[-1]["shown"] == 1
+    assert hits[-1]["global"] is True, "усечение здесь ГЛОБАЛЬНОЕ (max_results=1)"
+    assert hits[-1]["per_file"] is False, "пофайлового упора в этой фикстуре нет"
+    assert hits[-1]["files_capped"] == [] and hits[-1]["files_capped_count"] == 0
     # Without the flag: hard cut, no sentinel.
     plain = _git_grep(str(repo), TOK, mode="lines", max_results=1, include_truncation_sentinel=False)
     assert len(plain) == 1 and "_truncated" not in plain[0]
@@ -404,8 +413,13 @@ def test_git_search_error_dict_on_failure(repo, monkeypatch):
     out = bsl["git_search"](TOK)
     assert out["results"] == [] and out["returned"] == 0 and out["truncated"] is False
     assert out["error"] == "git grep failed or timed out"
-    assert set(out) == {"results", "returned", "truncated", "error", "hint"}, (
-        f"форма ошибки разъехалась с аргументными: {out[0]}"
+    # v1.36.0: набор вырос на ПОСТОЯННЫЙ `truncated_by` — он обязан быть на
+    # ВСЕХ путях, как `error` с v1.34.0, иначе `res["truncated_by"]` давал бы
+    # KeyError ровно на аварийной ветке. Тест охраняет ЕДИНСТВО формы
+    # ошибочных путей, а не конкретную пятёрку ключей.
+    assert out["truncated_by"] is None
+    assert set(out) == {"results", "returned", "truncated", "truncated_by", "error", "hint"}, (
+        f"форма ошибки разъехалась с аргументными: {sorted(out)}"
     )
     assert "safe_grep" in out["hint"], f"hint отказа git не дает замену: {out['hint']}"
 

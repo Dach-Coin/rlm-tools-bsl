@@ -431,6 +431,8 @@ Object/manager-вызовы (`Справочники.X.Метод`, `Контр�
 
 Ускоряет хелперы: `find_functional_options()`.
 
+> **v1.36.0 — `include_content` (read-time, данные не менялись).** `find_functional_options(..., include_content=False)` не сериализует колонку `content` в строку ответа, отдавая вместо неё `content_size: int`. Отбор строк и счётчики (`xml_total` / `code_total`) от параметра не зависят — режется только вес. `content_size == 0` означает ДОКАЗАННО пустой `<Content>` опции: оба производителя строк (индексный ридер и живой XML-парсер) кладут в `content` список либо не отдают строку вовсе.
+
 > **v1.30.0 — фильтр по `content` стал ТОЧНЫМ (read-time, без изменения данных).** Сама таблица и её заполнение не менялись; изменился только helper-side отбор строк: typed-ввод сверяется с канонической ссылкой (равенство или префикс `<ref>.` — как в уже существующем `get_functional_options_exact`), bare-имя — по точному второму сегменту ref'а. Подстрочный матч давал overcount, засчитывая ФО, где имя объекта встречалось лишь как ЧУЖОЙ реквизит внутри глубокой ссылки (`Document.Другой.TabularSection.Товары.Attribute.Имя`). Пересборка индекса для этого не нужна.
 
 ### enum_values
@@ -459,7 +461,16 @@ Object/manager-вызовы (`Справочники.X.Метод`, `Контр�
 | `object_ref`        | TEXT       | Ссылка на объект (Category.Name) | `Document.ПоступлениеТоваровНаСклад`         |
 | `file`              | TEXT       | Относительный путь к XML         | `Subsystems/ОбъектыУТКАУП/ОбъектыУТКАУП.mdo` |
 
-Ускоряет хелперы: `analyze_subsystem()`. Поддерживает обратный поиск: какие подсистемы содержат указанный объект.
+Ускоряет хелперы: `analyze_subsystem()`. Таблица обслуживает **ДВА направления вопроса**, и с v1.36.0 оба читает ОДИН метод ридера:
+
+| Метод ридера | Вопрос | Примечание |
+| --- | --- | --- |
+| `IndexReader.get_subsystem_lookup(query)` | «состав подсистемы X» (`direct`) **и** «в какие подсистемы входит объект X» (`containing`) — за ОДИН полный проход | v1.36.0; плюс `direct_candidates` из `file_paths`/`object_synonyms` |
+| `IndexReader.get_subsystems_for_object(name)` | только обратный вопрос (подстрока по `object_ref`) | прежний метод, не тронут; остаётся для других потребителей |
+
+> **Пустой `<Content>` таблица представить НЕ МОЖЕТ.** Нормализованная строка требует `object_ref`, поэтому подсистема без единого элемента состава не даёт ни одной строки. Отсюда `direct_candidates`: reader отдаёт пути-кандидаты из уже существующих каталогов (три поддержанные раскладки — CF-sibling `Subsystems/<Имя>.xml`, EDT `Subsystems/<Имя>/<Имя>.mdo`, CF-Ext `Subsystems/<Имя>/Ext/<любой>.xml`), а XML точечно разбирает helper. Пустой `direct` сам по себе отсутствия подсистемы НЕ доказывает.
+
+> **`has_metadata` — build-опция, а не coverage.** Полнота группы `containing` относится к УСПЕШНО собранным строкам этой таблицы: metadata-коллектор штатно продолжает сборку после malformed/unreadable XML, поэтому ни `has_metadata=1`, ни `_meta.reverse_lookup_supported=True` не являются доказательством того, что разобран каждый XML корня, и пустой ответ нельзя выдавать за доказанный ноль.
 
 ### role_rights
 
@@ -1234,7 +1245,7 @@ bsl modules incremental: L
 | `find_scheduled_jobs(name)`     | `SELECT` из `scheduled_jobs` (мгновенно)                           | XML-парсинг `ScheduledJobs/**`          |
 | `find_functional_options(obj)`  | `SELECT` из `functional_options` (мгновенно)                       | XML-парсинг `FunctionalOptions/**`      |
 | `find_enum_values(name)`        | `SELECT` из `enum_values` (мгновенно)                              | Glob + XML-парсинг `Enums/**`           |
-| `analyze_subsystem(name)`       | `SELECT` из `subsystem_content` (мгновенно)                        | Glob + XML-парсинг `Subsystems/**`      |
+| `analyze_subsystem(name)`       | `SELECT` из `subsystem_content` в ОБЕ стороны (`get_subsystem_lookup`, один проход) | Glob + XML-парсинг `Subsystems/**`, только прямой вопрос |
 | `find_roles(obj)`               | `SELECT` из `role_rights` (мгновенно)                              | Парсинг Rights.xml / .rights            |
 | `find_register_movements(doc)`  | `SELECT DISTINCT` из `register_movements` (мгновенно)              | Grep по ObjectModule + ManagerModule    |
 | `find_register_writers(reg)`    | `SELECT` из `register_movements` (мгновенно)                       | Параллельный поиск по ObjectModule      |

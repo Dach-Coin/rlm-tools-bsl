@@ -135,6 +135,12 @@ class InlineSandboxBackend:
         # сессии by design, не повод собирать альтернативную схему (§7.5).
         self._registry_snapshot: dict[str, dict] = sandbox.registry_metadata_snapshot()
         self._detected_prefixes, self._prefixes_source = self._compute_prefixes()
+        # Последняя потенциально падающая стадия init уже прошла; с этого места
+        # backend ВЛАДЕЕТ Sandbox, и finish_close сможет дождаться его потока.
+        # Запуск раньше (в Sandbox.__init__) оставил бы daemon без владельца на
+        # достижимом отказе `registry_metadata_snapshot` — `_rlm_start` тогда не
+        # получил бы backend и не смог бы передать его reaper-у.
+        sandbox._start_owned_prewarm()
 
     # -- metadata -----------------------------------------------------------
 
@@ -241,6 +247,18 @@ class InlineSandboxBackend:
         execute активен возвращаем ``residual`` — reaper повторит позже; а на
         исчерпании deadline отдаём закрытие отдельному daemon-потоку, чтобы
         handle всё-таки освободился, но reaper не блокировался.
+
+        **v1.36.0 — одно ОСОЗНАННОЕ исключение из «reaper не блокируется».**
+        Inline-сессия владеет ещё и фоновым прогревом живого каталога, и его
+        ``join`` выполняется СИНХРОННО в оставшееся время ``deadline`` (у reaper —
+        не больше ``_PER_BACKEND_DEADLINE_SECONDS``, у ``rlm_end`` — 1 с). Отличие
+        от reader-а принципиально: reader может держать ПОЛЬЗОВАТЕЛЬСКИЙ код
+        неограниченно, а прогрев — только перечисление ФС, чья цена измерена и
+        ограничена размером дерева. Отдать его daemon-потоку, как reader, нельзя:
+        именно факт «обход этой сессии ещё идёт» и есть то, что ``residual``
+        обязан сообщить. Плата — до ``deadline`` задержки уборки СОСЕДНИХ сессий
+        в редком окне; ``force_abort``/последняя попытка reaper-а этого окна не
+        создают: там deadline уже истёк и поток-демон отцепляется сразу.
         """
         with self._close_lock:
             return self._finish_close_locked(deadline)
@@ -288,8 +306,41 @@ class InlineSandboxBackend:
                     reader.close()
                 except Exception as exc:  # noqa: BLE001 — teardown не должен падать
                     report.errors.append(f"idx_reader.close: {type(exc).__name__}: {exc}")
-        with self._state_lock:
-            self._state = "closed"
+
+        # v1.36.0: inline-сессия владеет ещё и фоновым прогревом живого каталога.
+        # Порядок «сначала reader, потом prewarm» безопасен: `_ensure_live_bsl_catalog`
+        # методов ридера не вызывает — main перечисляется независимым FS-walk,
+        # extension-часть берётся из BSL-only каталога, — поэтому use-after-close
+        # здесь недостижим.
+        prewarm = getattr(self._sandbox, "_prewarm_thread", None)
+        if prewarm is not None and prewarm.is_alive():
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining:
+                # `_state_lock` здесь НЕ удерживается; prewarm backend не вызывает.
+                prewarm.join(timeout=remaining)
+            if prewarm.is_alive():
+                if remaining:
+                    report.closed = False
+                    report.residual = True
+                    # Это ожидаемое промежуточное состояние, не `errors`: server
+                    # shutdown считает непустой errors отдельной ошибкой, а reaper
+                    # уже получает достаточный машинный сигнал через residual.
+                else:
+                    # Deadline УЖЕ истёк — это ровно force-путь (`force_abort()` и
+                    # последняя попытка reaper-а передают `now - 1.0`, требуя
+                    # ДОВЕСТИ очистку, а не просить повтор). Просить здесь повтор
+                    # значит сделать backend НЕзакрываемым навсегда. Отцепляем так
+                    # же, как уже отцепляется reader на исчерпанном deadline:
+                    # prewarm — daemon, он не владеет ни reader-ом, ни handle БД,
+                    # только читает ФС, и умирает вместе с процессом.
+                    report.forced = True
+                    report.errors.append("live catalog prewarm still running (daemon detached)")
+
+        # Нельзя заявить closed, пока принадлежащий inline-сессии обход жив И
+        # бюджет закрытия ещё не исчерпан.
+        if report.closed:
+            with self._state_lock:
+                self._state = "closed"
         return report
 
     @staticmethod

@@ -26,7 +26,11 @@ set -euo pipefail
 
 BIND_HOST="${RLM_HOST:-}"
 PORT="${RLM_PORT:-}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# `BASH_SOURCE` is empty when the script is read from stdin (`curl ... | bash`), and
+# under `set -u` bash 5.3 aborts on it with a bare "unbound variable". `$0` is the
+# fallback: for a piped install it resolves to the current directory, the only
+# meaningful "next to the script" there is.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # --- Read the settings of an existing installation ---
 # Explicit user values and saved values are passed to `service install`; an omitted

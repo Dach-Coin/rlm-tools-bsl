@@ -2,6 +2,7 @@
 
 import builtins
 import os
+import pathlib
 import tempfile
 import textwrap
 
@@ -488,6 +489,52 @@ def test_poisoned_edt_neighbour_does_not_break_extension_scan(tmp_path):
     names = {e.name for e in ctx.nearby_extensions}
     assert "ЖивоеРасширение" in names, "живой EDT-сосед потерян — тест перестал стеречь скан"
     assert not any(e.path.endswith("СломанныйСосед") for e in ctx.nearby_extensions)
+
+
+def test_sibling_scan_stays_linear_in_the_number_of_neighbours(tmp_path, monkeypatch):
+    """Дедуп соседей обязан быть линейным по их числу.
+
+    Он сравнивал каждого нового соседа со ВСЕМИ уже собранными и на каждое
+    сравнение звал `Path.resolve()`, то есть системный вызов: квадратично.
+    Цена платится на КАЖДОМ `rlm_start`, и замер на tmpfs это подтверждал —
+    100 соседей 0.30 с, 400 соседей 4.40 с, 800 соседей 17.13 с.
+
+    Считаются ВЫЗОВЫ `resolve()`, а не секунды: счётчик не зависит ни от
+    железа, ни от файловой системы, поэтому тест не флейкует на медленной
+    машине и не зеленеет на быстрой.
+    """
+    neighbours = 60
+    parent = tmp_path / "container"
+    for i in range(neighbours):
+        nb = parent / f"Сосед{i:02d}" / "cfg"
+        nb.mkdir(parents=True)
+        (nb / "Configuration.xml").write_text(_CF_MAIN_XML, encoding="utf-8")
+
+    own = parent / "Основная"
+    own.mkdir(parents=True)
+    (own / "Configuration.xml").write_text(_CF_MAIN_XML, encoding="utf-8")
+
+    original_resolve = pathlib.Path.resolve
+    calls = 0
+
+    def counting_resolve(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", counting_resolve)
+    ctx = detect_extension_context(str(own))
+    monkeypatch.undo()
+
+    # Скан обязан РАБОТАТЬ: иначе линейность достигалась бы бездельем.
+    assert ctx.current.role == ConfigRole.MAIN
+    assert ctx.nearby_main is not None, "соседи не найдены — тест перестал стеречь скан"
+
+    quadratic = neighbours * (neighbours - 1) // 2
+    assert calls <= 6 * neighbours, (
+        f"{calls} вызовов resolve() на {neighbours} соседей — дедуп снова квадратичный "
+        f"(до починки лишних сравнений было ~{quadratic})"
+    )
 
 
 # ── v1.33.0: детектор расширений знает префикс Асинх ────────────────────────

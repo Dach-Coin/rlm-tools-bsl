@@ -8,6 +8,7 @@ when the sandbox base is a main config and there are nearby extensions.
 from __future__ import annotations
 
 import os
+import re
 import textwrap
 
 import pytest
@@ -117,15 +118,16 @@ _EXT_PREDEFINED_XML = textwrap.dedent("""\
 _EXT_SUBSYSTEM_XML = textwrap.dedent("""\
     <?xml version="1.0" encoding="UTF-8"?>
     <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
-                    xmlns:v8="http://v8.1c.ru/8.1/data/core">
+                    xmlns:v8="http://v8.1c.ru/8.1/data/core"
+                    xmlns:xr="http://v8.1c.ru/8.3/xcf/readable">
         <Subsystem>
             <Properties>
                 <Name>ExtSubsystemNoSyn</Name>
                 <Synonym/>
+                <Content>
+                    <xr:Item>Catalog.ExtCatalog</xr:Item>
+                </Content>
             </Properties>
-            <ChildObjects>
-                <Content>Catalog.ExtCatalog</Content>
-            </ChildObjects>
         </Subsystem>
     </MetaDataObject>
 """)
@@ -735,3 +737,125 @@ def test_profile_extension_name_is_metadata_name_not_folder(helpers_with_idx_rea
     p = bsl["get_object_profile"]("ExtCatalog")
     om = next(i for i in p["sections"]["modules"]["items"] if i["is_extension"])
     assert om["extension_name"] == "РеальноеИмяРасширения"  # metadata name, NOT folder 'ExtAddOn'
+
+
+# ---------------------------------------------------------------------------
+# v1.36.0 — analyze_subsystem: граница текущего корня названа, а не замаскирована
+# ---------------------------------------------------------------------------
+def test_analyze_subsystem_live_declares_current_root_scope(helpers_with_ext):
+    bsl, _cf, _cfe = helpers_with_ext
+    # Предусловие: XML-only подсистема расширения реально поддержана общим
+    # extension-resolver и существует в статичном дереве.
+    assert bsl["parse_object_xml"]("Subsystems/ExtSubsystemNoSyn")["name"] == "ExtSubsystemNoSyn"
+    res = bsl["analyze_subsystem"]("ExtSubsystemNoSyn")
+    assert "error" in res
+    assert res["_meta"]["extensions_included"] is False
+    assert "расширен" in res["hint"].lower()
+
+
+def test_analyze_subsystem_index_declares_current_root_scope(helpers_with_idx_reader):
+    bsl, _cf, _cfe, _reader = helpers_with_idx_reader
+    res = bsl["analyze_subsystem"]("ExtSubsystemNoSyn")
+    assert "error" in res
+    assert res["_meta"]["source"] == "index"
+    assert res["_meta"]["extensions_included"] is False
+    assert "текущ" in res["hint"].lower()
+
+
+@pytest.mark.parametrize("with_index", [False, True])
+def test_analyze_subsystem_direct_cfe_reads_its_current_root(tmp_path, monkeypatch, with_index):
+    """R75: current root может быть CFE; это не превращает ответ в main-only.
+
+    Никакого merge здесь нет: читается только текущий CFE, nearby main/другие CFE
+    остаются за границей. Проверяются обе реально поддержанные ветки.
+    """
+    _cf, cfe = _make_main_with_extension(tmp_path)
+    reader = None
+    try:
+        if with_index:
+            monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx-cfe"))
+            db = IndexBuilder().build(cfe, build_calls=False, build_metadata=True, build_fts=False)
+            reader = IndexReader(db)
+        generic, resolve_safe = make_helpers(cfe, idx_reader=reader)
+        bsl = make_bsl_helpers(
+            base_path=cfe,
+            resolve_safe=resolve_safe,
+            read_file_fn=generic["read_file"],
+            grep_fn=generic["grep"],
+            glob_files_fn=generic["glob_files"],
+            format_info=detect_format(cfe),
+            idx_reader=reader,
+            extension_paths=[],
+            current_config_role="extension",
+            current_config_name="ExtAddOn",
+            current_config_root=cfe,
+        )
+        res = bsl["analyze_subsystem"]("ExtSubsystemNoSyn")
+        (row,) = res["subsystems"]
+        assert row["raw_content"] == ["Catalog.ExtCatalog"]
+        assert res["_meta"]["source"] == ("index" if with_index else "live")
+        assert res["_meta"]["extensions_included"] is False
+        assert "текущ" in res["hint"].lower()
+        assert "расширен" in res["hint"].lower()
+    finally:
+        if reader is not None:
+            reader.close()
+
+
+@pytest.mark.parametrize("with_index", [False, True])
+def test_analyze_subsystem_empty_cfe_ext_layout_is_found(tmp_path, monkeypatch, with_index):
+    """R84: CF-Ext layout остаётся достижимым при пустом Content.
+
+    Дерево статично во время чтения: Content заменяется ДО build/make_helpers.
+    Это current-root CFE, а не overlay с main.
+    """
+    _cf, cfe = _make_main_with_extension(tmp_path)
+    rel = "Subsystems/ExtSubsystemNoSyn/Ext/Subsystem.xml"
+    empty_xml = re.sub(r"<Content>.*?</Content>", "<Content/>", _EXT_SUBSYSTEM_XML, flags=re.DOTALL)
+    assert "<Content/>" in empty_xml and "xr:Item" not in empty_xml, "фикстура пустого состава не собралась"
+    _write(os.path.join(cfe, *rel.split("/")), empty_xml)
+    reader = None
+    try:
+        if with_index:
+            monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx-cfe-empty"))
+            db = IndexBuilder().build(cfe, build_calls=False, build_metadata=True, build_fts=False)
+            reader = IndexReader(db)
+            with reader._lock:
+                n_content = reader._conn.execute(
+                    "SELECT COUNT(*) FROM subsystem_content WHERE subsystem_name='ExtSubsystemNoSyn'"
+                ).fetchone()[0]
+                n_synonyms = reader._conn.execute(
+                    "SELECT COUNT(*) FROM object_synonyms "
+                    "WHERE category='Subsystems' AND object_name='ExtSubsystemNoSyn'"
+                ).fetchone()[0]
+            assert (n_content, n_synonyms) == (0, 0), (
+                "предусловие: единственным индексным источником обязан быть file_paths"
+            )
+            lookup = reader.get_subsystem_lookup("ExtSubsystemNoSyn")
+            assert lookup["direct"] == []
+            assert lookup["direct_candidates"] == [rel]
+
+        generic, resolve_safe = make_helpers(cfe, idx_reader=reader)
+        bsl = make_bsl_helpers(
+            base_path=cfe,
+            resolve_safe=resolve_safe,
+            read_file_fn=generic["read_file"],
+            grep_fn=generic["grep"],
+            glob_files_fn=generic["glob_files"],
+            format_info=detect_format(cfe),
+            idx_reader=reader,
+            extension_paths=[],
+            current_config_role="extension",
+            current_config_name="ExtAddOn",
+            current_config_root=cfe,
+        )
+        res = bsl["analyze_subsystem"]("ExtSubsystemNoSyn")
+        (row,) = res["subsystems"]
+        assert row["name"] == "ExtSubsystemNoSyn" and row["match"] == "name"
+        assert row["total_objects"] == row["objects_returned"] == 0
+        assert row["raw_content"] == [] and row["content_truncated"] is False
+        assert res["_meta"]["source"] == ("index" if with_index else "live")
+        assert res["_meta"]["extensions_included"] is False
+    finally:
+        if reader is not None:
+            reader.close()

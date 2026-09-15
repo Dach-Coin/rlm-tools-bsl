@@ -606,6 +606,11 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
             )
             registry_snapshot = sandbox.registry_metadata_snapshot()
             detected_prefixes, prefixes_source = _compute_prefixes(sandbox, idx_reader)
+            # v1.36.0: worker-процесс уже lifecycle-владелец Sandbox; при
+            # последующем отказе он завершится вместе с daemon-потоком прогрева,
+            # поэтому отдельный parent-side join не нужен. Запуск строго ПОСЛЕ
+            # обеих успешных стадий init и ДО публикации init_ok.
+            sandbox._start_owned_prewarm()
         except Exception:
             _send(
                 conn,

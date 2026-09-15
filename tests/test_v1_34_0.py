@@ -1863,7 +1863,7 @@ def test_documented_return_shape_matches_reality():
 # ---------------------------------------------------------------------------
 # Ревью № 6 — находки, подтверждённые на исполнении
 # ---------------------------------------------------------------------------
-def test_builder_path_contract_is_pinned_per_candidate_class():
+def test_builder_path_contract_is_pinned_per_candidate_class(tmp_path):
     """Рамка релиза: builder-путь не тронут.
 
     Прежний тест сравнивал НОВУЮ функцию с ней же — детерминированную перестановку
@@ -1873,11 +1873,14 @@ def test_builder_path_contract_is_pinned_per_candidate_class():
     `categories=`: `_SYNONYM_CATEGORIES` — `frozenset`, и его обход зависит от
     рандомизации хешей процесса, то есть был недетерминирован и ДО релиза.
     """
-    import tempfile
-
     from rlm_tools_bsl.bsl_index import _collect_object_synonyms, _iter_metadata_xml_files
 
-    root = __import__("pathlib").Path(tempfile.mkdtemp()) / "cf"
+    # ТОЛЬКО tmp_path: `tempfile.mkdtemp()` не убирает за собой ничего, и это дерево
+    # с `cf/Configuration.xml` оставалось в системном %TEMP% навсегда. Там оно
+    # становилось «соседней основной конфигурацией» для тестов
+    # `test_extension_detector.py`, которые берут голый `TemporaryDirectory()`,
+    # — то есть сюита травила собственный СЛЕДУЮЩИЙ прогон (ложные падения на Windows).
+    root = tmp_path / "cf"
     _write(root / "Configuration.xml", _CF_DESCRIPTOR)
     ns = 'xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core"'
 

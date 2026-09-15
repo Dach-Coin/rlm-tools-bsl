@@ -68,6 +68,25 @@ def _walk_files(root: pathlib.Path):
             yield pathlib.Path(dirpath) / fname
 
 
+def _scan_workers() -> int:
+    """Число потоков обхода. ``RLM_SCAN_WORKERS``, default 4, диапазон 1..32.
+
+    Дефолт 4, а не 8: замер на боевой ЕРП-конфигурации (26 221 модуль,
+    115 521 каталог, тёплый кеш; медианы трёх чередующихся прогонов) даёт
+    1 -> 6.89 с, 4 -> 5.50 с, 8 -> 6.37 с, 16 -> 6.77 с — четыре потока БЫСТРЕЕ
+    восьми, потому что потолок здесь очередь к диску, а не CPU. Вдобавок
+    reader-backed прогрев включён по умолчанию, а сессий может быть
+    ``RLM_MAX_SESSIONS`` (5), поэтому пик конкуренции 5x4=20 потоков вместо 5x8=40.
+    """
+    try:
+        n = int(os.environ.get("RLM_SCAN_WORKERS", "4"))
+    except (ValueError, TypeError):
+        return 4  # нечисловое / пустое -> документированный дефолт
+    if n < 1:
+        return 4  # 0 и отрицательные -> дефолт (0 потоков = зависание)
+    return min(32, n)  # больше 32 УСЕКАЕТСЯ, а не откатывается к дефолту
+
+
 def scan_bsl_tree(root: pathlib.Path) -> tuple[list[str], int]:
     """Канон ``walk``: прямой обход дерева *root* поверх ``os.scandir``.
 
@@ -80,8 +99,27 @@ def scan_bsl_tree(root: pathlib.Path) -> tuple[list[str], int]:
     элемент (на боевой ЕРП-конфигурации 106 000 системных вызовов), тогда как
     ``DirEntry`` отдаёт тип из уже прочитанного каталога бесплатно.
 
+    **v1.36.0 — параллельное РАСПРЕДЕЛЕНИЕ обхода** (``RLM_SCAN_WORKERS``,
+    default 4; ``1`` возвращает прежнюю последовательную ветку байт в байт).
+    99 % цены здесь — ``os.scandir`` по ~115K каталогов, а не работа Python:
+    холодное дерево стоило 16-20 с последовательно и 5.5-6.7 с параллельно.
+    Параллелится именно РАСПРЕДЕЛЕНИЕ стека, а не семантика: ``_SKIP_DIRS``,
+    точки, ``seen_dirs``, разрешение Windows junction/reparse только внутрь
+    корня, пропуск directory symlink и подсчёт ошибок сохранены дословно.
+    Порядок выдачи канон ``walk`` не обещал и до релиза (потребитель сортирует
+    сам), поэтому параллельная ветка его не обязана воспроизводить; СОСТАВ и
+    число ошибок обязаны совпадать — это закреплено тестами эквивалентности.
+
     Returns: ``(absolute_paths, enumeration_errors)``.
     """
+    workers = _scan_workers()
+    if workers == 1:
+        return _scan_bsl_tree_serial(root)
+    return _scan_bsl_tree_parallel(root, workers)
+
+
+def _scan_bsl_tree_serial(root: pathlib.Path) -> tuple[list[str], int]:
+    """Прежний последовательный обход. Семантика — источник истины для параллельного."""
     errors = 0
     found: list[str] = []
     root_str = str(root)
@@ -138,6 +176,140 @@ def scan_bsl_tree(root: pathlib.Path) -> tuple[list[str], int]:
                 errors += 1
                 continue
             found.append(path)
+    return found, errors
+
+
+def _scan_bsl_tree_parallel(root: pathlib.Path, workers: int) -> tuple[list[str], int]:
+    """Тот же обход, распределённый по *workers* потокам.
+
+    Завершение определяется счётчиком НЕЗАКРЫТЫХ каталогов, а не пустотой
+    очереди: пустая очередь при работающих воркерах — не конец обхода, и цикл,
+    написанный «по пустоте», теряет часть дерева.
+
+    Создание потоков — best-effort: если ``Thread.start()`` упирается в
+    ресурсный лимит, уже запущенные воркеры и САМ вызывающий поток дренируют ту
+    же очередь до штатного счётчика. Частичный результат не публикуется, а
+    неудача запуска потока не прибавляется к ``errors`` перечисления — это
+    отказ ресурса, а не пропуск каталога.
+
+    Неожиданная ошибка НЕ типа ``OSError`` внутри воркера записывается в
+    приватный канал, прекращает выдачу новых каталогов и повторно бросается
+    вызывающему после join — так же, как её бросила бы последовательная ветка.
+    """
+    root_str = str(root)
+    lock = threading.Lock()
+    seen_dirs: set[str] = {os.path.normcase(root_str)}
+    stack: list[str] = [root_str]
+    found: list[str] = []
+    errors = 0
+    pending = 1  # ровно один невыполненный каталог — корень
+    failure: list[BaseException] = []
+    work_ready = threading.Condition(lock)
+
+    def _take() -> str | None:
+        """Снять каталог со стека; ``None`` — обход завершён либо провален."""
+        with work_ready:
+            while True:
+                if failure or pending <= 0:
+                    return None
+                if stack:
+                    return stack.pop()
+                work_ready.wait(timeout=0.05)
+
+    def _process(dir_path: str) -> None:
+        nonlocal errors
+        try:
+            scan = list(os.scandir(dir_path))
+        except OSError:
+            with work_ready:
+                errors += 1
+            return
+        local_found: list[str] = []
+        local_errors = 0
+        local_dirs: list[str] = []
+        for entry in scan:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name in _SKIP_DIRS or entry.name.startswith("."):
+                        continue
+                    target = entry.path
+                    # Резолв редиректа идёт ДО постановки в seen_dirs — ровно как
+                    # в serial: иначе один физический каталог, доступный по двум
+                    # именам, был бы обойдён дважды и дал бы дубли путей.
+                    if entry.is_symlink() or getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0):
+                        resolved_dir = pathlib.Path(target).resolve()
+                        resolved_dir.relative_to(root)
+                        target = str(resolved_dir)
+                    local_dirs.append(target)
+                    continue
+                if not entry.name.lower().endswith(".bsl"):
+                    continue
+                path = entry.path
+                if entry.is_symlink():
+                    if entry.is_dir():
+                        continue
+                    resolved = pathlib.Path(path).resolve()
+                    resolved.relative_to(root)
+                    path = str(resolved)
+            except ValueError:
+                continue
+            except OSError:
+                local_errors += 1
+                continue
+            local_found.append(path)
+        with work_ready:
+            found.extend(local_found)
+            errors += local_errors
+            added = 0
+            for target in local_dirs:
+                key = os.path.normcase(target)
+                if key in seen_dirs:
+                    continue
+                seen_dirs.add(key)
+                stack.append(target)
+                added += 1
+            if added:
+                _bump_pending(added)
+                work_ready.notify(added)
+
+    def _bump_pending(delta: int) -> None:
+        """Вызывается ТОЛЬКО под ``work_ready``."""
+        nonlocal pending
+        pending += delta
+
+    def _drain() -> None:
+        nonlocal pending
+        while True:
+            dir_path = _take()
+            if dir_path is None:
+                return
+            try:
+                _process(dir_path)
+            except BaseException as exc:  # noqa: BLE001 — повторно бросаем caller-у
+                with work_ready:
+                    failure.append(exc)
+                    work_ready.notify_all()
+                return
+            finally:
+                with work_ready:
+                    pending -= 1
+                    if pending <= 0:
+                        work_ready.notify_all()
+
+    threads: list[threading.Thread] = []
+    for i in range(workers - 1):
+        t = threading.Thread(target=_drain, name=f"rlm-scan-bsl-{i}", daemon=True)
+        try:
+            t.start()
+        except RuntimeError:
+            # Ресурсный отказ: очередь допьёт caller и уже стартовавшие воркеры.
+            break
+        threads.append(t)
+    _drain()  # вызывающий поток — полноценный воркер, а не только ожидающий
+    for t in threads:
+        t.join()
+    if failure:
+        raise failure[0]
     return found, errors
 
 
@@ -573,6 +745,12 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
     if _private_io is not None:
         _private_io["grep_with_status"] = grep_with_status
         _private_io["scan_bsl_catalog_status"] = _scan_main_bsl_catalog_status
+        # v1.36.0: FS-only glob ТЕКУЩЕГО корня. Публичный `glob_files` при
+        # переданном ридере сам index-backed, поэтому на live-fallback он
+        # перечислил бы `file_paths` (возможно, чужого или устаревшего) индекса и
+        # выдал бы это за живое перечисление. Канал приватный: в публичный словарь
+        # и в namespace песочницы он не попадает, agent-facing API не меняется.
+        _private_io["glob_files_fs"] = _glob_files_fs
 
     return {
         "read_file": read_file,

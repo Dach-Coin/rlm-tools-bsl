@@ -461,8 +461,8 @@ index-домена (синонимы, ссылки метаданных) пол�
 BEFORE YOU START: check rlm_start response — warnings, extension_context, detected_custom_prefixes.
 
 Step 0 — UNDERSTAND: decode the business question
-  If a "BUSINESS RECIPE" section appears below — follow it. It was auto-selected by your query.
-  No recipe? → analyze_subsystem('ПодсистемаИмя') for domain overview, then proceed to Step 1.
+  BUSINESS RECIPE? Follow it.
+  No recipe? → analyze_subsystem('Подсистема'); current-root; uncut known rows:all direct:!content_truncated&subsystems_found==len(subsystems);live:no reverse
 
 Step 1 — DISCOVER: find what you need
   search(query)                          → BROAD first pass: methods + objects + regions + headers + attributes + predefined
@@ -513,7 +513,7 @@ INSTANT (индексный путь, OK для batch 5-10 в одном rlm_exe
   get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
 
 HYBRID (часть из индекса, часть live — ОДИН вызов в batch, не больше 2-3):
-  find_functional_options(obj_name[, limit=10]) → xml_options из индекса; code_options через safe_grep (live, всегда); limit= — per-bucket cap, спасает от обрыва по max_output_chars
+  find_functional_options(obj_name,limit=10) → ФО объекта; широкий XML-обзор: find_functional_options('',include_code=False,include_content=False,limit=50), детали состава по file
 
 LIVE (читают тела процедур / parse XML — медленно, особенно без индекса):
   find_based_on_documents(doc_name)      → read_procedure(ОбработкаЗаполнения, ДобавитьКомандыСозданияНаОсновании) — НЕ batch массово
@@ -702,12 +702,12 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "full": [
             "search_objects('себестоимость') → документы, регистры, модули по синониму",
             "find_by_type('AccumulationRegisters', 'Себестоимость') → регистры себестоимости",
-            "find_register_writers('РегистрИмя') → статические reverse-кандидаты; Posting/CFE проверь через forward, свежесть main-кода — по живому файлу",
+            "find_register_writers('РегистрИмя') → reverse-кандидаты; Posting/CFE — forward, свежесть main — live-файл",
             "analyze_document_flow('ДокИмя') → проводки + подписки + задания",
-            "search_methods('Себестоимость') → методы расчёта по всей кодовой базе",
+            "search_methods('Себестоимость') → методы расчета",
             "find_callers_context('РассчитатьСебестоимость') → цепочка вызовов",
-            "analyze_subsystem('РасчетСебестоимости') → все объекты домена",
-            "ALT: grep('Себестоимость', path=module) если регистр не найден",
+            "analyze_subsystem('РасчетСебестоимости') → current-root; uncut:all direct:!content_truncated&subsystems_found==len(subsystems)",
+            "ALT: grep('Себестоимость', path=module)",
         ],
     },
     "проведение": {
@@ -740,11 +740,11 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "search_objects('распределение') → объекты по синониму",
             "search_methods('Распредел') → все методы распределения",
             "find_by_type('AccumulationRegisters', 'Распредел') → регистры распределения",
-            "find_register_writers('РегистрИмя') → статические reverse-кандидаты; Posting/CFE проверь через forward, свежесть main-кода — по живому файлу",
+            "find_register_writers('РегистрИмя') → reverse-кандидаты; Posting/CFE — forward, свежесть main — live-файл",
             "analyze_document_flow('ДокИмя') → полный flow документа распределения",
-            "analyze_subsystem('РаспределениеЗатрат') → все объекты домена",
+            "analyze_subsystem('РаспределениеЗатрат') → current-root; uncut:all direct:!content_truncated&subsystems_found==len(subsystems)",
             "find_callers_context('Распределить') → цепочка вызовов",
-            "ALT: grep('Распредел', path=module) для поиска в конкретных модулях",
+            "ALT: grep('Распредел', path=module)",
         ],
     },
     "печать": {
@@ -755,13 +755,13 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         ],
         "full": [
             "search_objects('печат') → объекты печати по синониму",
-            "find_print_forms('ОбъектИмя') → все печатные формы объекта",
-            "find_module('Печать') → модули подсистемы печати",
-            "search_methods('Печат') → методы формирования печатных форм",
+            "find_print_forms('ОбъектИмя') → формы объекта",
+            "find_module('Печать') → модули печати",
+            "search_methods('Печат') → методы печати",
             "find_callers_context('СформироватьПечатнуюФорму') → цепочка вызовов",
-            "analyze_subsystem('Печать') → все объекты подсистемы печати",
+            "analyze_subsystem('Печать') → current-root; uncut:all direct:!content_truncated&subsystems_found==len(subsystems)",
             "find_by_type('CommonModules', 'Печат') → общие модули печати",
-            "ALT: grep('ТабличныйДокумент', path=module) для поиска макетов",
+            "ALT: grep('ТабличныйДокумент',path=module)",
         ],
     },
     "права": {
@@ -776,11 +776,11 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "точное МЕМБЕРСТВО: find_references_to_object('Документ.X', kinds=['role_rights']) — требует индексной metadata_references и qualified ref; без неё _meta.unsupported_kinds=['role_rights'], без right_name",
             "точные ИМЕНА ПРАВ: get_object_profile('Документ.X', sections=['roles']) — right_names / matched_objects / rights_by_object — BOUNDED sample, при details_truncated=True сужай объект, а не считай список полным",
             "find_by_type('Roles') → полный список ролей конфигурации",
-            "find_functional_options('ОбъектИмя', limit=10) → функциональные опции; limit= (именованно!) режет xml_options и code_options КАЖДЫЙ до N + total/returned/has_more — без него обрыв по max_output_chars",
+            "find_functional_options('ОбъектИмя',limit=10) → ФО объекта; обзор: find_functional_options('',include_code=False,include_content=False,limit=50)",
             "search_methods('ПравоДоступа') → проверки прав в коде",
             "search_methods('РольДоступна') → программные проверки ролей",
-            "analyze_subsystem('УправлениеДоступом') → все объекты подсистемы прав",
-            "ALT: grep('ПравоДоступа|РольДоступна', path=module) в конкретных модулях",
+            "analyze_subsystem('УправлениеДоступом') → current-root; uncut:all direct:!content_truncated&subsystems_found==len(subsystems)",
+            "ALT: grep('ПравоДоступа|РольДоступна',path=module) в конкретных модулях",
         ],
     },
     "интеграция": {

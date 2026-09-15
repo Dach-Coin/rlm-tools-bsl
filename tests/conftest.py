@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -32,6 +33,38 @@ def _strategy_mode_default(request, monkeypatch):
     """
     mode = "slim" if "strategy_mode_slim" in request.keywords else "full"
     monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _prewarm_off_by_default():
+    """Фоновый прогрев живого каталога выключен для ВСЕЙ сюиты (v1.36.0).
+
+    Он не влияет ни на состав каталога, ни на его порядок (та же функция под тем
+    же замком), поэтому его отсутствие ничего не маскирует. Зато включённым он
+    запускал бы ``os.scandir`` по tmp-дереву на КАЖДУЮ session/backend-конструкцию,
+    а на Windows открытый handle каталога ломает уборку ``TemporaryDirectory``.
+
+    Scope именно SESSION, а не function: в ``tests/test_sandbox_process.py``
+    фикстура ``backend(scope="module")`` конструирует ``ProcessSandboxBackend`` и
+    запускает worker ДО setup function-scoped autouse — прогрев успел бы
+    стартовать. Session-фикстура не может зависеть от function-scoped
+    ``monkeypatch``, поэтому она точечно сохраняет и восстанавливает один ключ.
+
+    ИСКЛЮЧЕНИЕ — ``TestLiveCatalogPrewarm``: у него СВОЯ class-autouse фикстура
+    ``_prewarm_on``, которая возвращает прогрев. Полагаться на то, что каждый
+    тест класса вспомнит включить его сам, нельзя: часть тестов проходила бы
+    вхолостую, а тест с барьером падал бы по таймауту.
+    """
+    key = "RLM_PREWARM_LIVE_CATALOG"
+    previous = os.environ.get(key)
+    os.environ[key] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 @pytest.fixture(autouse=True)

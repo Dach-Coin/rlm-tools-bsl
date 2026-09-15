@@ -223,6 +223,29 @@ def _assert_payload_budget(monkeypatch, tmp_path, mode, query, baselines):
     _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline)
 
 
+# v1.36.0 (поправка V1): колонка «Факт» опорного замера зависела от ДЛИНЫ tmp-пути.
+# `rlm_start` кладёт `resolved_path` в payload РОВНО ОДИН раз, поэтому длина
+# `--basetemp` уезжала в измеряемую величину: с глубоким basetemp slim-ячейка падала
+# (21729 > 21725) на НЕТРОННУТОМ дереве, без единой правки кода. Меряем path-free:
+# фактическую escaped-длину пути заменяем на опорную константу.
+#
+# `_PATH_REF` не выбран, а ВЫЧИСЛЕН: он воспроизводит колонку «Факт» опорного замера
+# плана до символа во всех шести снятых там ячейках. Потолки и `_PAYLOAD_BASELINES`
+# при этом НЕ меняются — на опорном пути число то же, что и прежде, это не
+# ре-бэйслайн, а снятие зависимости гарда от окружения.
+_PATH_REF = 86
+
+
+def _esc(value: str) -> str:
+    """Значение так, как оно лежит ВНУТРИ JSON-строки payload (без кавычек)."""
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _pathfree_len(raw: str, resolved_path: str) -> int:
+    """Длина payload, нормализованная по длине `resolved_path`."""
+    return len(raw) - len(_esc(resolved_path)) + _PATH_REF
+
+
 def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_git_search=False):
     import rlm_tools_bsl.extension_detector as _ed
     from rlm_tools_bsl.bsl_index import IndexBuilder
@@ -256,8 +279,9 @@ def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_gi
         # стратегия несёт лишний блок предупреждения, и число было бы не про то.
         assert data["source_support"] == "supported", "budget config must be a supported cf/edt tree"
         ceiling = int(baseline * _DRIFT)
-        assert len(raw) <= ceiling, (
-            f"{mode}/{query or '(none)'} rlm_start payload {len(raw)} > {ceiling} (+5% of {baseline}). "
+        measured = _pathfree_len(raw, data["resolved_path"])
+        assert measured <= ceiling, (
+            f"{mode}/{query or '(none)'} rlm_start payload {measured} > {ceiling} (+5% of {baseline}). "
             "available_functions / index / strategy grew — trim or re-baseline intentionally."
         )
         # the new aggregate signature lives on available_functions — confirm it is present
@@ -322,11 +346,6 @@ _MISSING_INDEX_PAYLOAD_BASELINES = {"slim": 19995, "full": 47154}
 
 # Тот же однопроцедурный модуль, что и у фикстуры с индексом.
 _BUDGET_MODULE_BSL = "Процедура П() Экспорт\nКонецПроцедуры\n"
-
-
-def _esc(value: str) -> str:
-    """Значение так, как оно лежит ВНУТРИ JSON-строки payload (без кавычек)."""
-    return json.dumps(value, ensure_ascii=False)[1:-1]
 
 
 def _normalize_paths(raw: str, resolved: str) -> str:
@@ -397,14 +416,25 @@ _SIG_CEILINGS = {
     "find_call_hierarchy": 560,
     "find_path": 540,
     "get_object_full_structure": 520,
-    "get_object_modules": 500,
+    # v1.36.0 (Задача 3): sig 491 -> 467 (проекция orphan_methods вместо
+    # дублирующего хвоста). Потолок ЖЁСТЧЕ общего правила «факт + 10 %»
+    # (оно дало бы 520): у этой подписи запас был узким и до релиза
+    # (500 при 491), а расширять его на механической правке не за что.
+    "get_object_modules": 480,
     "get_module_outline": 470,
     "find_register_movements": 380,
+    # v1.36.0 (Задача 0): пояснения переехали из БЮДЖЕТИРУЕМОГО sig в recipe,
+    # поэтому потолки опускаются под новый факт (`ceil10(факт * 1.10)`) — иначе
+    # освобождённый запас будет молча съеден следующей правкой.
+    # `find_functional_options` потолка не имел вовсе; он ДОБАВЛЕН здесь при
+    # промежуточном факте 371 и поднят Задачей 4 до ceil10(412 * 1.10) под её
+    # осознанно расширенный контракт (include_content / общий ключ name).
+    "find_functional_options": 460,
     # Четыре подписи, несущие предупреждения о ложном отрицательном выводе
     # (см. test_sigs_warn_about_false_negative_answers). Потолок нужен именно им:
     # предупреждение тянет текст вверх, а sig уходит агенту на КАЖДОМ старте.
     # Запас к фактическому размеру ~10%: смысл дописывать можно, растекаться — нет.
-    "parse_form": 600,
+    "parse_form": 510,
     "search_regions": 560,
     "search_module_headers": 340,
     "search_methods": 320,

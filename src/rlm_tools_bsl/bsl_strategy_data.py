@@ -28,8 +28,8 @@ If a helper returns an error, read the HINT at the end — it tells you what to 
 BEFORE YOU START: check rlm_start response — warnings, extension_context, detected_custom_prefixes.
 
 Step 0 — UNDERSTAND: decode the business question
-  If a "BUSINESS RECIPE" section appears below — follow it. It was auto-selected by your query.
-  No recipe? → analyze_subsystem('ПодсистемаИмя') for domain overview, then proceed to Step 1.
+  BUSINESS RECIPE? Follow it.
+  No recipe? → analyze_subsystem('Подсистема'); current-root; uncut known rows:all direct:!content_truncated&subsystems_found==len(subsystems);live:no reverse
 
 Step 1 — DISCOVER: find what you need
   search(query)                          → BROAD first pass: methods + objects + regions + headers + attributes + predefined
@@ -89,7 +89,7 @@ INSTANT (индексный путь, OK для batch 5-10 в одном rlm_exe
   get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
 
 HYBRID (часть из индекса, часть live — ОДИН вызов в batch, не больше 2-3):
-  find_functional_options(obj_name[, limit=10]) → xml_options из индекса; code_options через safe_grep (live, всегда); limit= — per-bucket cap, спасает от обрыва по max_output_chars
+  find_functional_options(obj_name,limit=10) → ФО объекта; широкий XML-обзор: find_functional_options('',include_code=False,include_content=False,limit=50), детали состава по file
 
 LIVE (читают тела процедур / parse XML — медленно, особенно без индекса):
   find_based_on_documents(doc_name)      → read_procedure(ОбработкаЗаполнения, ДобавитьКомандыСозданияНаОсновании) — НЕ batch массово
