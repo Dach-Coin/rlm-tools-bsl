@@ -1126,7 +1126,9 @@ def test_get_overrides_unavailable_has_same_shape(tmp_path, monkeypatch):
     assert res["partial"] is True
     for key in ("by_annotation", "by_object_top", "by_extension_top"):
         assert res[key] == {}, key
-    for key in ("unique_objects", "unique_methods", "unique_extensions", "total"):
+    # v1.37.0: `unique_object_methods` входит в тот же shape — иначе агент, написавший
+    # его на индексной ветке, падал бы на конфигурации без расширений.
+    for key in ("unique_objects", "unique_methods", "unique_object_methods", "unique_extensions", "total"):
         assert res[key] == 0, key
     assert res["overrides"] == [] and res["truncated"] is False
 
@@ -1148,6 +1150,10 @@ _UNIFIED_OVERRIDE_KEYS = {
     "source_path",
     "source_module_id",
     "target_method_line",
+    # v1.37.0 (Задача 3): 14 → 15. Это УЖЕСТОЧЕНИЕ, а не вынужденная правка —
+    # сверка идёт подмножеством (`_UNIFIED_OVERRIDE_KEYS - set(row)`), поэтому без
+    # обновления тест остался бы зелёным, а новый ключ не был бы закреплён ничем.
+    "extension_file",
 }
 
 
@@ -1423,5 +1429,353 @@ def test_extract_procedures_read_time_ignores_ghosts(tmp_path, monkeypatch):
         assert [p["name"] for p in procs] == ["Настоящая"], procs
         assert isinstance(procs[0]["params"], list), procs[0]
         assert procs[0]["params"] == ["В", "Г"], procs[0]
+    finally:
+        reader.close()
+
+
+# ---------------------------------------------------------------------------
+# v1.37.0 (Задача 3) — ОДИН однозначный путь до файла расширения
+# ---------------------------------------------------------------------------
+
+
+def _bsl_with_ext_roots(base_path, reader, ext_paths):
+    """Сессия, которая ЗНАЕТ соседние корни расширений — как её строит сервер."""
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+    from rlm_tools_bsl.format_detector import detect_format
+    from rlm_tools_bsl.helpers import make_helpers
+
+    helpers, resolve_safe = make_helpers(base_path, idx_reader=reader)
+    fmt = detect_format(base_path)
+    return make_bsl_helpers(
+        base_path=base_path,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=fmt,
+        idx_reader=reader,
+        extension_paths=list(ext_paths),
+    )
+
+
+@pytest.fixture()
+def overrides_session(tmp_path, monkeypatch):
+    """MAIN-сессия с соседним CFE и живым индексом."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, cfe = _make_main_with_extension(str(tmp_path))
+    db_path = IndexBuilder().build(cf, build_calls=False, build_metadata=True)
+    reader = IndexReader(db_path)
+    try:
+        yield _bsl_with_ext_roots(cf, reader, [cfe]), cf, cfe
+    finally:
+        reader.close()
+
+
+def test_extension_file_is_executable_in_the_same_session(overrides_session):
+    """`extension_file` — '../'-путь от корня СЕССИИ, исполнимый прямо в ней.
+
+    Три существующих поля описывают путь, и ни одно не адресует файл: `source_path`
+    — от корня ОСНОВНОЙ конфигурации (в EXTENSION-индексе ""), `ext_module_path` —
+    от корня РАСШИРЕНИЯ, `extension_root` — абсолютный.
+    """
+    bsl, _cf, _cfe = overrides_session
+    rows = bsl["get_overrides"]()["overrides"]
+    assert rows, "фикстура обязана дать хотя бы один перехват"
+    row = rows[0]
+
+    assert row["extension_file"], row
+    # Исполним: хелпер читает тело по этому пути и по имени из ТОЙ ЖЕ строки.
+    body = bsl["read_procedure"](row["extension_file"], row["extension_method"])
+    assert body, (row["extension_file"], row["extension_method"])
+
+    # Одно физическое место — ОДНО представление: то же, что отдаёт find_module.
+    ext_mods = [m["path"] for m in bsl["find_module"](row["object_name"]) if m.get("owner") != "main"]
+    assert row["extension_file"] in ext_mods, (row["extension_file"], ext_mods)
+
+    # Ключ входит в инварианты Задачи 1: разделитель ОДИН, и на Windows это `/`.
+    # Без `.replace("\\","/")` `os.path.relpath` дал бы `..\cfe\X` + POSIX-хвост, и
+    # `read_procedure` такой путь ВСЁ РАВНО бы исполнил (Path понимает оба
+    # разделителя) — то есть тест «исполним» остался бы зелёным, а сравнение путей
+    # одного файла давало бы ложное несовпадение.
+    assert "\\" not in row["extension_file"], row["extension_file"]
+    assert row["extension_file"].startswith("../"), row["extension_file"]
+
+
+def test_extension_file_keeps_the_original_case_of_the_root(overrides_session):
+    """Префикс берётся В ИСХОДНОМ регистре, а не из normcase-компонентов.
+
+    `_ext_rel_prefixes` хранит пару (normcase-компоненты, СЫРОЙ путь корня); первый
+    элемент и `_current_rel_prefix()` опускают регистр на Windows, и собранный из них
+    путь дал бы `../cfe/тестовоерасширение/...` — ложное несовпадение с
+    `find_module(...)['path']`, то есть дефект §4 внутри релиза, который §4 закрывает.
+    """
+    bsl, _cf, cfe = overrides_session
+    row = bsl["get_overrides"]()["overrides"][0]
+    root_name = os.path.basename(cfe)
+    assert root_name in row["extension_file"], (root_name, row["extension_file"])
+
+
+def test_extension_file_key_is_always_present_even_when_root_is_unreachable(overrides_session):
+    """Недостижимый корень → пустая строка, но КЛЮЧ на месте.
+
+    `_normalize_override_row` зовётся и из `find_ext_overrides` с ПРОИЗВОЛЬНЫМ
+    `extension_root`. Если корня нет среди корней сессии, `extension_file == ""` —
+    это КОРРЕКТНО (исполнить такой путь из песочницы всё равно нельзя,
+    `_ext_resolve_safe` его отвергнет), и потому же названо в рецепте: иначе пустая
+    строка читается как «файл не найден».
+    """
+    bsl, _cf, cfe = overrides_session
+    live = bsl["find_ext_overrides"](cfe)
+    assert live["overrides"], live
+    for row in live["overrides"]:
+        assert "extension_file" in row, sorted(row)
+    assert "extension_file" in (bsl["find_ext_overrides"](cfe)["overrides"][0])
+
+
+def test_find_ext_overrides_recipe_explains_the_empty_extension_file():
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    recipe = build_helper_metadata_snapshot()["find_ext_overrides"]["recipe"]
+    assert "extension_file" in recipe
+    assert "КОРРЕКТНО" in recipe or "корректно" in recipe
+
+
+def test_extension_file_does_not_shift_the_cap_200_slice(overrides_session):
+    """Новый ключ считается ВНУТРИ нормализации, а не в сырой строке.
+
+    `_sort_key` берётся по СЫРОЙ строке до нормализации, и её последний элемент —
+    `json.dumps(r)`: новый ключ В СЫРОЙ строке сдвинул бы тай-брейк и состав среза 200.
+    """
+    bsl, _cf, _cfe = overrides_session
+    first = bsl["get_overrides"]()
+    again = bsl["get_overrides"]()
+    key = lambda rs: [(r["object_name"], r["target_method"], r["annotation"]) for r in rs]  # noqa: E731
+    assert key(first["overrides"]) == key(again["overrides"])
+    # Служебный токен сортировки наружу не попадает.
+    assert all("_sort_key" not in r for r in first["overrides"])
+
+
+def test_get_overrides_root_key_set_is_pinned(overrides_session):
+    """Корневой набор ключей `get_overrides` не был заморожен НИЧЕМ.
+
+    `_UNIFIED_OVERRIDE_KEYS` стережёт только СТРОКИ; корень не сверял никто, и
+    `unique_object_methods` (Задача 4) так же молча исчез бы в следующем релизе,
+    как молча появился бы сейчас.
+    """
+    bsl, _cf, _cfe = overrides_session
+    assert set(bsl["get_overrides"]()) == {
+        "overrides",
+        "total",
+        "offset",
+        "returned",
+        "has_more",
+        "truncated",
+        "partial",
+        "source",
+        "by_annotation",
+        "by_object_top",
+        "by_extension_top",
+        "unique_objects",
+        "unique_methods",
+        "unique_object_methods",
+        "unique_extensions",
+    }, sorted(bsl["get_overrides"]())
+
+
+# ---------------------------------------------------------------------------
+# v1.37.0 (Задача 4) — unique_methods считает ИМЕНА, а не пары
+# ---------------------------------------------------------------------------
+
+
+_HOMONYM_EXT_MODULE = """\
+&После("ПередЗаписью")
+Процедура Расш_ПередЗаписью(Отказ) Экспорт
+КонецПроцедуры
+"""
+
+
+def _make_homonym_extension(parent_dir):
+    """Одно расширение перехватывает ПередЗаписью и у Documents.Заказ, и у Catalogs.Заказ.
+
+    Без категории в ключе ответ был бы 1 вместо 2 — ровно та склейка, ради
+    устранения которой ключ и заводится.
+    """
+    cf = os.path.join(parent_dir, "src", "cf")
+    cfe = os.path.join(parent_dir, "src", "cfe", "Омонимы")
+    _write(os.path.join(cf, "Configuration.xml"), _CF_MAIN_XML)
+    for cat in ("Documents", "Catalogs"):
+        _write(
+            os.path.join(cf, cat, "Заказ", "Ext", "ObjectModule.bsl"),
+            "Процедура ПередЗаписью(Отказ) Экспорт\nКонецПроцедуры\n",
+        )
+    _write(os.path.join(cfe, "Configuration.xml"), _cf_extension_xml())
+    for cat in ("Documents", "Catalogs"):
+        _write(os.path.join(cfe, cat, "Заказ", "Ext", "ObjectModule.bsl"), _HOMONYM_EXT_MODULE)
+    return cf, cfe
+
+
+def test_unique_object_methods_counts_pairs_not_names(tmp_path, monkeypatch):
+    """`unique_methods` считает ИМЕНА (прибито тестом и не трогается), новый ключ — ПАРЫ."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, cfe = _make_homonym_extension(str(tmp_path))
+    db_path = IndexBuilder().build(cf, build_calls=False, build_metadata=True)
+    reader = IndexReader(db_path)
+    try:
+        bsl = _bsl_with_ext_roots(cf, reader, [cfe])
+        res = bsl["get_overrides"]()
+        assert res["total"] == 2, res
+        # Одно ИМЯ метода на два объекта одного имени в разных категориях.
+        assert res["unique_methods"] == 1, res
+        assert res["unique_objects"] == 1, res
+        # Пар — две: категория входит в ключ.
+        assert res["unique_object_methods"] == 2, res
+    finally:
+        reader.close()
+
+
+def test_unique_object_methods_uses_the_extension_path_not_source_path(tmp_path, monkeypatch):
+    """Категория берётся из пути САМОГО расширения.
+
+    Точный поиск `source_path` идёт по `rel_path`, но при промахе срабатывает
+    fallback «любой модуль с тем же именем и типом, первый по алфавиту» — он может
+    назвать ЧУЖУЮ категорию. Путь расширения этой ошибки не наследует: он всегда
+    называет категорию перехватывающего модуля.
+    """
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, cfe = _make_homonym_extension(str(tmp_path))
+    db_path = IndexBuilder().build(cf, build_calls=False, build_metadata=True)
+    reader = IndexReader(db_path)
+    try:
+        bsl = _bsl_with_ext_roots(cf, reader, [cfe])
+        rows = bsl["get_overrides"]()["overrides"]
+        cats = {r["ext_module_path"].split("/", 1)[0] for r in rows}
+        assert cats == {"Documents", "Catalogs"}, rows
+        # Даже если бы source_path назвал одну и ту же категорию обеим строкам,
+        # счёт пар остаётся честным.
+        assert bsl["get_overrides"]()["unique_object_methods"] == 2
+    finally:
+        reader.close()
+
+
+def test_unique_object_methods_on_the_live_branch_without_index(tmp_path):
+    """no-index MAIN-сессия: живая строка несёт `module_path`, а НЕ `ext_module_path`.
+
+    Правило «брать `module_path`, иначе `source_path`» на ШТАТНОМ ИНДЕКСНОМ маршруте
+    всегда падало бы в `source_path` (в колонках таблицы `module_path` нет вовсе),
+    поэтому пробуются ОБА имени.
+    """
+    cf, cfe = _make_homonym_extension(str(tmp_path))
+    bsl = _bsl_with_ext_roots(cf, None, [cfe])
+    res = bsl["get_overrides"]()
+    assert res["source"] != "index", res["source"]
+    assert res["total"] == 2, res
+    assert res["unique_object_methods"] == 2, res
+
+
+@pytest.mark.parametrize("with_index", [False, True])
+def test_extension_file_in_a_session_opened_on_the_extension_itself(tmp_path, monkeypatch, with_index):
+    """Корень СЕССИИ в карту соседних корней не попадает НИКОГДА.
+
+    `_ext_rel_prefixes` собирается из СОСЕДНИХ корней: у собственного корня
+    `os.path.relpath` даёт "." → пустые компоненты → строка не добавляется. Поэтому
+    поиск по карте промахивался на КАЖДОЙ строке ext-role сессии и отдавал `""` —
+    «корень недостижим» там, где корень и есть сессия, а файл лежит прямо под ним.
+
+    Пустым `extension_root` при этом не бывает ни на одной ветке: live-ветка
+    `get_overrides` достраивает его из текущего контекста ДО нормализации, а
+    ext-role индекс хранит его в таблице, — поэтому ветка «пустой корень» была
+    недостижима по построению.
+    """
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, cfe = _make_main_with_extension(str(tmp_path))
+    reader = None
+    if with_index:
+        reader = IndexReader(IndexBuilder().build(cfe, build_calls=False, build_metadata=True))
+    try:
+        bsl = _bsl_with_ext_roots(cfe, reader, [])
+        res = bsl["get_overrides"]()
+        assert res["overrides"], res
+        assert res["source"] == ("index" if with_index else "live"), res["source"]
+        for row in res["overrides"]:
+            assert row["extension_file"], row
+            # То же ОДНО представление, что у find_module для того же файла.
+            same = [m["path"] for m in bsl["find_module"](row["object_name"])]
+            assert row["extension_file"] in same, (row["extension_file"], same)
+            assert "\\" not in row["extension_file"], row["extension_file"]
+            # И он исполним прямо здесь.
+            assert bsl["read_procedure"](row["extension_file"], row["extension_method"])
+    finally:
+        if reader is not None:
+            reader.close()
+
+
+def test_extension_file_is_empty_only_when_the_root_is_truly_unreachable(tmp_path, monkeypatch):
+    """Пустая строка обязана означать РОВНО «корень недостижим из этой сессии».
+
+    MAIN-сессия + произвольный корень, которого нет среди её корней: исполнить такой
+    путь из песочницы всё равно нельзя (`_ext_resolve_safe` его отвергнет), поэтому
+    `""` здесь корректно — и это единственный класс, где оно корректно.
+    """
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, cfe = _make_main_with_extension(str(tmp_path))
+    foreign = tmp_path / "чужое" / "Расширение"
+    (foreign / "Catalogs" / "Номенклатура" / "Ext").mkdir(parents=True)
+    (foreign / "Catalogs" / "Номенклатура" / "Ext" / "ObjectModule.bsl").write_text(
+        '&После("ПриЗаписи")\nПроцедура Расш_ПриЗаписи(Отказ) Экспорт\nКонецПроцедуры\n',
+        encoding="utf-8",
+    )
+    _write(os.path.join(str(foreign), "Configuration.xml"), _cf_extension_xml())
+
+    # Сессия на MAIN и знает ТОЛЬКО свой соседний cfe.
+    bsl = _bsl_with_ext_roots(cf, None, [cfe])
+    live = bsl["find_ext_overrides"](str(foreign))
+    assert live["overrides"], live
+    for row in live["overrides"]:
+        assert "extension_file" in row, sorted(row)
+        assert row["extension_file"] == "", row
+    # Контроль: тот же вызов по ЗНАКОМОМУ корню даёт непустое значение — значит
+    # пустота выше про недостижимость, а не про сломанный ключ.
+    known = bsl["find_ext_overrides"](cfe)
+    assert known["overrides"] and all(r["extension_file"] for r in known["overrides"]), known
+
+
+def test_unique_object_methods_ignores_a_source_path_that_names_a_foreign_category(tmp_path, monkeypatch):
+    """Категория берётся из пути САМОГО расширения, а не из `source_path`.
+
+    На обычной фикстуре это НЕ проверяется: там `source_path == ext_module_path`, и
+    реализация «по source_path» дала бы тот же ответ. Поэтому строки подаются прямо
+    в ридер — ровно в том виде, в каком их порождает достижимый промах точного
+    поиска: `source_path` ищется по `rel_path`, а при промахе срабатывает fallback
+    `SELECT id, rel_path FROM modules WHERE object_name=? AND module_type=?
+    ORDER BY rel_path LIMIT 1`, то есть берётся ЛЮБОЙ модуль с тем же именем и
+    типом, первый по алфавиту. Сценарий: основная конфигурация в CF-выгрузке несёт и
+    `Catalogs/Заказ`, и `Documents/Заказ`, а расширение выгружено в EDT — точный
+    поиск промахивается, и ОБЕ строки получают `source_path` из `Catalogs/…`.
+    """
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    cf, cfe = _make_homonym_extension(str(tmp_path))
+    reader = IndexReader(IndexBuilder().build(cf, build_calls=False, build_metadata=True))
+    try:
+        real = reader.get_extension_overrides(None, None)
+        assert real and len(real) == 2, real
+
+        # `source_path` у ОБЕИХ строк называет ОДНУ (чужую для второй) категорию —
+        # ровно то, что отдаёт alphabetical fallback.
+        poisoned = []
+        for row in real:
+            copy = dict(row)
+            copy["source_path"] = "Catalogs/Заказ/Ext/ObjectModule.bsl"
+            poisoned.append(copy)
+        assert {r["ext_module_path"].split("/", 1)[0] for r in poisoned} == {"Catalogs", "Documents"}
+        assert {r["source_path"].split("/", 1)[0] for r in poisoned} == {"Catalogs"}
+
+        monkeypatch.setattr(reader, "get_extension_overrides", lambda *a, **kw: poisoned)
+        res = _bsl_with_ext_roots(cf, reader, [cfe])["get_overrides"]()
+        assert res["source"] == "index", res["source"]
+        assert res["total"] == 2, res
+        # По `source_path` вышла бы ОДНА пара — та самая склейка, ради устранения
+        # которой ключ и заведён.
+        assert res["unique_object_methods"] == 2, res
+        assert res["unique_methods"] == 1 and res["unique_objects"] == 1, res
     finally:
         reader.close()

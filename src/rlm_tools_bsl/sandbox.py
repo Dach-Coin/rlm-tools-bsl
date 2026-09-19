@@ -126,12 +126,14 @@ _KNOWN_HELPER_ALIASES: dict[str, str] = {
 _GENERIC_HELPER_SIGNATURES: dict[str, dict] = {
     "read_file": {"sig": "read_file(path) -> str"},
     "read_files": {"sig": "read_files(paths) -> dict[path, str]"},
-    "grep": {"sig": "grep(pattern, path='.') -> list[dict] keys: file, line, text"},
-    "grep_summary": {"sig": "grep_summary(pattern, path='.') -> str"},
-    "grep_read": {"sig": "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files, summary}"},
-    "glob_files": {"sig": "glob_files(pattern) -> list[str]"},
+    "grep": {"sig": "grep(pattern, path='.') -> list[dict] keys: file, line, text  # пути через /"},
+    "grep_summary": {"sig": "grep_summary(pattern, path='.') -> str  # пути через /"},
+    "grep_read": {
+        "sig": "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files, summary}  # пути через /"
+    },
+    "glob_files": {"sig": "glob_files(pattern) -> list[str]  # пути через /"},
     "tree": {"sig": "tree(path='.', max_depth=3) -> str"},
-    "find_files": {"sig": "find_files(name) -> list[str]"},
+    "find_files": {"sig": "find_files(name) -> list[str]  # пути через /"},
 }
 
 

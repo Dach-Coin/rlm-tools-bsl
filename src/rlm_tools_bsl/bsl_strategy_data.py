@@ -54,7 +54,7 @@ Step 2 — READ: understand the code
 
 Step 3 — TRACE: follow the call chains
   find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
-  find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. Для одноимённого объектного метода передай module_hint='Документ.X' (exact-режим, точные рёбра).
+  find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. module_hint: точно — rel_path=find_module('X')[i]['path']; 'Документ.X'/голое имя — ОБЪЕКТ.
   safe_grep(pattern, name_hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
 
@@ -172,6 +172,25 @@ LLM (if available):
    Неусечённая выдача ничего не говорит о полноте исходного домена.
 8. scope — legacy-композит, занят тремя разными смыслами и заморожен.
    НЕ выводи из него ни источник, ни CFE-охват, ни полноту.
+9. Сигналы СВЕЖЕСТИ — МАТРИЦА, а не иерархия: ни один не главнее других, потому
+   что все они про РАЗНОЕ. Читай по строкам «сигнал → что доказывает → действие»:
+     index_status=missing/incomplete → индекса нет или он неполон → собери его;
+     index_status=stale_content      → содержимое разошлось с диском → index update;
+     index_status=stale_age          → только КАЛЕНДАРЬ, содержимое не проверялось
+                                       → сверь критичное живьём;
+     index_status=ok                 → полноты НЕ доказывает: у молодого индекса
+                                       выборочная проверка содержимого пропускается,
+                                       а структурный дрейф не проверяется никогда —
+                                       добавленный сегодня .bsl оставляет 'ok';
+     index_coverage=disabled         → домен НЕ строился (--no-metadata/--no-synonyms)
+                                       → пересобери с нужной опцией; свежесть тут ни
+                                       при чём, 'ok' рядом с ним нормален;
+     index_coverage=unavailable |
+     wider_than_current              → строки годны, полнота НЕ доказана → пользуйся,
+                                       но отрицательный вывод не делай;
+     partial=True                    → неполон ИМЕННО ЭТОТ ответ → читай _meta.reasons.
+   index_status — снимок СЕССИИ (снят один раз на rlm_start), а partial и
+   index_coverage считаются ВОКРУГ конкретного запроса и зависят от его аргументов.
 
 ПУСТОЙ ОТВЕТ доказывает отсутствие только там, где это подтверждает контракт
 конкретного хелпера — обычно total_exact=True либо явный exact-статус секции.
@@ -196,9 +215,9 @@ DISAMBIGUATION_PAIRS: list[dict] = [
     {
         "pair": ("find_call_hierarchy", "find_callers_context"),
         "summary": "multi-level tree vs single level + context",
-        "when_a": "N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации. module_hint включает exact-режим для одноимённых объектных методов (точные рёбра по callee_key, _meta.root_exact/exact_rows).",
+        "when_a": "N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации. module_hint=rel_path привязывает корень к ОДНОМУ модулю → exact (рёбра по callee_key, _meta.root_exact/exact_rows).",
         "when_b": "1 уровень callers + контекст вызова (line/text). Быстрее.",
-        "rule": "Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy (с module_hint, если корень — неуникальный объектный метод).",
+        "rule": "Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy. Точная форма hint — rel_path=find_module('X')[i]['path']; 'Документ.X'/голое имя — лишь ОБЪЕКТ.",
         "tags": ["callers", "trace"],
     },
     {
@@ -303,5 +322,85 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "when_b": "get_object_full_structure — МЕТАДАННЫЕ: реквизиты, ТЧ, измерения/ресурсы, предопределённые, раскрытые перечисления, формы.",
         "rule": "Разные стороны объекта, дополняют друг друга. Нужен код → get_object_modules; нужны реквизиты/ТЧ → get_object_full_structure; нужно и то и то → зови оба (каждый дёшев на индексе).",
         "tags": ["modules", "structure", "metadata", "composite"],
+    },
+    {
+        "pair": ("find_references_to_object", "find_based_on_documents"),
+        "summary": "декларативный <BasedOn> vs две корзины (XML + код)",
+        "when_a": (
+            "find_references_to_object('Документ.X') → корзина based_on — ТОЛЬКО декларативный "
+            "<BasedOn> из XML, и направление ОДНО: ЧТО создаётся НА ОСНОВАНИИ X (строку объявляет "
+            "XML ДРУГОГО объекта). Обратного «на основании чего создаётся X» здесь НЕТ вовсе, а "
+            "source_object отбрасывается."
+        ),
+        "when_b": (
+            "find_based_on_documents('X') → ДВЕ корзины, и XML питает только ОДНУ: "
+            "can_create_from_here — тот же <BasedOn> (via='metadata') ПЛЮС "
+            "ДобавитьКомандыСозданияНаОсновании и back_scan по чужим ОбработкаЗаполнения; "
+            "can_be_created_from — ТОЛЬКО ОбработкаЗаполнения самого документа, XML в неё НЕ "
+            "попадает."
+        ),
+        "rule": (
+            "Множества РАЗНЫЕ, и происхождение каждой строки B названо БЕЗУСЛОВНЫМ ключом via: "
+            "'direct' (код самого документа), 'metadata' (декларативный <BasedOn>), 'back_scan' "
+            "(обратный скан чужих тел). Прежде отсутствие via означало direct, и об этом знал "
+            "только докстринг."
+        ),
+        "tags": ["based_on", "references", "documents"],
+    },
+    {
+        "pair": ("find_references_to_object", "find_functional_options"),
+        "summary": "обе эмиссии одного ref_kind vs только состав опции",
+        "when_a": (
+            "find_references_to_object(ref, kinds=['functional_option_content']) → под ОДНИМ "
+            "ref_kind лежат ДВЕ эмиссии: <Content> функциональной опции и её <Location> "
+            "(объект-хранилище)."
+        ),
+        "when_b": (
+            "find_functional_options(object_name) смотрит ТОЛЬКО на content, поэтому объект, "
+            "который является ХРАНИЛИЩЕМ опции, не находит НИКОГДА."
+        ),
+        "rule": (
+            "Различие уже доступно хвостом used_in: '….Content' — состав, '….Location' — "
+            "хранилище. Нового ref_kind не заводится (он требовал бы бампа BUILDER_VERSION)."
+        ),
+        "tags": ["functional_options", "references"],
+    },
+    {
+        "pair": ("get_object_profile", "find_functional_options"),
+        "summary": "typed-ref из ридера vs собственный выбор index/live + code-scan",
+        "when_a": (
+            "get_object_profile(name, sections=['functional_options']) → только typed-ref из "
+            "ридера, строка = {name}. Дёшево, но это НЕ перепись."
+        ),
+        "when_b": (
+            "find_functional_options(name) сам выбирает index или live для XML-корзины плюс "
+            "делает live code-scan вызовов ПолучитьФункциональнуюОпцию(); на bare-имени — union "
+            "омонимов."
+        ),
+        "rule": (
+            "Расхождение счётчиков — НОРМА, а не ошибка: провенанс каждой корзины назван машинно "
+            "в _meta (source — сводный, xml_source и code_source — по корзинам: index | live | "
+            "not_requested)."
+        ),
+        "tags": ["functional_options", "profile", "composite"],
+    },
+    {
+        "pair": ("find_references_to_object", "find_event_subscriptions"),
+        "summary": "домен подписки по source_types vs поиск по фрагменту",
+        "when_a": (
+            "find_references_to_object(ref, kinds=['event_subscription_source']) строится ТОЛЬКО "
+            "из НЕПУСТОГО source_types, поэтому universal-подписки (без указанного источника) в "
+            "домен не входят вовсе."
+        ),
+        "when_b": (
+            "find_event_subscriptions(фрагмент) включает их всегда и различает охват: "
+            "scope ∈ exact | partial | universal."
+        ),
+        "rule": (
+            "Это РАЗНЫЕ вопросы, а не расхождение хелперов: на боевой конфигурации 13 exact "
+            "против 179 по фрагменту — ожидаемое соотношение. Кода релиз здесь не менял: scope "
+            "уже есть."
+        ),
+        "tags": ["subscriptions", "references", "events"],
     },
 ]

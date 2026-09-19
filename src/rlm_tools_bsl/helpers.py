@@ -453,7 +453,10 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
                     if compiled.search(line):
                         results.append(
                             {
-                                "file": str(file_path.relative_to(base)),
+                                # v1.37.0: ОДНО представление относительного пути — POSIX.
+                                # `str(...)` давал нативный разделитель, и на Windows `file`
+                                # расходился с POSIX-путями индекса, safe_grep и BSL-хелперов.
+                                "file": file_path.relative_to(base).as_posix(),
                                 "line": i,
                                 "text": line.strip(),
                             }
@@ -572,7 +575,7 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
             if any(part in _SKIP_DIRS or part.startswith(".") for part in parts[:-1]):
                 continue
             try:
-                safe_matches.append(str(match.resolve().relative_to(base)))
+                safe_matches.append(match.resolve().relative_to(base).as_posix())
             except ValueError:
                 continue
         if not safe_matches and dir_matches:
@@ -605,8 +608,9 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
                             f"[hint: pattern '{pattern}' matched directories but no files. "
                             f"Add a file suffix, e.g. '{pattern}/**' or '{pattern}/Module.bsl']"
                         ]
-                # Normalize separators to match FS behavior (backslash on Windows)
-                return [p.replace("/", os.sep) for p in indexed]
+                # v1.37.0: ридер уже отдаёт POSIX — де-нормализация в os.sep убрана.
+                # Обе ветки glob_files (индексная и FS) публикуют ОДНУ форму пути.
+                return list(indexed)
             # Fallback: pattern unsupported or index error
             if _fallback_reason is None:
                 _fallback_reason = "unsupported"
@@ -635,7 +639,7 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
                     extension = "    " if i == len(visible) - 1 else "│   "
                     _walk(entry, prefix + extension, depth + 1)
 
-        lines.append(str(target.relative_to(base)) if target != base else ".")
+        lines.append(target.relative_to(base).as_posix() if target != base else ".")
         _walk(target, "", 0)
         return "\n".join(lines)
 
@@ -698,7 +702,7 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
                 return
             for fpath in _walk_files(base):
                 try:
-                    _file_index.append(str(fpath.relative_to(base)))
+                    _file_index.append(fpath.relative_to(base).as_posix())
                 except ValueError:
                     continue
             _file_index_built[0] = True
@@ -708,6 +712,14 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
 
         Uses SQLite index for ranked results when available, falls back to FS scan.
         """
+        if os.name == "nt":
+            # v1.37.0: обе ветки ищут теперь по POSIX-путям, а агент на Windows пишет
+            # needle с `\`. Индексная ветка искала по POSIX `rel_path` и `\` не матчила
+            # НИКОГДА, то есть правка выравнивает поведение, а не вводит новое.
+            # Нормализация стоит ДО индексной ветки, иначе `\`-needle просто уходил бы
+            # в FS-fallback и платил обход дерева там, где индекс ответил бы сразу.
+            # На POSIX замену делать НЕЛЬЗЯ: `\` там легальный символ ИМЕНИ файла.
+            name = name.replace("\\", "/")
         if idx_reader is not None:
             try:
                 indexed = idx_reader.find_files_indexed(name, limit=100)
@@ -718,9 +730,10 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
             # ТОЛЬКО zero-hit staleness (файл есть на диске, но отсутствует в stale-индексе);
             # partial-hit staleness (индекс отдал старые строки) — вне scope.
             if indexed:
-                return [p.replace("/", os.sep) for p in indexed]
+                # v1.37.0: ридер отдаёт POSIX — не де-нормализуем (см. glob_files).
+                return list(indexed)
         _build_file_index()
-        needle = name.lower()
+        needle = name.lower()  # `name` уже нормализован выше (см. os.name == "nt")
         return [f for f in _file_index if needle in f.lower()][:100]
 
     def _scan_main_bsl_catalog_status(route_canon: str) -> tuple[list[str], int]:

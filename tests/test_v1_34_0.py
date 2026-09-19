@@ -913,6 +913,10 @@ def test_coverage_map_matches_reality(cf_ext):
         "search_objects": _source(bsl["search_objects"]("Док", count_only=True)),
         "find_by_type": _source(bsl["find_by_type"]("Documents", count_only=True)),
         "get_overrides": _source(bsl["get_overrides"]()),
+        # v1.37.0: провенанс find_functional_options объявлен машинно, значит и
+        # карта охвата обязана его нести — иначе новая строка документации
+        # протухла бы молча.
+        "find_functional_options": _source(bsl["find_functional_options"]("Док")),
     }
     for helper, value in actual.items():
         assert helper in table, f"{helper} исчез из карты охвата"
@@ -2026,9 +2030,16 @@ def test_functional_options_code_scope_is_declared(tmp_path):
     assert res["code_total"] == 0, res
     assert res.get("partial") is None, res
     assert res["_meta"]["code_scope"] == "object_modules", res["_meta"]
-    # Обратная сторона: без code-скана описывать нечего, и замороженный legacy-набор
-    # ключей обязан остаться прежним (его стережёт test_arg_guards).
-    assert "_meta" not in bsl["find_functional_options"]("Цель", include_code=False)
+    # v1.37.0: `_meta` публикуется и БЕЗ code-скана — провенанс XML-корзины есть
+    # ВСЕГДА, а «code-домена нет вовсе» теперь сказано машинно, а не отсутствием ключа.
+    no_code = bsl["find_functional_options"]("Цель", include_code=False)
+    assert no_code["_meta"]["code_source"] == "not_requested", no_code["_meta"]
+    assert no_code["_meta"]["xml_source"] in ("index", "live"), no_code["_meta"]
+    # `_meta` стал безусловным в v1.37.0, поэтому прежний hint про ПОЛНЫЙ code-скан
+    # теперь достижим и при include_code=False. Машинный и текстовый каналы обязаны
+    # говорить одно: пустая code-корзина здесь ничего об отсутствии вызовов не доказывает.
+    assert "не запрашивался" in no_code["_meta"]["hint"], no_code["_meta"]
+    assert "code-скан полон" not in no_code["_meta"]["hint"], no_code["_meta"]
 
     # Домен обязан быть назван МАШИННО там, где `_meta` публикуется: пустой обзор
     # с каталогом больше бюджета даёт причину, а значит и `_meta`.

@@ -31,7 +31,16 @@ import time
 
 from rlm_tools_bsl.format_detector import BslFileInfo
 
-CACHE_VERSION = 1
+# v1.37.0: 1 -> 2. До релиза `_build_main_rows_from_glob` кормил `load_index`
+# НАТИВНЫМИ путями от `glob_files`, а `save_index` хэшировал `relative_path` в
+# POSIX, поэтому на Windows дисковый кеш живого каталога не попадал НИКОГДА и
+# перезаписывался на каждом старте. Как только он начнёт попадать, станет
+# достижим кеш, записанный ПРЕЖНИМ парсером: в файле лежит сама классификация
+# (c/o/m/f/cmd/fe), а сверяются только версия, счётчик и хэш путей. Цена бампа —
+# ровно один промах.
+#
+# ПРАВИЛО: правишь `parse_bsl_path` — бампай `CACHE_VERSION` (см. docs/MODULE_MAP.md).
+CACHE_VERSION = 2
 _disk_lock = threading.Lock()
 
 LAST_USED_MARKER = "last_used.txt"

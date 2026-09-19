@@ -1986,6 +1986,13 @@ def make_bsl_helpers(
         return name
 
     def _info_to_dict(relative_path: str, info: BslFileInfo) -> dict:
+        """СЫРАЯ строка каталога: ``form_name`` как его посчитал ``parse_bsl_path``.
+
+        Проекция для агента — ``_public_form_name`` (см. ниже). Здесь её делать
+        НЕЛЬЗЯ: результат этой функции служит и УПРАВЛЯЮЩИМ условием (``form_name is
+        not None`` сужает поиск до одного файла), и подменять сырое значение значит
+        менять поведение поиска, а не только его отображение.
+        """
         return {
             "path": relative_path,
             "category": info.category,
@@ -1994,6 +2001,28 @@ def make_bsl_helpers(
             "form_name": info.form_name,
             "owner": _owner_for(relative_path),
         }
+
+    def _public_form_name(row: dict) -> str | None:
+        """``form_name`` в том виде, в каком его обещает КОНТРАКТ хелперов.
+
+        У ОБЩЕЙ формы (`CommonForms/ИмяФормы/Ext/Form/Module.bsl`) в пути нет
+        сегмента ``Forms``, а классификатор ищет именно его — поэтому
+        ``find_by_type('CommonForms')`` отдавал ``form_name=None`` ВСЕГДА, хотя это
+        и есть форма, и `parse_form` то же имя заполняет (`object_name` == имя формы).
+
+        Чинить в ``parse_bsl_path`` НЕЛЬЗЯ: там ``is_form_module = form_name is not
+        None``, то есть изменилась бы колонка ``modules.is_form`` — ВЫХОД сборщика.
+        Поэтому проекция делается на agent-facing границе и только на КОПИИ строки.
+        """
+        if row.get("form_name") is not None:
+            return row["form_name"]
+        if (row.get("category") or "") == "CommonForms":
+            return row.get("object_name")
+        return None
+
+    def _project_public_rows(rows: list[dict]) -> list[dict]:
+        """КОПИИ строк с публичным ``form_name`` — сырые строки не мутируются."""
+        return [{**row, "form_name": _public_form_name(row)} for row in rows]
 
     def _single_or_map(arg, fn):
         """P1 list-перегрузка: целевой аргумент list/tuple → ``{str(x): fn(x)}``
@@ -2217,7 +2246,9 @@ def make_bsl_helpers(
         усечения был неисполним — агент узнавал, что выдача обрезана, и не мог её
         дочитать. Порядок выдачи — прямой проход каталога, НЕ релевантность.
 
-        Returns: list of dicts {path, category, object_name, module_type, form_name}."""
+        Returns: list of dicts {path, category, object_name, module_type, form_name,
+        owner}. ``form_name`` — ПУБЛИЧНАЯ проекция (``_public_form_name``): у ОБЩЕЙ
+        формы он равен её имени, хотя сегмента ``Forms`` в пути нет."""
         limit, _w = _coerce_bound(limit, 50, "limit", "find_module(name='', module_type='', category='', limit=50)")
         _warn_bound(_w)
         if limit <= 0:
@@ -2227,7 +2258,7 @@ def make_bsl_helpers(
             # при limit=0 результат зависел бы от того, совпала ли первая запись, —
             # одна строка либо пусто, недетерминировано относительно порядка каталога.
             return []
-        return _find_module_matches(name, module_type, category, max_results=limit)
+        return _project_public_rows(_find_module_matches(name, module_type, category, max_results=limit))
 
     def _find_by_type_count_payload(meta_type_lower: str, name_lower: str) -> dict:
         """``count_only`` для ``find_by_type`` (v1.34.0).
@@ -2359,7 +2390,9 @@ def make_bsl_helpers(
         extensions_included, _meta}`` (+ ``total_main``/``total_extensions`` при
         extension-scope) — обе величины из одного прохода, без ``break``.
 
-        Returns: list of dicts {path, category, object_name, module_type, form_name}."""
+        Returns: list of dicts {path, category, object_name, module_type, form_name,
+        owner}. ``form_name`` — ПУБЛИЧНАЯ проекция (``_public_form_name``): у ОБЩЕЙ
+        формы он равен её имени, хотя сегмента ``Forms`` в пути нет."""
         # Sentinel сравнивается по IDENTITY и не уезжает ни в JSON, ни в registry
         # metadata; «аргумент пропущен» и явная пустая строка — РАЗНЫЕ случаи.
         if meta_type is not _MISSING and category is not _MISSING:
@@ -2391,7 +2424,7 @@ def make_bsl_helpers(
             results.append(_info_to_dict(relative_path, info))
             if len(results) >= limit:
                 break
-        return results
+        return _project_public_rows(results)
 
     _proc_lazy = LazyDict()
     _prefilter_lazy = LazyDict()
@@ -2815,8 +2848,11 @@ def make_bsl_helpers(
 
         # #7: normalize `file` to POSIX '/' at the single assembly point — covers the
         # git, Python base-grep and extension branches at once, so a single result set is
-        # homogeneous (helpers.grep directory-walk yields '\' on Windows) and the (file,
-        # line) sort is stable. Convention as in find_roles ('.replace("\\","/")').
+        # homogeneous and the (file, line) sort is stable. Convention as in find_roles
+        # ('.replace("\\","/")').
+        # v1.37.0: `helpers.grep` сам отдаёт POSIX, поэтому нормализация ЗДЕСЬ больше не
+        # чинит его выдачу — она остаётся как защита границы: `grep_fn` подменяем, и
+        # сторонний источник вправе прийти с нативным разделителем.
         # COPY, never mutate in place: ``grep_fn`` is normally ``helpers.grep``, which
         # caches its result list and hands the SAME dicts back on a cache hit — an
         # in-place rewrite would silently and permanently change what a later direct
@@ -2999,8 +3035,12 @@ def make_bsl_helpers(
         # агент, сломавший СВОЙ аргумент, читал ответ как «git сломался» — шёл чинить не то (или
         # вовсе бросал git_search). Классифицируем КАЖДУЮ аргументную причину ЗДЕСЬ и называем
         # виновника; только после этого ``res is None`` означает РОВНО отказ git.
-        # Порядок и содержание проверок ОБЯЗАНЫ повторять ранние guard'ы _git_grep
-        # (bsl_index: mode -> pattern -> pathspec) — иначе классификация разъедется с реальностью.
+        # Зеркалятся ЛЕКСИЧЕСКИЕ guard'ы _git_grep (bsl_index: mode -> pattern -> pathspec):
+        # их порядок и содержание обязаны совпадать, иначе классификация разъедется с
+        # реальностью. ФС-причины сюда НЕ переносятся: `_sanitize_grep_path` намеренно
+        # диска не касается, а классификация узла (v1.37.0) живёт в backend — вторая,
+        # независимая проверка дала бы TOCTOU-расхождение с той, по которой строился
+        # pathspec. Такие причины приходят каналом `err` и выдаются наружу через `_gs_error`.
         _FILTER_HINT = (
             "ожидается ОТНОСИТЕЛЬНЫЙ литеральный путь внутри конфигурации (напр. "
             "'CommonModules/ИмяМодуля'); Windows-разделитель '\\' допустим — он нормализуется. "
@@ -3108,6 +3148,11 @@ def make_bsl_helpers(
         # неразличимы, и хелперу остается гадать. Гадание и было корнем: битый ERE уезжал в
         # "git grep failed". Теперь причину называет САМ git.
         err: dict = {}
+        # scope — ВТОРОЙ out-канал, симметричный err: без него обёртка не отличает
+        # «узел не доказан» от «доказанный каталог, в котором таких файлов нет».
+        # Успешный ПУСТОЙ ответ приходит из rc==1 прямым `return []` и никакой
+        # классификации не несёт, а err заполняется только на отказе.
+        scope: dict = {}
         res = _git_grep(
             base_path,
             pattern,
@@ -3121,8 +3166,20 @@ def make_bsl_helpers(
             max_per_file=_PER_FILE_CAP,
             include_truncation_sentinel=True,
             err=err,
+            scope=scope,
         )
         if res is None:
+            if err.get("kind") == "file_type_mismatch":
+                # ДОКАЗАННЫЙ файл с суффиксом вне file_types. Это единственный
+                # класс, где ответ известен точно, поэтому он и не уходит в hint
+                # на пустой выдаче: молчаливого нуля здесь больше нет.
+                wanted = ", ".join(err.get("file_types") or [])
+                return _gs_error(
+                    f"path={err.get('path')!r} — файл, а его расширение не входит в file_types={wanted!r}",
+                    "поиск по такому запросу пуст ПО ПОСТРОЕНИЮ, а не потому, что совпадений нет. "
+                    "ДЕЙСТВИЕ: убери file_types (искать в самом файле) либо расширь его "
+                    "расширением этого файла.",
+                )
             # Форма ошибки ЕДИНАЯ ({error, hint}) на ВСЕХ путях — потребитель, которому докстринг
             # обещал hint, не должен ловить KeyError именно на аварийном.
             git_msg = ""
@@ -3235,6 +3292,46 @@ def make_bsl_helpers(
                 "физически не отдаст больше по одному файлу. Смотри, какие файлы "
                 f"уперлись: _meta.files_capped. {route}"
             )
+        elif not rows and scope:
+            # Пустая выдача на ветке path+file_types. У нуля есть прочтения, которых
+            # агенту не видно, — и стоят они ноль обращений к диску: классификация уже
+            # в кармане. Ключ `hint` условный, новых постоянных ключей не заводится.
+            kind = scope.get("path_kind")
+            if kind == "file":
+                # Маршрут обязан быть ИСПОЛНИМЫМ ДОСЛОВНО — та же конвенция, что у
+                # `_semantics_route` выше: в свежей песочнице нет ни переменной `pattern`,
+                # ни предзагруженного `re`, поэтому вопрос экранирования решает СЕРВЕР и
+                # вставляет РЕЗУЛЬТАТ готовым литералом. При `regex=True` экранировать
+                # НЕЛЬЗЯ: `re.escape` сменил бы смысл выражения на литерал и дал бы второй
+                # ложный ноль (наблюдалось: git-ERE побайтный, `.` не берёт кириллицу →
+                # ноль, а тот же паттерн в Python `re` совпадает).
+                if len(pattern) > 300:
+                    _same_file_route = (
+                        f"перенеси выражение в grep КАК ЕСТЬ, БЕЗ re.escape: grep(<твой паттерн>, {path!r})"
+                        if regex
+                        else f"собери сам: import re; grep(re.escape('<твой литерал>'), {path!r})"
+                    )
+                else:
+                    _same_file_pattern = pattern if regex else re.escape(pattern)
+                    _same_file_route = f"grep({_same_file_pattern!r}, {path!r})"
+                out["hint"] = (
+                    f"Ноль на ДОКАЗАННОМ файле {path!r}. Три прочтения: совпадений и правда нет; "
+                    "регистр набранного пути разошёлся с именем на диске (pathspec регистрозависим, "
+                    "а сама ФС на Windows — нет); файл под .gitignore, а git_search игнорируемые НЕ "
+                    "ищет. ДЕЙСТВИЕ: сверь регистр пути и проверь .gitignore; тот же файл другим "
+                    f"движком — {_same_file_route}. safe_grep тут не годится: он ищет ТОЛЬКО по BSL "
+                    "и адресует модуль ИМЕНЕМ, а не путём."
+                )
+            elif kind == "indeterminate":
+                out["hint"] = (
+                    f"Ноль, и КЛАСС узла {path!r} доказать не удалось (reparse-point/junction, нет "
+                    "доступа либо узла нет). Два прочтения: путь — файл, исключённый file_types; "
+                    "путь — каталог, в котором таких файлов нет. ДЕЙСТВИЕ: убери file_types либо "
+                    "расширь его — тогда ответ станет однозначным."
+                )
+            # ДОКАЗАННЫЙ каталог hint'а НЕ получает: прочтение «это файл, исключённый
+            # file_types» там просто ЛОЖНО, а релиз ровно о том, чтобы не утверждать
+            # недоказанное.
         return out
 
     def _read_procedure_one(
@@ -3530,7 +3627,19 @@ def make_bsl_helpers(
         target_files: list[str] | None = None  # None = search all
 
         if module_hint:
-            hint_modules = find_module(module_hint)
+            # СЫРОЙ matcher, а не публичный `find_module`: ниже `form_name` —
+            # УПРАВЛЯЮЩЕЕ условие, сужающее поиск до ОДНОГО файла. С публичной
+            # проекцией (v1.37.0) у общей формы оно стало бы истинным, и экспортная
+            # процедура `CommonForms/X/Ext/Form/Module.bsl` перестала бы находиться
+            # вызывающими из других модулей — регресс, не видимый в выдаче.
+            #
+            # `max_results=50` ОБЯЗАТЕЛЕН и не косметика: у сырого matcher-а дефолт
+            # `None` (без потолка), а цикл ниже на КАЖДОГО кандидата зовёт
+            # `extract_procedures`, и из внешнего цикла выходит ТОЛЬКО когда
+            # `target_files` проставлен — для экспортной процедуры этого не бывает,
+            # то есть парсятся ВСЕ кандидаты. Matcher же совпадает и по подстроке
+            # ПУТИ: `module_hint='Ext'` дал бы все 26 тысяч модулей CF-выгрузки.
+            hint_modules = _find_module_matches(module_hint, max_results=50)
             if hint_modules:
                 # Find the target procedure in hint modules
                 for hm in hint_modules:
@@ -3712,17 +3821,25 @@ def make_bsl_helpers(
                 an ENTRY POINT, not a caller. Each trigger:
                 {edge_type, source_name, source_kind, detail, file, line,
                  caller_name, object_name, category, target_key, resolved}.
-            module_hint: Optional disambiguator for the ROOT target — enables the
-                exact (resolved) call-graph mode for same-named object methods
-                (e.g. ОбработкаПроведения in many Documents). Forms:
-                  - rel_path (the precise form, e.g. 'Documents/X/.../ObjectModule.bsl');
-                  - public 'Документ.X' / 'Document.X' (RU/EN);
-                  - bare object_name 'РеализацияТоваровУслуг'.
+            module_hint: disambiguator for the ROOT target. Only rel_path enables
+                the exact (resolved) call-graph mode unconditionally — take it ready
+                from find_module('X')[i]['path']. Forms:
+                  - rel_path — the ONLY precise form (e.g.
+                    'Documents/X/.../ObjectModule.bsl');
+                  - public 'Документ.X' / 'Document.X' (RU/EN) and bare object_name
+                    'РеализацияТоваровУслуг' select the OBJECT and turn exact on ONLY
+                    when the name is unique inside that object
+                    (``_resolve_target_key`` needs exactly one rel_path); otherwise
+                    root_exact=False, and the failure DIFFERS: the bare form narrows
+                    to an ARBITRARY module of the object (a form module, possibly),
+                    while the typed form does not narrow at all and admits same-named
+                    methods of OTHER objects.
                 An exported common-module method needs no hint ONLY if its name is
                 globally unique across the whole DB (no-hint exact requires global
                 name-uniqueness); if root_exact=False the name is ambiguous — pass
-                module_hint. Deeper levels propagate each caller's rel_path
-                automatically, so the exact mode continues without per-level hints.
+                module_hint=find_module('X')[i]['path']. Deeper levels propagate each
+                caller's rel_path automatically, so the exact mode continues without
+                per-level hints.
 
         Returns:
             On success: {root, direction, depth, tree, visited, truncated_targets, _meta}
@@ -3734,7 +3851,7 @@ def make_bsl_helpers(
                 {exact_available, root_exact, exact_targets, fallback_targets,
                  exact_rows, fallback_rows, node_budget_exceeded, visited_cap}.
                 node_budget_exceeded=True means a wide root hit visited_cap and the
-                tree is partial (level-ordered) — pass module_hint to narrow it.
+                tree is partial (level-ordered) — pass module_hint=find_module('X')[i]['path'] to narrow it.
             On unsupported direction: {error, hint, supported_directions}.
         """
         if direction not in ("callers", "callees", "both"):
@@ -3921,10 +4038,21 @@ def make_bsl_helpers(
             from_name: source method (the start of the forward path).
             to_name: target method (the end of the forward path).
             max_depth: max edges in the path (clamped 1..8, default 4).
-            from_hint / to_hint: optional module disambiguators (rel_path |
-                'Документ.X'/'Document.X' | bare object_name) — pin a same-named
-                method to one module. ``to_hint`` enables the exact-mode root;
-                ``from_hint`` makes the hit test pin ``from`` to its module.
+            from_hint / to_hint: module disambiguators. Only ``rel_path`` pins a
+                same-named method to ONE module; 'Документ.X'/'Document.X' and a bare
+                object_name select the OBJECT and pin a module only when the name is
+                unique inside it (``_resolve_target_key`` needs exactly one rel_path,
+                otherwise it returns None). ``to_hint`` is what switches the root to
+                exact mode, but it takes effect only when it resolves to ONE module
+                (rel_path always does); ``from_hint`` pins ``from`` for the hit test the
+                same way.
+                NB: the ambiguity guard below is switched off by ANY non-empty hint on
+                that end, so a NON-resolving object hint does not stop the walk — the
+                answer comes back WITHOUT ``error`` but with ``to_exact=False`` and
+                ``precision='heuristic'``, i.e. reachability by NAME, not a proven
+                path. Measured on a document declaring the handler both in its
+                ObjectModule and in a form module: no hint → error with 2 candidates,
+                'Документ.X' → found=True, bare object name → found=False.
             include_triggers: annotate each path node with its non-call inbound
                 edges via get_inbound_edges (see find_call_hierarchy).
 
@@ -5737,11 +5865,12 @@ def make_bsl_helpers(
                         candidate_files=candidate_files if synonym_candidates_supported else None,
                     )
 
-                    # Ключ НОРМАЛИЗУЕТСЯ по разделителю: строки ридера несут `file`
-                    # в POSIX, а живые приходят из `glob_files`, который приводит
-                    # разделитель к `os.sep`. На Windows сырой ключ дал бы
-                    # `Subsystems/Почта.xml` и `Subsystems\Почта.xml` как РАЗНЫЕ
-                    # строки — одна подсистема пришла бы дважды.
+                    # Ключ НОРМАЛИЗУЕТСЯ по разделителю. До v1.37.0 это чинило
+                    # реальное расхождение: строки ридера несли `file` в POSIX, а
+                    # живые приходили из `glob_files` с `os.sep`, и на Windows
+                    # `Subsystems/Почта.xml` и `Subsystems\Почта.xml` считались
+                    # РАЗНЫМИ — одна подсистема приходила дважды. Теперь обе ветки
+                    # POSIX, и нормализация остаётся защитой границы.
                     def _key(r):
                         return (r["name"].lower(), (r["file"] or "").replace("\\", "/"))
 
@@ -6751,7 +6880,12 @@ def make_bsl_helpers(
             entry = {
                 "path": rel,
                 "module_type": info.module_type,
-                "form_name": info.form_name,
+                # Тот же agent-facing контракт, что у find_module / find_by_type:
+                # `_build_module_entries` — ещё один публикующий производитель, и
+                # питает ДВА хелпера (get_object_modules и секцию `modules` профиля).
+                "form_name": _public_form_name(
+                    {"form_name": info.form_name, "category": info.category, "object_name": info.object_name}
+                ),
                 # Готовый owner ПРОЕЦИРУЕТСЯ, а не считается заново.
                 "owner": outline.get("owner"),
                 "totals": totals,
@@ -8514,7 +8648,13 @@ def make_bsl_helpers(
 
         Returns: dict with document, code_registers, modules_scanned. При Posting=Deny
                  всегда добавляются is_postable=False + hint; найденные статические строки
-                 сохраняются с явной пометкой, что при проведении они недостижимы."""
+                 сохраняются с явной пометкой, что при проведении они недостижимы.
+                 Когда обработчик проведения НАЙДЕН, рядом едут
+                 ``posting_handler_present`` и ``_meta`` с тройкой (v1.37.0):
+                 ``delegates`` — ограниченная первая страница имён получателей,
+                 разобранных из тела, плюс ``delegates_total`` и
+                 ``delegates_truncated``. Пагинации эта страница НЕ обещает: полный
+                 разбор идёт через ``hint``. Без обработчика ключей нет вовсе."""
         # `_meta` здесь условный (ставится setdefault и может отсутствовать), поэтому
         # предупреждение уходит в лог, а не в ответ.
         posting_calls_offset, _w = _coerce_bound(
@@ -9553,8 +9693,19 @@ def make_bsl_helpers(
         profile: bool,
         interceptors: list[dict] | None = None,
         posting_calls_offset: int = 0,
+        facts_out: dict | None = None,
     ) -> str:
         """Hint = ФАКТЫ разбора + только те шаги, которые в песочнице ИСПОЛНИМЫ.
+
+        ``facts_out`` (v1.37.0) — out-канал разобранных ФАКТОВ, той же конвенции, что
+        ``err``/``scope`` у ``_git_grep``. До релиза словарь ``facts`` был ЛОКАЛЬНЫМ, и
+        имена делегатов, разобранные машинно, существовали наружу только прозой внутри
+        ``hint``. Канал выбран вместо разделения тел на ``_collect_posting_facts`` /
+        ``_render_posting_hint`` намеренно: ТЕКСТ hint обязан остаться прежним
+        (``test_posting_hint_route_executes_end_to_end_and_names_the_delegate``
+        ИСПОЛНЯЕТ вырезанные из него шаги), а у ``_hint_steps``/``_decl_search_fragments``
+        около сорока потребителей — перекладывание тел стоило бы дороже задачи при том
+        же результате. Все три call-site остаются неизменными: канал опционален.
 
         Шаги нумеруются подряд «(N) код -> пояснение» и являются валидным Python: тест вырезает их
         из текста и ИСПОЛНЯЕТ — псевдокод здесь = SyntaxError = красный тест. Ни один шаг не зовёт
@@ -10025,7 +10176,42 @@ def make_bsl_helpers(
         hint = "".join(parts)
         if profile:
             hint += _POSTING_PROFILE_TAIL.format(doc=document_name)
+        if facts_out is not None:
+            facts_out.clear()
+            facts_out.update(facts)
         return hint
+
+    # Bounded ПЕРВАЯ СТРАНИЦА `_meta.delegates`. Пагинация НЕ обещается: существующий
+    # `posting_calls_offset` индексирует СМЕШАННУЮ последовательность (record_sets +
+    # record_sets_created + overflow-делегаты), а первые шесть делегатов рендерятся
+    # вообще другим каналом, поэтому `posting_calls_offset=40` не имеет отношения к
+    # `delegates[40:]`. Вторая ось пагинации в том же ответе отвергнута.
+    #
+    # Публикация «как есть» отменила бы существующую границу рендера
+    # (`_MAX_DELEGATE_ROUTES = 6` + компактная страница 40/2400): обработчик с 200
+    # вызовами `Модуль.Метод()` повторил бы все 200 и упёрся в `max_output_chars`.
+    # Внутри `analyze_document_flow` страница вдобавок ложится рядом с полным
+    # `analyze_object`, поэтому она остаётся МАЛОЙ.
+    _DELEGATES_PAGE_MAX = 6
+    _DELEGATES_PAGE_CHARS = 1200
+
+    def _bounded_delegates(delegates: list[dict]) -> tuple[list[dict], int, bool]:
+        """`(страница, total, truncated)`; char-cap считается по СЕРИАЛИЗОВАННОМУ списку."""
+        page: list[dict] = []
+        for d in delegates:
+            row = dict(d)
+            if len(page) >= _DELEGATES_PAGE_MAX:
+                break
+            candidate = [*page, row]
+            # Проверяется ФАКТИЧЕСКАЯ сериализация страницы — вместе со скобками и
+            # запятыми и, главное, уже для ПЕРВОЙ строки. Oversized receiver нельзя
+            # обрезать: частичное имя выглядело бы исполнимым, но адресовало бы другой
+            # объект. Такая строка остаётся за границей страницы целиком; total и
+            # truncated ниже сохраняют машинный сигнал о пропуске.
+            if len(json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str)) > _DELEGATES_PAGE_CHARS:
+                break
+            page.append(row)
+        return page, len(delegates), len(page) < len(delegates)
 
     def _live_posting_signal(
         document_name: str, *, index_prefilter: bool = False
@@ -10240,6 +10426,7 @@ def make_bsl_helpers(
             return
         handler_path, module_body, interceptors = found
         result["posting_handler_present"] = True
+        facts: dict = {}
         result["hint"] = _build_posting_hint(
             document_name,
             handler_path,
@@ -10247,7 +10434,16 @@ def make_bsl_helpers(
             profile=False,
             interceptors=interceptors,
             posting_calls_offset=posting_calls_offset,
+            facts_out=facts,
         )
+        # `code_registers=0` при делегировании читается как «движений нет», хотя
+        # `posting_handler_present=True` уже сказано. Имена делегатов разобраны МАШИННО,
+        # но жили только прозой внутри hint — публикуем их машинно рядом.
+        page, total, truncated = _bounded_delegates(facts.get("delegates") or [])
+        meta = result.setdefault("_meta", {})
+        meta["delegates"] = page
+        meta["delegates_total"] = total
+        meta["delegates_truncated"] = truncated
 
     def find_register_writers(register_name: str) -> dict:
         """Find static document references to a specific register.
@@ -10415,9 +10611,11 @@ def make_bsl_helpers(
         сканы пропускаются (иначе при омонимичном Document.X подмешались бы связи документа).
 
         Returns: dict with document, can_create_from_here, can_be_created_from.
-        Для прямых code-derived записей ``via`` отсутствует (backcompat; отсутствие означает
-        direct); back_scan/metadata помечены явно. Metadata несет также category + canonical
-        ref — Catalog-основания и омонимы."""
+        ``via`` — БЕЗУСЛОВНЫЙ ключ КАЖДОЙ строки (v1.37.0): ``direct`` (прямой обход кода
+        самого документа), ``back_scan`` (обратный скан чужих ОбработкаЗаполнения),
+        ``metadata`` (декларативный ``<BasedOn>``). Прежде у прямых строк ключа не было
+        вовсе, а правило «отсутствие означает direct» жило только здесь, в докстринге.
+        Metadata несет также category + canonical ref — Catalog-основания и омонимы."""
         # Canonical category is resolved BEFORE the FS walk (#3, code-review): every scan
         # below is document-specific (Documents/<name>/Ext/*, ДокументСсылка.<name>), so a
         # typed non-document input (``Справочник.X``) must not run them — with a homonymous
@@ -10637,6 +10835,17 @@ def make_bsl_helpers(
                     "Таблица недоступна или индекс не подключен, поэтому пустые списки здесь неполны; "
                     "пересобери индекс и повтори вызов."
                 )
+
+        # v1.37.0: `via` стал БЕЗУСЛОВНЫМ. Правило «отсутствие поля означает direct»
+        # жило ТОЛЬКО в докстринге, то есть было ключом, которого никто не читает:
+        # агент, встретивший строку без `via`, не отличал «прямой обход» от «поле
+        # забыли». Тем же приёмом v1.34.0 сделал безусловным `_meta` у
+        # `find_references_to_object`. Достраивается ПОСЛЕ сборки обеих корзин —
+        # значения, выставленные самими сканами ('back_scan'/'metadata'), не трогаются.
+        for bucket in ("can_create_from_here", "can_be_created_from"):
+            for row in result.get(bucket) or []:
+                if isinstance(row, dict) and not row.get("via"):
+                    row["via"] = "direct"
 
         return result
 
@@ -11764,11 +11973,19 @@ def make_bsl_helpers(
         # (@_transient_safe) → идём в live XML; [] = таблица есть, совпадений нет →
         # это ОКОНЧАТЕЛЬНЫЙ ответ, live звать нельзя.
         xml_options: list[dict] | None = None
+        # v1.37.0 — ПРОВЕНАНС. Источник ответа СМЕШАННЫЙ по построению: при рабочем
+        # индексе и include_code=True XML приходит из SQLite, а code_options — из
+        # ЖИВОГО дерева. Один `source="index"|"live"` был бы ложью, а "mixed" не
+        # объясняет, почему профиль вернул 2 typed-опции, а direct — ещё и code-строки.
+        # Поэтому ключа три: xml_source / code_source по корзинам и сводный source.
+        xml_source = "live"
         if not object_name:
             # Пустой ввод — обзор «все ФО». Exact-предикат на пустом имени не совпал бы
             # ни с чем и молча обнулил бы обзорную ветку, поэтому выходим до фильтра.
             if idx_reader is not None:
                 xml_options = idx_reader.get_functional_options("")
+            if xml_options is not None:
+                xml_source = "index"
             if xml_options is None:
                 xml_options = [dict(fo) for fo in _ensure_functional_options()]
         else:
@@ -11784,6 +12001,8 @@ def make_bsl_helpers(
                         if rows is None
                         else [r for r in rows if _fo_content_matches(r.get("content"), "", object_name)]
                     )
+            if xml_options is not None:
+                xml_source = "index"
             if xml_options is None:
                 xml_options = [
                     dict(fo)
@@ -11888,6 +12107,18 @@ def make_bsl_helpers(
             каталога, а не бюджет обзора. До релиза `_meta` появлялся только в
             бюджетной ветке пустого обзора, где совет был точен.
             """
+            if not include_code:
+                # `_meta` стал безусловным в v1.37.0, а этот прежний builder был
+                # написан для веток, где code-скан уже состоялся. Не позволяем его
+                # дефолтным нулям превратиться в ложное «скан полон». `code_scope`
+                # сохраняет прежнюю форму и называет домен, который был бы проверен
+                # при include_code=True; доказательством результата он здесь не служит.
+                scope = "object_modules" if object_name.strip() else "overview_budget"
+                return (
+                    "code-скан не запрашивался (include_code=False, code_source='not_requested'); "
+                    "пустые code_options и code_total=0 ничего об отсутствии вызовов не доказывают. "
+                    f"code_scope={scope!r} — домен вызова с include_code=True; xml_total точен."
+                )
             if code_reason is None:
                 # ПОЛНЫЙ ответ: ни одной причины неполноты. Прежний текст всё равно
                 # утверждал «code-скан неполон (охват неполон)», прямо противореча
@@ -11920,7 +12151,15 @@ def make_bsl_helpers(
 
         def _fo_meta() -> dict:
             """Единый meta-builder обеих веток — чтобы они не разъехались."""
+            # `source` ОБЯЗАТЕЛЕН, а не производный по желанию:
+            # `test_coverage_map_matches_reality` читает его через
+            # `res.get("source") or res["_meta"]["source"]`, и без него добавление
+            # хелпера в жёсткий словарь дало бы KeyError ДО ассерта.
+            code_source = "live" if include_code else "not_requested"
             meta = {
+                "source": "index+live" if (xml_source == "index" and include_code) else xml_source,
+                "xml_source": xml_source,
+                "code_source": code_source,
                 "reason": code_reason,
                 "code_modules_scanned": code_status["modules_scanned"],
                 "code_modules_total": code_status["modules_total"],
@@ -11971,18 +12210,13 @@ def make_bsl_helpers(
             }
             if code_reason is not None:
                 plain["partial"] = True
-            # `_meta` публикуется на ЛЮБОМ ответе, где code-скан РЕАЛЬНО выполнялся,
-            # а не только при неполноте: домен code-корзины сужен `name_hint`-ом
-            # всегда, и именно на ПОЛНОМ ответе `code_total=0` читается как «во всей
-            # конфигурации вызовов нет». Машинный признак нужен ровно там, где
-            # ошибиться легче всего. `partial` при этом появляется ТОЛЬКО при
-            # реальной неполноте — сужение домена неполнотой не является.
-            # Гейт по `include_code` существенен: при `include_code=False` code-домена
-            # нет вовсе, описывать нечего, и замороженный legacy-набор ключей
-            # (`test_functional_options_without_limit_keep_legacy_key_set`) обязан
-            # остаться прежним.
-            if include_code:
-                plain["_meta"] = _fo_meta()
+            # v1.37.0: `_meta` стал БЕЗУСЛОВНЫМ — тем же приёмом, каким v1.34.0
+            # сделал безусловным `_meta` у `find_references_to_object`. Прежний гейт
+            # по `include_code` означал, что форма ответа зависит от аргумента, а
+            # провенанс XML-корзины (он есть ВСЕГДА) публиковать было негде. Если
+            # code-скан не запрошен, `_fo_hint` явно запрещает читать нулевую корзину
+            # как доказанный отрицательный результат.
+            plain["_meta"] = _fo_meta()
             return plain
         # Per-bucket cap (#6): each list truncated independently to ``limit``.
         n = max(0, int(limit))
@@ -11999,8 +12233,7 @@ def make_bsl_helpers(
         }
         if code_reason is not None:
             page["partial"] = True
-        if include_code:
-            page["_meta"] = _fo_meta()
+        page["_meta"] = _fo_meta()
         return page
 
     def find_roles(object_name: str, details_limit: int = _ROLE_DETAILS_DEFAULT) -> dict:
@@ -13626,6 +13859,61 @@ def make_bsl_helpers(
     )
     _OVERRIDE_OPT_KEYS = ("ext_line", "line", "target_method_line", "source_module_id")
 
+    def _override_extension_file(out: dict) -> str:
+        """`../`-путь от корня СЕССИИ до физического файла расширения.
+
+        Три существующих поля описывают путь, и ни одно не адресует файл:
+        ``source_path`` — от корня ОСНОВНОЙ конфигурации (в EXTENSION-индексе ""),
+        ``ext_module_path`` — от корня РАСШИРЕНИЯ, ``extension_root`` — абсолютный.
+        Здесь собирается ЧЕТВЁРТОЕ, исполнимое в этой же сессии значение:
+        ``read_procedure(row['extension_file'], row['extension_method'])`` — такие
+        пути принимает ``_ext_resolve_safe``. Недостижимый корень → ``""``, но КЛЮЧ
+        присутствует всегда.
+        """
+        tail = str(out.get("ext_module_path") or out.get("module_path") or "").replace("\\", "/").strip("/")
+        if not tail:
+            return ""
+        root = out.get("extension_root") or ""
+        # Корень СЕССИИ проверяется ПЕРВЫМ, и пустое значение здесь — не единственный
+        # признак. Карта `_ext_rel_prefixes` собрана из СОСЕДНИХ корней, и собственный
+        # корень сессии в неё не попадает НИКОГДА (`relpath` даёт "." → пустые
+        # компоненты → строка не добавляется). Поэтому в сессии, открытой ПРЯМО НА
+        # расширении, поиск по карте промахивался бы на КАЖДОЙ строке и отдавал ""
+        # — то есть «корень недостижим» там, где корень и есть сессия, а файл лежит
+        # прямо под ним. Пустым `extension_root` при этом не бывает: live-ветка
+        # `get_overrides` достраивает его из текущего контекста ДО нормализации, а
+        # ext-role индекс хранит его в таблице.
+        if not root or _root_key_safe(root) == _root_key_safe(_current_root_path()):
+            # Префикс берётся В ИСХОДНОМ РЕГИСТРЕ. `_current_rel_prefix()` normcase-ит
+            # компоненты, а `os.path.normcase` на Windows опускает регистр — собранный
+            # из них путь разошёлся бы с `find_module(...)['path']` на сравнении, то
+            # есть воспроизвёл бы §4 внутри релиза, который §4 и закрывает.
+            if _current_root_role() != "extension":
+                # Корень MAIN-сессии расширением не является: путь до него собирать
+                # не из чего, и утверждать его нельзя.
+                return ""
+            prefix = _current_rel_prefix_raw()
+            return f"{prefix}/{tail}" if prefix else tail
+        # Сопоставление СОСЕДНИХ корней — ТОЛЬКО через `_root_key_safe`: карта хранит
+        # `str(Path(ext).resolve())`, а `extension_root` индексной строки — сырой
+        # `ext.path` детектора. Сравнение строк дало бы молчаливый "" на subst-диске,
+        # junction, 8.3-имени или расхождении регистра.
+        want = _root_key_safe(root)
+        for _comps, ext_root_str in _ext_rel_prefixes:
+            if _root_key_safe(ext_root_str) != want:
+                continue
+            try:
+                # Префикс пересчитывается ровно так, как его строит сам каталог
+                # ext-модулей (см. `_ensure_extension_bsl_catalog`): `os.path.relpath`
+                # на Windows отдаёт `..\cfe\X`, и без `.replace` склейка дала бы
+                # смешанный разделитель — `read_procedure` его бы понял, а сравнение
+                # с `find_module(...)['path']` дало бы ЛОЖНОЕ несовпадение.
+                rel = os.path.relpath(ext_root_str, str(_base_path_resolved)).replace("\\", "/").strip("/")
+            except ValueError:
+                return ""
+            return f"{rel}/{tail}" if rel else tail
+        return ""
+
     def _normalize_override_row(row: dict, extension_name: str = "", extension_root: str = "") -> dict:
         """Единый ADDITIVE shape строки перехвата для index / live / find_ext веток.
 
@@ -13671,6 +13959,7 @@ def make_bsl_helpers(
                 out[key] = ""
         for key in _OVERRIDE_OPT_KEYS:
             out.setdefault(key, None)
+        out["extension_file"] = _override_extension_file(out)
         return out
 
     def _overrides_payload(
@@ -13728,6 +14017,7 @@ def make_bsl_helpers(
         by_extension: dict[str, list] = {}
         by_annotation: dict[str, list] = {}
         methods: set[str] = set()
+        object_methods: set[tuple[str, str, str]] = set()
         for r in rows:
             obj = r.get("object_name") or ""
             ext = r.get("extension_name") or ""
@@ -13740,6 +14030,33 @@ def make_bsl_helpers(
                 _bump(by_annotation, ann)
             if r.get("target_method"):
                 methods.add(str(r["target_method"]).lower())  # та же нормализация, что у фильтра
+                # v1.37.0: `unique_methods` считает ИМЕНА, а имя поля читается как
+                # «сколько методов перехвачено» (замер на боевой: 130 имён против 189
+                # пар объект+метод). Значение прибито тестом и не трогается — рядом
+                # встаёт ADDITIVE ключ по ПОЛНОМУ набору.
+                #
+                # Ключ — ТРОЙКА (категория, объект, метод), и категория берётся из пути
+                # САМОГО РАСШИРЕНИЯ. Оба имени означают одно (путь внутри расширения),
+                # но в СЫРОЙ строке присутствует РОВНО ОДНО, разное по веткам: у
+                # индексной это колонки `extension_overrides` (там `ext_module_path` и
+                # НЕТ `module_path`), у живой — наоборот. Алиас достраивается ПОСЛЕ,
+                # `_normalize_override_row`, а агрегаты считаются ДО неё.
+                #
+                # `source_path` в качестве категории брать НЕЛЬЗЯ: точный поиск идёт по
+                # `rel_path`, а при промахе срабатывает fallback «любой модуль с тем же
+                # именем и типом, первый по алфавиту», то есть он может назвать ЧУЖУЮ
+                # категорию (перехват `Documents.Заказ` получит `Catalogs`) — ровно ту
+                # склейку, ради устранения которой ключ и заводится.
+                ext_path = str(r.get("ext_module_path") or r.get("module_path") or "")
+                if not ext_path:
+                    ext_path = str(r.get("source_path") or "")
+                category = ext_path.replace("\\", "/").strip("/").split("/", 1)[0] if ext_path else ""
+                if not category:
+                    # Категория не извлеклась ни из одного пути — НЕ сливать такие строки
+                    # общим "": дискриминатором берётся нормализованный путь строки.
+                    # Консервативно: лучше ложно разделить, чем ложно склеить.
+                    category = "\x00" + ext_path.replace("\\", "/")
+                object_methods.add((category.lower(), obj.lower(), str(r["target_method"]).lower()))
 
         # Детерминизм ПОЛНЫЙ: бизнес-ключи задают осмысленный порядок, а финальный
         # tie-breaker — стабильная сериализация ВСЕЙ строки, чтобы различимые записи не
@@ -13788,6 +14105,9 @@ def make_bsl_helpers(
             "by_extension_top": _top(by_extension, _OVERRIDES_TOP_N),
             "unique_objects": len(by_object),  # lower()-ключи → регистр не двоит
             "unique_methods": len(methods),  # тот же lower()
+            # ПАРЫ объект+метод с учётом категории — не то же, что `unique_methods`
+            # (ИМЕНА) и не то же, что `unique_objects` (ИМЕНА объектов).
+            "unique_object_methods": len(object_methods),
             "unique_extensions": len(by_extension),
         }
         if failed_extension_roots:
@@ -13803,7 +14123,11 @@ def make_bsl_helpers(
                      truncated: bool, partial: bool,
                      source: "index"|"live"|"unavailable",
                      by_annotation, by_object_top, by_extension_top,
-                     unique_objects, unique_methods, unique_extensions}.
+                     unique_objects, unique_methods, unique_object_methods,
+                     unique_extensions}.
+        ``unique_object_methods`` (v1.37.0) считает ПАРЫ (категория, объект, метод),
+        тогда как ``unique_objects``/``unique_methods`` считают ИМЕНА: `Документ.Заказ`
+        и `Справочник.Заказ` в парах РАЗНЫЕ, а в именах схлопываются в одно.
         Без аргументов ``overrides`` отдает ПЕРВЫЕ 200 перехватов, детерминированно
         ОТСОРТИРОВАННЫХ. ``total`` — полное число перехватов; ``truncated`` сигналит,
         что список неполон ОТНОСИТЕЛЬНО total (а не «есть следующая страница»).
@@ -13821,7 +14145,11 @@ def make_bsl_helpers(
         Каждый перехват ГАРАНТИРОВАННО несёт ключ ``extension_name`` (имя расширения)
         во всех ветках источника — index, live из main-сессии и live из сессии,
         открытой прямо на расширении (нормализуется из идентичности текущего
-        расширения)."""
+        расширения). Там же ВСЕГДА есть ``extension_file`` (v1.37.0) — готовый путь до
+        файла расширения, исполнимый как есть:
+        ``read_procedure(row['extension_file'], row['extension_method'])``. Пустым он
+        бывает ровно в одном случае — корень расширения из текущей сессии недостижим;
+        сам ключ есть всегда."""
         # Гарды limit/offset — через `_coerce_bound` (конвенция v1.30.0):
         # предупреждение уходит в лог, ключи ответа не засоряются.
         limit, _wl = _coerce_bound(limit, _OVERRIDES_CAP, "limit", "get_overrides(..., limit=200, offset=0)")
@@ -14118,8 +14446,15 @@ def make_bsl_helpers(
                 code_partial/code_meta. Metadata keys are unchanged.
 
         Returns:
-            {object, references, total, truncated, partial, by_kind}
+            {object, references, total, truncated, partial, by_kind,
+             _meta:{source, index_coverage, extensions_included, kinds_requested,
+                    kinds_applied, unsupported_kinds}}
             (+ code_* keys when include_code=True).
+
+        ``kinds_requested`` / ``kinds_applied`` (v1.37.0) say what was ASKED and what
+        actually ran after the route was chosen — a kind can be dropped by the ROUTE,
+        not by the filter. ``unsupported_kinds`` describes the LIVE parser only and is
+        always empty on the index source, so it must NOT be read as «the kind ran».
         """
         # Без гарда битый limit роняет индексный запрос, голый `except Exception`
         # ниже его глушит, и управление уходит в live-скан ВСЕЙ конфигурации —
@@ -14176,6 +14511,16 @@ def make_bsl_helpers(
                 "extensions_included": False,
                 "unsupported_kinds": [],
                 "index_coverage": "not_used" if idx_reader is None else "unavailable",
+                # v1.37.0. `kind='owner'` возвращал 0 и НЕ попадал в
+                # `unsupported_kinds`: на индексном маршруте список обнуляется
+                # конструкцией, потому что это capability-карта LIVE-парсера, — и
+                # сказано об этом было только комментарием в коде.
+                #
+                # `kinds_requested` — эхо ввода как он пришёл; `kinds_applied`
+                # считается ПОСЛЕ выбора маршрута и по умолчанию пуст: здесь ещё
+                # ничего не читалось (ранний структурный ответ / unavailable).
+                "kinds_requested": list(kinds) if kinds else [],
+                "kinds_applied": [],
             },
         }
         if not canonical or "." not in canonical:
@@ -14224,6 +14569,12 @@ def make_bsl_helpers(
                 # На INDEX-маршруте `unsupported_kinds` ВСЕГДА пуст: это
                 # capability-карта LIVE-parser'а, и смешивать две причины нельзя.
                 result["_meta"]["unsupported_kinds"] = []
+                # На индексе применяется пересечение запроса с публичными видами:
+                # `_REF_KIND_PRIORITY` — полный их список, а `effective_kinds` уже
+                # раскрыл falsy-контракт `kinds=[] == kinds=None == все виды`.
+                result["_meta"]["kinds_applied"] = sorted(
+                    k for k in (effective_kinds or _REF_KIND_PRIORITY) if k in _REF_KIND_PRIORITY
+                )
                 # v15 не хранит результатов read/parse/traversal census optional
                 # домена, поэтому строки/total сохраняются как НИЖНЯЯ оценка, live
                 # recall не добавляется, но покрытие честно неполное — это ось
@@ -14275,6 +14626,12 @@ def make_bsl_helpers(
                 "scan_error": type(exc).__name__,
             }
         requested_live = _requested_live_kinds(effective_kinds)
+        # На LIVE-ветке применяется `_requested_live_kinds`, а НЕ «все поддержанные»:
+        # шести видам (`role_rights`, `functional_option_content`,
+        # `event_subscription_source`, `choice_parameter_link`, `link_by_type`,
+        # `predefined_characteristic_type`) живая ветка недоступна, и заявить их
+        # применёнными было бы прямой ложью.
+        result["_meta"]["kinds_applied"] = sorted(requested_live)
         # Каноническая формула: отдельный счётчик успехов И identity фактически
         # обойдённого root, а НЕ разность после catch. Для wrapper-CFE вторая часть
         # всегда ложна, пока walker сохраняет scope `Path(base_path)`.
@@ -15292,8 +15649,17 @@ def make_bsl_helpers(
     _reg(
         "find_module",
         find_module,
-        "find_module(name='', module_type='', category='', limit=50) -> [{path, category, object_name, module_type, owner}]  # name — опц. фрагмент (пусто = любой модуль); фильтры module_type/category опциональны и работают без name; limit — страница, порядок выдачи НЕ релевантность",
+        "find_module(name='', module_type='', category='', limit=50) -> [{path, category, object_name, module_type, form_name, owner}]  # name — опц. фрагмент; limit — страница",
         "discovery",
+        None,
+        "FIND MODULE:\n"
+        "  # name — ОПЦИОНАЛЬНЫЙ фрагмент имени: пусто = любой модуль.\n"
+        "  # Фильтры module_type/category тоже опциональны и работают БЕЗ name.\n"
+        "  mods = find_module('Заказ', module_type='ObjectModule')\n"
+        "  # limit — размер СТРАНИЦЫ, а не отбор лучших: порядок выдачи\n"
+        "  # НЕ релевантность, поэтому усечение режет произвольные строки.\n"
+        "  for m in mods:\n"
+        "      print(m['path'], m['category'], m['module_type'], m['owner'])",
     )
     _reg(
         "find_by_type",
@@ -15317,9 +15683,17 @@ def make_bsl_helpers(
         "extract_procedures",
         extract_procedures,
         "extract_procedures(path|object_name) -> [{name, type, line, end_line, is_export, params(list)}]  "
-        "# path ИЛИ имя объекта: имя → авто-выбор модуля по (category, module_type); неоднозначно → ValueError "
-        "(для прозрачного разрешения по имени с _meta — get_module_outline)",
+        "# path ИЛИ имя объекта; неоднозначно → ValueError",
         "code",
+        None,
+        "EXTRACT PROCEDURES:\n"
+        "  # Первый аргумент — путь ИЛИ имя объекта. По имени модуль выбирается\n"
+        "  # автоматически по паре (category, module_type).\n"
+        "  # Неоднозначное имя → ValueError; за прозрачным разрешением по имени\n"
+        "  # с _meta (какой модуль выбран и почему) иди в get_module_outline.\n"
+        "  procs = extract_procedures('Заказ')\n"
+        "  for p in procs:\n"
+        "      print(p['name'], p['line'], p['is_export'], p['params'])",
     )
     _reg(
         "find_exports",
@@ -15396,7 +15770,13 @@ def make_bsl_helpers(
         "  # ДОВЕРИЕ к ребрам: _meta.exact_rows — ребра, привязанные ТОЧНО (по callee_key);\n"
         "  # _meta.fallback_rows — эвристические, по ИМЕНИ метода (возможны однофамильцы).\n"
         "  # _meta.exact_available — поддерживает ли схема индекса точный режим;\n"
-        "  # _meta.target_exact — разрешилась ли сама цель в один модуль (иначе передай module_hint).",
+        "  # _meta.target_exact — разрешилась ли сама цель в один модуль (иначе передай module_hint=find_module('X')[i]['path']).\n"
+        "  # ФОРМЫ module_hint: ТОЧНАЯ — rel_path, готовый в find_module('X')[i]['path'];\n"
+        "  #   'Документ.X' и голое имя объекта задают уровень ОБЪЕКТА, и цель разрешается точно\n"
+        "  #   ТОЛЬКО когда искомое имя внутри объекта уникально. Иначе голый hint сужает поиск к\n"
+        "  #   ПРОИЗВОЛЬНОМУ модулю объекта (бывает форма или не-export — отсюда ответ «по объектному\n"
+        "  #   модулю вместо обработчика формы»), а типизированный 'Документ.X' не сужает вовсе и\n"
+        "  #   пропускает неквалифицированные вызовы одноимённого метода других объектов.",
     )
     _reg(
         "find_call_hierarchy",
@@ -15443,14 +15823,22 @@ def make_bsl_helpers(
         "          print(f\"  TRUNCATED: {t['name']} (L{t['level']}): {t['returned']}/{t['total']}\")\n"
         "          # полный список callers метода — find_callers_context(t['name'], '', offset=200, limit=200)\n"
         "  # ТОЧНОСТЬ (exact-режим): для ОДНОИМЕННЫХ методов (один и тот же метод в сотнях объектов)\n"
-        "  #   передай module_hint — привяжет КОРЕНЬ к одному модулю и уберет ложные звенья от\n"
-        "  #   однофамильцев. NB: у платформенных обработчиков (см. выше) hint не добавит\n"
-        "  #   отсутствующий ПЛАТФОРМЕННЫЙ вход; для ЯВНЫХ BSL-вызовов их обычные рёбра остаются.\n"
+        "  #   передай ТОЧНЫЙ module_hint (rel_path) — привяжет КОРЕНЬ к одному модулю и уберет\n"
+        "  #   ложные звенья от однофамильцев. NB: у платформенных обработчиков (см. выше) hint не\n"
+        "  #   добавит отсутствующий ПЛАТФОРМЕННЫЙ вход; для ЯВНЫХ BSL-вызовов их рёбра остаются.\n"
         "  #   Hint нужен для одноименных методов, которые РЕАЛЬНО зовут из кода:\n"
-        "  res = find_call_hierarchy('ЗаполнитьДокумент', module_hint='Документ.РеализацияТоваровУслуг', depth=2)\n"
-        "  #   формы hint: rel_path | 'Документ.X'/'Document.X' | голый object_name.\n"
+        "  om = [m for m in find_module('РеализацияТоваровУслуг') if m['module_type'] == 'ObjectModule'][0]\n"
+        "  res = find_call_hierarchy('ЗаполнитьДокумент', module_hint=om['path'], depth=2)\n"
+        "  #   ФОРМЫ hint и их ОХВАТ: rel_path — ТОЧНАЯ, однозначная форма; бери её готовой:\n"
+        "  #     module_hint=find_module('X')[i]['path'] — привязывает корень к ОДНОМУ модулю.\n"
+        "  #     'Документ.X'/'Document.X' и голый object_name задают уровень ОБЪЕКТА, и exact\n"
+        "  #     включается ТОЛЬКО когда имя внутри объекта уникально. Когда нет — два РАЗНЫХ отказа:\n"
+        "  #       - голый hint: корень берётся ПРОИЗВОЛЬНЫМ модулем объекта (может оказаться формой\n"
+        "  #         или не-export), и поиск сузится к ЭТОМУ файлу — ответ будет не про тот модуль;\n"
+        "  #       - типизированный 'Документ.X': сужения не происходит ВОВСЕ, и в ответ могут попасть\n"
+        "  #         неквалифицированные вызовы одноимённого метода ДРУГИХ объектов.\n"
         "  #   Экспортному методу общего модуля hint НЕ нужен, ЕСЛИ его имя уникально во всей БД\n"
-        "  #   (exact включится сам); если root_exact=False — имя неуникально, передай module_hint.\n"
+        "  #   (exact включится сам); если root_exact=False — имя неуникально, передай module_hint=find_module('X')[i]['path'].\n"
         "  #   Глубже 1-го уровня обход идёт по rel_path найденного caller'а → exact автоматически.\n"
         "  # ДОВЕРИЕ к рёбрам — читай _meta:\n"
         "  #   _meta.exact_available — поддерживает ли схема индекса точный режим (callee_key);\n"
@@ -15459,7 +15847,7 @@ def make_bsl_helpers(
         "  #   node['meta'].target_exact — точен ли конкретный узел; node['target_key'] = rel_path::метод.\n"
         "  # Одноимённые методы без hint возвращают список носителей — выбирай по object_name/category.\n"
         "  #   _meta.node_budget_exceeded=True — широкий корень упёрся в visited_cap, дерево частичное\n"
-        "  #     (по уровням): передай module_hint, чтобы и сузить, и ускорить обход.\n"
+        "  #     (по уровням): передай module_hint=om['path'], чтобы и сузить, и ускорить обход.\n"
         "  # Для глубины 1 эффективнее обычный find_callers_context().\n"
         "  # ТРИГГЕРЫ (include_triggers=True): метод вызывается не только из кода. Подмешивает на\n"
         "  #   КАЖДЫЙ узел node['triggers'] — не-call ребра (подписки/события форм/рег.задания/CFE).\n"
@@ -15469,7 +15857,7 @@ def make_bsl_helpers(
         "  #   Для ОбработкаПроведения из ТРИГГЕРОВ придет разве что CFE-перехват обработчика\n"
         "  #   расширением: ребра «его зовет платформа» не существует. (Явные BSL-вызовы, если\n"
         "  #   они есть, приходят обычными callers — триггеры к ним отношения не имеют.)\n"
-        "  res = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.X', include_triggers=True)\n"
+        "  res = find_call_hierarchy('ОбработкаПроведения', module_hint=om['path'], include_triggers=True)\n"
         "  for node in res['tree']:\n"
         "      for t in node.get('triggers', []):\n"
         "          print(f\"  TRIGGER {t['edge_type']}: {t['source_name']} ({t['detail']}) resolved={t['resolved']}\")\n"
@@ -15513,7 +15901,9 @@ def make_bsl_helpers(
         "      print('путь не найден' if not res['_meta']['budget_exceeded'] else 'обход обрезан — сузь hint/уменьши max_depth')\n"
         "  # ТОЧНОСТЬ: _meta.precision='exact' ⇔ to разрешён точно И все рёбра пути по callee_key;\n"
         "  #   'heuristic' (старый индекс/FS/имя) → found=True = достижимость ПО ИМЕНИ, не доказанный путь.\n"
-        "  # Одноимённые методы: from_hint/to_hint (rel_path | 'Документ.X' | object_name) пинят к модулю.\n"
+        "  # Одноимённые методы: from_hint/to_hint. ТОЧНАЯ форма — rel_path (res['candidates'][i]['file']\n"
+        "  #   либо find_module('X')[i]['path']); 'Документ.X' и object_name задают лишь ОБЪЕКТ, и конец\n"
+        "  #   пинится точно ТОЛЬКО когда имя внутри объекта уникально.\n"
         "  # _meta.budget_exceeded=True → обход обрезан (visited_cap ИЛИ у узла >одной страницы callers),\n"
         "  #   found=False НЕ доказывает отсутствие; только found=False+budget_exceeded=False И без 'error' — точно «не достижим».",
     )
@@ -15523,8 +15913,7 @@ def make_bsl_helpers(
         "find_definition(name, module_hint='', limit=50) -> {name, definitions:[{file, line, end_line, type, "
         "is_export, params, category, object_name, module_type, owner}], total, truncated, partial, "
         "_meta:{index_used, unique, slow_fallback, source, extensions_included, total_exact, ...}}  "
-        "# ГДЕ ОПРЕДЕЛЁН метод. Одноимённые в N объектах — норма: вернёт всех, сужай module_hint. "
-        "Без индекса — live-скан, расширения учтены; hint по объекту — ТОЧНОЕ имя",
+        "# ГДЕ ОПРЕДЕЛЁН метод; hint по объекту — ТОЧНОЕ имя",
         "code",
         [
             "definition",
@@ -15542,9 +15931,12 @@ def make_bsl_helpers(
         "  for x in d['definitions']:\n"
         "      print(x['file'], x['line'], x['type'], 'export' if x['is_export'] else '')\n"
         "  # Одноимённые методы (ОбработкаПроведения есть в каждом документе — 600+ кандидатов):\n"
-        "  #   сузь module_hint (rel_path | 'Документ.X' | имя объекта) → _meta.unique=True:\n"
-        "  d = find_definition('ОбработкаПроведения', 'Документ.РеализацияТоваровУслуг')\n"
-        "  # дальше: read_procedure(d['definitions'][0]['file'], 'ОбработкаПроведения')  # тело\n"
+        "  #   сузь module_hint до ТОЧНОЙ формы — это rel_path модуля; 'Документ.X' и имя объекта\n"
+        "  #   задают лишь ОБЪЕКТ и дают ОДИН только когда имя внутри объекта уникально (бывает и\n"
+        "  #   ObjectModule, и модуль формы с тем же обработчиком, а MAIN-сессия домешивает CFE):\n"
+        "  om = [m for m in find_module('РеализацияТоваровУслуг') if m['module_type'] == 'ObjectModule'][0]\n"
+        "  d = find_definition('ОбработкаПроведения', om['path'])  # rel_path → _meta.unique ДОКАЗАН\n"
+        "  # дальше (ТОЛЬКО при _meta.unique): read_procedure(d['definitions'][0]['file'], 'ОбработкаПроведения')\n"
         "  #   NB: у платформенного обработчика вызов от ПЛАТФОРМЫ в граф не попадает, поэтому ПУСТЫЕ\n"
         "  #   обратные ссылки — это НОРМА, а не мертвый код (ЯВНЫЙ вызов из BSL, если он есть, найдется).\n"
         "  #   Но ЧЕМ он пишет движения, так не узнать: читай тело и трассируй ДЕЛЕГАТА (rlm_help('проведение')).\n"
@@ -15598,7 +15990,7 @@ def make_bsl_helpers(
     _reg(
         "find_callers",
         find_callers,
-        "find_callers(proc, module_hint='', max_files=20) -> [{file, line, text}]  # COMPACT FIRST PAGE: thin wrapper над find_callers_context, default limit=20, без _meta/has_more — quick view; для полного аудита callers — find_callers_context",
+        "find_callers(proc, module_hint='', max_files=20) -> [{file, line, text}]  # COMPACT FIRST PAGE of find_callers_context: без _meta/has_more",
         "code",
         ["compact callers", "плоский список вызовов", "только пути вызовов"],
         "COMPACT FIRST PAGE OF CALLERS (для quick view: 3 поля вместо 7, без пагинации):\n"
@@ -15681,7 +16073,7 @@ def make_bsl_helpers(
     _reg(
         "parse_form",
         parse_form,
-        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers:[{element, element_type, event, handler, data_path, scope}], commands:[{name, action}], attributes:[{name, types, main, main_table, query_text}]}]  # имя элемента — element; types — list[str]; в CF элемент несет префикс пространства имен (cfg:/xs:/v8:), в EDT нет, поэтому `'DynamicList' in types` — сравнение по ЭЛЕМЕНТУ — на CF дает False: сверяй ХВОСТ t.rsplit(':',1)[-1]",
+        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers:[{element, element_type, event, handler, data_path, scope}], commands:[{name, action}], attributes:[{name, types, main, main_table?, query_text?}]}]  # имя элемента — element; types — list[str]; в CF элемент несет префикс пространства имен (cfg:/xs:/v8:), в EDT нет, поэтому `'DynamicList' in types` — сравнение по ЭЛЕМЕНТУ — на CF дает False: сверяй ХВОСТ t.rsplit(':',1)[-1]; handler= режет формы И handlers",
         "xml",
         kw=["parse_form", "события формы", "обработчики формы", "элементы формы", "form handler", "form event"],
         recipe=(
@@ -15712,6 +16104,23 @@ def make_bsl_helpers(
             "       if any(t.rsplit(':', 1)[-1] == 'DynamicList' for t in a['types'])]\n"
             "# Основной реквизит формы — a['main']: True НЕ БОЛЕЕ чем у одного, а у общих\n"
             "# и произвольных форм его может не быть вовсе (next(...) без default упадет).\n"
+            "\n"
+            "# ОХВАТ handler= (v1.37.0). Без form_name проверяются ВСЕ формы объекта;\n"
+            "# остаются формы, где обработчик нашёлся, а ВНУТРИ них список handlers\n"
+            "# ОТФИЛЬТРОВАН до совпавших. commands/attributes при этом ПОЛНЫЕ — их\n"
+            "# handler= не режет. Одна конкретная форма — form_name=.\n"
+            "\n"
+            "# НЕСИММЕТРИЧНЫЕ КЛЮЧИ: безусловны только name, types и main. main_table и\n"
+            "# query_text — УСЛОВНЫЕ (есть лишь у динамических списков), поэтому прямая\n"
+            "# индексация роняет обход KeyError'ом на одной форме и молча работает на\n"
+            "# другой. Бери через .get с дефолтом:\n"
+            "for f in forms:\n"
+            "    for a in f['attributes']:\n"
+            "        q = a.get('query_text', '')\n"
+            "        if q:\n"
+            "            print(f['form_name'], a['name'], q[:80])\n"
+            "# query_text ОБРЕЗАН до 512 символов и флага усечения НЕ несёт: полный текст\n"
+            "# запроса читай из самого XML формы либо через extract_queries(module_path).\n"
         ),
     )
     _reg(
@@ -15784,9 +16193,7 @@ def make_bsl_helpers(
         get_object_profile,
         "get_object_profile(name, sections=None, include_flow=False, include_code_usages=False, limit=20) -> "
         "{object_name, category, sections:{structure, modules, registers, subscriptions, roles, functional_options}, _meta}  "
-        "# ОБЗОР ОБЪЕКТА ЗА 1 ВЫЗОВ: compact roll-up index-секций вместо ~10 хелперов; секция = "
-        "{status: ok|empty|unavailable|skipped|error, summary, items:top-N, _meta:{source}}, БЕЗ тел; "
-        "тяжёлое (поток/code-scan) — только include_flow=True / include_code_usages=True",
+        "# ОБЗОР ОБЪЕКТА ЗА 1 ВЫЗОВ; секция = {status, summary, items:top-N, _meta:{source}}, БЕЗ тел",
         "composite",
         [
             "обзор объекта",
@@ -15803,9 +16210,20 @@ def make_bsl_helpers(
         "  print(p['object_name'], p['category'])\n"
         "  for name, sec in p['sections'].items():\n"
         "      print(f\"  {name}: {sec['status']} {sec.get('summary')}\")  # счётчики; items — top-N preview без тел\n"
+        "  # status секции: ok | empty | unavailable | skipped | error. 'empty' — таблица есть, а\n"
+        "  #   строк по объекту НЕТ; полноту это НЕ доказывает (см. легенду охвата: структурный\n"
+        "  #   дрейф индекса не проверяется, и добавленный сегодня объект оставляет ok).\n"
+        "  #   'skipped' — ДВА разных случая, различает _meta.reason: секция НЕ ПРИМЕНИМА\n"
+        "  #   (registers у не-документа, reason='not_a_document' — читать там нечего) либо\n"
+        "  #   прочитано не всё (modules: список есть, но счётчики методов не авторитетны →\n"
+        "  #   get_object_modules(no_live=False)). 'unavailable' — источник недоступен ЛИБО\n"
+        "  #   отдан lower-bound (причина там же). Ни то, ни другое нулём не является, но и\n"
+        "  #   items у них отбрасывать нельзя.\n"
+        "  # Это compact roll-up index-секций вместо ~10 одиночных хелперов.\n"
         "  # точечно глубже: read_procedure(path, 'Метод') по p['sections']['modules']['items'][i]['path']\n"
         "  # ровно нужное: get_object_profile(name, sections=['structure','roles'])\n"
-        "  # тяжёлое ТОЛЬКО по флагу: get_object_profile(name, include_flow=True) → +секция flow (analyze_document_flow)\n"
+        "  # тяжёлое ТОЛЬКО по флагу: get_object_profile(name, include_flow=True) → +секция flow\n"
+        "  #   (analyze_document_flow), include_code_usages=True → +code-scan. Без флагов они НЕ считаются.\n"
         "  # ДИЗАМБИГУАЦИЯ: весь обзор за 1 вызов → get_object_profile; только код-скелет → get_object_modules;\n"
         "  #   только метаданные → get_object_full_structure; глубокий разбор тел/потока → analyze_document_flow / analyze_object",
     )
@@ -15813,12 +16231,13 @@ def make_bsl_helpers(
         "analyze_object",
         analyze_object,
         "analyze_object(name) -> {name, category, metadata (XML), modules:[{module_type, procedures, exports, ...}]}  "
-        "# ДОРОГО: читает XML + ВСЕ тела всех модулей (extract_procedures). Для обзора бери get_object_profile; "
-        "сюда — только когда реально нужны ВСЕ процедуры объекта сразу",
+        "# ДОРОГО: XML + ВСЕ тела всех модулей. Для обзора — get_object_profile",
         "composite",
         ["analyze_object", "все тела объекта", "все процедуры объекта"],
-        "DEEP OBJECT DUMP (ДОРОГО — XML + все тела; для обзора используй get_object_profile):\n"
-        "  result = analyze_object('АвансовыйОтчет')  # бери ТОЛЬКО когда нужны ВСЕ процедуры объекта сразу\n"
+        "DEEP OBJECT DUMP (ДОРОГО — XML + все тела через extract_procedures):\n"
+        "  # Бери ТОЛЬКО когда реально нужны ВСЕ процедуры объекта сразу; для обзора —\n"
+        "  # get_object_profile (compact roll-up без чтения тел).\n"
+        "  result = analyze_object('АвансовыйОтчет')\n"
         "  meta = result.get('metadata', {})\n"
         "  print(f\"Объект: {result['name']} ({meta.get('synonym', '')})\")\n"
         "  for m in result.get('modules', []):\n"
@@ -15831,7 +16250,8 @@ def make_bsl_helpers(
         "get_object_full_structure(name) -> {object_name, category, synonym, posting, attributes, "
         "tabular_sections:[{name, synonym, columns}], dimensions, resources, predefined_items, "
         "enum_values_for_typed_refs:{Enum.X:[{name,synonym}]}, forms:[str], "
-        "_meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}",
+        "_meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}"
+        "  # posting=None — НЕ читалось, не «не проводится»",
         "composite",
         [
             "структура объекта",
@@ -15928,10 +16348,13 @@ def make_bsl_helpers(
     _reg(
         "analyze_document_flow",
         analyze_document_flow,
-        "analyze_document_flow(doc_name) -> {document, metadata, event_subscriptions, register_movements, related_scheduled_jobs, based_on, print_forms}  # dict (+ is_postable/hint для непроводимых); register_movements — сам dict (см. find_register_movements), event_subscriptions/related_scheduled_jobs — списки",
+        "analyze_document_flow(doc_name) -> {document, metadata, event_subscriptions, register_movements, related_scheduled_jobs, based_on, print_forms}  # dict (+ is_postable/hint для непроводимых)",
         "composite",
         ["lifecycle", "жизненн", "flow", "end-to-end", "полный анализ", "как работает"],
         "FULL DOCUMENT LIFECYCLE:\n"
+        "  # Формы вложенных значений: register_movements — сам dict (контракт см.\n"
+        "  # find_register_movements), based_on — dict (см. find_based_on_documents),\n"
+        "  # event_subscriptions / related_scheduled_jobs — списки.\n"
         "  flow = analyze_document_flow('АвансовыйОтчет')\n"
         "  print('Подписки:', len(flow['event_subscriptions']))\n"
         "  for s in flow['event_subscriptions']:\n"
@@ -16038,7 +16461,8 @@ def make_bsl_helpers(
         "find_register_movements(doc_name, posting_calls_offset=0) -> {code_registers:[dict], suppressed_main_code_registers?:[dict],"
         " erp_mechanisms/manager_tables/adapted_registers:[str], is_postable?, posting_handler_present?,"
         " hint?, partial?, _meta?}"
-        "  # code_registers — словари (source: code|manager_code), остальные три — списки ИМЕН-строк",
+        "  # code_registers — словари (source: code|manager_code), остальные три — списки ИМЕН-строк"
+        "; _meta.delegates/_total/_truncated — стр.1",
         "business",
         ["движени", "movement", "регистр", "register", "проведен", "posting"],
         "TRACE DOCUMENT REGISTER MOVEMENTS:\n"
@@ -16111,14 +16535,14 @@ def make_bsl_helpers(
     _reg(
         "find_based_on_documents",
         find_based_on_documents,
-        "find_based_on_documents(doc_name) -> {can_create_from_here, can_be_created_from}",
+        "find_based_on_documents(doc_name) -> {can_create_from_here, can_be_created_from}  # via всегда: direct|metadata|back_scan",
         "business",
         ["основани", "ввод на основании", "создать на основании", "based on", "filling", "заполнени"],
         "FIND BASED-ON DOCUMENTS (ввод на основании):\n"
         "  result = find_based_on_documents('ПриобретениеТоваровУслуг')\n"
         "  print('Можно создать из этого документа:')\n"
         "  for d in result['can_create_from_here']:\n"
-        "      via = d.get('via', 'direct')  # 'direct' / 'back_scan' / 'metadata'\n"
+        "      via = d['via']  # v1.37.0 — БЕЗУСЛОВНЫЙ: 'direct' / 'back_scan' / 'metadata'\n"
         "      ref = d.get('ref') or d['document']  # metadata: canonical Catalog.X/Document.X\n"
         '      print(f"  -> {ref} ({via})")\n'
         "  print('Этот документ создается на основании:')\n"
@@ -16152,7 +16576,8 @@ def make_bsl_helpers(
         find_functional_options,
         "find_functional_options(obj_name, include_code=True, limit=None, include_content=True) -> "
         "{object,xml_options:[{name,synonym,location,file,content?|content_size?}],"
-        "code_options:[{name,option_name,file,line}],total,xml_total,code_total,returned?,has_more?,partial?,_meta?}"
+        "code_options:[{name,option_name,file,line}],total,xml_total,code_total,returned?,has_more?,partial?,"
+        "_meta:{source,xml_source,code_source,...}}"
         "  # xml_total exact, code_total=substring grep; limit is per bucket and must be named; "
         "include_content=False returns xml rows without content",
         "business",
@@ -16183,7 +16608,17 @@ def make_bsl_helpers(
         "      print(fo['name'], fo['content_size'])\n"
         "  # состав КОНКРЕТНОЙ опции — по ее файлу из той же строки:\n"
         "  detail = parse_object_xml(page['xml_options'][0]['file'])['content']\n"
-        "  #   (limit=1 вернул бы ПЕРВУЮ опцию обзора, а не выбранную тобой)",
+        "  #   (limit=1 вернул бы ПЕРВУЮ опцию обзора, а не выбранную тобой)\n"
+        "  # ПРОВЕНАНС (v1.37.0) — ТРИ ключа, потому что источник смешанный ПО ПОСТРОЕНИЮ:\n"
+        "  #   при рабочем индексе XML приходит из SQLite, а code_options — из ЖИВОГО дерева.\n"
+        "  #   _meta.xml_source / _meta.code_source = index | live | not_requested (по корзинам),\n"
+        "  #   _meta.source — сводный (index | live | index+live). Один общий source был бы ЛОЖЬЮ.\n"
+        "  # ГРАНИЦА vs find_references_to_object(kinds=['functional_option_content']): там под\n"
+        "  #   ОДНИМ ref_kind ДВЕ эмиссии — <Content> опции и её <Location> (хранилище), и\n"
+        "  #   различаются они хвостом used_in ('….Content' / '….Location'). Здесь смотрим\n"
+        "  #   ТОЛЬКО на content, поэтому объект-ХРАНИЛИЩЕ опции не находится НИКОГДА.\n"
+        "  # ГРАНИЦА vs get_object_profile(sections=['functional_options']): профиль отдаёт только\n"
+        "  #   typed-ref из ридера (строка = {name}) — расхождение счётчиков НОРМА, а не ошибка.",
     )
     _reg(
         "find_roles",
@@ -16423,7 +16858,8 @@ def make_bsl_helpers(
         find_references_to_object,
         "find_references_to_object(object_ref, kinds=None, limit=1000, include_code=False) -> {object, references: [{used_in, path, line, kind}], total, truncated, partial, by_kind} (+ code_usages/code_total/code_by_kind/code_truncated/code_partial/code_meta при include_code)"
         "  # line у 5 видов на v15+, иначе None — КОНТРАКТ; kinds=[] == kinds=None; _meta ВСЕГДА:"
-        " source/extensions_included/unsupported_kinds/index_coverage",
+        " source/extensions_included/unsupported_kinds/index_coverage"
+        "; kinds_requested/kinds_applied; unsupported_kinds — LIVE",
         "business",
         [
             "ссылк",
@@ -16553,14 +16989,20 @@ def make_bsl_helpers(
         "      ext_path = ctx['nearby_extensions'][0]['path']\n"
         "      ovr_obj = find_ext_overrides(ext_path, 'Номенклатура')\n"
         "  # Если есть индекс v9+ — предпочитай get_overrides() (мгновенно из SQLite).\n"
-        "  # find_ext_overrides — для live-проверки на проектах без индекса или для верификации.",
+        "  # find_ext_overrides — для live-проверки на проектах без индекса или для верификации.\n"
+        "  # v1.37.0: строки несут extension_file — '../'-путь от корня СЕССИИ. Здесь\n"
+        "  #   extension_path задаёт ПРОИЗВОЛЬНЫЙ корень, и если его нет среди корней сессии,\n"
+        "  #   extension_file = '' — это КОРРЕКТНО, а не «файл не найден»: исполнить такой путь\n"
+        "  #   из песочницы всё равно нельзя (_ext_resolve_safe его отвергнет). Читай тело по\n"
+        "  #   ext_module_path относительно самого extension_path.",
     )
     _reg(
         "get_overrides",
         get_overrides,
         "get_overrides(object_name='', method_name='', limit=200, offset=0) -> {overrides, total, offset,"
         " returned, has_more, truncated, partial, source, by_annotation/by_object_top/by_extension_top="
-        "dict{имя:N}, unique_*}  # stats full iff partial=False",
+        "dict{имя:N}, unique_objects/unique_methods=ИМЕНА, unique_object_methods=ПАРЫ}"
+        "  # stats full iff partial=False; row.extension_file — исполним",
         "extension",
         ["перехват", "override", "расширен", "extension", "вместо", "после", "перед"],
         "GET OVERRIDES:\n"
@@ -16578,6 +17020,13 @@ def make_bsl_helpers(
         "  # перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения\n"
         "  # и т.п.), у которого в базовом модуле нет текстового объявления, а также\n"
         "  # строка без source-привязки.\n"
+        "  # ПУТЬ ДО ФАЙЛА расширения — ОДИН ключ, и он ИСПОЛНИМ в этой же сессии (v1.37.0):\n"
+        "  #   body = read_procedure(ov['extension_file'], ov['extension_method'])\n"
+        "  # Прежние три поля описывают путь, но НЕ адресуют файл: source_path — от корня\n"
+        "  #   ОСНОВНОЙ конфигурации (в EXTENSION-индексе пусто), ext_module_path — от корня\n"
+        "  #   РАСШИРЕНИЯ, extension_root — абсолютный. extension_file = '../'-путь от корня\n"
+        "  #   сессии; он же равен find_module(...)['path'] для того же физического файла.\n"
+        "  #   Пустая строка = корень недостижим из этой сессии; КЛЮЧ присутствует всегда.\n"
         "  # To read extension method body:\n"
         "  body = read_procedure(path, 'MethodName', include_overrides=True)\n"
         "  # NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths\n"
@@ -16643,8 +17092,11 @@ def make_bsl_helpers(
             "  #   бинарного списка готовой команды НЕТ: у git -i и Python re.IGNORECASE разный\n"
             "  #   Unicode case-folding, а POSIX ERE != Python re — hint честно называет границу.\n"
             "  # НЕ сужай до одного файла как fallback: git_search(path=<файл>) все равно отдаст\n"
-            "  #   не больше 50 строк, а git_search(path=<файл>, file_types=...) вернет 0 при error=None.\n"
-            "  #   Полное содержимое одного файла — только grep(pattern, file).\n"
+            "  #   не больше 50 строк. Полное содержимое одного файла — только grep(pattern, file).\n"
+            "  # v1.37.0: git_search(path=<файл>, file_types=...) больше НЕ отдает молчаливый 0 —\n"
+            "  #   совпадающий суффикс ищется в самом файле, а НЕсовпадающий даёт НАЗВАННЫЙ отказ\n"
+            "  #   (error + hint: убрать file_types либо расширить его). Пустая выдача при этом\n"
+            "  #   несет hint, разводящий прочтения нуля (регистр пути, .gitignore, класс узла).\n"
             "  # regex=True is POSIX ERE (end-of-line anchor on CRLF files needs '[[:space:]]*$', not '$').\n"
             "  # Failure -> results == [] with a non-None error: follow hint for safe_grep/grep pattern semantics.",
         )

@@ -9,6 +9,10 @@ v1.23.0 baselines and fails if a future edit grows any case by more than ~5%.
 Baselines are deterministic: the strategy is built from the FROZEN helper-metadata
 snapshot (build_helper_metadata_snapshot force-registers git_search), so the numbers
 do not depend on git availability or the live registry.
+
+Это верно для ячеек СТРАТЕГИИ. Ячейки whole-payload идут через настоящий
+`_rlm_start`, то есть через ЖИВОЙ реестр, и git-возможность там регистрируется по
+дереву: их вариант закреплён барьером `_pin_git_discovery_to_the_tree`.
 """
 
 from __future__ import annotations
@@ -100,11 +104,26 @@ from rlm_tools_bsl.format_detector import detect_format
 # Проза ужималась ПЕРВОЙ: длинные пояснения переехали в НЕбюджетируемый `recipe`
 # (rlm_help отдаёт его по запросу), из подписей убраны дубли и marketing-фразы.
 # Оставшееся неустранимо без удаления самих имён ключей.
+#
+# v1.37.0: ВОСЕМЬ новых full-ячеек — по одной на каждый домен «правим», кроме уже
+# имевшегося «проведение». Это ЕДИНСТВЕННОЕ место, которое видит `full`-форму
+# доменного рецепта: payload-ячейки идут по `auto`→`medium`, то есть инлайнят
+# `compact`, а `get_strategy("high", …)` — `full`. Без этих ячеек правки
+# `full`-формы девяти доменов не мерило бы НИЧТО. Числа сняты ДО первой правки
+# релиза на нетронутом дереве (`29e5e0d`).
 _BASELINES = {
     ("slim", ""): 7146,
     ("slim", "проведение"): 7990,
     ("full", ""): 33858,
     ("full", "проведение"): 35597,
+    ("full", "права"): 35667,
+    ("full", "расширения"): 37184,
+    ("full", "структура объекта"): 35469,
+    ("full", "события формы"): 35165,
+    ("full", "ссылки"): 36677,
+    ("full", "ввод на основании"): 35004,
+    ("full", "иерархия вызовов"): 37180,
+    ("full", "достижимость"): 35645,
 }
 # Whole rlm_start payload baselines (strategy + available_functions + index +
 # extension_context) for a fixed minimal INDEXED config — the plan's real target.
@@ -134,7 +153,45 @@ _DOMAIN_PAYLOAD_BASELINES: dict[tuple[str, str], int] = {
     # ячеек «права» нельзя.
     ("slim", "проведение"): 22631,
     ("full", "проведение"): 48864,
+    # v1.37.0: остальные СЕМЬ доменов, чьи рецепты правит релиз, бюджетом не мерил
+    # НИКТО — они росли бы вне любого гарда. Числа сняты ДО первой правки релиза на
+    # нетронутом дереве (`29e5e0d`), поэтому «бэйслайн» не вобрал в себя уже
+    # сделанный рост.
+    ("slim", "расширения"): 22363,
+    ("full", "расширения"): 50143,
+    ("slim", "структура объекта"): 22004,
+    ("full", "структура объекта"): 49328,
+    ("slim", "события формы"): 21988,
+    ("full", "события формы"): 48825,
+    ("slim", "ссылки"): 22142,
+    ("full", "ссылки"): 49993,
+    ("slim", "ввод на основании"): 21927,
+    ("full", "ввод на основании"): 48760,
+    ("slim", "иерархия вызовов"): 22664,
+    ("full", "иерархия вызовов"): 50321,
+    ("slim", "достижимость"): 22217,
+    ("full", "достижимость"): 49055,
 }
+
+# Девять доменов `_BUSINESS_RECIPES`, чьи рецепты правит v1.37.0.
+_BUDGET_DOMAINS = (
+    "проведение",
+    "права",
+    "расширения",
+    "структура объекта",
+    "события формы",
+    "ссылки",
+    "ввод на основании",
+    "иерархия вызовов",
+    "достижимость",
+)
+
+# v1.37.0: у доменных ячеек effort пинится ЯВНО. Через `auto` он зависит от ТЕКСТА
+# запроса (`_auto_effort`), и «иерархия вызовов» — единственный домен с маркером
+# сложности («иерарх») — ушла бы в `high`, то есть инлайнила бы `full`-форму
+# рецепта, пока остальные восемь инлайнят `compact`. Одна и та же прибавка в
+# «+120» означала бы тогда у разных доменов разное.
+_DOMAIN_EFFORT = "medium"
 
 _DRIFT = 1.05  # allow ≤5% growth before failing
 
@@ -188,7 +245,9 @@ def test_get_object_profile_signature_stays_compact():
     """The new sig appears in available_functions + the strategy helpers table — keep it lean."""
     snap = build_helper_metadata_snapshot()
     sig = snap["get_object_profile"]["sig"]
-    assert len(sig) <= 525, f"get_object_profile sig is {len(sig)} chars — trim to stay in budget"
+    # v1.37.0: 525 -> 340, то же правило `ceil10(факт * 1.10)` и только вниз
+    # (факт после Задачи 0 — 308; прежний потолок оставлял 217 свободных символов).
+    assert len(sig) <= 340, f"get_object_profile sig is {len(sig)} chars — trim to stay in budget"
 
 
 def test_helper_snapshot_count_locked():
@@ -218,9 +277,11 @@ def test_domain_matched_rlm_start_payload_within_budget(monkeypatch, tmp_path, m
 def _assert_payload_budget(monkeypatch, tmp_path, mode, query, baselines):
     if baselines is None:
         baseline = _DOMAIN_PAYLOAD_BASELINES[(mode, query)]
+        effort = _DOMAIN_EFFORT
     else:
         baseline = baselines[mode]
-    _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline)
+        effort = "auto"
+    _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, effort=effort)
 
 
 # v1.36.0 (поправка V1): колонка «Факт» опорного замера зависела от ДЛИНЫ tmp-пути.
@@ -246,10 +307,44 @@ def _pathfree_len(raw: str, resolved_path: str) -> int:
     return len(raw) - len(_esc(resolved_path)) + _PATH_REF
 
 
-def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_git_search=False):
+# v1.37.0: ячейка обязана мерить ИМЕННО свой git-вариант, а не вариант окружения.
+#
+# `git_search` регистрируется, когда у `base_path` есть git-ПРЕДОК:
+# `bsl_helpers._git_search_available` обходит `parents` в поиске `.git` и
+# подтверждает находку вызовом `_git_available`. pytest кладёт `tmp_path` под
+# `--basetemp`, поэтому basetemp внутри любого git-репозитория (скажем, внутри
+# самого checkout'а) молча превращал non-git ячейку в git-ячейку: +413 символов
+# `git_search.sig` в `available_functions` и +716 символов git-блока стратегии.
+# Замер уезжал с 21 162 на 22 291 — то есть РОВНО в бэйслайн git-ячейки
+# (22 814, потолок 23 954), а «base slim» краснел на НЕТРОНУТОМ коде. Гард
+# ловил не рост payload, а место, куда указывал `--basetemp`.
+#
+# Барьер — штатный `GIT_CEILING_DIRECTORIES`: git не поднимается В перечисленные
+# каталоги. Ставится на РОДИТЕЛЯ дерева, а не на само дерево: текущий каталог git
+# из поиска не исключает, и потолок на самом дереве не помогает (проверено).
+# Ячейке `test_git_backed_rlm_start_payload_within_budget` барьер безвреден: там
+# `.git` лежит В дереве и находится без подъёма — и это не предположение, а её
+# собственный ассерт `require_git_search=True`.
+#
+# Это снятие зависимости гарда от окружения, как `_pathfree_len` (длина пути) и
+# `_clean_ctx` (соседние расширения), а НЕ ре-бэйслайн: на дереве без git-предка
+# числа те же, что и прежде.
+def _pin_git_discovery_to_the_tree(monkeypatch, root) -> None:
+    """Запретить обнаружению git подниматься ВЫШЕ дерева замера."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(root.parent.resolve()))
+
+
+def _payload_fixture(monkeypatch, tmp_path, mode):
+    """Дерево + индекс + чистый extension-контекст ОДИН раз на тест.
+
+    Возвращает `(query, effort) -> (raw, data)`: индекс строится единожды, поэтому
+    несколько запросов в одном тесте (надбавка = домен − base) не платят за
+    пересборку И, что важнее, меряются на ОДНОМ дереве — разность двух прогонов
+    несла бы чужое смещение.
+    """
     import rlm_tools_bsl.extension_detector as _ed
     from rlm_tools_bsl.bsl_index import IndexBuilder
-    from rlm_tools_bsl.server import _rlm_end, _rlm_start
+    from rlm_tools_bsl.server import _rlm_start
 
     obj = tmp_path / "Documents" / "БюджетТест" / "Ext"
     obj.mkdir(parents=True)
@@ -257,6 +352,8 @@ def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_gi
     (tmp_path / "Configuration.xml").write_text(_CF_DESCRIPTOR, encoding="utf-8")
     monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
     monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
+    # До сборки индекса: git-обнаружение спрашивает и `IndexBuilder`.
+    _pin_git_discovery_to_the_tree(monkeypatch, tmp_path)
     IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=True)
 
     # The baseline is the NO-extension start cost. detect_extension_context scans sibling /
@@ -271,8 +368,18 @@ def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_gi
 
     monkeypatch.setattr("rlm_tools_bsl.server.detect_extension_context", _clean_ctx)
 
-    raw = _rlm_start(path=str(tmp_path), query=query)
-    data = json.loads(raw)
+    def _start(query, effort):
+        raw = _rlm_start(path=str(tmp_path), query=query, effort=effort)
+        return raw, json.loads(raw)
+
+    return _start
+
+
+def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_git_search=False, effort="auto"):
+    from rlm_tools_bsl.server import _rlm_end
+
+    start = _payload_fixture(monkeypatch, tmp_path, mode)
+    raw, data = start(query, effort)
     try:
         assert not data["extension_context"]["nearby_extensions"], "budget config must be extension-free"
         # Бюджет обязан меряться на поддерживаемом дереве: на чужом формате
@@ -286,15 +393,130 @@ def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_gi
         )
         # the new aggregate signature lives on available_functions — confirm it is present
         assert any("get_object_profile(name" in s for s in data["available_functions"])
+        has_git_search = any(s.startswith("git_search(") for s in data["available_functions"])
         if require_git_search:
-            assert any(s.startswith("git_search(") for s in data["available_functions"]), (
-                "фикстура деградировала в non-git — бюджетная защита git_search.sig стала бы ложной"
+            assert has_git_search, "фикстура деградировала в non-git — бюджетная защита git_search.sig стала бы ложной"
+        else:
+            assert not has_git_search, (
+                "ячейка обязана быть non-git, а git_search зарегистрирован: обнаружение git "
+                "поднялось ВЫШЕ дерева замера. Ячейка мерила бы git-вариант (+1129 символов) "
+                "против non-git бэйслайна — см. _pin_git_discovery_to_the_tree"
             )
         # index discovery keys present so the agent skips get_index_info() on start
         assert data["index"]["loaded"] is True
         assert "has_object_attributes" in data["index"]
     finally:
         _rlm_end(data["session_id"])
+
+
+# ── v1.37.0: НАДБАВКА доменного рецепта, а не абсолют ячейки ────────────────
+#
+# Плановый предел правки доменного рецепта — +60 slim / +120 full, и он жёстче
+# штатного `×1.05`: на full-ячейке ~50 000 символов тот даёт запас ~2 500, то есть
+# случайный дубль абзаца в 900 символов прошёл бы зелёным.
+#
+# Мерить НАДБАВКУ обязательно, а не абсолют: ячейка домена = базовый payload ПЛЮС
+# рецепт, и универсальные правки релиза (подписи, DISAMBIGUATION, COVERAGE) входят
+# в неё целиком. Сравнение полной дельты ячейки с «+120» ложно остановило бы релиз
+# на первой же задаче.
+#
+# Разность существующих словарей для этого НЕ годится: `_PAYLOAD_BASELINES` и
+# `_DOMAIN_PAYLOAD_BASELINES` сняты в РАЗНЫЕ релизы, универсальная часть в них не
+# одна и та же и не сокращается — на момент снятия смещение составляло −994 в slim,
+# то есть гард был бы вакуумным. Поэтому здесь заморожена сама разность
+# `домен − base`, снятая на ОДНОМ дереве, а в прогоне `base` меряется тем же
+# способом и в том же процессе.
+_RECIPE_OVERHEAD_BASELINES: dict[tuple[str, str], int] = {
+    ("slim", "проведение"): 946,
+    ("full", "проведение"): 866,
+    ("slim", "права"): 623,
+    ("full", "права"): 548,
+    ("slim", "расширения"): 741,
+    ("full", "расширения"): 1601,
+    ("slim", "структура объекта"): 382,
+    ("full", "структура объекта"): 786,
+    ("slim", "события формы"): 366,
+    ("full", "события формы"): 283,
+    ("slim", "ссылки"): 520,
+    ("full", "ссылки"): 1451,
+    ("slim", "ввод на основании"): 305,
+    ("full", "ввод на основании"): 218,
+    ("slim", "иерархия вызовов"): 1042,
+    ("full", "иерархия вызовов"): 1779,
+    ("slim", "достижимость"): 595,
+    ("full", "достижимость"): 513,
+}
+
+# Та же величина для `full`-ФОРМЫ рецепта. Форму выбирает `effort`, а не режим
+# стратегии: payload идёт по `medium` → `compact`, и `full`-форму девяти доменов
+# не видит ни одна ячейка payload. Единственное место, где она меряется, —
+# `get_strategy("high", …)`, то есть гард текста стратегии.
+_FULL_FORM_RECIPE_OVERHEAD_BASELINES: dict[str, int] = {
+    "проведение": 1739,
+    "права": 1209,
+    "расширения": 2726,
+    "структура объекта": 1011,
+    "события формы": 707,
+    "ссылки": 2219,
+    "ввод на основании": 546,
+    "иерархия вызовов": 2722,
+    "достижимость": 1187,
+}
+
+_RECIPE_OVERHEAD_LIMITS = {"slim": 60, "full": 120}
+
+
+@pytest.mark.parametrize("mode", ["slim", "full"])
+def test_compact_recipe_overhead_within_plan_limit(monkeypatch, tmp_path, mode):
+    """`compact`-форма доменного рецепта растёт не более чем на плановую статью.
+
+    Оба вычитаемых снимаются в ОДНОМ прогоне на ОДНОМ дереве — иначе в разность
+    уезжает универсальный дрейф релиза, и предел перестаёт означать что-либо.
+    """
+    from rlm_tools_bsl.server import _rlm_end
+
+    start = _payload_fixture(monkeypatch, tmp_path, mode)
+    limit = _RECIPE_OVERHEAD_LIMITS[mode]
+
+    def _measure(query, effort):
+        raw, data = start(query, effort)
+        try:
+            return _pathfree_len(raw, data["resolved_path"])
+        finally:
+            _rlm_end(data["session_id"])
+
+    base = _measure("", "auto")
+    grown = []
+    for domain in _BUDGET_DOMAINS:
+        overhead = _measure(domain, _DOMAIN_EFFORT) - base
+        frozen = _RECIPE_OVERHEAD_BASELINES[(mode, domain)]
+        if overhead - frozen > limit:
+            grown.append(f"{domain}: {frozen} -> {overhead} (+{overhead - frozen} > {limit})")
+    assert not grown, (
+        f"{mode}: compact-рецепт вырос сверх плановой статьи: {'; '.join(grown)}. "
+        "Подрежьте текст рецепта или поднимите статью ОСОЗНАННО, отдельным решением."
+    )
+
+
+def test_full_form_recipe_overhead_within_plan_limit(_fmt_info, monkeypatch):
+    """То же для `full`-формы рецепта — её видит ТОЛЬКО текст стратегии."""
+    monkeypatch.setenv("RLM_STRATEGY_MODE", "full")
+    snap = build_helper_metadata_snapshot()
+
+    def _measure(query):
+        return len(get_strategy("high", _fmt_info, registry=snap, idx_stats=_IDX_STATS, query=query))
+
+    base = _measure("")
+    grown = []
+    for domain in _BUDGET_DOMAINS:
+        overhead = _measure(domain) - base
+        frozen = _FULL_FORM_RECIPE_OVERHEAD_BASELINES[domain]
+        if overhead - frozen > 120:
+            grown.append(f"{domain}: {frozen} -> {overhead} (+{overhead - frozen} > 120)")
+    assert not grown, (
+        f"full-форма рецепта выросла сверх плановой статьи: {'; '.join(grown)}. "
+        "Подрежьте текст рецепта или поднимите статью ОСОЗНАННО, отдельным решением."
+    )
 
 
 # v1.34.0: whole-payload фикстура выше работает НЕ под git, поэтому её
@@ -377,6 +599,7 @@ def test_missing_index_rlm_start_payload_within_budget(monkeypatch, tmp_path, mo
     # наивная нормализация схлопнула бы 3 вхождения из 5.
     monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
     monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
+    _pin_git_discovery_to_the_tree(monkeypatch, project)
 
     _real_single = _ed._detect_single
 
@@ -393,6 +616,9 @@ def test_missing_index_rlm_start_payload_within_budget(monkeypatch, tmp_path, mo
         assert data["index"]["loaded"] is False
         assert data["index"]["index_status"] == "missing"
         assert not data["extension_context"]["nearby_extensions"], "budget config must be extension-free"
+        assert not any(s.startswith("git_search(") for s in data["available_functions"]), (
+            "ячейка обязана быть non-git — см. _pin_git_discovery_to_the_tree"
+        )
 
         baseline = _MISSING_INDEX_PAYLOAD_BASELINES[mode]
         ceiling = int(baseline * _DRIFT)
@@ -415,7 +641,11 @@ def test_missing_index_rlm_start_payload_within_budget(monkeypatch, tmp_path, mo
 _SIG_CEILINGS = {
     "find_call_hierarchy": 560,
     "find_path": 540,
-    "get_object_full_structure": 520,
+    # v1.37.0 (завершение релиза): 520 -> 410 по правилу `ceil10(факт * 1.10)` и
+    # ТОЛЬКО ВНИЗ. Задача 0 срезала прозу, факт стал 370, и прежний потолок оставлял
+    # 150 символов, которые следующая правка съела бы молча. Остальные потолки уже
+    # ЖЁСТЧЕ этого правила и потому не двигаются — оно опускает, но не поднимает.
+    "get_object_full_structure": 410,
     # v1.36.0 (Задача 3): sig 491 -> 467 (проекция orphan_methods вместо
     # дублирующего хвоста). Потолок ЖЁСТЧЕ общего правила «факт + 10 %»
     # (оно дало бы 520): у этой подписи запас был узким и до релиза
@@ -546,3 +776,34 @@ def test_sigs_warn_about_false_negative_answers():
         _sig_says(sig, ("стемминг",), helper, "причина (нет стемминга)")
         _sig_says(sig, ("отсутстви",), helper, "суть (0 ≠ отсутствие)")
         _sig_says(sig, ("проверь", "попробуй", "возьми"), helper, "ДЕЙСТВИЕ (что делать при нуле)")
+
+    # v1.37.0 — три НОВЫХ предупреждения того же класса: ноль (или None) в них
+    # читается как доказанное отсутствие, хотя доказывает совсем другое. Без этих
+    # ассертов следующая резка прозы снимет их молча — ровно так, как снялись бы
+    # предупреждения выше. Провенанс каждого:
+    #   * `get_object_full_structure.posting` — на ЧИСТОМ index-пути значение не
+    #     хранится вовсе, и `None` там означает «НЕ читалось», а не «документ не
+    #     проводится». Гарантированный маршрут — `find_register_movements`.
+    #   * `find_references_to_object` — `kind='owner'` на индексе возвращал 0 и НЕ
+    #     попадал в `unsupported_kinds`: тот список — capability-карта LIVE-парсера
+    #     и на `source='index'` всегда пуст. Что применено РЕАЛЬНО, говорит
+    #     `kinds_applied`.
+    #   * `find_register_movements` — `code_registers=0` при делегировании читается
+    #     как «движений нет»; имена получателей называет `_meta.delegates`.
+    sig = snap["get_object_full_structure"]["sig"]
+    _sig_says(sig, ("posting=None",), "get_object_full_structure", "предмет (какое поле)")
+    _sig_says(sig, ("НЕ читалось", "не читалось"), "get_object_full_structure", "причина")
+    _sig_says(
+        sig,
+        ("не «не проводится»", "не 'не проводится'", "не «не проводится"),
+        "get_object_full_structure",
+        "суть (None ≠ Posting=Deny)",
+    )
+
+    sig = snap["find_references_to_object"]["sig"]
+    _sig_says(sig, ("kinds_applied",), "find_references_to_object", "ДЕЙСТВИЕ (что применено реально)")
+    _sig_says(sig, ("unsupported_kinds",), "find_references_to_object", "предмет")
+    _sig_says(sig, ("LIVE", "live"), "find_references_to_object", "граница (чья это карта)")
+
+    sig = snap["find_register_movements"]["sig"]
+    _sig_says(sig, ("_meta.delegates",), "find_register_movements", "ДЕЙСТВИЕ (где имена делегатов)")

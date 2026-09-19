@@ -514,7 +514,21 @@ def test_functional_options_without_limit_keep_legacy_key_set(guarded_bsl):
     assert len(res["xml_options"]) > 0, "фикстура обязана давать ФО, иначе проверка вакуумна"
     # Freeze обновлён, а НЕ ослаблен до >=: смысл заморозки — ловить
     # незапланированный рост формы, а totals здесь запланированы (Задача 5).
-    assert set(res) == {"object", "xml_options", "code_options", "total", "xml_total", "code_total"}
+    # v1.37.0: `_meta` стал БЕЗУСЛОВНЫМ. Прежний гейт по `include_code` означал, что
+    # ФОРМА ответа зависит от аргумента, а провенанс XML-корзины (он есть ВСЕГДА)
+    # публиковать было негде. Заморозка ужесточается под новый набор, а не снимается.
+    assert set(res) == {
+        "object",
+        "xml_options",
+        "code_options",
+        "total",
+        "xml_total",
+        "code_total",
+        "_meta",
+    }
+    # При include_code=False code-домена нет вовсе — это названо машинно.
+    assert res["_meta"]["code_source"] == "not_requested", res["_meta"]
+    assert res["_meta"]["source"] == res["_meta"]["xml_source"], res["_meta"]
 
 
 def test_functional_options_bucket_totals_match_total_with_limit(guarded_bsl):

@@ -1122,12 +1122,12 @@ def _rlm_start(
         [
             "read_file(path) -> str (numbered: '  42 | code')",
             "read_files(paths) -> dict[path, str] — BATCH: читай N файлов одним вызовом вместо N×read_file (numbered)",
-            "grep(pattern, path='.') -> list[dict] keys: file, line, text",
-            "grep_summary(pattern, path='.') -> compact grouped string",
-            "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files (numbered), summary}",
-            "glob_files(pattern) -> list[str]",
+            "grep(pattern, path='.') -> list[dict] keys: file, line, text  # пути через /",
+            "grep_summary(pattern, path='.') -> compact grouped string  # пути через /",
+            "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files (numbered), summary}  # пути через /",
+            "glob_files(pattern) -> list[str]  # пути через /",
             "tree(path='.', max_depth=3) -> str",
-            "find_files(name) -> list[str]",
+            "find_files(name) -> list[str]  # пути через /",
         ]
     )
     if has_llm_tools:

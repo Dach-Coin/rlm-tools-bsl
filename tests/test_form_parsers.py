@@ -927,3 +927,155 @@ def test_edt_form_types_is_a_list_too():
     by_name = {a["name"]: a for a in res["attributes"]}
     assert by_name["Объект"]["types"] == ["CatalogObject.Х", "CatalogRef.Х"]
     assert by_name["Прочий"]["types"] == ["String"]
+
+
+# ---------------------------------------------------------------------------
+# v1.37.0 (Задача 7) — охват handler= и НЕсимметричные ключи реквизита
+# ---------------------------------------------------------------------------
+
+_TWO_FORMS_A = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform">
+  <Events>
+    <Event name="OnCreateAtServer">ПриСозданииНаСервере</Event>
+    <Event name="OnOpen">ПриОткрытии</Event>
+  </Events>
+  <Attributes>
+    <Attribute name="Объект">
+      <Type><v8:Type xmlns:v8="http://v8.1c.ru/8.1/data/core">cfg:DocumentObject.Тест</v8:Type></Type>
+      <MainAttribute>true</MainAttribute>
+    </Attribute>
+  </Attributes>
+</Form>
+"""
+
+_TWO_FORMS_B = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform">
+  <Events>
+    <Event name="OnCreateAtServer">ПриСозданииНаСервере</Event>
+  </Events>
+  <Attributes>
+    <Attribute name="Список">
+      <Type><v8:Type xmlns:v8="http://v8.1c.ru/8.1/data/core">cfg:DynamicList</v8:Type></Type>
+      <MainAttribute>true</MainAttribute>
+      <Settings xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="DynamicListExtInfo">
+        <MainTable>Документ.Тест</MainTable>
+        <QueryText>ВЫБРАТЬ * ИЗ Документ.Тест</QueryText>
+      </Settings>
+    </Attribute>
+  </Attributes>
+</Form>
+"""
+
+
+def _multi_form_helpers(tmp_path, *, with_index=False, monkeypatch=None):
+    """Объект с ДВУМЯ формами: обработчик есть в обеих, второй — только в одной."""
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+    base = tmp_path / "cfg"
+    for form_name, xml in (("ФормаА", _TWO_FORMS_A), ("ФормаБ", _TWO_FORMS_B)):
+        d = base / "Documents" / "Тест" / "Forms" / form_name / "Ext"
+        d.mkdir(parents=True)
+        (d / "Form.xml").write_text(xml, encoding="utf-8")
+        (d / "Form").mkdir()
+        (d / "Form" / "Module.bsl").write_text("// module", encoding="utf-8")
+    (base / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+
+    reader = None
+    if with_index:
+        from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+        db_path = IndexBuilder().build(str(base), build_calls=False, build_metadata=True)
+        reader = IndexReader(db_path)
+
+    def read_file(path):
+        full = path if os.path.isabs(path) else os.path.join(str(base), path)
+        try:
+            return Path(full).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+    def glob_files(pattern):
+        return [str(p.relative_to(base)).replace("\\", "/") for p in base.glob(pattern)]
+
+    h = make_bsl_helpers(
+        base_path=str(base),
+        resolve_safe=lambda p: Path(base) / p,
+        read_file_fn=read_file,
+        grep_fn=lambda *a, **kw: [],
+        glob_files_fn=glob_files,
+        idx_reader=reader,
+    )
+    return h, reader
+
+
+@pytest.mark.parametrize("with_index", [False, True])
+def test_handler_filter_scope_is_the_whole_object_on_both_branches(tmp_path, monkeypatch, with_index):
+    """Контракт `handler=`: без `form_name` проверяются ВСЕ формы объекта.
+
+    Остаются формы, где обработчик нашёлся, а ВНУТРИ них список `handlers`
+    ОТФИЛЬТРОВАН до совпавших; `commands`/`attributes` — ПОЛНЫЕ. Фильтруются ОБЕ
+    половины, и обе обязаны быть названы — иначе агент читает «нашлось в одной
+    форме» как «в объекте один обработчик».
+    """
+    h, reader = _multi_form_helpers(tmp_path, with_index=with_index, monkeypatch=monkeypatch)
+    try:
+        # (1) Набор ФОРМ: обработчик есть в обеих — обе и остаются.
+        common = h["parse_form"]("Тест", handler="ПриСозданииНаСервере")
+        assert {f["form_name"] for f in common} == {"ФормаА", "ФормаБ"}, common
+
+        # (2) Набор ОБРАБОТЧИКОВ внутри формы: только совпавшие.
+        only_a = h["parse_form"]("Тест", handler="ПриОткрытии")
+        assert {f["form_name"] for f in only_a} == {"ФормаА"}, only_a
+        assert [x["handler"] for x in only_a[0]["handlers"]] == ["ПриОткрытии"], only_a
+
+        # ...а без фильтра у той же формы обработчиков больше.
+        full = [f for f in h["parse_form"]("Тест") if f["form_name"] == "ФормаА"][0]
+        assert len(full["handlers"]) > len(only_a[0]["handlers"]), (full, only_a)
+
+        # (3) Одна конкретная форма — form_name=.
+        one = h["parse_form"]("Тест", form_name="ФормаА", handler="ПриСозданииНаСервере")
+        assert {f["form_name"] for f in one} == {"ФормаА"}, one
+    finally:
+        if reader is not None:
+            reader.close()
+
+
+@pytest.mark.parametrize("with_index", [False, True])
+def test_main_table_and_query_text_are_conditional_keys(tmp_path, monkeypatch, with_index):
+    """Безусловны только `name`, `types`, `main`.
+
+    `main_table`/`query_text` есть лишь у динамических списков, поэтому прямая
+    индексация роняет обход KeyError'ом на одной форме и молча работает на другой.
+    Подпись перечисляла оба имени БЕЗ пометки — отсюда и ошибка.
+    """
+    h, reader = _multi_form_helpers(tmp_path, with_index=with_index, monkeypatch=monkeypatch)
+    try:
+        forms = {f["form_name"]: f for f in h["parse_form"]("Тест")}
+        plain = forms["ФормаА"]["attributes"][0]
+        dynamic = forms["ФормаБ"]["attributes"][0]
+
+        for key in ("name", "types", "main"):
+            assert key in plain and key in dynamic, (plain, dynamic)
+        assert "query_text" not in plain, plain
+        assert "main_table" not in plain, plain
+        assert dynamic.get("query_text"), dynamic
+        assert dynamic.get("main_table"), dynamic
+    finally:
+        if reader is not None:
+            reader.close()
+
+
+def test_parse_form_sig_marks_the_conditional_keys_and_names_the_handler_scope():
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    sig = build_helper_metadata_snapshot()["parse_form"]["sig"]
+    assert "main_table?" in sig and "query_text?" in sig, sig
+    assert "handler=" in sig, sig
+    recipe = build_helper_metadata_snapshot()["parse_form"]["recipe"]
+    # ДЕЙСТВИЕ и обрезка живут в рецепте: это не предупреждение о ложном
+    # ОТРИЦАТЕЛЬНОМ выводе (там KeyError, а не пустой ответ).
+    assert ".get('query_text'" in recipe, recipe
+    assert "512" in recipe, recipe

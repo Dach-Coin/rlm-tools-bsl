@@ -406,7 +406,7 @@ Replace `<path>` with the actual path to your 1C source code that has nearby ext
    - Проверь extension_context из ответа rlm_start — какая роль конфигурации, есть ли расширения рядом
 
 2. **Обзор всех перехватов из индекса**:
-   - get_overrides() без фильтров → сначала проверь `partial`. При `partial=False` `total` и агрегаты посчитаны по ПОЛНОМУ выбранному источнику; при `partial=True` это нижняя оценка по успешно прочитанной части, а причины перечислены в `_meta.failed_extension_roots`. **Сводку строй по АГРЕГАТАМ**, а не по срезу: `by_annotation`, `by_object_top` (топ-20 объектов), `by_extension_top` (топ-20 расширений), `unique_objects`/`unique_methods`/`unique_extensions`. Три `by_*` — это **dict `{имя: количество}`**, а не список записей: итерируй `.items()`, срез бери как `list(d.items())[:N]`. Список `overrides` — усечённый срез (первые 200), **группировать его вручную НЕЛЬЗЯ**. `target_method_line=None` у строки — валидное значение (перехват предопределённого события платформы без текстового объявления в базовом модуле), не ошибка индекса
+   - get_overrides() без фильтров → сначала проверь `partial`. При `partial=False` `total` и агрегаты посчитаны по ПОЛНОМУ выбранному источнику; при `partial=True` это нижняя оценка по успешно прочитанной части, а причины перечислены в `_meta.failed_extension_roots`. **Сводку строй по АГРЕГАТАМ**, а не по срезу: `by_annotation`, `by_object_top` (топ-20 объектов), `by_extension_top` (топ-20 расширений), `unique_objects`/`unique_methods`/`unique_object_methods`/`unique_extensions`. **Три `unique_*` считают РАЗНОЕ:** `unique_objects` — ИМЕНА объектов (`Documents.Заказ` и `Catalogs.Заказ` — один), `unique_methods` — ИМЕНА методов, `unique_object_methods` (**v1.37.0**) — ПАРЫ объект+метод с учётом категории. «Сколько методов перехвачено» отвечает последний. Три `by_*` — это **dict `{имя: количество}`**, а не список записей: итерируй `.items()`, срез бери как `list(d.items())[:N]`. Список `overrides` — усечённый срез (первые 200), **группировать его вручную НЕЛЬЗЯ**. `target_method_line=None` у строки — валидное значение (перехват предопределённого события платформы без текстового объявления в базовом модуле), не ошибка индекса
    - Разбивка по расширениям — из `by_extension_top` (+ `unique_extensions`); назначение (purpose) каждого расширения возьми из extension_context/detect_extensions()
    - Разбивка по типам аннотаций (&Перед, &После, &Вместо, &ИзменениеИКонтроль) — из `by_annotation`
 
@@ -459,7 +459,7 @@ This prompt verifies the extension overrides indexing pipeline from v1.5.0: the 
 |------|-----------------|----------------|
 | Index diagnostics | `get_index_info()` | builder_version=9, has_extension_overrides=True, count>0 |
 | Extension context | `rlm_start` response | extension_context with nearby extensions, live overrides |
-| Indexed overrides | `get_overrides()` | source="index", `partial=false`, instant response; `overrides` = deterministic slice of first 200 rows (`total`/`truncated` present). Stats come from the aggregates (`by_annotation`, `by_object_top`, `by_extension_top`, `unique_*`), not from grouping the slice. On a live fallback, `partial=true` makes these stats lower bounds; inspect `_meta.failed_extension_roots` |
+| Indexed overrides | `get_overrides()` | source="index", `partial=false`, instant response; `overrides` = deterministic slice of first 200 rows (`total`/`truncated` present). Stats come from the aggregates (`by_annotation`, `by_object_top`, `by_extension_top`, `unique_*`), not from grouping the slice. The three `unique_*` count different things: `unique_objects`/`unique_methods` are NAMES, `unique_object_methods` (v1.37.0) are object+method PAIRS with the category taken into account. On a live fallback, `partial=true` makes these stats lower bounds; inspect `_meta.failed_extension_roots` |
 | Filtered overrides | `get_overrides(object_name)` | Correct filtering by object |
 | Procedure enrichment | `extract_procedures(path)` | overridden_by field on intercepted methods |
 | Read original | `read_procedure(path, name)` | Clean body without override data (regression) |
@@ -1500,8 +1500,12 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 
 2. **Точки входа метода — ТРИГГЕРЫ (метод вызывается не только из кода)**:
    - Найди ключевые методы документа (ОбработкаПроведения, ПередЗаписью, ПриЗаписи).
-   - Для каждого построй find_call_hierarchy(method, module_hint='Документ.РеализацияТоваровУслуг',
-     depth=2, include_triggers=True).
+   - Возьми ТОЧНЫЙ hint ГОТОВЫМ выражением (ключ `path` и есть rel_path):
+     om = [m for m in find_module('РеализацияТоваровУслуг') if m['module_type'] == 'ObjectModule'][0]
+   - Для каждого построй find_call_hierarchy(method, module_hint=om['path'], depth=2,
+     include_triggers=True). 'Документ.X' задаёт лишь ОБЪЕКТ, и у ПередЗаписью/ПриЗаписи
+     (они объявлены и в ObjectModule, и в модуле формы) корень не пинится:
+     _meta.root_exact=False, и в дерево подмешиваются однофамильцы.
    - На узлах разбери node['triggers']: сгруппируй по edge_type
      (subscription / form_event / scheduled_job / cfe_override), покажи source_name, detail, resolved.
    - Сравни узлы дерева БЕЗ include_triggers и С ним — какие точки входа добавились (ключ triggers
@@ -1513,13 +1517,13 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
      причины — в `_meta.failed_extension_roots`. `res['overrides']` — усечённый срез первых
      200 строк, группировать его вручную нельзя.
    - Возьми объект с наибольшим числом перехватов (первый ключ `by_object_top`); для одного его перехваченного метода построй
-     find_call_hierarchy(метод, module_hint=<этот объект>, include_triggers=True) и подтверди, что в
+     find_call_hierarchy(метод, module_hint=find_module(<имя этого объекта>)[i]['path'], include_triggers=True) и подтверди, что в
      triggers появляется ребро edge_type='cfe_override' с resolved=True.
 
 4. **Достижимость по графу ВЫЗОВОВ (find_path)**:
    - Из иерархии вызовов выбери низкоуровневый метод (например, экспортный метод общего модуля из
      цепочки проведения) и проверь find_path('<низкоуровневый>', 'ОбработкаПроведения',
-     to_hint='Документ.РеализацияТоваровУслуг').
+     to_hint=find_module('РеализацияТоваровУслуг')[i]['path']).
    - Разбери результат: СНАЧАЛА `if 'error' in res` — многозначное имя (определено в >1 модуле) без
      своего hint вернёт `{error, hint, candidates:[{object_name, category, module_type, file, line}]}`
      (ambiguous_arg='to'|'from') БЕЗ обхода; добавь to_hint/from_hint (file из candidates надёжнее
@@ -1579,7 +1583,7 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Reachability (NEW) | `find_path(from, to, to_hint=...)` | СНАЧАЛА `if 'error' in res` (многозначное имя без hint → `{error, hint, candidates}`); затем forward path; `_meta.precision` exact/heuristic; `call_line` = edge line; `found=False`+`budget_exceeded=False`+нет `error` = truly unreachable |
 | Data path (NEW) | `find_data_path(from, to)` → `find_metadata_refs_from` | edge list {from,to,kind}; bare endpoint → structural hint (no traversal); `partial` on old index |
 | Recipes (NEW) | `help('достижимость')`, `help('путь данных')` | recipes resolve |
-| Contract: get_overrides | `get_overrides()` | dict `{overrides,total,truncated,partial,source,by_annotation,by_object_top,by_extension_top,unique_objects,unique_methods,unique_extensions,_meta?}`; `overrides`=отсортированный срез первых 200. При `partial=false` агрегаты полны для выбранного источника; при `true` — нижняя оценка, см. `_meta.failed_extension_roots`. Каждый row несёт `extension_name` (incl. live extension session). `by_*` — dict `{имя: количество}` (итерировать `.items()`); `target_method_line=None` валиден. **v1.30.0**: набор ключей строки одинаков у `get_overrides` и `find_ext_overrides` (алиасы `module_path`↔`ext_module_path`, `line`↔`ext_line`, `module_type`), состав и порядок среза 200 не изменились |
+| Contract: get_overrides | `get_overrides()` | dict `{overrides,total,offset,returned,has_more,truncated,partial,source,by_annotation,by_object_top,by_extension_top,unique_objects,unique_methods,unique_object_methods,unique_extensions,_meta?}`; `overrides`=отсортированный срез первых 200. При `partial=false` агрегаты полны для выбранного источника; при `true` — нижняя оценка, см. `_meta.failed_extension_roots`. Каждый row несёт `extension_name` (incl. live extension session). `by_*` — dict `{имя: количество}` (итерировать `.items()`); `target_method_line=None` валиден. **v1.30.0**: набор ключей строки одинаков у `get_overrides` и `find_ext_overrides` (алиасы `module_path`↔`ext_module_path`, `line`↔`ext_line`, `module_type`), состав и порядок среза 200 не изменились. **v1.37.0**: строка несёт `extension_file` — `../`-путь от корня сессии, исполнимый как `read_procedure(row['extension_file'], row['extension_method'])`; `unique_objects`/`unique_methods` — ИМЕНА, `unique_object_methods` — ПАРЫ объект+метод с категорией |
 | Contract: register movements | `find_register_movements()` | `code_registers`=Posting/CFE-фильтрованные кандидаты list[dict]; main-строки — снимок SQLite и после изменения кода проверяются по живому файлу. При `is_postable=False` строки статические; если хотя бы один CFE `&Вместо` не вызывает напрямую `ПродолжитьВызов`/`ProceedWithCall`, handler-only main rows переходят в `suppressed_main_code_registers` и объясняются в `_meta.cfe_posting_replacement`; `erp_mechanisms`/`manager_tables`/`adapted_registers`=list[str] |
 | Contract: register writers | `find_register_writers()` | `writers` — статические кандидаты, `runtime_filtered=false`: CFE/`Posting=Deny` не применены; forward-helper применяет эти фильтры, свежесть main-строки проверяется по живому файлу |
 | Contract: roles | `find_roles()` | `rights` = list[str] |
@@ -1644,9 +1648,13 @@ Use this prompt to verify the three navigation primitives added in v1.20.0:
      в разных документах (_meta.unique=False; truncated=True если total > limit). Покажи total и
      первые 5 (file, object_name). (Если ОбработкаПроведения в конфигурации редок — возьми другой
      явно одноимённый метод: ПередЗаписью / ПриЗаписи.)
-   - Сужение module_hint: find_definition('ОбработкаПроведения', 'Документ.<документ_из_выдачи>') →
-     ровно 1 определение, _meta.hint_applied=True, _meta.unique=True. module_hint принимает 3 формы:
-     rel_path | 'Документ.X'/'Document.X' | голое имя объекта — проверь хотя бы две.
+   - Сужение module_hint: ТОЧНАЯ форма — rel_path модуля; возьми её готовой из
+     find_module('<документ_из_выдачи>') (строка с module_type='ObjectModule') и вызови
+     find_definition('ОбработкаПроведения', <rel_path>) → ровно 1 определение,
+     _meta.hint_applied=True, _meta.unique=True. Затем проверь ОБЪЕКТНУЮ форму
+     ('Документ.X'/'Document.X' или голое имя объекта): она задаёт лишь ОБЪЕКТ, поэтому ровно 1
+     даёт ТОЛЬКО когда имя внутри объекта уникально; total>1 при _meta.unique=False — НОРМА
+     (ObjectModule + модуль формы с тем же обработчиком, main+CFE), а НЕ дефект.
    - Регистронезависимость кириллицы: тот же метод в НИЖНЕМ регистре ('обработкапроведения') →
      find_definition всё равно находит определения, _meta.slow_fallback=True (медленный py_lower-проход
      ТОЛЬКО на промахе NOCASE для кириллицы — это норма, не ошибка).
@@ -1743,7 +1751,8 @@ Use this prompt to verify the three navigation primitives added in v1.20.0:
 | Metric | Expected |
 |--------|----------|
 | `find_definition('ОбработкаПроведения')` (или иной одноимённый) | `total` ≫ 1 (десятки-сотни), `_meta.unique=False`; `truncated=True` при `total > limit` |
-| `find_definition(name, 'Документ.X')` | `total=1`, `_meta.unique=True`, `_meta.hint_applied=True` |
+| `find_definition(name, find_module('X')[i]['path'])` | `total=1`, `_meta.unique=True`, `_meta.hint_applied=True` |
+| `find_definition(name, 'Документ.X')` — объектная форма | `_meta.hint_applied=True`; `total=1`/`unique=True` ТОЛЬКО если имя внутри объекта уникально, иначе `total>1` и `unique=False` — это НОРМА, а не дефект |
 | lowercase-кириллица | находит определения, `_meta.slow_fallback=True` |
 | `find_definition('')` / несуществующий | `{error}` / `total=0` (НЕ ошибка) |
 | `definitions[].params` | `list[str]` |

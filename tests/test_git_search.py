@@ -957,3 +957,226 @@ def test_git_search_positional_compat_unchanged(repo):
     # Same positional call with regex=False → the metachar pattern matches nothing literally.
     literal = bsl["git_search"]("VIN.OKEN", "CommonModules", "bsl", False, mode="files")
     assert literal["error"] is None and literal["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# v1.37.0 (Задача 2) — path=<ФАЙЛ> + file_types больше не даёт молчаливый ноль
+# ---------------------------------------------------------------------------
+#
+# `{san_path}/*.{ext}` работает для каталога, но для файла даёт `…/Module.bsl/*.bsl` —
+# он не совпадает ни с чем, rc==1 → `[]`, то есть ответ, БУКВАЛЬНО равный честному нулю.
+
+
+@pytest.fixture
+def scoped_repo(tmp_path):
+    """Раскладка замера: файл, файл в другом регистре, файл без расширения,
+    каталог и каталог, чьё собственное имя оканчивается на `.bsl`."""
+    base = tmp_path / "src"
+    base.mkdir(parents=True)
+    (base / "file.bsl").write_text(MODULE_BSL, encoding="utf-8")
+    (base / "Case.BSL").write_text(MODULE_BSL, encoding="utf-8")
+    (base / "LICENSE").write_text(MODULE_BSL, encoding="utf-8")
+    sub = base / "dir" / "sub"
+    sub.mkdir(parents=True)
+    (sub / "a.bsl").write_text(MODULE_BSL, encoding="utf-8")
+    (sub / "b.xml").write_text(FORM_XML, encoding="utf-8")
+    dirlike = base / "dirlike.bsl"
+    dirlike.mkdir()
+    (dirlike / "ok.bsl").write_text(MODULE_BSL, encoding="utf-8")
+    (dirlike / "leak.xml").write_text(FORM_XML, encoding="utf-8")
+    (base / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+    _git_init(tmp_path)
+    return base
+
+
+def _scoped_files(root, path, file_types, mode="files", **kw):
+    res = _git_grep(str(root), TOK, path=path, file_types=file_types, mode=mode, **kw)
+    return None if res is None else sorted(r["file"] for r in res)
+
+
+def test_file_path_with_matching_file_type_is_found(scoped_repo):
+    """Целевой дефект: ФАЙЛ + совпадающий file_types отдаёт строки, а не пустоту."""
+    assert _scoped_files(scoped_repo, "file.bsl", "bsl") == ["file.bsl"]
+    assert _scoped_files(scoped_repo, "dir/sub/a.bsl", "bsl") == ["dir/sub/a.bsl"]
+    # Регистр расширения на диске звёздочной ветке недоступен (`*.bsl` у git
+    # регистроЗАВИСИМ — проверено), а `:(literal)` берёт путь как набран.
+    assert _scoped_files(scoped_repo, "Case.BSL", "bsl") == ["Case.BSL"]
+
+
+def test_file_path_outside_file_types_is_a_named_refusal(scoped_repo):
+    """ДОКАЗАННЫЙ файл вне file_types — назван, а не выдан за честный ноль.
+
+    Путь БЕЗ расширения сюда входит намеренно: пустой суффикс есть несовпадение,
+    файл без расширения не входит ни в один `file_types`.
+    """
+    for path, types in (("file.bsl", "xml"), ("LICENSE", "bsl")):
+        err = {}
+        assert _git_grep(str(scoped_repo), TOK, path=path, file_types=types, err=err) is None
+        assert err["kind"] == "file_type_mismatch", err
+        assert err["path"] == path
+
+
+def test_directory_branch_is_unchanged(scoped_repo):
+    assert _scoped_files(scoped_repo, "dir", "bsl") == ["dir/sub/a.bsl"]
+    assert _scoped_files(scoped_repo, "dir", "bsl,xml") == ["dir/sub/a.bsl", "dir/sub/b.xml"]
+    # Каталог с именем на `.bsl` отвечает ровно как прежде.
+    assert _scoped_files(scoped_repo, "dirlike.bsl", "bsl") == ["dirlike.bsl/ok.bsl"]
+
+
+def test_proven_directory_does_not_pay_for_a_literal_pathspec(scoped_repo, monkeypatch):
+    """Ассерт на САМ argv: совпадение выдачи этого НЕ ловит.
+
+    `:(literal)<каталог>` заставил бы git прочитать ВСЁ поддерево по ВСЕМ типам, а
+    Python фильтровал бы уже готовый stdout. Выдача при этом одинакова — разница
+    видна только в СТОИМОСТИ, то есть в argv.
+    """
+    captured = []
+
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    def _spy(cmd, **kw):
+        captured.append(list(cmd))
+        return _R()
+
+    monkeypatch.setattr(bsl_index_mod, "run_git", _spy)
+
+    def _literals(path):
+        captured.clear()
+        _git_grep(str(scoped_repo), TOK, path=path, file_types="bsl", mode="files")
+        return [a for a in captured[0] if a.startswith(":(literal)")]
+
+    assert _literals("dirlike.bsl") == [], "доказанный каталог не должен платить за литерал"
+    assert _literals("dir") == []
+    assert _literals("file.bsl") == [":(literal)file.bsl"]
+
+
+@pytest.mark.parametrize("mode", ["lines", "files"])
+def test_postfilter_drops_children_outside_file_types(scoped_repo, monkeypatch, mode):
+    """Постусловие выдачи: НИ ОДНА строка не выходит за file_types.
+
+    Гонку ФС воспроизводить не нужно — фильтр чистое постусловие над строками.
+    Заглушка отдаёт то, что git вернул бы, окажись узел между `lstat` и `run_git`
+    каталогом: потомка вне `file_types`. Строки двух режимов РАЗНОЙ формы, общий у
+    них только источник, поэтому проверяются оба.
+    """
+    leak = "dirlike.bsl/leak.xml"
+    ok = "dirlike.bsl/ok.bsl"
+    stdout = f"{ok}\x00{leak}\x00" if mode == "files" else f"{ok}\x001\x00текст\n{leak}\x002\x00текст\n"
+
+    class _R:
+        returncode = 0
+        stderr = ""
+
+    def _spy(cmd, **kw):
+        r = _R()
+        r.stdout = stdout
+        return r
+
+    monkeypatch.setattr(bsl_index_mod, "run_git", _spy)
+    # path=file.bsl — ДОКАЗАННЫЙ файл, значит литерал применён и постфильтр включён.
+    res = _git_grep(str(scoped_repo), TOK, path="file.bsl", file_types="bsl", mode=mode)
+    assert [r["file"] for r in res] == [ok], res
+
+
+def test_postfilter_runs_before_the_truncation_counters(scoped_repo, monkeypatch):
+    """Фильтр стоит ДО per-file-счётчиков, среза и sentinel — иначе `shown` /
+    `files_capped` назвали бы отброшенный файл."""
+    leak = "dirlike.bsl/leak.xml"
+    stdout = "".join(f"{leak}\x00{i}\x00текст\n" for i in range(1, 60))
+
+    class _R:
+        returncode = 0
+        stderr = ""
+
+    def _spy(cmd, **kw):
+        r = _R()
+        r.stdout = stdout
+        return r
+
+    monkeypatch.setattr(bsl_index_mod, "run_git", _spy)
+    res = _git_grep(
+        str(scoped_repo),
+        TOK,
+        path="file.bsl",
+        file_types="bsl",
+        mode="lines",
+        max_per_file=5,
+        include_truncation_sentinel=True,
+    )
+    assert res == [], res  # ни строк, ни sentinel про отброшенный файл
+
+
+def test_scope_channel_is_filled_on_every_class_and_on_refusal(scoped_repo):
+    """Канал классификации обязателен, иначе hint пустой выдачи неисполним."""
+    scope = {}
+    _git_grep(str(scoped_repo), TOK, path="file.bsl", file_types="bsl", mode="files", scope=scope)
+    assert scope == {"path_kind": "file", "literal_applied": True}
+
+    scope = {}
+    _git_grep(str(scoped_repo), TOK, path="dir", file_types="bsl", mode="files", scope=scope)
+    assert scope == {"path_kind": "directory", "literal_applied": False}
+
+    scope = {}
+    _git_grep(str(scoped_repo), TOK, path="missing/node.bsl", file_types="bsl", mode="files", scope=scope)
+    assert scope == {"path_kind": "indeterminate", "literal_applied": True}
+
+    # И на ветке ОТКАЗА канал годен: он заполняется ДО run_git.
+    scope = {}
+    assert _git_grep(str(scoped_repo), TOK, path="LICENSE", file_types="bsl", scope=scope) is None
+    assert scope == {"path_kind": "file", "literal_applied": False}
+
+
+def test_git_search_names_the_file_type_mismatch(scoped_repo):
+    """Обёртка рисует новую причину отдельным `_gs_error`: причина + граница + ДЕЙСТВИЕ."""
+    bsl = _make_bsl(scoped_repo)
+    out = bsl["git_search"](TOK, path="LICENSE", file_types="bsl")
+    assert out["results"] == [] and out["error"], out
+    assert "file_types" in out["error"]
+    assert "git grep failed" not in out["error"]
+    assert "убери file_types" in out["hint"], out["hint"]
+
+
+def test_empty_output_hint_distinguishes_the_readings(scoped_repo):
+    """Условный hint появляется на ДОКАЗАННОМ файле и на НЕдоказанном узле, но НЕ
+    на доказанном пустом каталоге: там прочтение «это файл» просто ЛОЖНО."""
+    bsl = _make_bsl(scoped_repo)
+    absent = "НЕТТАКОГОТОКЕНА"
+
+    on_file = bsl["git_search"](absent, path="file.bsl", file_types="bsl")
+    assert on_file["error"] is None and on_file["results"] == []
+    assert ".gitignore" in on_file.get("hint", ""), on_file
+
+    on_dir = bsl["git_search"](absent, path="dir", file_types="bsl")
+    assert on_dir["error"] is None and on_dir["results"] == []
+    assert "hint" not in on_dir, on_dir
+
+    on_unknown = bsl["git_search"](absent, path="нет/такого.bsl", file_types="bsl")
+    assert on_unknown["error"] is None and on_unknown["results"] == []
+    assert "file_types" in on_unknown.get("hint", ""), on_unknown
+    # Тексты двух веток РАЗНЫЕ: у файловой названы регистр и .gitignore.
+    assert on_unknown["hint"] != on_file["hint"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junction — Windows-примитив")
+def test_file_and_directory_under_a_junction(scoped_repo):
+    """Файл ПОД junction находится, а каталог через junction по-прежнему отдаёт строки.
+
+    Каталог через junction — обычная раскладка общей выгрузки, и общий fail-closed
+    превратил бы работающий запрос в отказ.
+    """
+    rc = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(scoped_repo / "linked"), str(scoped_repo / "dir")],
+        capture_output=True,
+        text=True,
+    )
+    if rc.returncode != 0:
+        pytest.skip(f"junction создать не удалось: {rc.stderr or rc.stdout}")
+
+    assert _scoped_files(scoped_repo, "linked/sub", "bsl") == ["linked/sub/a.bsl"]
+    assert _scoped_files(scoped_repo, "linked/sub/a.bsl", "bsl") == ["linked/sub/a.bsl"]
+    scope = {}
+    _git_grep(str(scoped_repo), TOK, path="linked/sub/a.bsl", file_types="bsl", mode="files", scope=scope)
+    assert scope["path_kind"] == "indeterminate" and scope["literal_applied"] is True

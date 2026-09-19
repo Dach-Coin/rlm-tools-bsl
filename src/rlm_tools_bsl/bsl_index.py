@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
@@ -1665,6 +1666,48 @@ def _sanitize_grep_excludes(exclude_path) -> list[str] | None:
 _GIT_GREP_DEFAULT_MAX_PER_FILE = 50
 
 
+def _classify_grep_path(base_path: str, san_path: str) -> str:
+    """Трёхзначная классификация узла: ``file`` | ``directory`` | ``indeterminate``.
+
+    Обход КОМПОНЕНТНЫЙ и останавливается на ПЕРВОМ reparse-point. Одного
+    ``lstat(base/san_path)`` мало: junction на offline UNC В СЕРЕДИНЕ пути висит
+    дольше git-таймаута, а ``Path.is_file()`` вдобавок глотает ``OSError`` и
+    отвечает ``False`` там, где ответа нет вовсе.
+
+    ``indeterminate`` объединяет reparse-point, отсутствующий узел, конечный
+    symlink и узел, недоступный для ``lstat``. Оно ведёт себя как ``file``, а НЕ
+    как ``directory``: именно в этом состоит починка файла ПОД junction. Ложным
+    утверждением это не становится — ``file_type_mismatch`` выдаётся только на
+    ДОКАЗАННОМ файле, а корректность широкой ветки держит постфильтр.
+    """
+    parts = [p for p in san_path.split("/") if p and p != "."]
+    if not parts:
+        return "directory"
+    cur = os.path.abspath(base_path)
+    last = len(parts) - 1
+    for i, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            return "indeterminate"
+        if os.name == "nt" and getattr(st, "st_reparse_tag", 0):
+            # На Windows `is_symlink()` для junction ЛОЖЕН, поэтому смотрим тег.
+            return "indeterminate"
+        if stat.S_ISLNK(st.st_mode):
+            return "indeterminate"
+        if stat.S_ISREG(st.st_mode):
+            # Обычный файл. Последний компонент — ДОКАЗАН файл; не последний —
+            # спускаться некуда, значит доказать нечего.
+            return "file" if i == last else "indeterminate"
+        if stat.S_ISDIR(st.st_mode):
+            if i == last:
+                return "directory"
+            continue
+        return "indeterminate"
+    return "directory"
+
+
 def _git_grep(
     base_path: str,
     pattern: str,
@@ -1681,6 +1724,7 @@ def _git_grep(
     include_truncation_sentinel: bool = False,
     timeout: int | None = None,
     err: dict | None = None,
+    scope: dict | None = None,
 ) -> list[dict] | None:
     """Run a single ``git grep`` over the work tree at *base_path*.
 
@@ -1745,6 +1789,17 @@ def _git_grep(
         "Invalid preceding regular expression". Let git say what is wrong — its own
         message names both the pattern and the reason. Populating *err* changes no
         return value, so existing callers are unaffected.
+
+      * *scope* — второй out-канал, симметричный *err* и такой же ВНУТРЕННИЙ (в
+        ответ агенту не попадает, в контракт ``git_search`` не входит). Заполняется
+        на ветке ``path`` + ``file_types``: ``path_kind`` ∈
+        ``{"file","directory","indeterminate"}`` и ``literal_applied: bool``.
+        Без него обёртка не может отличить «узел не доказан» от «доказанный
+        каталог, в котором таких файлов нет»: успешный ПУСТОЙ ответ уходит из
+        ``rc == 1`` прямым ``return []`` и никакой классификации не несёт, а ``err``
+        заполняется только на отказе. Канал берётся из ТОЙ ЖЕ единственной
+        классификации и заполняется ДО ``run_git`` — тогда он годен и на ветке
+        отказа, и второго ``lstat`` в обёртке не появляется.
     """
 
     def _fail(kind: str, **extra) -> None:
@@ -1767,6 +1822,9 @@ def _git_grep(
         return _fail("no_git")
 
     # Build pathspecs.
+    # Множество расширений постфильтра. Не None ТОЛЬКО когда добавлен `:(literal)`,
+    # то есть ровно тогда, когда git может отдать потомков узла в обход `file_types`.
+    postfilter_exts: set[str] | None = None
     if literal_files is not None:
         if not literal_files:
             return []  # explicit empty candidate set → nothing to search
@@ -1785,7 +1843,38 @@ def _git_grep(
             # malformed exclude filter → error, not silent widening
             return _fail("bad_pathspec", arg="exclude_path")
         if san_path and exts:
+            # v1.37.0. `{san_path}/*.{ext}` работает для КАТАЛОГА, но для ФАЙЛА даёт
+            # `…/Module.bsl/*.bsl` — не совпадает ни с чем, rc==1 → `[]`, то есть
+            # МОЛЧАЛИВЫЙ ноль, неотличимый от честного.
+            #
+            # Классификация ТРЁХЗНАЧНАЯ, и третье значение здесь не роскошь:
+            # `:(literal)<каталог>` заставил бы git прочитать ВСЁ поддерево по ВСЕМ
+            # типам (проверено: у каталога `target.bsl` он вернул и `ok.bsl`, и
+            # `leak.xml`), а Python фильтрует уже готовый stdout — на `Vendor/archive.bsl`
+            # с десятками тысяч XML это регрессия СТОИМОСТИ на КОРРЕКТНОМ запросе.
+            # Поэтому ДОКАЗАННЫЙ каталог идёт прежней, побайтно той же веткой.
             pathspecs = [f"{san_path}/*.{ext}" for ext in exts]
+            path_kind = _classify_grep_path(base_path, san_path)
+            suffix = san_path.rsplit("/", 1)[-1].rsplit(".", 1)
+            suffix_lower = suffix[1].lower() if len(suffix) == 2 else ""
+            exts_lower = {e.lower() for e in exts}
+            if path_kind == "file" and suffix_lower not in exts_lower:
+                # Утверждение делается только там, где ФС его доказала. Пустой
+                # суффикс — тоже несовпадение: файл без расширения не входит ни в
+                # один `file_types`.
+                if scope is not None:
+                    scope.clear()
+                    scope.update(path_kind=path_kind, literal_applied=False)
+                return _fail("file_type_mismatch", path=san_path, file_types=sorted(exts))
+            literal_applied = path_kind != "directory" and suffix_lower in exts_lower
+            if literal_applied:
+                # Дубли исключены: git отдаёт файл ОДИН раз независимо от числа
+                # совпавших pathspec (проверено).
+                pathspecs.append(f":(literal){san_path}")
+                postfilter_exts = exts_lower
+            if scope is not None:
+                scope.clear()
+                scope.update(path_kind=path_kind, literal_applied=literal_applied)
         elif exts:
             pathspecs = [f"*.{ext}" for ext in exts]
         elif san_path:
@@ -1857,10 +1946,31 @@ def _git_grep(
     capped_global = False
     capped_files: set[str] = set()
     per_file_counts: dict[str, int] = {}
+
+    def _outside_file_types(f: str) -> bool:
+        """Постусловие выдачи: НИ ОДНА строка не выходит за ``file_types``.
+
+        Это не догадка о состоянии ФС, а ограничение РЕЗУЛЬТАТА. `:(literal)<путь>`
+        рекурсивно захватывает потомков, если узел между `lstat` и `run_git`
+        оказался каталогом, — и гонка file→directory после фильтра даёт РОВНО тот
+        же ответ, что честный поиск по каталогу. Поэтому отдельная причина отказа
+        (`path_changed`) не нужна и не заводится: повторный `lstat` был бы той же
+        гонкой, только сдвинутой.
+
+        Регистр складывается намеренно и только в эту сторону: звёздочный `*.bsl` у
+        git регистроЗАВИСИМ (проверено — `Foo.BSL` им не находится), поэтому строки
+        звёздочной ветки проходят фильтр ВСЕГДА, а регистронезависимость может лишь
+        СОХРАНИТЬ строку, никогда не отбросить.
+        """
+        if postfilter_exts is None:
+            return False
+        tail = f.rsplit("/", 1)[-1].rsplit(".", 1)
+        return len(tail) != 2 or tail[1].lower() not in postfilter_exts
+
     if mode == "files":
         # ``-l -z`` → NUL-separated paths (printed verbatim).
         for f in stdout.split("\x00"):
-            if f:
+            if f and not _outside_file_types(f):
                 results.append({"file": f})
     else:
         # ``-n -z`` → records ``path \0 lineno \0 text`` separated by the file's
@@ -1876,6 +1986,10 @@ def _git_grep(
             try:
                 ln = int(lineno)
             except ValueError:
+                continue
+            # Фильтр стоит ДО per-file-счётчиков, ДО среза max_results и ДО
+            # sentinel — иначе `shown` / `files_capped` назвали бы отброшенный файл.
+            if _outside_file_types(f):
                 continue
             if per_file_probe:
                 seen = per_file_counts.get(f, 0) + 1
@@ -11121,41 +11235,70 @@ class IndexReader:
             object_name: Object name (case-insensitive substring match against object_ref).
 
         Returns:
-            List of dicts {name, synonym, file, matched_refs} or None if table missing.
+            List of dicts {name, synonym, file, files, matched_refs} or None if table
+            missing. ``files`` (v1.37.0) is the ADDITIVE full, sorted, de-duplicated
+            list of the files that declared the subsystem; ``file`` stays a string.
+
+        v1.37.0 — три правки, все аддитивные по форме:
+
+        * ``file`` и ``synonym`` берутся из ОДНОЙ строки — первой после сортировки
+          по нормализованному пути. Прежде группировка перезаписывала оба поля
+          ПОСЛЕДНЕЙ строкой группы при ``SELECT`` без ``ORDER BY``, и
+          ``Subsystems/Продажи.xml`` с синонимом A вместе с
+          ``Subsystems/Продажи/Ext/Subsystem.xml`` с синонимом B могли дать `file`
+          первого и `synonym` второго — комбинацию, которой нет ни в одном исходнике.
+        * ``matched_refs`` НЕ дедуплицируется: коллектор допускает строки из каждого
+          найденного файла, и один и тот же ``Document.Заказ`` в двух XML даёт две
+          записи. Дедуп сменил бы КРАТНОСТЬ у внешнего потребителя, который их
+          считает. Добавлен только детерминированный порядок.
+        * Широкий ``except sqlite3.OperationalError: return None`` убран — он глушил
+          не-транзиентные ошибки, которые ``@_transient_safe`` обязан пере-бросить.
+          Контракт докстринга «``None`` if table missing» сохраняется сам собой:
+          ``"no such table"`` входит в ``_TRANSIENT_SQLITE_MARKERS``, то есть
+          декоратор отдаёт тот же ``None``. Меняется ровно одно: ``"no such column"``
+          / ``"malformed"`` / ``"disk I/O error"`` перестают выдаваться за «таблицы нет».
         """
         with self._lock:
-            try:
-                rows = self._conn.execute(
-                    "SELECT subsystem_name, subsystem_synonym, object_ref, file "
-                    "FROM subsystem_content WHERE py_lower(object_ref) LIKE py_lower(?)",
-                    (f"%{object_name}%",),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                return None
+            rows = self._conn.execute(
+                "SELECT subsystem_name, subsystem_synonym, object_ref, file "
+                "FROM subsystem_content WHERE py_lower(object_ref) LIKE py_lower(?)",
+                (f"%{object_name}%",),
+            ).fetchall()
 
             if not rows:
                 return []  # Table exists but no matches — don't fallback
 
-            # Group by subsystem
+            def _norm(path) -> str:
+                return str(path or "").replace("\\", "/")
 
             grouped: dict[str, dict] = {}
             for r in rows:
                 key = r["subsystem_name"]
-                if key not in grouped:
-                    grouped[key] = {"synonym": "", "file": "", "matched_refs": []}
-                grouped[key]["synonym"] = r["subsystem_synonym"] or ""
-                grouped[key]["file"] = r["file"] or ""
-                grouped[key]["matched_refs"].append(r["object_ref"])
+                slot = grouped.get(key)
+                if slot is None:
+                    slot = grouped[key] = {"files": set(), "rows": [], "refs": []}
+                file_norm = _norm(r["file"])
+                if file_norm:
+                    slot["files"].add(file_norm)
+                # Пара (file, synonym) хранится ЦЕЛИКОМ, чтобы победитель отдал оба
+                # поля из одной и той же строки.
+                slot["rows"].append((file_norm, r["subsystem_synonym"] or ""))
+                slot["refs"].append((_norm(r["object_ref"]).lower(), _norm(r["file"]), r["object_ref"]))
 
-            return [
-                {
-                    "name": name,
-                    "synonym": info["synonym"],
-                    "file": info["file"],
-                    "matched_refs": info["matched_refs"],
-                }
-                for name, info in grouped.items()
-            ]
+            result = []
+            for name in sorted(grouped, key=lambda n: (str(n or "").lower(), str(n or ""))):
+                info = grouped[name]
+                winner = min(info["rows"], key=lambda pair: (pair[0], pair[1]))
+                result.append(
+                    {
+                        "name": name,
+                        "synonym": winner[1],
+                        "file": winner[0],
+                        "files": sorted(info["files"]),
+                        "matched_refs": [raw for _k, _f, raw in sorted(info["refs"])],
+                    }
+                )
+            return result
 
     @_transient_safe(lambda: None)
     def get_subsystem_lookup(self, query: str) -> dict | None:

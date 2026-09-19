@@ -456,6 +456,13 @@ extensions_included=False НЕ означает «расширений нет» 
 index-домена (синонимы, ссылки метаданных) полноту читай по _meta.index_coverage
 (disabled|build_unproven|wider_than_current|unavailable|not_used). owner ('main' |
 'extension:<Имя>') — провенанс СТРОКИ. scope — legacy-композит, полноту по нему не судят.
+СВЕЖЕСТЬ — МАТРИЦА, не иерархия: index_status=missing/incomplete → собери индекс;
+stale_content → index update; stale_age → только календарь, сверь критичное живьём;
+ok полноты НЕ доказывает (структурный дрейф не проверяется никогда);
+index_coverage=disabled → домен не строился, пересобери с нужной опцией;
+unavailable|wider_than_current → строки годны, полнота не доказана; partial=True →
+неполон ИМЕННО этот ответ (см. _meta.reasons). index_status — снимок СЕССИИ, а
+partial/index_coverage считаются вокруг КОНКРЕТНОГО запроса.
 
 == WORKFLOW ==
 BEFORE YOU START: check rlm_start response — warnings, extension_context, detected_custom_prefixes.
@@ -487,7 +494,7 @@ Step 2 — READ: understand the code
 
 Step 3 — TRACE: follow the call chains
   find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
-  find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. Для одноимённого объектного метода передай module_hint='Документ.X' (exact-режим, точные рёбра).
+  find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. module_hint: точно — rel_path=find_module('X')[i]['path']; 'Документ.X'/голое имя — ОБЪЕКТ.
   safe_grep(pattern, name_hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
 
@@ -540,17 +547,12 @@ get_object_full_structure(name) vs analyze_object(name):
 
 find_call_hierarchy(name, depth=N, module_hint=...) vs find_callers_context(name):
   - find_callers_context → 1 уровень callers + контекст вызова (line/text). Быстрее.
-  - find_call_hierarchy → N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации.
-    + module_hint у hierarchy: для ОДНОИМЕННЫХ объектных методов, которые РЕАЛЬНО зовут из BSL
-      (ЗаполнитьДокумент и т.п.), привязывает корень к одному модулю → exact-режим (точные ребра
-      по callee_key, без однофамильцев).
-      Глубже exact распространяется сам. Доверие к ребрам — в _meta (root_exact/exact_rows/fallback_rows).
-    + ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью, ПриЗаписи): вызов от ПЛАТФОРМЫ
-      в граф ВЫЗОВОВ не попадает → callers=0 это НОРМА, а не мертвый код (module_hint это не лечит).
-      По имени хелпер их НЕ исключает: ЯВНЫЙ вызов обработчика из BSL, если он есть, он ПОКАЖЕТ.
-      Но ЧЕМ пишутся движения, так не найти: читай тело и трассируй ДЕЛЕГАТА (rlm_help(topic='проведение')).
-  Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy
-  (с module_hint, если корень — неуникальный объектный метод).
+  - find_call_hierarchy → N уровней (1-3) дерево БЕЗ контекста строк, один вызов вместо итерации.
+  module_hint=rel_path привязывает корень к ОДНОМУ модулю → exact (ребра по callee_key); точная форма —
+  rel_path=find_module('X')[i]['path'], 'Документ.X'/голое имя задают лишь ОБЪЕКТ. Доверие к
+  ребрам — _meta.root_exact/exact_rows/fallback_rows. У ПЛАТФОРМЕННЫХ обработчиков callers=0 —
+  НОРМА (платформа в граф не попадает), а чем пишутся движения — rlm_help(topic='проведение').
+  Один уровень → find_callers_context; глубина >=2 → find_call_hierarchy.
 
 find_callers(name) vs find_callers_context(name):
   - find_callers          → COMPACT FIRST PAGE: тонкая обёртка над find_callers_context,
@@ -573,13 +575,11 @@ parse_object_xml(path) vs find_attributes(object_name=X):
 
 get_object_full_structure(name) ключи vs find_attributes:
   - find_attributes:           [{attr_name, attr_synonym, attr_type, attr_kind}]
-  - get_object_full_structure: {attributes:[{name, synonym, type}], dimensions:[{name, synonym, type}],
-                                resources:[{name, synonym, type}],
+  - get_object_full_structure: {attributes/dimensions/resources:[{name, synonym, type}],
                                 tabular_sections:[{name, synonym, columns:[{name, synonym, type}]}]}
-  Каноничные ключи разные, но записи ТОЛЕРАНТНЫ (v1.18.0): get_object_full_structure → a['name'],
-  find_attributes → r['attr_name']; «чужой» алиас (name↔attr_name, synonym↔attr_synonym, type↔attr_type)
-  тоже принимается. Итерируй: for a in s['attributes']: a['name'].
-  Для регистров — данные в s['dimensions'] и s['resources'], s['attributes'] пустой.
+  Ключи разные, но записи ТОЛЕРАНТНЫ (v1.18.0): «чужой» алиас (name↔attr_name, synonym↔attr_synonym,
+  type↔attr_type) принимается обеими. У регистров данные в s['dimensions']/s['resources'],
+  s['attributes'] пуст.
 
 parse_object_xml(path) — путь к ДИРЕКТОРИИ объекта (не к файлу):
   - 'Documents/X'                         → ПРЕДПОЧТИТЕЛЬНО (auto-resolves to .mdo or Ext/Document.xml).
@@ -604,14 +604,13 @@ find_event_subscriptions(event_filter=...) — list[str], НЕ голая стр
   (['B','e','f',...]) и фильтр де-факто игнорировался: каждый одно-символьный
   matcher ловил почти все события. Сейчас защита есть, но рекомендуется list[str].
 
-find_based_on_documents(doc_name) — прямой обход + back_scan:
-  - Прямой: ManagerModule.ДобавитьКомандыСозданияНаОсновании + ObjectModule.ОбработкаЗаполнения САМОГО документа.
-  - Back_scan (lazy fallback): если прямой пуст для can_create_from_here — сканируется
-    ОбработкаЗаполнения других Documents и собираются те, кто упомянул ДокументСсылка.<doc_name>.
-  - Записи из back_scan помечены via='back_scan' (типичный кейс — Письма в ДО3:
-    у них нет ДобавитьКомандыСозданияНаОсновании, но Задача/Поручение могут заполняться от них).
-  - Декларативный BasedOn из metadata_references добавляет документы и другие категории.
-    Для типизированного не-документа это единственный источник; без доступной таблицы ответ partial=True.
+find_references_to_object → based_on vs find_based_on_documents:
+  - A → ТОЛЬКО декларативный <BasedOn> из XML; направление ОДНО: ЧТО создаётся НА
+    ОСНОВАНИИ X (объявляет XML ДРУГОГО объекта), обратного тут нет; source_object отброшен.
+  - B → ДВЕ корзины, XML питает только can_create_from_here (via='metadata') вместе с
+    ДобавитьКомандыСозданияНаОсновании и back_scan по чужим; can_be_created_from — ТОЛЬКО
+    ОбработкаЗаполнения самого документа, XML в неё не попадает.
+  Происхождение строки B — в безусловном via: 'direct' | 'metadata' | 'back_scan'.
 
 find_register_movements(doc) vs find_register_writers(reg):
   - find_register_movements: документ → какие регистры пишет (есть is_postable).
@@ -620,18 +619,14 @@ find_register_movements(doc) vs find_register_writers(reg):
   после изменения main-кода проверь живое тело файла кандидата.
 
 find_roles(object_name) vs find_references_to_object(ref, kinds=['role_rights']):
-  - find_roles → BROAD literal-substring по сырому object_name из Rights.xml: в выдачу
-    закономерно попадают права на ЧЛЕНОВ объекта (Command/Attribute/ТЧ) и на ОДНОКОРЕННЫЕ
-    имена (Заказ → ЗаказПоставщику). match='substring'; case_sensitive различается по
-    веткам (index — регистронезависимо, live-парсинг Rights.xml — регистрозависимо).
-  - find_references_to_object(qualified, kinds=['role_rights']) → ТОЧНАЯ ссылка на САМ
-    объект, но ТОЛЬКО при индексной metadata_references и ТОЛЬКО для qualified ref
-    ('Документ.X'); отдаёт reference на роль, БЕЗ индивидуальных right_name. Без таблицы
-    live-walker этот вид не поддерживает: _meta.unsupported_kinds=['role_rights'].
-  - Точные ИМЕНА ПРАВ на объект и его члены → get_object_profile('Документ.X',
-    sections=['roles']) при индексе: right_names / matched_objects / rights_by_object —
-    BOUNDED sample, details_truncated=True означает «сузь qualified object».
-  Это ТРИ разных вопроса, а не расхождение хелперов. Bare-name в точных маршрутах запрещён.
+  - find_roles → BROAD substring по сырому object_name из Rights.xml: в выдачу попадают права
+    на ЧЛЕНОВ объекта и на ОДНОКОРЕННЫЕ имена (Заказ → ЗаказПоставщику).
+  - find_references_to_object('Документ.X', kinds=['role_rights']) → ТОЧНАЯ ссылка на САМ объект,
+    но ТОЛЬКО при индексе и БЕЗ индивидуальных right_name; live этот вид не умеет
+    (_meta.unsupported_kinds=['role_rights'], а _meta.kinds_applied его не назовёт).
+  - Имена ПРАВ → get_object_profile('Документ.X', sections=['roles']): bounded sample,
+    details_truncated=True значит «сузь qualified object».
+  ТРИ разных вопроса, а не расхождение. Bare-name в точных маршрутах запрещён.
 
 find_references_to_object(ref) vs find_code_usages(ref):
   - find_references_to_object → ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов,
@@ -663,6 +658,20 @@ get_object_modules(name) vs get_object_full_structure(name):
   - get_object_full_structure → METADATA-side: реквизиты, ТЧ, измерения/ресурсы, предопределённые, перечисления, формы.
   Разные стороны объекта, дополняют друг друга — нужны обе стороны, зови оба (каждый дёшев на индексе).
 
+find_references_to_object(kinds=['functional_option_content']) vs find_functional_options:
+  - A → обе эмиссии ОДНОГО ref_kind: и <Content> опции, и её <Location> (хранилище).
+  - B → смотрит ТОЛЬКО на content, поэтому хранилище опции не находит НИКОГДА.
+  Различай по хвосту used_in: '….Content' — состав, '….Location' — хранилище.
+
+get_object_profile(sections=['functional_options']) vs find_functional_options:
+  - A → только typed-ref из ридера, строка = {name}. Дёшево, но это НЕ перепись.
+  - B → сам выбирает index/live для XML плюс live code-scan; на bare-имени — union омонимов.
+  Расхождение счётчиков — норма: провенанс каждой корзины в _meta (source/xml_source/code_source).
+
+find_references_to_object(kinds=['event_subscription_source']) vs find_event_subscriptions(фрагмент):
+  - A → строится только из НЕПУСТОГО source_types: universal-подписки в домен НЕ входят вовсе.
+  - B → включает их всегда и различает scope: exact | partial | universal.
+  Разные вопросы, а не расхождение: 13 exact против 179 по фрагменту — это нормально.
 == BATCHING & OUTPUT ==
 ОБЗОР ОБЪЕКТА ЗА 1 ВЫЗОВ — Step 0 полного анализа объекта (вместо ~10 одиночных хелперов):
   get_object_profile(name) → compact roll-up по секциям (структура+модули+регистры+подписки+роли+ФО), items=top-N без тел.
@@ -714,7 +723,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
             "get_object_profile('ДокИмя') → за 1 вызов: регистры (registers) + подписки (subscriptions) + структура + модули + роли",
-            "registers.summary: main_code_registers_suppressed_by_cfe>0 — handler-only main не active; code_registers=0 ≠ непроводимый: смотри posting_handler_present. Posting=Deny определяет только find_register_movements.is_postable. Исполняй hint: сервер назвал регистры и классифицировал получателя (МОДУЛЬ/ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН); неподтвержденный МОДУЛЬ молча даст ЧУЖОЕ тело, для НЕ ОПОЗНАН дал tree-search. Проверка category=='CommonModules' — ТАВТОЛОГИЯ: module_hint уже применил этот фильтр. find_call_hierarchy движений не найдет: обработчик зовет ПЛАТФОРМА",
+            "registers.summary: main_code_registers_suppressed_by_cfe>0 — handler-only main не active; code_registers=0 ≠ непроводимый: смотри posting_handler_present. Posting=Deny определяет только find_register_movements.is_postable. Исполняй hint: сервер назвал регистры и классифицировал получателя (МОДУЛЬ/ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН); неподтвержденный МОДУЛЬ молча даст ЧУЖОЕ тело, для НЕ ОПОЗНАН дал tree-search. module_hint точно — rel_path; category=='CommonModules' — ТАВТОЛОГИЯ его фильтра. _meta.delegates называет получателей машинно. find_call_hierarchy движений не найдет: обработчик зовет ПЛАТФОРМА",
             "поток целиком → get_object_profile('ДокИмя', include_flow=True)",
         ],
         "full": [
@@ -722,9 +731,10 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "find_register_movements('ДокИмя') → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса",
             "сигналы: is_postable=False -> нет движений; suppressed_main_code_registers -> handler-only main не active; posting_handler_present при code_registers=0 -> прямых Движения.X нет, возможны делегаты",
             "ТРАССИРОВКА: исполняй result['hint']: сервер вернул регистр, делегата (получатель может быть НЕ РАЗРЕШЕН), dotless local-global или «не пишет»; CFE через read_file недоступен",
-            "ЛОВУШКИ: (1) точка НЕ доказывает модуль: слева бывает ПЕРЕМЕННАЯ/РЕКВИЗИТ; одноименный модуль молча отдаст ЧУЖОЕ тело — верь метке hint. (2) category=='CommonModules' при 'ОбщийМодуль.' — ТАВТОЛОГИЯ: это фильтр module_hint. (3) find_definition работает и БЕЗ индекса: пусто = definitions=[], неполнота — в partial. (4) ПУСТО — исполни live safe_grep-маршрут из hint: строки в res['results'], res['truncated'] = остановка на 50 кандидатах",
+            "ЛОВУШКИ: (1) точка НЕ доказывает модуль: слева бывает ПЕРЕМЕННАЯ/РЕКВИЗИТ; одноименный модуль молча отдаст ЧУЖОЕ тело — верь метке hint. (2) module_hint точно — rel_path; category=='CommonModules' — ТАВТОЛОГИЯ его фильтра. (3) find_definition работает и БЕЗ индекса: пусто = definitions=[], неполнота — в partial. (4) ПУСТО — исполни live safe_grep-маршрут из hint: строки в res['results'], res['truncated'] = остановка на 50 кандидатах",
             "НАШЕЛ Движения.X: find_register_writers('Регистр') даст static-кандидатов; Posting/CFE проверь forward, измененный после build main-файл — живьем. Набор записей helper не найдет — ищи регистр через git_search, иначе safe_grep",
             "ОбработкаПроведения зовет ПЛАТФОРМА: callers=0 норма, но ЯВНЫЙ BSL-вызов хелперы покажут. Движения ищи через hint, call-хелперами трассируй ДЕЛЕГАТА; include_triggers — лишь CFE-перехват",
+            "_meta.delegates/_total/_truncated — первая страница получателей машинно; пагинации нет",
             "analyze_document_flow('ДокИмя') → проводки + подписки + регзадания",
             "find_event_subscriptions('ДокИмя', event_filter=['BeforeWrite','OnWrite','Posting','Проведение','ПередЗаписью','ПриЗаписи']) → подписки документа",
             "ALT: search_methods('Проведение') при нестандартном имени",
@@ -768,7 +778,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('ОбъектИмя') → найти объект по бизнес-имени",
             "get_object_profile('ОбъектИмя') → за 1 вызов: роли (roles) + функц.опции (functional_options) + структура",
-            "find_roles('ОбъектИмя') — BROAD substring (вкл. членов/однокоренные), не exact; точные имена прав — get_object_profile(...,sections=['roles']) при индексе; find_functional_options('ОбъектИмя', limit=10) по опциям (limit= ИМЕНОВАННО — per-bucket cap + total/returned/has_more; без него на «жирных» объектах обрыв по max_output_chars)",
+            "find_roles('ОбъектИмя') — BROAD substring (вкл. членов/однокоренные), не exact; точные имена прав — get_object_profile(...,sections=['roles']) при индексе; find_functional_options('ОбъектИмя', limit=10) по опциям (провенанс — _meta.xml_source/code_source) (limit= ИМЕНОВАННО — per-bucket cap + total/returned/has_more; без него на «жирных» объектах обрыв по max_output_chars)",
         ],
         "full": [
             "search_objects('ОбъектИмя') → найти объект по бизнес-имени",
@@ -776,7 +786,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "точное МЕМБЕРСТВО: find_references_to_object('Документ.X', kinds=['role_rights']) — требует индексной metadata_references и qualified ref; без неё _meta.unsupported_kinds=['role_rights'], без right_name",
             "точные ИМЕНА ПРАВ: get_object_profile('Документ.X', sections=['roles']) — right_names / matched_objects / rights_by_object — BOUNDED sample, при details_truncated=True сужай объект, а не считай список полным",
             "find_by_type('Roles') → полный список ролей конфигурации",
-            "find_functional_options('ОбъектИмя',limit=10) → ФО объекта; обзор: find_functional_options('',include_code=False,include_content=False,limit=50)",
+            "find_functional_options('ОбъектИмя',limit=10) → ФО объекта; обзор: find_functional_options('',include_code=False,include_content=False,limit=50)"
+            "; провенанс — _meta.xml_source/code_source",
             "search_methods('ПравоДоступа') → проверки прав в коде",
             "search_methods('РольДоступна') → программные проверки ролей",
             "analyze_subsystem('УправлениеДоступом') → current-root; uncut:all direct:!content_truncated&subsystems_found==len(subsystems)",
@@ -834,7 +845,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     },
     "ссылки": {
         "compact": [
-            "find_references_to_object('Справочник.Имя') → метаданные-XML ссылки (типы, владелец, подсистемы, права…)",
+            "find_references_to_object('Справочник.Имя') → метаданные-XML ссылки; _meta.kinds_applied — что применено реально",
             "find_code_usages('Документ.Имя') → ОБРАЩЕНИЯ В КОДЕ (Документы.X, \"ДокументСсылка.X\", запросы Документ.X.ТЧ)",
             "Нужны оба сразу — find_references_to_object('Документ.Имя', include_code=True)",
             "Если объект упоминается через DefinedType — find_defined_types('Имя') раскроет составляющие",
@@ -843,6 +854,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "res = find_references_to_object('Справочник.ВидыПодарочныхСертификатов')  # метаданные-XML",
             "print(res['by_kind'], res['total'])",
             "Filter by kind: find_references_to_object('Справочник.Х', kinds=['attribute_type'])",
+            "_meta.kinds_applied — что применено ПОСЛЕ выбора маршрута; unsupported_kinds — LIVE, на index пуст",
             "Членство в подсистемах: find_references_to_object('Документ.Х', kinds=['subsystem_content']); на устаревшем индексе состав подсистем мог измениться — проверь live (rlm_index build)",
             "code = find_code_usages('Документ.ПриобретениеТоваровУслуг')  # обращения в коде",
             "print(code['by_kind'])  # {'manager':.., 'ref_type':.., 'query':..}; u['member'] = имя ТЧ для query",
@@ -894,10 +906,11 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "find_based_on_documents('ДокИмя') → {can_create_from_here, can_be_created_from}",
             "Двунаправленно: что создаётся ИЗ документа и НА основании чего создаётся документ",
+            "via у КАЖДОЙ строки: direct | metadata | back_scan",
         ],
         "full": [
             "rel = find_based_on_documents('ПриобретениеТоваровУслуг')",
-            'for d in rel[\'can_create_from_here\']: print(f\'  -> {d.get("ref") or d["document"]} (via={d.get("via","direct")})\')  # metadata ref канонический: Catalog.X/Document.X',
+            'for d in rel[\'can_create_from_here\']: print(f\'  -> {d.get("ref") or d["document"]} (via={d["via"]})\')  # metadata ref канонический: Catalog.X/Document.X',
             "for d in rel['can_be_created_from']: print(f'  <- {d[\"type\"]}')",
             "search_methods('Заполнить') → процедуры заполнения шапки/ТЧ при вводе на основании",
             "find_event_subscriptions('ДокИмя', event_filter=['Filling','ОбработкаЗаполнения']) → подписки на заполнение",
@@ -915,11 +928,12 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "s['predefined_items'] — предопределённые значения с типами",
             "s['enum_values_for_typed_refs'] — типы EnumRef уже раскрыты в значения",
             "s['forms'] — список form_name; для деталей формы → parse_form(name)",
+            "posting=None — НЕ читалось (index-путь), не «не проводится»; даёт find_register_movements",
             "Если нужен код: find_module(name) → modules → extract_procedures(path)",
         ],
         "code_hint": (
             "s = get_object_full_structure('РеализацияТоваровУслуг')\n"
-            "print(f\"{s['object_name']}: posting={s.get('posting')}\")\n"
+            "print(f\"{s['object_name']}: posting={s.get('posting')} (None = НЕ читалось)\")\n"
             "print(f\"  attrs={len(s['attributes'])}, ts={len(s['tabular_sections'])}, forms={len(s['forms'])}\")\n"
             "for ts in s['tabular_sections']:\n"
             "    print(f\"  ТЧ {ts['name']}: {len(ts['columns'])} cols\")\n"
@@ -952,17 +966,17 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     "иерархия вызовов": {
         "compact": [
             "find_call_hierarchy('ПроцИмя', direction='callers', depth=2) → транзитивные вызывающие на 2 уровня",
-            "Одноименный ОБЪЕКТНЫЙ метод, который РЕАЛЬНО зовут из кода (ЗаполнитьДокумент, ОтразитьВУчете) → добавь module_hint='Документ.X' для точности (exact-режим)",
+            "Одноимённый ОБЪЕКТНЫЙ метод (ЗаполнитьДокумент) → module_hint=find_module('X')[i]['path']: rel_path — ТОЧНАЯ форма, 'Документ.X' задаёт лишь ОБЪЕКТ",
             "ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 это НОРМА, а не мертвый код. По имени хелпер их НЕ исключает — ЯВНЫЙ вызов из BSL он ПОКАЖЕТ; но движения так не найти: читай тело и трассируй ДЕЛЕГАТА → рецепт «проведение»",
-            "Экспортный метод общего модуля с уникальным во всей БД именем → hint не нужен (exact сам); если root_exact=False — имя неуникально, передай module_hint",
+            "Экспортный метод общего модуля с уникальным во всей БД именем → hint не нужен (exact сам); если root_exact=False — имя неуникально, пинь rel_path",
             "Для одного уровня + контекст строк используй find_callers_context('ПроцИмя')",
             "direction='callees' пока не поддерживается (возвращает error-dict с hint)",
         ],
         "full": [
-            "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint='Документ.РеализацияТоваровУслуг', depth=2) → одноименный ОБЪЕКТНЫЙ метод, который РЕАЛЬНО зовут из кода",
+            "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint=find_module('РеализацияТоваровУслуг')[i]['path'], depth=2) → одноимённый ОБЪЕКТНЫЙ метод",
             "ПЛАТФОРМЕННЫЕ обработчики модуля объекта (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф ВЫЗОВОВ не попадает → callers=0 это НОРМА, а не мертвый код, и module_hint этого не лечит. НО по имени хелпер обработчики НЕ исключает: если BSL-код где-то ЯВНО зовет ОбработкаПроведения(...), такое ребро в индексе ЕСТЬ и хелпер его ПОКАЖЕТ — не игнорируй его. Просто ЧЕМ пишутся движения, так не найти: трассируй ДЕЛЕГАТА из тела обработчика → рецепт «проведение». include_triggers ребра «зовет платформа» не добавит (такого edge_type нет), но CFE-перехват самого обработчика ПОКАЖЕТ",
-            "module_hint привязывает КОРЕНЬ к одному модулю → exact-режим убирает ложные звенья от однофамильцев",
-            "Формы hint: rel_path | 'Документ.X'/'Document.X' | голый object_name; глубже обход exact идёт сам (по rel_path caller'а)",
+            "module_hint=rel_path привязывает КОРЕНЬ к ОДНОМУ модулю → exact; 'Документ.X'/голое имя — лишь при уникальном в объекте имени",
+            "Формы hint: rel_path (ТОЧНАЯ) | 'Документ.X' | голое имя — две последние задают лишь ОБЪЕКТ: exact только если имя в нём уникально",
             "Доверие: _meta.root_exact (включился ли exact на корне), _meta.exact_rows/fallback_rows, node['meta'].target_exact, node['target_key']=rel_path::метод",
             "Дерево по узлам: tree['tree'][i] = {name, target_hint, target_key, meta, callers}",
             "tree['truncated_targets'] — список узлов с >200 callers (популярные имена)",
@@ -973,9 +987,9 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "ALT: find_callers_context('ПроцИмя', module_hint='ОбщегоНазначения') для disambig'а омонимов",
         ],
         "code_hint": (
-            "# NB: корень — метод, который РЕАЛЬНО зовут из BSL. На платформенном обработчике\n"
-            "# (ОбработкаПроведения и др.) этот пример вернет callers=0 — его зовет ПЛАТФОРМА.\n"
-            "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint='Документ.РеализацияТоваровУслуг', depth=2)\n"
+            "# NB: корень — метод, который РЕАЛЬНО зовут из BSL: у платформенного callers=0.\n"
+            "hint = [m['path'] for m in find_module('РеализацияТоваровУслуг') if m['module_type'] == 'ObjectModule'][0]\n"
+            "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint=hint, depth=2)  # rel_path — ТОЧНАЯ форма\n"
             "m = tree.get('_meta', {})\n"
             "print(f\"root_exact={m.get('root_exact')} exact_rows={m.get('exact_rows')} fallback_rows={m.get('fallback_rows')}\")\n"
             "for node in tree.get('tree', []):\n"
@@ -987,7 +1001,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     },
     "расширения": {
         "compact": [
-            "get_overrides('ИмяОбъекта') → перехваты объекта из индекса (source='index')",
+            "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file → read_procedure",
             "get_overrides() → вся конфигурация: сначала partial. False → агрегаты по ВСЕМ перехватам; True → нижняя оценка, причины в _meta.failed_extension_roots. НЕ группируй overrides — это срез 200",
             "extract_procedures(path) → поле overridden_by у перехваченных методов",
             "read_procedure(path, name, include_overrides=True) → оригинал + тело расширения с аннотацией",
@@ -995,8 +1009,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         ],
         "full": [
             "get_overrides() → перехваты конфигурации. СНАЧАЛА partial: False — total/агрегаты по полному выбранному источнику; True — только по прочитанной части, причины в _meta.failed_extension_roots. overrides = отсортированный срез 200, total/truncated сигналят обрезку; сводку по срезу не строй",
-            "get_overrides('ИмяОбъекта') → перехваты одного объекта (метод, аннотация, файл расширения)",
-            "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей",
+            "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file исполним в read_procedure",
+            "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_objects/unique_methods — ИМЕНА, unique_object_methods — ПАРЫ",
             "target_method_line=None — валидно: перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения) без текстового объявления в базовом модуле либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
             "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
@@ -1014,7 +1028,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "print('по аннотациям:', res['by_annotation'])\n"
             "print('топ объектов:', list(res['by_object_top'].items())[:5])\n"
             "print('топ расширений:', list(res['by_extension_top'].items())[:5])\n"
-            "print(f\"объектов={res['unique_objects']} методов={res['unique_methods']} расширений={res['unique_extensions']}\")\n"
+            "print(f\"имён объектов={res['unique_objects']} имён методов={res['unique_methods']} ПАР={res['unique_object_methods']} расш={res['unique_extensions']}\")\n"
             "# Не группируй res['overrides'] — это срез; агрегаты полны только при partial=False\n"
             "# Детализация топ-объекта (имя берем из АГРЕГАТА, а не из среза):\n"
             "top_obj = next(iter(res['by_object_top']), None)\n"
@@ -1025,7 +1039,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     },
     "достижимость": {
         "compact": [
-            "if 'error' in res (find_path): имя многозначно (определено в >1 модуле) без своего hint → добавь to_hint/from_hint из res['candidates'] (file надёжнее всего); проверяй ПЕРЕД found/budget_exceeded",
+            "if 'error' in res (find_path): имя многозначно (определено в >1 модуле) без своего hint → добавь to_hint/from_hint = res['candidates'][i]['file'] (это rel_path — ТОЧНАЯ форма); проверяй ПЕРЕД found/budget_exceeded",
             "find_path('МетодА', 'МетодБ') → есть ли путь вызовов from→to (forward)",
             "found=False + _meta.budget_exceeded → обход обрезан, сузь max_depth/дай hint",
             "find_call_hierarchy('Метод', include_triggers=True) → callers + триггеры (подписки/формы/рег.задания/CFE)",
@@ -1034,9 +1048,9 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "СНАЧАЛА if 'error' in res: find_path для многозначного имени (NOCASE-COUNT>1 = разные модули) БЕЗ своего hint вернёт {error, hint, candidates:[{object_name, category, module_type, file, line}], _meta:{ambiguous, ambiguous_arg}} вместо обхода — добавь to_hint/from_hint (file из candidates) и повтори; проверяй error ПЕРЕД found/budget_exceeded",
             "find_path('НизкоуровневыйМетод', 'ОбработчикUI', max_depth=4) → достижимость по графу ВЫЗОВОВ (forward path from→…→to)",
             "проверь _meta.precision: 'exact' = путь доказан по callee_key; 'heuristic' = по имени (старый индекс/FS/однофамильцы)",
-            "одноимённые методы → from_hint/to_hint ('Документ.X' | rel_path | object_name) пинят концы к модулю",
+            "одноимённые методы → from_hint/to_hint: rel_path ТОЧЕН, 'Документ.X'/object_name — лишь ОБЪЕКТ",
             "call_line элемента пути = строка ВЫЗОВА к СЛЕДУЮЩЕМУ узлу (ребро), НЕ определения; у терминального (to) None",
-            "find_call_hierarchy('Метод', module_hint='Документ.X', include_triggers=True) → дерево callers + не-call триггеры на КАЖДОМ узле",
+            "find_call_hierarchy('Метод', module_hint=find_module('X')[i]['path'], include_triggers=True) → дерево callers + не-call триггеры на КАЖДОМ узле",
             "_meta.budget_exceeded=True → обход упёрся в visited_cap, found=False НЕ доказывает отсутствие пути",
             "ALT: find_callers_context('Метод') для одного уровня callers с контекстом строк и file:line",
         ],
@@ -1488,7 +1502,7 @@ def _build_full_strategy(
         tips = [
             "INDEX TIPS:",
             "  - find_callers_context() returns instantly — для СКОРОСТИ scope-hint не нужен, ищи по всей кодовой базе.",
-            "  - НО module_hint у find_call_hierarchy/find_callers_context — это ТОЧНОСТЬ, не скорость: для одноименных объектных методов, которые РЕАЛЬНО зовут из BSL (ЗаполнитьДокумент, ОтразитьВУчете), hint включает exact-режим (точные ребра по callee_key, без однофамильцев из других модулей); экспортному методу общего модуля hint не нужен, ЕСЛИ его имя уникально во всей БД — иначе (root_exact=False) передай module_hint.",
+            "  - НО module_hint — это ТОЧНОСТЬ, не скорость. Точная форма — rel_path: module_hint=find_module('X')[i]['path'] привязывает корень к ОДНОМУ модулю (exact по callee_key). 'Документ.X' и голое имя задают лишь ОБЪЕКТ: exact — только если имя внутри него уникально, иначе корень берётся произвольно, а типизированный hint не сужает вовсе.",
             "  - ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 норма, не мертвый код (ЯВНЫЙ BSL-вызов хелпер покажет). Движения ищи не тут: rlm_help(topic='проведение').",
             "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
             "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",
@@ -1827,7 +1841,7 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
     tips = [
         "INDEX TIPS:",
         "  - find_callers_context() returns instantly — для СКОРОСТИ scope-hint не нужен, ищи по всей кодовой базе.",
-        "  - НО module_hint у find_call_hierarchy/find_callers_context — это ТОЧНОСТЬ, не скорость: для одноименных объектных методов, которые РЕАЛЬНО зовут из BSL (ЗаполнитьДокумент, ОтразитьВУчете), hint включает exact-режим (точные ребра по callee_key, без однофамильцев из других модулей); экспортному методу общего модуля hint не нужен, ЕСЛИ его имя уникально во всей БД — иначе (root_exact=False) передай module_hint.",
+        "  - НО module_hint — это ТОЧНОСТЬ, не скорость. Точная форма — rel_path: module_hint=find_module('X')[i]['path'] привязывает корень к ОДНОМУ модулю (exact по callee_key). 'Документ.X' и голое имя задают лишь ОБЪЕКТ: exact — только если имя внутри него уникально, иначе корень берётся произвольно, а типизированный hint не сужает вовсе.",
         "  - ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 норма, не мертвый код (ЯВНЫЙ BSL-вызов хелпер покажет). Движения ищи не тут: rlm_help(topic='проведение').",
         "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
         "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",

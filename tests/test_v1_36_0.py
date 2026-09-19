@@ -1088,7 +1088,20 @@ def test_reader_fixtures_smoke(request, fixture_name):
 # Порог двигается ТОЛЬКО после exact-теста соответствующей подписи и ровно на
 # заранее известную дельту:
 #   Task 0: 11928   Task 1: 12289 (+361)   Task 3: 12265 (-24)   Task 4: 12306 (+41)
-_SIG_SUM_BUDGET_WITHOUT_GIT = 12306
+#
+# v1.37.0 — ЛЕСТНИЦА по задачам, а не одна установка на финал. Порог, выставленный
+# сразу на конечное число, открыл бы окно на все прибавки релиза разом: задача
+# потратила бы больше своей статьи и прошла зелёной, а перебор вскрылся бы на
+# последней, когда резать пришлось бы уже написанное. Шаги (каждый — измеренный
+# факт после своей задачи, БЕЗ коэффициента):
+#   Task 0: 11478 (снято 819 прозы из sig в recipe — см. тесты ниже)
+#   Задачи 5, 1, 2, 8 подписей не трогают вовсе.
+#   Task 3: +31 (extension_file у get_overrides, статья 36)   -> 11509
+#   Task 4: +55 (unique_object_methods + граница, статья 60) -> 11564
+#   Task 6.2: +150 (delegates 43 + posting=None 50 + kinds 57; статья 160) -> 11714
+#   Task 7: +46 (метки 2, охват handler= 33, form_name 11; статья 57) -> 11760
+#   Task 6.1: +76 (безусловный via 41 + _meta провенанс 35; статья 80) -> 11836
+_SIG_SUM_BUDGET_WITHOUT_GIT = 11836
 
 
 def test_sig_budget_headroom_freed_for_release():
@@ -1144,6 +1157,50 @@ def test_trimmed_sigs_did_not_lose_a_single_key_name():
             "exact_rows",
             "fallback_rows",
         ],
+        # v1.37.0 (Задача 0) — надзор РАСШИРЕН на каждую фактически порезанную
+        # подпись. Перечень выше покрывал лишь подписи, которые резал v1.36.0;
+        # без этих строк резка вместе с именем ключа прошла бы зелёной.
+        "find_module": ["name", "module_type", "category", "limit", "path", "object_name", "owner"],
+        "extract_procedures": ["path", "object_name", "name", "line", "end_line", "is_export", "params"],
+        "find_callers": ["proc", "module_hint", "max_files", "file", "line", "text"],
+        "find_definition": [
+            "name",
+            "module_hint",
+            "limit",
+            "definitions",
+            "owner",
+            "total",
+            "truncated",
+            "partial",
+            "_meta",
+        ],
+        "get_object_profile": [
+            "sections",
+            "include_flow",
+            "include_code_usages",
+            "limit",
+            "structure",
+            "modules",
+            "registers",
+            "subscriptions",
+            "roles",
+            "functional_options",
+            "status",
+            "summary",
+            "items",
+            "_meta",
+        ],
+        "analyze_object": ["name", "category", "metadata", "modules", "module_type", "procedures", "exports"],
+        "analyze_document_flow": [
+            "document",
+            "metadata",
+            "event_subscriptions",
+            "register_movements",
+            "related_scheduled_jobs",
+            "based_on",
+            "print_forms",
+            "is_postable",
+        ],
     }
     for helper, keys in required.items():
         sig = snap[helper]["sig"]
@@ -1168,6 +1225,21 @@ def test_moved_prose_landed_in_the_unbudgeted_recipe():
     assert "attr_type" in snap["parse_form"]["recipe"]
     assert "exact_rows" in snap["find_callers_context"]["recipe"]
     assert "fallback_rows" in snap["find_callers_context"]["recipe"]
+
+    # v1.37.0 (Задача 0): перенос — это ПЕРЕНОС и для новых порезанных подписей.
+    # Каждая фраза ниже жила в `sig` до релиза; её отсутствие в `recipe` означало
+    # бы, что знание удалено, а не перенесено.
+    assert "любой модуль" in snap["find_module"]["recipe"]
+    assert "НЕ релевантность" in snap["find_module"]["recipe"]
+    assert "get_module_outline" in snap["extract_procedures"]["recipe"]
+    assert "ValueError" in snap["extract_procedures"]["recipe"]
+    assert "find_callers_context" in snap["find_callers"]["recipe"]
+    assert "module_hint" in snap["find_definition"]["recipe"]
+    assert "live" in snap["find_definition"]["recipe"].casefold()
+    assert "unavailable" in snap["get_object_profile"]["recipe"]
+    assert "include_code_usages" in snap["get_object_profile"]["recipe"]
+    assert "extract_procedures" in snap["analyze_object"]["recipe"]
+    assert "find_register_movements" in snap["analyze_document_flow"]["recipe"]
 
 
 def test_analyze_subsystem_registered_sig_exact():
@@ -2079,11 +2151,18 @@ class TestBasedOnDedup:
         assert len(types) == 2  # фикстура: 3 совпадения на 2 типа
 
     def test_key_set_of_a_row_is_unchanged(self, cf_two_branch_filling):
-        """Дедуп — это ТОЛЬКО дедуп: новых ключей в строке не появляется."""
+        """Дедуп — это ТОЛЬКО дедуп: новых ключей в строке не появляется.
+
+        v1.37.0: `via` стал БЕЗУСЛОВНЫМ ключом КАЖДОЙ строки — правило «отсутствие
+        поля означает direct» жило только в докстринге, то есть было ключом,
+        которого никто не читает. Набор ужесточён, а не ослаблен: теперь он ТОЧНЫЙ
+        и включает `via`, и у прямых строк значение обязано быть именно 'direct'.
+        """
         bsl = _make_bsl(cf_two_branch_filling.root)
         res = bsl["find_based_on_documents"]("ЦелевойДок")
         for r in res["can_be_created_from"]:
-            assert set(r) == {"type", "file"}
+            assert set(r) == {"type", "file", "via"}
+            assert r["via"] == "direct", r
 
     def test_first_occurrence_order_and_spelling_preserved(self, cf_two_branch_filling):
         """Ключ дедупа считается по lower(), но в ответ уезжает ПЕРВОЕ написание:
@@ -2123,8 +2202,9 @@ class TestBasedOnDedup:
         same_documents = [r for r in res["can_create_from_here"] if r["document"] == "ОбщаяЦель"]
         assert len(same_types) == 1
         assert len(same_documents) == 1
-        assert set(same_types[0]) == {"type", "file"}
-        assert set(same_documents[0]) == {"document", "file"}
+        assert set(same_types[0]) == {"type", "file", "via"}
+        assert set(same_documents[0]) == {"document", "file", "via"}
+        assert same_types[0]["via"] == "direct" and same_documents[0]["via"] == "direct"
 
     def test_metadata_union_seed_still_sees_deduped_direct_rows(self, cf_indexed_basedon):
         """Соседний metadata-дедуп засевается из can_create_from_here — он обязан
@@ -2142,7 +2222,7 @@ class TestBasedOnDedup:
         assert len(keys) == len(set(keys))
         target_rows = [r for r in res["can_create_from_here"] if r["document"].lower() == "цель"]
         assert len(target_rows) == 1
-        assert "via" not in target_rows[0], "первой сохраняется direct-строка"
+        assert target_rows[0]["via"] == "direct", "первой сохраняется direct-строка"
 
     def test_document_flow_embeds_the_same_deduped_contract(self, cf_two_branch_filling):
         """Непосредственный consumer не должен восстановить дубли либо изменить
@@ -2349,7 +2429,20 @@ class TestFunctionalOptionsShape:
     def test_legacy_top_level_key_set_unchanged(self, cf_fo):
         bsl = _make_bsl(cf_fo.root, idx_reader=cf_fo.reader)
         res = bsl["find_functional_options"]("ТестДок", include_code=False)
-        assert set(res) == {"object", "xml_options", "code_options", "total", "xml_total", "code_total"}
+        # v1.37.0: `_meta` стал БЕЗУСЛОВНЫМ (провенанс XML-корзины есть ВСЕГДА, а
+        # прежний гейт по `include_code` делал ФОРМУ ответа зависящей от аргумента).
+        # Это ВТОРАЯ, независимая заморозка того же набора — она обновляется вместе с
+        # `test_arg_guards.test_functional_options_without_limit_keep_legacy_key_set`.
+        assert set(res) == {
+            "object",
+            "xml_options",
+            "code_options",
+            "total",
+            "xml_total",
+            "code_total",
+            "_meta",
+        }
+        assert res["_meta"]["code_source"] == "not_requested", res["_meta"]
 
     def test_include_content_false_does_not_poison_the_live_cache(self, cf_fo):
         bsl = _make_bsl(cf_fo.root)  # live-ветка, кеш _ensure_functional_options
@@ -2377,11 +2470,14 @@ def test_functional_options_registered_sig_exact():
     from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 
     sig = build_helper_metadata_snapshot()["find_functional_options"]["sig"]
-    assert len(sig) == 412
+    # v1.37.0 (Задача 6.1): 412 -> 447 — объявлены три ключа провенанса. Число
+    # правится ВМЕСТЕ с подписью: заморозка длины на то и заведена.
+    assert len(sig) == 447
     for marker in (
         "include_content=True",
         "synonym,location,file,content?|content_size?",
         "code_options:[{name,option_name,file,line}]",
+        "_meta:{source,xml_source,code_source",
     ):
         assert marker in sig
 
@@ -3287,11 +3383,21 @@ def test_agent_facing_routes_match_subsystem_and_fo_contracts():
     rights_full = "\n".join(K._BUSINESS_RECIPES["права"]["full"])
     assert "find_functional_options('',include_code=False,include_content=False,limit=50)" in rights_full
 
+    # Пофайловый гард ДЛИНЫ четырёх `full`-рецептов, сжатых в v1.36.0: он не даёт им
+    # отрасти обратно. Потолки стоят ВПЛОТНУЮ к факту (запас 14 / 2 / 10 / 0), то есть
+    # любая прибавка обязана быть осознанной и названной.
+    #
+    # v1.37.0: «права» 1118 → 1160, ровно на +42 — правило синхронизации текстов
+    # (docs/MODULE_MAP.md) требует обновить домен вместе с контрактом хелпера, а
+    # `find_functional_options` объявил провенанс смешанного источника
+    # (`_meta.xml_source`/`code_source`). Прибавка ужата: она дописана в УЖЕ
+    # существующую строку про ФО, а не отдельным пунктом списка (тот стоил бы 92).
+    # Остальные три потолка не двигаются — их домены релиз не правит.
     old_full_lengths = {
         "себестоимость": 612,
         "распределение": 573,
         "печать": 465,
-        "права": 1118,
+        "права": 1160,
     }
     for domain, ceiling in old_full_lengths.items():
         assert sum(map(len, K._BUSINESS_RECIPES[domain]["full"])) <= ceiling
