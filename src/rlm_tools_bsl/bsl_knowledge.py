@@ -469,7 +469,7 @@ BEFORE YOU START: check rlm_start response — warnings, extension_context, dete
 
 Step 0 — UNDERSTAND: decode the business question
   BUSINESS RECIPE? Follow it.
-  No recipe? → analyze_subsystem('Подсистема'); current-root; uncut known rows:all direct:!content_truncated&subsystems_found==len(subsystems);live:no reverse
+  No recipe? → analyze_subsystem('Подсистема'); current-root; uncut known rows:all direct:!content_truncated&subsystems_found==len(subsystems)
 
 Step 1 — DISCOVER: find what you need
   search(query)                          → BROAD first pass: methods + objects + regions + headers + attributes + predefined
@@ -669,8 +669,8 @@ get_object_profile(sections=['functional_options']) vs find_functional_options:
   Расхождение счётчиков — норма: провенанс каждой корзины в _meta (source/xml_source/code_source).
 
 find_references_to_object(kinds=['event_subscription_source']) vs find_event_subscriptions(фрагмент):
-  - A → строится только из НЕПУСТОГО source_types: universal-подписки в домен НЕ входят вовсе.
-  - B → включает их всегда и различает scope: exact | partial | universal.
+  - A → из НЕПУСТОГО source_types плюс наборы типов, раскрытые НА ЧТЕНИИ: universal в домен НЕ входят.
+  - B → включает их всегда и различает scope: exact | set | partial | universal (почему — matched_via).
   Разные вопросы, а не расхождение: 13 exact против 179 по фрагменту — это нормально.
 == BATCHING & OUTPUT ==
 ОБЗОР ОБЪЕКТА ЗА 1 ВЫЗОВ — Step 0 полного анализа объекта (вместо ~10 одиночных хелперов):
@@ -723,7 +723,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
             "get_object_profile('ДокИмя') → за 1 вызов: регистры (registers) + подписки (subscriptions) + структура + модули + роли",
-            "registers.summary: main_code_registers_suppressed_by_cfe>0 — handler-only main не active; code_registers=0 ≠ непроводимый: смотри posting_handler_present. Posting=Deny определяет только find_register_movements.is_postable. Исполняй hint: сервер назвал регистры и классифицировал получателя (МОДУЛЬ/ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН); неподтвержденный МОДУЛЬ молча даст ЧУЖОЕ тело, для НЕ ОПОЗНАН дал tree-search. module_hint точно — rel_path; category=='CommonModules' — ТАВТОЛОГИЯ его фильтра. _meta.delegates называет получателей машинно. find_call_hierarchy движений не найдет: обработчик зовет ПЛАТФОРМА",
+            "registers.summary: main_code_registers_suppressed_by_cfe>0 — handler-only main не active; code_registers=0 ≠ непроводимый: смотри posting_handler_present. Posting=Deny определяет только find_register_movements.is_postable. Исполняй hint: сервер назвал регистры и классифицировал получателя (МОДУЛЬ/ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН); неподтвержденный МОДУЛЬ молча даст ЧУЖОЕ тело, для НЕ ОПОЗНАН дал tree-search. module_hint точно — rel_path; category=='CommonModules' — ТАВТОЛОГИЯ его фильтра. declared_registers — ОБЪЯВЛЕННЫЙ состав, ось отдельная от кода; unresolved — неразрешимые. find_call_hierarchy движений не найдет: обработчик зовет ПЛАТФОРМА",
             "поток целиком → get_object_profile('ДокИмя', include_flow=True)",
         ],
         "full": [
@@ -731,12 +731,13 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "find_register_movements('ДокИмя') → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса",
             "сигналы: is_postable=False -> нет движений; suppressed_main_code_registers -> handler-only main не active; posting_handler_present при code_registers=0 -> прямых Движения.X нет, возможны делегаты",
             "ТРАССИРОВКА: исполняй result['hint']: сервер вернул регистр, делегата (получатель может быть НЕ РАЗРЕШЕН), dotless local-global или «не пишет»; CFE через read_file недоступен",
-            "ЛОВУШКИ: (1) точка НЕ доказывает модуль: слева бывает ПЕРЕМЕННАЯ/РЕКВИЗИТ; одноименный модуль молча отдаст ЧУЖОЕ тело — верь метке hint. (2) module_hint точно — rel_path; category=='CommonModules' — ТАВТОЛОГИЯ его фильтра. (3) find_definition работает и БЕЗ индекса: пусто = definitions=[], неполнота — в partial. (4) ПУСТО — исполни live safe_grep-маршрут из hint: строки в res['results'], res['truncated'] = остановка на 50 кандидатах",
+            "ЛОВУШКИ: (1) точка НЕ доказывает модуль: слева бывает ПЕРЕМЕННАЯ/РЕКВИЗИТ; одноименный модуль молча отдаст ЧУЖОЕ тело — верь метке hint. (2) module_hint точно — rel_path; category=='CommonModules' — ТАВТОЛОГИЯ его фильтра. (3) ПУСТО — исполни live safe_grep-маршрут из hint: строки в res['results'], res['truncated'] = остановка на 50 кандидатах",
             "НАШЕЛ Движения.X: find_register_writers('Регистр') даст static-кандидатов; Posting/CFE проверь forward, измененный после build main-файл — живьем. Набор записей helper не найдет — ищи регистр через git_search, иначе safe_grep",
             "ОбработкаПроведения зовет ПЛАТФОРМА: callers=0 норма, но ЯВНЫЙ BSL-вызов хелперы покажут. Движения ищи через hint, call-хелперами трассируй ДЕЛЕГАТА; include_triggers — лишь CFE-перехват",
             "_meta.delegates/_total/_truncated — первая страница получателей машинно; пагинации нет",
+            "declared_registers/_total/_truncated — ОБЪЯВЛЕННЫЙ состав, ось ОТДЕЛЬНАЯ от кода; undeclared_code_registers — выведено, но не объявлено; unresolved — неразрешимо статически, пустой читай с _meta.unresolved_available",
             "analyze_document_flow('ДокИмя') → проводки + подписки + регзадания",
-            "find_event_subscriptions('ДокИмя', event_filter=['BeforeWrite','OnWrite','Posting','Проведение','ПередЗаписью','ПриЗаписи']) → подписки документа",
+            "find_event_subscriptions('ДокИмя', event_filter=['OnWrite','Posting','ПередЗаписью']) → подписки документа",
             "ALT: search_methods('Проведение') при нестандартном имени",
         ],
     },

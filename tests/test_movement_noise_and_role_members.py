@@ -95,7 +95,7 @@ def test_extract_movements_rejects_bsl_methods_strict_set():
     )
     info = _doc_object_info()
     rows = _extract_movements(content, info, info.relative_path)
-    names = {name for (name, src, _f) in rows if src == "code"}
+    names = {r[0] for r in rows if r[1] == "code"}
     # STRICT equality (Codex #4): also fails on a truncated 'Записат'/'Записа' leak.
     assert names == {"ТоварыНаСкладах", "Продажи"}
 

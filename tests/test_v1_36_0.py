@@ -1101,7 +1101,16 @@ def test_reader_fixtures_smoke(request, fixture_name):
 #   Task 6.2: +150 (delegates 43 + posting=None 50 + kinds 57; статья 160) -> 11714
 #   Task 7: +46 (метки 2, охват handler= 33, form_name 11; статья 57) -> 11760
 #   Task 6.1: +76 (безусловный via 41 + _meta провенанс 35; статья 80) -> 11836
-_SIG_SUM_BUDGET_WITHOUT_GIT = 11836
+#
+# v1.38.0 — продолжение лестницы. Порог поднят РОВНО на сумму подписей
+# ТРЁХ НОВЫХ хелперов релиза (count_matches 270 + find_common_modules 128 +
+# find_templates 159 = 557), чтобы гард ПРОДОЛЖАЛ держать старые подписи на
+# прежнем уровне: факт по СТАРЫМ хелперам после всех задач — 11 515,
+# то есть НИЖЕ прежнего порога 11 836 (задача бюджета сняла 456 прозы,
+# а новые ключи вернули меньше).
+#   Task 0 (бюджет): −456 прозы из 8 подписей; новые ключи Задач 2/5/6/7/8/9/11/12.
+#   Три новых хелпера: +557                                     -> 12393
+_SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557
 
 
 def test_sig_budget_headroom_freed_for_release():
@@ -1246,13 +1255,18 @@ def test_analyze_subsystem_registered_sig_exact():
     from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 
     sig = build_helper_metadata_snapshot()["analyze_subsystem"]["sig"]
-    assert len(sig) == 427
+    # v1.38.0 (Задача 2): 427 -> 420. Хвост «content=matched(index)» больше неверен
+    # — обратный вопрос решают ОБЕ ветки. Число правится ВМЕСТЕ с подписью.
+    # v1.38.0: 420 -> 396. Добавлен live_scan, срезана проза «direct=row-full;
+    # content=matched» (форма строки описана в recipe и HELPERS.md).
+    assert len(sig) == 396
     for marker in (
         "subsystems_found",
         "content_truncated",
         "reverse_lookup_supported",
         "extensions_included",
-        "direct=row-full",
+        # v1.38.0: `live_scan` — бюджет живого обратного прохода; он БЕЗУСЛОВНЫЙ.
+        "live_scan",
         "total_objects=row-total",
         "found>len(subsystems)=>14K.",
     ):
@@ -1333,7 +1347,9 @@ def test_analyze_subsystem_goes_live_instead_of_publishing_a_rebuild_window(buil
     bsl = _make_bsl(built_index_env.root, idx_reader=reader)
     res = bsl["analyze_subsystem"]("ПодсистемаА")
     assert res["_meta"]["source"] == "live"
-    assert res["_meta"]["reverse_lookup_supported"] is False
+    # v1.38.0 (Задача 2): обратный вопрос решают ОБЕ ветки.
+    assert res["_meta"]["reverse_lookup_supported"] is True
+    assert res["_meta"]["live_scan"] is not None
     (row,) = res["subsystems"]
     assert row["total_objects"] == 2
     assert set(row["raw_content"]) == {"CommonModule.ПодсистемаАСервер", "Document.ЧужоеИмя"}
@@ -1511,24 +1527,48 @@ class TestAnalyzeSubsystemSingleShape:
         b = sorted(s["name"] for s in idx["analyze_subsystem"]("Почта")["subsystems"] if s["match"] == "name")
         assert a == b == ["Почта"]
 
-    def test_live_branch_declares_that_it_cannot_do_reverse_lookup(self, cf_indexed):
-        """Живая ветка ищет XML подсистемы ПО ИМЕНИ ФАЙЛА, поэтому запрос по имени
-        входящего объекта не найдёт ничего НИКОГДА. Это обязано быть ОБЪЯВЛЕНО,
-        а не выглядеть как «объект ни в одну подсистему не входит»."""
+    def test_live_branch_answers_the_reverse_question_too(self, cf_indexed):
+        """v1.38.0 (Задача 2): живая ветка отвечает на ОБА вопроса одним проходом.
+
+        До релиза XML подсистемы искался ПО ИМЕНИ ФАЙЛА, поэтому запрос по имени
+        входящего объекта не находил ничего НИКОГДА, и пустой ответ ничего не
+        доказывал. Теперь перед разбором стоит подстрочный префильтр по сырому
+        тексту — надмножественный тест, ложных отрицаний дать не может.
+        """
         live = _make_bsl(cf_indexed.root)  # без ридера
         direct = live["analyze_subsystem"]("ПодсистемаА")
-        assert direct["_meta"]["reverse_lookup_supported"] is False
+        assert direct["_meta"]["reverse_lookup_supported"] is True
         assert all(s["match"] == "name" for s in direct["subsystems"])
         reverse = live["analyze_subsystem"]("ЧужоеИмя")
-        # Пустой ответ на обратный вопрос СОПРОВОЖДЁН объяснением, а не молчит,
-        # и _meta есть даже на нём (иначе агент не отличит «нет» от «не искали»).
-        assert "error" in reverse
-        assert reverse["_meta"]["reverse_lookup_supported"] is False
-        # Текст проверяется ПО СМЫСЛУ, а не по факту наличия: прежний hint обещал
-        # обратный поиск и на живой ветке, то есть подтверждал ложный вывод.
-        assert "не поддержан" in reverse["hint"]
-        assert "match='content'" not in reverse["hint"], "hint живой ветки не имеет права обещать то, чего она не умеет"
-        assert "rlm_index build" in reverse["hint"], "нужен исполнимый выход"
+        assert "error" not in reverse, reverse
+        assert [s["match"] for s in reverse["subsystems"]] == ["content"], reverse["subsystems"]
+        assert reverse["_meta"]["reverse_lookup_supported"] is True
+        # Бюджет прохода ОБЪЯВЛЕН, а не подразумевается.
+        scan = reverse["_meta"]["live_scan"]
+        assert set(scan) == {"files_total", "files_read", "files_parsed", "failed_files", "truncated"}
+        assert scan["files_total"] >= 1 and scan["truncated"] is False
+
+    def test_live_and_index_branches_return_the_same_row_set(self, cf_indexed):
+        """Гард против нового расхождения форм: одно дерево — один НАБОР строк."""
+        live = _make_bsl(cf_indexed.root)
+        idx = _make_bsl(cf_indexed.root, idx_reader=cf_indexed.reader)
+
+        def _rows(bsl, query):
+            res = bsl["analyze_subsystem"](query)
+            return sorted(
+                (s["name"], (s["file"] or "").replace("\\", "/"), s["match"]) for s in res.get("subsystems", [])
+            )
+
+        for query in ("ПодсистемаА", "ЧужоеИмя"):
+            assert _rows(live, query) == _rows(idx, query), query
+
+    def test_index_route_does_not_pay_for_the_reverse_scan(self, cf_indexed):
+        """Индексный маршрут своего поведения НЕ меняет: прохода не было."""
+        idx = _make_bsl(cf_indexed.root, idx_reader=cf_indexed.reader)
+        res = idx["analyze_subsystem"]("ПодсистемаА")
+        assert res["_meta"]["source"] == "index"
+        # Ключ ЕСТЬ всегда (правило безусловного ключа), но равен None.
+        assert "live_scan" in res["_meta"] and res["_meta"]["live_scan"] is None
 
     def test_index_empty_hint_does_not_turn_has_metadata_into_coverage(self, cf_indexed):
         """Пустая таблица — ноль среди разобранных строк, не сертификат всех XML."""
@@ -1573,7 +1613,7 @@ class TestAnalyzeSubsystemSingleShape:
         bsl = _make_bsl(cf_indexed.root, idx_reader=reader)
         res = bsl["analyze_subsystem"]("ПодсистемаА")
         assert res["_meta"]["source"] == "live"
-        assert res["_meta"]["reverse_lookup_supported"] is False
+        assert res["_meta"]["reverse_lookup_supported"] is True
 
     def test_synonym_match_on_both_branches(self, cf_synonym):
         """R52: `Спецодежда` при имени `ктнСпецодежда` и синониме `Спецодежда` —
@@ -1601,6 +1641,8 @@ class TestAnalyzeSubsystemSingleShape:
             "source": "index",
             "limit": 200,
             "reverse_lookup_supported": True,
+            # v1.38.0: ключ присутствует ВСЕГДА; None = живого прохода не было.
+            "live_scan": None,
             "extensions_included": False,
         }
 
@@ -1784,11 +1826,15 @@ class TestAnalyzeSubsystemSingleShape:
             "parse_metadata_xml",
             lambda *_: pytest.fail("validation обязана быть раньше XML"),
         )
-        for bsl, source, reverse in ((indexed, "index", True), (live, "live", False)):
+        for bsl, source in ((indexed, "index"), (live, "live")):
             res = bsl["analyze_subsystem"](query)
             assert "error" in res and "непуст" in res["hint"].lower()
             assert res["_meta"]["source"] == source
-            assert res["_meta"]["reverse_lookup_supported"] is reverse
+            # v1.38.0: значение больше не выводится из доступности индексного
+            # маршрута — обратный вопрос решают ОБЕ ветки.
+            assert res["_meta"]["reverse_lookup_supported"] is True
+            # Validation отработала ДО любого прохода: ключ есть, значения нет.
+            assert res["_meta"]["live_scan"] is None
             assert len(json.dumps(res, ensure_ascii=False)) <= 14_000
 
     def test_overlong_query_fails_bounded_without_echo(self, cf_indexed):
@@ -1817,7 +1863,7 @@ class TestAnalyzeSubsystemSingleShape:
             bsl = _make_bsl(cf_indexed.root, idx_reader=reader)
             res = bsl["analyze_subsystem"]("X" * 20_000)
             assert res["_meta"]["source"] == "live"
-            assert res["_meta"]["reverse_lookup_supported"] is False
+            assert res["_meta"]["reverse_lookup_supported"] is True
         finally:
             reader.close()
 
@@ -1840,7 +1886,7 @@ class TestAnalyzeSubsystemSingleShape:
         res = bsl["analyze_subsystem"](query)
         assert "error" in res
         assert res["_meta"]["source"] == "live"
-        assert res["_meta"]["reverse_lookup_supported"] is False
+        assert res["_meta"]["reverse_lookup_supported"] is True
 
     def test_foreign_reader_never_publishes_another_roots_subsystems(self, cf_foreign_subsystem_index, monkeypatch):
         """Два статичных корня: reader B не является данными current-root A.
@@ -1869,7 +1915,7 @@ class TestAnalyzeSubsystemSingleShape:
         alien = bsl["analyze_subsystem"]("ТолькоБ")
         assert "error" in alien
         assert alien["_meta"]["source"] == "live"
-        assert alien["_meta"]["reverse_lookup_supported"] is False
+        assert alien["_meta"]["reverse_lookup_supported"] is True
         own = bsl["analyze_subsystem"]("ТолькоА")
         assert own["_meta"]["source"] == "live"
         assert [r["name"] for r in own["subsystems"]] == ["ТолькоА"]
@@ -2161,7 +2207,10 @@ class TestBasedOnDedup:
         bsl = _make_bsl(cf_two_branch_filling.root)
         res = bsl["find_based_on_documents"]("ЦелевойДок")
         for r in res["can_be_created_from"]:
-            assert set(r) == {"type", "file", "via"}
+            # v1.38.0 (Задача 9): набор ужесточён ДВУМЯ ключами — `declared`
+            # (объявлена ли связь платформой) и `line` (строка фактического
+            # вызова). `via` при этом НЕ переопределяется: это провенанс СКАНА.
+            assert set(r) == {"type", "file", "via", "declared", "line"}
             assert r["via"] == "direct", r
 
     def test_first_occurrence_order_and_spelling_preserved(self, cf_two_branch_filling):
@@ -2202,8 +2251,8 @@ class TestBasedOnDedup:
         same_documents = [r for r in res["can_create_from_here"] if r["document"] == "ОбщаяЦель"]
         assert len(same_types) == 1
         assert len(same_documents) == 1
-        assert set(same_types[0]) == {"type", "file", "via"}
-        assert set(same_documents[0]) == {"document", "file", "via"}
+        assert set(same_types[0]) == {"type", "file", "via", "declared", "line"}
+        assert set(same_documents[0]) == {"document", "category", "file", "via", "declared", "line"}
         assert same_types[0]["via"] == "direct" and same_documents[0]["via"] == "direct"
 
     def test_metadata_union_seed_still_sees_deduped_direct_rows(self, cf_indexed_basedon):
@@ -2472,7 +2521,9 @@ def test_functional_options_registered_sig_exact():
     sig = build_helper_metadata_snapshot()["find_functional_options"]["sig"]
     # v1.37.0 (Задача 6.1): 412 -> 447 — объявлены три ключа провенанса. Число
     # правится ВМЕСТЕ с подписью: заморозка длины на то и заведена.
-    assert len(sig) == 447
+    # v1.38.0 (Задача 0, бюджет): 447 -> 384 — проза переехала в
+    # небюджетируемый `recipe` (имена ключей ниже не тронуты).
+    assert len(sig) == 384
     for marker in (
         "include_content=True",
         "synonym,location,file,content?|content_size?",
@@ -3349,15 +3400,16 @@ def test_agent_facing_routes_match_subsystem_and_fo_contracts():
     subsystem_route = (
         "No recipe? → analyze_subsystem('Подсистема'); current-root; uncut "
         "known rows:all direct:!content_truncated&"
-        "subsystems_found==len(subsystems);live:no reverse"
+        "subsystems_found==len(subsystems)"
     )
     # Байтовый гард ЯЧЕЙКИ (R127): «BUSINESS RECIPE? Follow it.» (27) + перевод
-    # строки + маршрут (156) = 184 при прежних 186. Держатся ОБЕ строки и их
-    # соседство, а не только вторая. Отступ секции в два пробела учтён явно.
+    # строки + маршрут. Держатся ОБЕ строки и их соседство, а не только
+    # вторая. v1.38.0 (Задача 2): 156 -> 140, хвост «;live:no reverse» ушёл —
+    # обратный вопрос решают обе ветки, и утверждать обратное больше нельзя.
     import re
 
     recipe_line = "BUSINESS RECIPE? Follow it."
-    assert (len(recipe_line), len(subsystem_route)) == (27, 156)
+    assert (len(recipe_line), len(subsystem_route)) == (27, 140)
     pair = re.compile(re.escape(recipe_line) + r"\n[ \t]*" + re.escape(subsystem_route))
     for text in (slim_workflow, full):
         assert pair.search(text), "пара Step 0 обязана остаться СОСЕДНИМИ строками"

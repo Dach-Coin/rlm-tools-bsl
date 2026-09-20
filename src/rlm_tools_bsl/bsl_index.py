@@ -23,6 +23,7 @@ from bisect import insort
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from pathlib import Path
+from collections.abc import Callable
 from typing import NamedTuple
 
 from rlm_tools_bsl._git_process import run_git
@@ -34,15 +35,76 @@ from rlm_tools_bsl.bsl_knowledge import (
 from rlm_tools_bsl.cache import _paths_hash
 from rlm_tools_bsl.format_detector import BslFileInfo, parse_bsl_path
 from rlm_tools_bsl.bsl_xml_parsers import (
+    CATEGORY_TO_REF_HEAD as _CATEGORY_TO_REF_HEAD,
     _CODE_MANAGER_COLLECTIONS,
     _CODE_QUERY_COLLECTIONS,
     _RU_REFTYPE_TO_CANONICAL,
     canonicalize_type_ref,
+    classify_subscription_row,
 )
 
 logger = logging.getLogger(__name__)
 
-BUILDER_VERSION = 15
+# Sentinel для кешей, где None — ЗНАЧИМОЕ значение («раскрыть нечем»), а не «нет в кеше».
+_UNSET = object()
+
+
+def _json_list(raw) -> list[str]:
+    """JSON-массив строк из колонки; битое/пустое значение — пустой список."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return [str(x) for x in parsed] if isinstance(parsed, list) else []
+
+
+_ES_COLUMNS = "name, synonym, event, handler_module, handler_procedure, source_types, source_count, file"
+
+
+def _ES_SELECT_SQL(has_v16: bool) -> str:  # noqa: N802 — имя-константа по смыслу
+    """SELECT подписок, гейтованный по поколению индекса.
+
+    На v15-базе колонки ``source_type_sets`` НЕТ, и безусловный SELECT дал бы
+    ``OperationalError``, который ``@_transient_safe`` деградирует в ``None``, —
+    то есть ВЕСЬ домен подписок молча ушёл бы в живой XML-разбор ещё до
+    пересборки. Гейт читается однократной пробой при открытии ридера.
+    """
+    extra = ", source_type_sets" if has_v16 else ""
+    return f"SELECT {_ES_COLUMNS}{extra} FROM event_subscriptions"  # noqa: S608
+
+
+_MOVEMENTS_COLUMNS = "register_name, source, file"
+
+
+def _MOVEMENTS_SELECT_SQL(has_v16: bool, by_column: str) -> str:  # noqa: N802 — имя-константа по смыслу
+    """SELECT движений, гейтованный по поколению индекса (см. ``_ES_SELECT_SQL``)."""
+    extra = ", evidence, kind" if has_v16 else ""
+    return (
+        f"SELECT DISTINCT {_MOVEMENTS_COLUMNS}{extra} "  # noqa: S608
+        f"FROM register_movements WHERE {by_column} = ? COLLATE NOCASE"
+    )
+
+
+def _row_opt(row, column: str):
+    """Значение колонки, которой на v15-выборке нет вовсе."""
+    try:
+        return row[column]
+    except (IndexError, KeyError):
+        return None
+
+
+def _row_type_sets(row) -> list[str]:
+    """``source_type_sets`` строки; на v15-выборке колонки нет вовсе."""
+    try:
+        raw = row["source_type_sets"]
+    except (IndexError, KeyError):
+        return []
+    return _json_list(raw)
+
+
+BUILDER_VERSION = 16
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
@@ -588,7 +650,13 @@ CREATE TABLE IF NOT EXISTS event_subscriptions (
     handler_procedure TEXT,
     source_types TEXT,
     source_count INTEGER,
-    file TEXT
+    file TEXT,
+    -- v16: НАБОРЫ типов-источников (платформенный cfg:DocumentObject либо
+    -- cfg:DefinedType.X). Хранятся ОТДЕЛЬНО от source_types и раскрываются НА
+    -- ЧТЕНИИ: один DefinedType даёт до 608 ссылок, и разворот на сборке утяжелил
+    -- бы каждую строку. Следствие для чтения: source_count == 0 БОЛЬШЕ НЕ
+    -- означает catch-all — catch-all это «source_types И source_type_sets пусты».
+    source_type_sets TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_es_name ON event_subscriptions(name);
 
@@ -635,10 +703,100 @@ CREATE TABLE IF NOT EXISTS register_movements (
     document_name TEXT NOT NULL,
     register_name TEXT NOT NULL,
     source TEXT DEFAULT 'code',
-    file TEXT
+    file TEXT,
+    -- v16: ограниченный по длине фрагмент кода, ДОКАЗАВШИЙ строку. Агент
+    -- проверяет кандидата, не перечитывая модуль (обработчик бывает только в
+    -- CFE, куда песочный read_file не пускает).
+    evidence TEXT,
+    -- v16: вид строки source='unresolved' — 'dynamic_name' (имя регистра
+    -- вычисляется во время исполнения) либо 'unknown_register' (литерал есть,
+    -- регистра с таким именем в каталоге нет). У всех прочих строк NULL:
+    -- evidence — свободный текст и машинным дискриминатором быть не может.
+    kind TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_rm_document ON register_movements(document_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_rm_register ON register_movements(register_name COLLATE NOCASE);
+
+-- v16 (Задача 7): ОБЪЯВЛЕННЫЙ состав движений документа — <RegisterRecords> в
+-- CF-XML / повторяющийся <registerRecords> в EDT-.mdo. Отдельная таблица, а не
+-- строки в register_movements: те молча изменили бы каждый существующий
+-- счётчик (erp_mechanisms/manager_tables/adapted) и ответ find_register_writers.
+CREATE TABLE IF NOT EXISTS declared_register_records (
+    id INTEGER PRIMARY KEY,
+    document_ref TEXT NOT NULL,
+    register_ref TEXT NOT NULL,
+    file TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_drr_document ON declared_register_records(document_ref COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_drr_register ON declared_register_records(register_ref COLLATE NOCASE);
+
+-- v16 (Задача 8): флаг уровня роли setForNewObjects. Строка есть у КАЖДОЙ роли
+-- (в том числе с флагом 0) — иначе «роли нет в таблице» и «флаг не взведён»
+-- были бы неотличимы.
+CREATE TABLE IF NOT EXISTS role_flags (
+    id INTEGER PRIMARY KEY,
+    role_name TEXT NOT NULL,
+    set_for_new_objects INTEGER NOT NULL DEFAULT 0,
+    file TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rf_role ON role_flags(role_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_rf_flag ON role_flags(set_for_new_objects);
+
+-- v16 (Задача 8): ИСКЛЮЧЕНИЯ флагованной роли — записи объекта, где право
+-- выключено явно (<value>false</value>).
+CREATE TABLE IF NOT EXISTS role_exclusions (
+    id INTEGER PRIMARY KEY,
+    role_name TEXT NOT NULL,
+    object_name TEXT NOT NULL,
+    right_name TEXT NOT NULL,
+    file TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rx_object ON role_exclusions(object_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_rx_role ON role_exclusions(role_name COLLATE NOCASE);
+
+-- v16 (Задача 11): свойства общих модулей. EDT ОПУСКАЕТ ложные флаги целиком,
+-- поэтому отсутствие узла читается как 0, а не как «неизвестно», — иначе два
+-- формата дали бы разные ответы на одну конфигурацию.
+CREATE TABLE IF NOT EXISTS common_module_props (
+    id INTEGER PRIMARY KEY,
+    module_name TEXT NOT NULL,
+    global_ INTEGER NOT NULL DEFAULT 0,
+    server INTEGER NOT NULL DEFAULT 0,
+    server_call INTEGER NOT NULL DEFAULT 0,
+    privileged INTEGER NOT NULL DEFAULT 0,
+    external_connection INTEGER NOT NULL DEFAULT 0,
+    client_managed INTEGER NOT NULL DEFAULT 0,
+    client_ordinary INTEGER NOT NULL DEFAULT 0,
+    return_values_reuse TEXT,
+    file TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cmp_name ON common_module_props(module_name COLLATE NOCASE);
+
+-- v16 (Задача 11): константы конфигурации с типом значения. Тип хранится в
+-- ФОРМЕ ССЫЛКИ (CatalogRef.X), тем же путём, что типы реквизитов, — канонизация
+-- здесь дала бы пустую строку на примитивах и Catalog.X там, где соседний
+-- реквизит в том же ответе показывает CatalogRef.X.
+CREATE TABLE IF NOT EXISTS constants (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    synonym TEXT,
+    value_type TEXT,
+    file TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_const_name ON constants(name COLLATE NOCASE);
+
+-- v16 (Задача 11): макеты. owner_ref пуст у ОБЩИХ макетов — владельца у них нет.
+CREATE TABLE IF NOT EXISTS templates (
+    id INTEGER PRIMARY KEY,
+    owner_ref TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    synonym TEXT,
+    template_type TEXT,
+    file TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tpl_owner ON templates(owner_ref COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_tpl_name ON templates(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_tpl_type ON templates(template_type);
 
 -- Level-3: enum values
 CREATE TABLE IF NOT EXISTS enum_values (
@@ -969,6 +1127,39 @@ _ATTR_CATEGORIES: list[str] = [
     "AccountingRegisters",
     "ChartsOfCharacteristicTypes",
 ]
+
+# v16 (Задача 9): категории, которые ПОДДЕРЖИВАЮТ ввод на основании, но в
+# `_ATTR_CATEGORIES` не входят. Для них эмитится ТОЛЬКО `based_on` и ТОЛЬКО
+# отдельным циклом.
+#
+# Почему отдельный цикл, а не расширение `_ATTR_CATEGORIES`: тот список управляет
+# ещё и `object_attributes`, `predefined_items` и whitelist'ом pointwise-обновления,
+# и расширение потянуло бы за собой три чужих домена и рост индекса, которого
+# релиз не заказывал.
+#
+# `Reports` и `DataProcessors` сюда НЕ входят — ввода на основании у них нет.
+_BASED_ON_EXTRA_CATEGORIES: list[str] = [
+    "BusinessProcesses",
+    "Tasks",
+    "ChartsOfAccounts",
+    "ChartsOfCalculationTypes",
+    "ExchangePlans",
+]
+
+# Полный набор категорий, для которых строки `based_on` В ИНДЕКСЕ ЕСТЬ. Читается
+# read-time слоем: кандидат ВНЕ этого набора обязан получать `declared=None`
+# («сверка невозможна»), а не `False` — иначе это уверенная ложь.
+BASED_ON_EMITTING_CATEGORIES: frozenset[str] = frozenset(
+    [
+        "Documents",
+        "Catalogs",
+        "InformationRegisters",
+        "AccumulationRegisters",
+        "AccountingRegisters",
+        "ChartsOfCharacteristicTypes",
+        *_BASED_ON_EXTRA_CATEGORIES,
+    ]
+)
 
 # Categories with predefined items
 _PREDEFINED_CATEGORIES: list[str] = [
@@ -1706,6 +1897,70 @@ def _classify_grep_path(base_path: str, san_path: str) -> str:
             continue
         return "indeterminate"
     return "directory"
+
+
+def _git_grep_counts(
+    base_path: str,
+    pattern: str,
+    *,
+    literal_files: list[str],
+    timeout: int | None = None,
+) -> dict[str, int] | None:
+    """``git grep -c`` по ТОЧНОМУ списку файлов → ``{rel_path: число строк}``.
+
+    Отдельная функция, а не режим ``_git_grep``: там выдача построчная, и на
+    частом паттерне по 23 тысячам файлов она дала бы миллионы строк в память —
+    ровно тот отказ (``MemoryError``), ради которого ``count_matches`` и заведён.
+    ``-c`` печатает ОДНУ строку на совпавший файл, то есть выход ограничен числом
+    файлов.
+
+    ``None`` — настоящий отказ (git недоступен, rc≥2, таймаут); ``{}`` — ноль
+    совпадений. Caller обязан различать: на ``None`` он идёт Python-веткой.
+    """
+    if not literal_files:
+        return {}
+    if not isinstance(pattern, str) or not pattern or "\n" in pattern or "\x00" in pattern:
+        return None
+    cmd = _git_base_cmd(base_path)
+    if cmd is None:
+        return None
+    # Те же два флага доверенной ветки, что у `_git_grep(literal_files=...)`:
+    # список сформировал сам сервер, и «искать ровно в этих файлах» не должно
+    # зависеть ни от .gitignore, ни от `*.bsl binary` в .gitattributes.
+    grep_cmd = [
+        *cmd,
+        "grep",
+        "--untracked",
+        "--no-color",
+        "--no-exclude-standard",
+        "--text",
+        "-c",
+        "-F",
+        "-e",
+        pattern,
+        "--",
+        *[f":(literal){f}" for f in literal_files],
+    ]
+    try:
+        r = run_git(grep_cmd, timeout=timeout if timeout is not None else _git_grep_timeout())
+    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        logger.info("_git_grep_counts: %s", type(exc).__name__)
+        return None
+    if r.returncode == 1:
+        return {}
+    if r.returncode != 0:
+        logger.info("_git_grep_counts: rc=%d", r.returncode)
+        return None
+    out: dict[str, int] = {}
+    for line in (r.stdout or "").splitlines():
+        rel, sep, count = line.rpartition(":")
+        if not sep:
+            continue
+        try:
+            out[rel] = int(count)
+        except ValueError:
+            continue
+    return out
 
 
 def _git_grep(
@@ -2607,10 +2862,23 @@ def _extract_code_usages(
                 if query_canon:
                     out.append((query_canon + g2, g3 or None, "query", lineno))
                     continue
-                # BUILD keeps the pre-1.28 case-sensitive extraction contract.  Public
-                # lookup canonicalization is intentionally case-insensitive, but widening
-                # persisted code usages requires its own builder-version migration.
-                en_ref = canonicalize_type_ref(f"{g1}.{g2}", fold_case=False)
+                # v16 (Задача 10): `fold_case=False` СНЯТ — сборка приведена к той же
+                # канонизации, что публичный поиск (регистронезависимой с v1.28).
+                # Миграция оплачена бампом BUILDER_VERSION.
+                #
+                # РОСТА ПОЛНОТЫ релиз НЕ заявляет: замер на выборке 3000 файлов
+                # боевой конфигурации дал НОЛЬ новых строк — английская ветка
+                # `_CODE_QUERY_COLLECTIONS` уже регистронезависима (`g1.lower()`) и
+                # срабатывает РАНЬШЕ, перехватывая каждое строчное английское имя
+                # коллекции. Изменение закрывает расхождение КОНТРАКТОВ, а не
+                # наблюдаемый дефект.
+                #
+                # Известная граница (пре-существующая, шум не фильтруется): тот же
+                # регистронезависимый вход означает, что в таблицу попадает
+                # JavaScript из строковых литералов — `Document.getElementById`,
+                # `Document.body`. Масштаб 71 строка из 457 863 (0.02 %), и
+                # неточный фильтр выбросил бы настоящие ссылки.
+                en_ref = canonicalize_type_ref(f"{g1}.{g2}")
                 if en_ref:
                     out.append((en_ref, None, "ref_type", lineno))
     return out
@@ -2922,6 +3190,138 @@ def _parse_configuration_meta(base_path: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Level-2 metadata collection (ES, SJ, FO)
 # ---------------------------------------------------------------------------
+# Категории-владельцы макетов (CF-раскладка ``<Категория>/<Объект>/Templates/<Имя>.xml``).
+# Перечислять их поимённо не нужно: описатель макета опознаётся ПО ПУТИ, а не по
+# списку категорий, — иначе новая категория молча потеряла бы свои макеты.
+_TEMPLATE_OWNER_DEPTH = 4  # Категория / Объект / Templates / Имя.xml
+
+
+def _owner_ref_for(category: str, object_name: str) -> str:
+    """Каноническая ссылка владельца: ``Documents`` + ``Заказ`` → ``Document.Заказ``.
+
+    Через карту категорий, а НЕ через ``canonicalize_type_ref``: тот знает только
+    ЕДИНСТВЕННЫЕ формы (``Document.X``) и на ``Documents.X`` возвращает пустую
+    строку, то есть построение ссылки молча ушло бы в некононический фолбэк, а
+    ``declared_register_records.document_ref`` уже хранит ``Document.X``.
+    """
+    return f"{_CATEGORY_TO_REF_HEAD.get(category, category)}.{object_name}"
+
+
+def _collect_templates(base: Path, read: Callable[[Path], str]) -> list[tuple]:
+    """Макеты конфигурации: ``(owner_ref, name, synonym, template_type, file)``.
+
+    ТРИ раскладки, а не две:
+
+    * CF, макет объекта — отдельный описатель ``<Владелец>/Templates/<Имя>.xml``
+      (на боевой конфигурации 15 190 файлов, разбор ~2.3 с);
+    * CF/EDT, ОБЩИЙ макет — ``CommonTemplates/<Имя>.xml`` либо
+      ``CommonTemplates/<Имя>/<Имя>.mdo`` с корнем ``mdclass:CommonTemplate``
+      и БЕЗ вложенного блока ``<templates>``; ``owner_ref`` у таких строк пуст —
+      владельца у общего макета нет;
+    * EDT, макет объекта — повторяющийся блок ``<templates>`` внутри ``.mdo``
+      владельца.
+
+    Тип НЕ выводится из расширения файла полезной нагрузки (``Template.mxlx`` /
+    ``Template.txt``), хотя догадка напрашивается: ``file_paths`` индексирует
+    только ``.bsl`` и ``.mdo``, а наборы триггеров инкрементального обновления
+    знают ``.xml``/``.mdo``/``.form``/``.rights`` — замена расширения полезной
+    нагрузки не попала бы ни в один из них, и таблица протухла бы молча. Читая тип
+    из описателя/``.mdo``, мы инвалидируемся тем же триггером, что и все остальные
+    метаданные объекта.
+    """
+    from rlm_tools_bsl.bsl_xml_parsers import parse_metadata_xml, parse_template_descriptor
+
+    rows: list[tuple] = []
+
+    # 1. CF-описатели макетов объектов: <Категория>/<Объект>/Templates/<Имя>.xml
+    for fp in sorted(base.glob("*/*/Templates/*.xml")):
+        if not fp.is_file():
+            continue
+        parts = fp.relative_to(base).parts
+        if len(parts) != _TEMPLATE_OWNER_DEPTH:
+            continue
+        content = read(fp)
+        if not content:
+            continue
+        parsed = parse_template_descriptor(content)
+        if not parsed:
+            continue
+        owner_ref = _owner_ref_for(parts[0], parts[1])
+        rows.append(
+            (
+                owner_ref,
+                parsed["name"],
+                parsed.get("synonym") or "",
+                parsed.get("template_type") or "",
+                fp.relative_to(base).as_posix(),
+            )
+        )
+
+    # 2. Общие макеты: CF-файл рядом либо EDT-каталог с .mdo
+    common_dir = base / "CommonTemplates"
+    if common_dir.is_dir():
+        for entry in sorted(common_dir.iterdir()):
+            fp = None
+            if entry.is_file() and entry.suffix.lower() == ".xml":
+                fp = entry
+            elif entry.is_dir():
+                candidate = entry / f"{entry.name}.mdo"
+                if candidate.is_file():
+                    fp = candidate
+            if fp is None:
+                continue
+            content = read(fp)
+            if not content:
+                continue
+            parsed = parse_template_descriptor(content)
+            if not parsed:
+                continue
+            rows.append(
+                (
+                    "",
+                    parsed["name"],
+                    parsed.get("synonym") or "",
+                    parsed.get("template_type") or "",
+                    fp.relative_to(base).as_posix(),
+                )
+            )
+
+    # 3. EDT: блоки <templates> внутри .mdo владельца. Подстрочный префильтр по
+    # СЫРОМУ тексту — надмножественный тест, ложных отрицаний дать не может:
+    # блок, объявляющий макет, буквально содержит эту подстроку.
+    for fp in sorted(base.glob("*/*/*.mdo")):
+        if not fp.is_file() or fp.parent.name != fp.stem:
+            continue
+        parts = fp.relative_to(base).parts
+        if parts[0] == "CommonTemplates":
+            continue
+        content = read(fp)
+        if not content or "<templates" not in content:
+            continue
+        try:
+            parsed = parse_metadata_xml(content)
+        except Exception:
+            continue
+        if not parsed:
+            continue
+        owner_ref = _owner_ref_for(parts[0], parts[1])
+        rel = fp.relative_to(base).as_posix()
+        for tmpl in parsed.get("templates") or []:
+            if not isinstance(tmpl, dict) or not tmpl.get("name"):
+                continue
+            rows.append(
+                (
+                    owner_ref,
+                    tmpl["name"],
+                    tmpl.get("synonym") or "",
+                    tmpl.get("template_type") or "",
+                    rel,
+                )
+            )
+
+    return rows
+
+
 def _collect_metadata_tables(
     base_path: str,
     *,
@@ -2938,6 +3338,9 @@ def _collect_metadata_tables(
     collect_defined_types: bool = True,
     collect_pvh_types: bool = True,
     collect_metadata_refs_categories: set[str] | None = None,
+    collect_common_modules: bool = True,
+    collect_constants: bool = True,
+    collect_templates: bool = True,
 ) -> dict[str, list[tuple]]:
     """Scan and parse metadata XMLs selectively.
 
@@ -2963,6 +3366,8 @@ def _collect_metadata_tables(
         parse_enum_xml,
         parse_event_subscription_xml,
         parse_exchange_plan_content,
+        parse_common_module_props,
+        parse_constant_xml,
         parse_functional_option_xml,
         parse_http_service_xml,
         parse_metadata_xml,
@@ -2990,6 +3395,13 @@ def _collect_metadata_tables(
         "exchange_plan_content": [],
         "defined_types": [],
         "characteristic_types": [],
+        # v16 — объявленный состав конфигурации
+        "declared_register_records": [],
+        "role_flags": [],
+        "role_exclusions": [],
+        "common_module_props": [],
+        "constants": [],
+        "templates": [],
     }
 
     # Active set of source_categories for metadata_references rows.
@@ -3064,6 +3476,7 @@ def _collect_metadata_tables(
         handler_module = parts[0].replace("CommonModule.", "") if len(parts) > 1 else ""
         handler_procedure = parts[-1] if parts else ""
         source_types = parsed.get("source_types") or []
+        source_type_sets = parsed.get("source_type_sets") or []
         rel = fp.relative_to(base).as_posix()
         result["event_subscriptions"].append(
             (
@@ -3075,6 +3488,7 @@ def _collect_metadata_tables(
                 json.dumps(source_types, ensure_ascii=False),
                 len(source_types),
                 rel,
+                json.dumps(source_type_sets, ensure_ascii=False),
             )
         )
         # Emit metadata_references for each source type
@@ -3177,6 +3591,63 @@ def _collect_metadata_tables(
                             None,
                         )
                     )
+
+    # --- v16: свойства общих модулей ---
+    # Раскладка «объект в своём подкаталоге» (EDT) и «файл рядом» (CF) —
+    # одна и та же у CommonModules и Constants, поэтому обход общий.
+    def _iter_flat_objects(category: str):
+        """(имя объекта, путь к описателю) для CF-sibling и EDT-каталожной раскладок."""
+        cat_dir = base / category
+        if not cat_dir.is_dir():
+            return
+        for entry in sorted(cat_dir.iterdir()):
+            if entry.is_file() and entry.suffix.lower() == ".xml":
+                yield entry.stem, entry
+            elif entry.is_dir():
+                mdo = entry / f"{entry.name}.mdo"
+                if mdo.is_file():
+                    yield entry.name, mdo
+                    continue
+                # CF-раскладка с подкаталогом: CommonModules/<Имя>/Ext/Module.bsl
+                # описателя не несёт — sibling-XML уже отдан веткой выше.
+
+    for obj_name, fp in _iter_flat_objects("CommonModules") if collect_common_modules else []:
+        content = _read(fp)
+        if not content:
+            continue
+        parsed = parse_common_module_props(content)
+        if not parsed or not parsed.get("name"):
+            continue
+        rel = fp.relative_to(base).as_posix()
+        result["common_module_props"].append(
+            (
+                parsed["name"],
+                1 if parsed["global_"] else 0,
+                1 if parsed["server"] else 0,
+                1 if parsed["server_call"] else 0,
+                1 if parsed["privileged"] else 0,
+                1 if parsed["external_connection"] else 0,
+                1 if parsed["client_managed"] else 0,
+                1 if parsed["client_ordinary"] else 0,
+                parsed.get("return_values_reuse") or "",
+                rel,
+            )
+        )
+
+    # --- v16: константы (имя, синоним, ТИП ЗНАЧЕНИЯ) ---
+    for obj_name, fp in _iter_flat_objects("Constants") if collect_constants else []:
+        content = _read(fp)
+        if not content:
+            continue
+        parsed = parse_constant_xml(content)
+        if not parsed or not parsed.get("name"):
+            continue
+        rel = fp.relative_to(base).as_posix()
+        result["constants"].append((parsed["name"], parsed.get("synonym") or "", parsed.get("value_type") or "", rel))
+
+    # --- v16: макеты (три раскладки, а не две) ---
+    if collect_templates:
+        result["templates"].extend(_collect_templates(base, _read))
 
     # Enums
     for fp in _glob_xml("Enums") if collect_enums else []:
@@ -3347,6 +3818,15 @@ def _collect_metadata_tables(
                 content_lines=content.splitlines(),
             )
 
+            # v16 (Задача 7): ОБЪЯВЛЕННЫЙ состав движений документа. Отдельная
+            # таблица — класть строки в register_movements нельзя: это молча
+            # изменило бы каждый существующий счётчик (erp_mechanisms /
+            # manager_tables / adapted) и ответ find_register_writers.
+            if category == "Documents":
+                doc_ref = f"Document.{obj_name}"
+                for reg_ref in parsed.get("register_records") or []:
+                    result["declared_register_records"].append((doc_ref, reg_ref, rel))
+
             for attr in parsed.get("attributes", []):
                 result["object_attributes"].append(
                     (
@@ -3404,6 +3884,55 @@ def _collect_metadata_tables(
                             rel,
                         )
                     )
+
+    # --- v16 (Задача 9): based_on для категорий ВНЕ _ATTR_CATEGORIES ---
+    # Проверка на боевом индексе: строк `based_on` с source_category='BusinessProcesses'
+    # было НОЛЬ, хотя в исходнике бизнес-процесс `Задание` объявляет 267 оснований,
+    # включая Document.РеализацияТоваровУслуг. Без этого цикла сверка `declared` для
+    # таких кандидатов невозможна, и они обязаны получать None.
+    # Гейт ровно ОДИН — `_ref_allowed`, то есть `collect_metadata_refs_categories`.
+    # Второго гейта по `collect_attrs_categories` здесь быть НЕ МОЖЕТ, и это не
+    # стилистика: на selective-обновлении `attrs_cats` считается как
+    # `changed ∩ (_ATTR_CATEGORIES | _PREDEFINED_CATEGORIES)`, а ни одна из ЧЕТЫРЁХ
+    # категорий `BusinessProcesses` / `Tasks` / `ChartsOfCalculationTypes` /
+    # `ExchangePlans` в эти списки не входит по построению. Сбор пропускался бы
+    # всегда, а `_insert_metadata_tables_selective` БЕЗУСЛОВНО делает
+    # `DELETE FROM metadata_references WHERE source_category IN (triggered)` — то есть
+    # обычный инкрементальный `update` после правки бизнес-процесса СНОСИЛ бы его
+    # строки `based_on` и не восстанавливал до полной пересборки, а `index info`
+    # отрапортовал бы успех. Ровно тот класс отказа, который этот цикл и заводился
+    # чинить (см. точечный путь в `_refresh_object`).
+    for category in _BASED_ON_EXTRA_CATEGORIES:
+        if not _ref_allowed(category):
+            continue
+        cat_dir = base / category
+        if not cat_dir.is_dir():
+            continue
+        for obj_dir in sorted(cat_dir.iterdir()):
+            if not obj_dir.is_dir():
+                continue
+            xml_path = _find_metadata_xml(obj_dir, category)
+            if xml_path is None:
+                continue
+            content = _read(xml_path)
+            if not content:
+                continue
+            try:
+                parsed = parse_metadata_xml(content)
+            except Exception:
+                continue
+            if not parsed:
+                continue
+            based_on_refs = [r for r in parsed.get("references", []) if r.get("ref_kind") == "based_on"]
+            if not based_on_refs:
+                continue
+            _emit_refs(
+                based_on_refs,
+                obj_dir.name,
+                category,
+                xml_path.relative_to(base).as_posix(),
+                content_lines=content.splitlines(),
+            )
 
     # --- Level-11: Predefined items (ПВХ, справочники, планы счетов) ---
     _active_predef_cats = (
@@ -3741,6 +4270,62 @@ def _collect_metadata_tables(
     return result
 
 
+# v16: INSERT новых таблиц объявленного состава — ЕДИНЫЙ источник на все пути
+# вставки (полная сборка, полный скан update, selective git fast path).
+_V16_TABLE_INSERT_SQL: dict[str, str] = {
+    "declared_register_records": (
+        "INSERT INTO declared_register_records (document_ref, register_ref, file) VALUES (?, ?, ?)"
+    ),
+    "common_module_props": (
+        "INSERT INTO common_module_props (module_name, global_, server, server_call, privileged, "
+        "external_connection, client_managed, client_ordinary, return_values_reuse, file) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ),
+    "constants": "INSERT INTO constants (name, synonym, value_type, file) VALUES (?, ?, ?, ?)",
+    "templates": ("INSERT INTO templates (owner_ref, name, synonym, template_type, file) VALUES (?, ?, ?, ?, ?)"),
+}
+
+# Категория, изменение которой обязано перечитать таблицу целиком.
+# `templates` в карту НЕ входит: макет принадлежит ЛЮБОЙ категории-владельцу, и
+# привязать его к одной нельзя — правило инвалидации у него своё (см.
+# `_v16_template_trigger`).
+# Имя флага в запросе агента → КОЛОНКА. Белый список: значение уезжает в SQL
+# как имя колонки, и строить его из пользовательского ввода нельзя.
+_COMMON_MODULE_FLAG_COLUMNS: dict[str, str] = {
+    "global": "global_",
+    "global_": "global_",
+    "server": "server",
+    "server_call": "server_call",
+    "servercall": "server_call",
+    "privileged": "privileged",
+    "external_connection": "external_connection",
+    "externalconnection": "external_connection",
+    "client_managed": "client_managed",
+    "clientmanagedapplication": "client_managed",
+    "client_ordinary": "client_ordinary",
+    "clientordinaryapplication": "client_ordinary",
+}
+
+_V16_TABLE_CATEGORY_MAP: dict[str, str] = {
+    "common_module_props": "CommonModules",
+    "constants": "Constants",
+}
+
+
+def _insert_v16_tables(conn: sqlite3.Connection, tables: dict[str, list[tuple]], only: set[str] | None = None) -> None:
+    """DELETE+INSERT новых таблиц v16. ``only=None`` — все четыре."""
+    for table, sql in _V16_TABLE_INSERT_SQL.items():
+        if only is not None and table not in only:
+            continue
+        try:
+            conn.execute(f"DELETE FROM {table}")  # noqa: S608
+        except sqlite3.OperationalError:
+            continue
+        rows = tables.get(table)
+        if rows:
+            conn.executemany(sql, rows)
+
+
 def _insert_metadata_tables(conn: sqlite3.Connection, tables: dict[str, list[tuple]]) -> None:
     """Insert Level-2 metadata into the database."""
     # Clear existing data
@@ -3755,8 +4340,9 @@ def _insert_metadata_tables(conn: sqlite3.Connection, tables: dict[str, list[tup
     if tables["event_subscriptions"]:
         conn.executemany(
             "INSERT INTO event_subscriptions "
-            "(name, synonym, event, handler_module, handler_procedure, source_types, source_count, file) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(name, synonym, event, handler_module, handler_procedure, source_types, source_count, file, "
+            "source_type_sets) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             tables["event_subscriptions"],
         )
 
@@ -3869,6 +4455,9 @@ def _insert_metadata_tables(conn: sqlite3.Connection, tables: dict[str, list[tup
             tables["characteristic_types"],
         )
 
+    # v16: объявленный состав конфигурации
+    _insert_v16_tables(conn, tables)
+
 
 def _insert_metadata_tables_selective(
     conn: sqlite3.Connection,
@@ -3898,8 +4487,9 @@ def _insert_metadata_tables_selective(
     _TABLE_INSERT_SQL: dict[str, str] = {
         "event_subscriptions": (
             "INSERT INTO event_subscriptions "
-            "(name, synonym, event, handler_module, handler_procedure, source_types, source_count, file) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "(name, synonym, event, handler_module, handler_procedure, source_types, source_count, file, "
+            "source_type_sets) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ),
         "scheduled_jobs": (
             "INSERT INTO scheduled_jobs "
@@ -3930,6 +4520,19 @@ def _insert_metadata_tables_selective(
         rows = tables.get(table_name)
         if rows:
             conn.executemany(_TABLE_INSERT_SQL[table_name], rows)
+
+    # v16: CommonModules / Constants — своя категория у каждой таблицы.
+    _v16_refresh = {t for t, cat in _V16_TABLE_CATEGORY_MAP.items() if cat in changed_categories}
+    # `declared_register_records` привязан к Documents; `templates` — к ЛЮБОЙ
+    # категории-владельцу, поэтому перечитывается при изменении любой из них.
+    # Обе таблицы малы относительно полной сборки, а «обновить не ту строку или
+    # ни одной» дороже лишнего перечитывания.
+    if "Documents" in changed_categories:
+        _v16_refresh.add("declared_register_records")
+    if changed_categories:
+        _v16_refresh.add("templates")
+    if _v16_refresh:
+        _insert_v16_tables(conn, tables, only=_v16_refresh)
 
     # Category-aware tables: DELETE by category
     for cat in changed_categories:
@@ -4760,6 +5363,69 @@ def _emit_object_command_refs(
         )
 
 
+def _insert_templates_for_object(
+    conn: sqlite3.Connection,
+    base_path: str,
+    owner_ref: str,
+    category: str,
+    object_name: str,
+    parsed: dict,
+    rel_path: str,
+) -> None:
+    """Макеты ОДНОГО объекта на точечном пути — обе раскладки.
+
+    CF: описатель лежит ОТДЕЛЬНЫМ файлом ``<Категория>/<Объект>/Templates/<Имя>.xml``,
+    поэтому привязка к владельцу идёт ПО ПУТИ — иначе правка описателя обновила бы
+    не ту строку или ни одной. EDT: блоки ``<templates>`` уже разобраны из ``.mdo``
+    владельца, второго чтения нет.
+    """
+    from rlm_tools_bsl.bsl_xml_parsers import parse_template_descriptor
+
+    rows: list[tuple] = []
+    tmpl_dir = Path(base_path) / category / object_name / "Templates"
+    if tmpl_dir.is_dir():
+        for fp in sorted(tmpl_dir.iterdir()):
+            if not fp.is_file() or fp.suffix.lower() != ".xml":
+                continue
+            text = _read_text(fp)
+            if not text:
+                continue
+            parsed_tmpl = parse_template_descriptor(text)
+            if not parsed_tmpl:
+                continue
+            rows.append(
+                (
+                    owner_ref,
+                    parsed_tmpl["name"],
+                    parsed_tmpl.get("synonym") or "",
+                    parsed_tmpl.get("template_type") or "",
+                    fp.relative_to(Path(base_path)).as_posix(),
+                )
+            )
+    for tmpl in parsed.get("templates") or []:
+        if not isinstance(tmpl, dict) or not tmpl.get("name"):
+            continue
+        # CF-ветка parse_metadata_xml отдаёт только имя (synonym/template_type —
+        # None): полные строки уже собраны выше из описателей, поэтому пустышку
+        # дублировать нельзя.
+        if tmpl.get("template_type") is None:
+            continue
+        rows.append(
+            (
+                owner_ref,
+                tmpl["name"],
+                tmpl.get("synonym") or "",
+                tmpl.get("template_type") or "",
+                rel_path,
+            )
+        )
+    if rows:
+        try:
+            conn.executemany(_V16_TABLE_INSERT_SQL["templates"], rows)
+        except sqlite3.OperationalError:
+            pass
+
+
 def _insert_synonym_for_object(
     conn: sqlite3.Connection,
     category: str,
@@ -4811,6 +5477,20 @@ def _refresh_object(
             "DELETE FROM object_synonyms WHERE category=? AND object_name=?",
             (category, object_name),
         )
+    # v16: объявленный состав движений и макеты объекта. Точечный путь ОБЯЗАН
+    # знать про них: `Documents` входит в whitelist Group A, и без DELETE+INSERT
+    # здесь правка документа оставила бы обе таблицы протухшими, а `index info`
+    # отрапортовал бы успех.
+    _owner_ref_pw = _owner_ref_for(category, object_name)
+    if category == "Documents":
+        try:
+            conn.execute("DELETE FROM declared_register_records WHERE document_ref=?", (_owner_ref_pw,))
+        except sqlite3.OperationalError:
+            pass
+    try:
+        conn.execute("DELETE FROM templates WHERE owner_ref=?", (_owner_ref_pw,))
+    except sqlite3.OperationalError:
+        pass
 
     # 2. Найти файл объекта (EDT, CF sibling, CF Ext) — _find_metadata_xml сам
     #    закрывает CF sibling-only через obj_dir.parent (Path.parent работает
@@ -4862,9 +5542,8 @@ def _refresh_object(
     # 7-8. metadata_references — все DELETE/INSERT защищены has_metadata_references_table.
     if opt.get("has_metadata_references_table"):
         # Refs из parsed.references — bulk collector эмитит их ТОЛЬКО в loop по
-        # _ATTR_CATEGORIES ([bsl_index.py:1962-2055]). ChartsOfAccounts в этот loop
-        # не попадает (только в _PREDEFINED_CATEGORIES) — поэтому pointwise тоже
-        # не должен их эмитить, иначе CoA pointwise разойдётся с fresh full build.
+        # _ATTR_CATEGORIES, поэтому pointwise обязан эмитить РОВНО тот же набор:
+        # иначе точечный путь разошёлся бы со свежей полной сборкой.
         if category in _ATTR_CATEGORIES:
             _insert_references_for_object(
                 conn,
@@ -4874,8 +5553,33 @@ def _refresh_object(
                 rel,
                 content_lines=content.splitlines(),
             )
+        elif category in _BASED_ON_EXTRA_CATEGORIES:
+            # v16 (Задача 9): ИНВАРИАНТ ПЕРЕВЕРНУЛСЯ. Прежде ChartsOfAccounts
+            # НАМЕРЕННО не эмитил ссылок здесь — bulk-коллектор их тоже не эмитил.
+            # Теперь bulk эмитит для этих категорий `based_on`, а `_refresh_object`
+            # БЕЗУСЛОВНО делает DELETE FROM metadata_references по объекту, то есть
+            # без этой ветки правка плана счетов УДАЛИЛА бы его строки `based_on` и
+            # не восстановила, а `index info` отрапортовал бы успех.
+            _insert_references_for_object(
+                conn,
+                category,
+                object_name,
+                [r for r in parsed.get("references", []) if r.get("ref_kind") == "based_on"],
+                rel,
+                content_lines=content.splitlines(),
+            )
         if category in _CMD_HOST_CATS:
             _emit_object_command_refs(conn, base_path, category, object_name)
+
+    # 9. v16 — объявленный состав движений и макеты объекта.
+    if category == "Documents":
+        declared_rows = [(_owner_ref_pw, reg_ref, rel) for reg_ref in parsed.get("register_records") or []]
+        if declared_rows:
+            try:
+                conn.executemany(_V16_TABLE_INSERT_SQL["declared_register_records"], declared_rows)
+            except sqlite3.OperationalError:
+                pass
+    _insert_templates_for_object(conn, base_path, _owner_ref_pw, category, object_name, parsed, rel)
 
 
 # ---------------------------------------------------------------------------
@@ -5056,11 +5760,12 @@ def _insert_global_object(
         handler_module = parts[0].replace("CommonModule.", "") if len(parts) > 1 else ""
         handler_procedure = parts[-1] if parts else ""
         source_types = parsed.get("source_types") or []
+        source_type_sets = parsed.get("source_type_sets") or []
         conn.execute(
             "INSERT INTO event_subscriptions "
             "(name, synonym, event, handler_module, handler_procedure, "
-            "source_types, source_count, file) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "source_types, source_count, file, source_type_sets) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 parsed.get("name") or "",
                 parsed.get("synonym") or "",
@@ -5070,6 +5775,7 @@ def _insert_global_object(
                 json.dumps(source_types, ensure_ascii=False),
                 len(source_types),
                 rel_path,
+                json.dumps(source_type_sets, ensure_ascii=False),
             ),
         )
     elif category == "ScheduledJobs":
@@ -5511,6 +6217,42 @@ _MANAGER_RECORDSET_RE = re.compile(
     re.IGNORECASE,
 )  # РегистрыСведений.X.СоздатьНаборЗаписей( | InformationRegisters.X.CreateRecordSet(
 
+# ИНДЕКСАТОРНАЯ форма обращения к менеджеру регистров:
+#   РегистрыНакопления[МетаданныеРегистра.Имя].СоздатьНаборЗаписей()
+#   РегистрыСведений["ИмяРегистра"].СоздатьНаборЗаписей()
+#
+# Существующая `_MANAGER_RECORDSET_RE` дать её НЕ МОЖЕТ: она требует литеральное
+# имя между двумя точками, то есть КАЖДОЕ её совпадение статично по построению,
+# и «совпадение, имя которого не литерал» там недостижимо.
+#
+# Набор методов тот же, что у первой (СоздатьНаборЗаписей / CreateRecordSet):
+# `СоздатьМенеджерЗаписи` движением НАБОРА не является, а без метода
+# (`МенеджерРегистра = РегистрыНакопления[ИмяРегистра];`) движения нет вовсе.
+_MANAGER_INDEXER_RE = re.compile(
+    r"(?<![\w.])(?:\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u044b(?:\u0421\u0432\u0435\u0434\u0435\u043d\u0438\u0439|\u041d\u0430\u043a\u043e\u043f\u043b\u0435\u043d\u0438\u044f|\u0411\u0443\u0445\u0433\u0430\u043b\u0442\u0435\u0440\u0438\u0438|\u0420\u0430\u0441\u0447\u0435\u0442\u0430)"
+    r"|(?:Information|Accumulation|Accounting|Calculation)Registers)"
+    r"\s*\[([^\]\n]*)\]\s*\.\s*"
+    r"(?:\u0421\u043e\u0437\u0434\u0430\u0442\u044c\u041d\u0430\u0431\u043e\u0440\u0417\u0430\u043f\u0438\u0441\u0435\u0439|CreateRecordSet)\s*\(",
+    re.IGNORECASE,
+)
+
+# Потолок доказательства: фрагмент кода, а не тело метода.
+_EVIDENCE_MAX_CHARS = 200
+
+# Виды строк source='unresolved' (колонка register_movements.kind).
+MOVEMENT_KIND_DYNAMIC = "dynamic_name"
+MOVEMENT_KIND_UNKNOWN = "unknown_register"
+MOVEMENT_SOURCE_UNRESOLVED = "unresolved"
+
+
+def _evidence_of(text: str, start: int, end: int) -> str:
+    """Ограниченный по длине фрагмент ОРИГИНАЛА, доказавший строку."""
+    fragment = " ".join(text[start:end].split())
+    if len(fragment) > _EVIDENCE_MAX_CHARS:
+        fragment = fragment[: _EVIDENCE_MAX_CHARS - 1] + "\u2026"
+    return fragment
+
+
 _REGISTER_CATALOG_DIRS = (
     "InformationRegisters",
     "AccumulationRegisters",
@@ -5639,11 +6381,54 @@ class FileResult(NamedTuple):
     code_usages: tuple[tuple[str, str | None, str, int], ...] = ()
 
 
+_MOVEMENTS_INSERT_SQL = (
+    "INSERT INTO register_movements (document_name, register_name, source, file, evidence, kind) "
+    "VALUES (?, ?, ?, ?, ?, ?)"
+)
+
+
+def _movement_rows_for_insert(results, known_registers: frozenset[str]) -> tuple[list[tuple], int]:
+    """Строки ``register_movements`` из результатов разбора файлов.
+
+    ЕДИНАЯ точка на все три маршрута вставки (полная сборка и обе ветки update):
+    правило «литерал не из каталога регистров движением не становится» обязано
+    звучать одинаково везде, иначе индекс разойдётся сам с собой.
+
+    v16: отбракованный литерал больше НЕ исчезает молча — он возвращается строкой
+    ``source='unresolved'`` с ``kind='unknown_register'``. ``register_name`` у таких
+    строк ПУСТ намеренно: ``find_register_writers`` ищет документы по
+    ``register_movements.register_name``, и литерал там заставил бы его отвечать
+    документами по несуществующему регистру, то есть менял бы его контракт мимо
+    задачи. Сам литерал виден человеку в ``evidence`` и в поиске не участвует.
+    """
+    rows: list[tuple] = []
+    dropped = 0
+    for r in results:
+        if not r.movements or not r.info.object_name:
+            continue
+        for reg_name, source, file_path_str, evidence, kind in r.movements:
+            if source == "manager_code" and reg_name.lower() not in known_registers:
+                dropped += 1
+                rows.append(
+                    (
+                        r.info.object_name,
+                        "",
+                        MOVEMENT_SOURCE_UNRESOLVED,
+                        file_path_str,
+                        evidence,
+                        MOVEMENT_KIND_UNKNOWN,
+                    )
+                )
+                continue
+            rows.append((r.info.object_name, reg_name, source, file_path_str, evidence, kind))
+    return rows, dropped
+
+
 def _extract_movements(
     content: str,
     info: BslFileInfo,
     rel_path: str,
-) -> list[tuple[str, str, str]]:
+) -> list[tuple[str, str, str, str, str | None]]:
     """Extract register movements from Document modules (in-band, no extra I/O).
 
     v1.33.0: ни один регекс больше не работает по СЫРОМУ тексту.
@@ -5660,10 +6445,13 @@ def _extract_movements(
     if info.module_type not in ("ObjectModule", "ManagerModule"):
         return []
 
-    results: list[tuple[str, str, str]] = []
+    results: list[tuple[str, str, str, str, str | None]] = []
     src_lines = content.splitlines()
     full = "\n".join(mask_comments_and_strings(src_lines))
     comments_only = "\n".join(mask_comments_and_strings(src_lines, keep_string_content=True))
+
+    def _row(reg: str, source: str, match, kind: str | None = None):
+        return (reg, source, rel_path, _evidence_of(content, match.start(), match.end()), kind)
 
     if info.module_type == "ObjectModule":
         for m in _MOVEMENTS_RE.finditer(full):
@@ -5672,12 +6460,12 @@ def _extract_movements(
             # but a paren-less Движения.Записать would still capture — drop stop-set names.
             if reg.lower() in _MOVEMENT_METHOD_NOISE:
                 continue
-            results.append((reg, "code", rel_path))
+            results.append(_row(reg, "code", m))
     elif info.module_type == "ManagerModule":
         for m in _ERP_MECHANISM_RE.finditer(comments_only):
-            results.append((m.group(1), "erp_mechanism", rel_path))
+            results.append(_row(m.group(1), "erp_mechanism", m))
         for m in _MANAGER_TABLE_RE.finditer(full):
-            results.append((m.group(1), "manager_table", rel_path))
+            results.append(_row(m.group(1), "manager_table", m))
         # ИЗВЕСТНАЯ ГРАНИЦА (не регресс v1.33.0): `_ADAPTED_PROC_RE` ищет границы функции
         # по `comments_only`, где литералы целы, поэтому строка `"КонецФункции"` ВНУТРИ
         # литерала обрывает блок раньше и следующие `ИмяРегистра = "X"` теряются. В v14
@@ -5687,11 +6475,30 @@ def _extract_movements(
         adapted_match = _ADAPTED_PROC_RE.search(comments_only)
         if adapted_match:
             for m in _ADAPTED_REG_RE.finditer(adapted_match.group(1)):
-                results.append((m.group(1), "adapted", rel_path))
+                # Смещения этого matcher'а считаны ВНУТРИ group(1), а не по всему
+                # тексту, поэтому доказательством служит сам литерал.
+                results.append((m.group(1), "adapted", rel_path, _evidence_of(m.group(0), 0, len(m.group(0))), None))
         # Имя регистра берётся из КОДА, поэтому маска ``full``. Отбраковка по каталогу
         # регистров идёт при ВСТАВКЕ: per-file экстрактор каталога не видит.
         for m in _MANAGER_RECORDSET_RE.finditer(full):
-            results.append((m.group(1), "manager_code", rel_path))
+            results.append(_row(m.group(1), "manager_code", m))
+        # v16: ИНДЕКСАТОРНАЯ форма. Совпадение ищется по ``full`` (это доказывает,
+        # что перед нами настоящий код, а не текст в комментарии), а СОДЕРЖИМОЕ
+        # скобок берётся по ТЕМ ЖЕ смещениям из ``comments_only``: маска по
+        # построению СОХРАНЯЕТ ДЛИНУ, поэтому смещения применимы к обеим строкам, а
+        # `comments_only` гасит только комментарии и литерал оставляет целым.
+        # Вторая маска уже посчитана выше — второго прохода не появляется.
+        for m in _MANAGER_INDEXER_RE.finditer(full):
+            masked_key = (m.group(1) or "").strip()
+            if len(masked_key) >= 2 and masked_key[0] == masked_key[-1] and masked_key[0] in ('"', "'"):
+                # Статический индексатор: имя известно, строка идёт обычным
+                # manager_code и проходит штатную сверку с каталогом регистров.
+                raw_key = comments_only[m.start(1) : m.end(1)].strip()
+                literal = raw_key[1:-1].strip() if len(raw_key) >= 2 else ""
+                if literal:
+                    results.append(_row(literal, "manager_code", m))
+                    continue
+            results.append(_row("", MOVEMENT_SOURCE_UNRESOLVED, m, MOVEMENT_KIND_DYNAMIC))
 
     return results
 
@@ -5812,14 +6619,46 @@ def _role_rights_to_references(
     return out
 
 
-def _collect_role_rights(base_path: str) -> list[tuple[str, str, str, str]]:
-    """Collect role rights from all Roles directories.
+class _RoleData(NamedTuple):
+    """Итог одного прохода по файлам прав — три таблицы из ОДНОГО чтения.
 
-    Returns list of (role_name, object_name, right_name, file_path).
+    Заводить второй проход ради флага нельзя: на боевой конфигурации это 2159
+    файлов общим весом 242 МБ (самый крупный — 26 МБ).
     """
 
+    rights: list[tuple[str, str, str, str]]
+    flags: list[tuple[str, int, str]]
+    exclusions: list[tuple[str, str, str, str]]
+
+
+def _insert_role_flags(conn: sqlite3.Connection, data: "_RoleData") -> None:
+    """Перезалить role_flags / role_exclusions из свежего прохода по файлам прав.
+
+    Одна точка на ВСЕ три маршрута (build и обе ветки update): разъехавшись, они
+    дали бы индекс, где флаг роли протух, а `index info` отрапортовал успех.
+    """
+    for table in ("role_flags", "role_exclusions"):
+        try:
+            conn.execute(f"DELETE FROM {table}")  # noqa: S608
+        except sqlite3.OperationalError:
+            return
+    if data.flags:
+        conn.executemany(
+            "INSERT INTO role_flags (role_name, set_for_new_objects, file) VALUES (?, ?, ?)",
+            data.flags,
+        )
+    if data.exclusions:
+        conn.executemany(
+            "INSERT INTO role_exclusions (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
+            data.exclusions,
+        )
+
+
+def _collect_role_data(base_path: str) -> _RoleData:
+    """Права, флаг ``setForNewObjects`` и исключения — за один проход по файлам прав."""
+    from rlm_tools_bsl.bsl_xml_parsers import parse_rights_meta
+
     base = Path(base_path)
-    all_results: list[tuple[str, str, str, str]] = []
 
     # Find all rights files
     rights_files: list[tuple[str, Path]] = []
@@ -5834,26 +6673,51 @@ def _collect_role_rights(base_path: str) -> list[tuple[str, str, str, str]]:
         role_name = f.parent.name
         rights_files.append((role_name, f))
 
-    def _process_rights_file(
-        item: tuple[str, Path],
-    ) -> list[tuple[str, str, str, str]]:
+    def _process_rights_file(item: tuple[str, Path]) -> _RoleData:
         role_name, f = item
         try:
             content = f.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
-            return []
+            return _RoleData([], [], [])
         rel = f.relative_to(base).as_posix()
-        return _parse_role_rights_for_index(content, role_name, rel)
+        rights = _parse_role_rights_for_index(content, role_name, rel)
+        meta = parse_rights_meta(content)
+        flagged = bool(meta.get("set_for_new_objects"))
+        flags = [(role_name, 1 if flagged else 0, rel)]
+        exclusions: list[tuple[str, str, str, str]] = []
+        # Исключения хранятся ТОЛЬКО у флагованных ролей: у обычной роли запись с
+        # false означает просто «право не выдано», и таких на боевой конфигурации
+        # сотни тысяч — таблица выросла бы на порядок без единого потребителя.
+        if flagged:
+            for entry in meta.get("exclusions") or []:
+                for right in entry.get("rights") or []:
+                    exclusions.append((role_name, entry["object"], right, rel))
+        return _RoleData(rights, flags, exclusions)
 
+    all_rights: list[tuple[str, str, str, str]] = []
+    all_flags: list[tuple[str, int, str]] = []
+    all_exclusions: list[tuple[str, str, str, str]] = []
+    batches: list[_RoleData] = []
     if len(rights_files) > 1:
         workers = min(os.cpu_count() or 4, 8)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for batch in pool.map(_process_rights_file, rights_files):
-                all_results.extend(batch)
+            batches = list(pool.map(_process_rights_file, rights_files))
     elif rights_files:
-        all_results.extend(_process_rights_file(rights_files[0]))
+        batches = [_process_rights_file(rights_files[0])]
+    for batch in batches:
+        all_rights.extend(batch.rights)
+        all_flags.extend(batch.flags)
+        all_exclusions.extend(batch.exclusions)
 
-    return all_results
+    return _RoleData(all_rights, all_flags, all_exclusions)
+
+
+def _collect_role_rights(base_path: str) -> list[tuple[str, str, str, str]]:
+    """Collect role rights from all Roles directories.
+
+    Returns list of (role_name, object_name, right_name, file_path).
+    """
+    return _collect_role_data(base_path).rights
 
 
 # ---------------------------------------------------------------------------
@@ -6882,20 +7746,9 @@ class IndexBuilder:
         # из ManagerModule статически неоднозначно, и без сверки в таблицу попали бы
         # имена полей набора записей.
         known_registers = _known_register_names(base)
-        all_movements: list[tuple[str, str, str, str]] = []
-        dropped_manager = 0
-        for r in results:
-            if r.movements and r.info.object_name:
-                for reg_name, source, file_path_str in r.movements:
-                    if source == "manager_code" and reg_name.lower() not in known_registers:
-                        dropped_manager += 1
-                        continue
-                    all_movements.append((r.info.object_name, reg_name, source, file_path_str))
+        all_movements, dropped_manager = _movement_rows_for_insert(results, known_registers)
         if all_movements:
-            conn.executemany(
-                "INSERT INTO register_movements (document_name, register_name, source, file) VALUES (?, ?, ?, ?)",
-                all_movements,
-            )
+            conn.executemany(_MOVEMENTS_INSERT_SQL, all_movements)
             conn.commit()
             logger.info(
                 "Register movements: %d entries (manager_code rows dropped by register catalog: %d)",
@@ -6904,7 +7757,11 @@ class IndexBuilder:
             )
 
         # Level-3: role rights (parallel regex parsing)
-        role_rights = _collect_role_rights(base_path)
+        # v16: флаг setForNewObjects и исключения берутся ТЕМ ЖЕ проходом —
+        # второе чтение 242 МБ файлов прав ради флага недопустимо.
+        _role_data = _collect_role_data(base_path)
+        role_rights = _role_data.rights
+        _insert_role_flags(conn, _role_data)
         if role_rights:
             conn.executemany(
                 "INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
@@ -7154,9 +8011,16 @@ class IndexBuilder:
         # считает дельту по mtime/size и нетронутые модули не перечитывает, поэтому
         # без подъёма порога старые methods / register_movements / form_elements /
         # metadata_references пережили бы бамп вместе с призраками из комментариев.
+        #
+        # v16 — шесть новых таблиц и три новые колонки, ПРОИЗВОДНЫЕ ОТ XML. Порог
+        # обязан подняться до 16 именно поэтому: `update` перечитывает XML-таблицы
+        # только при изменении самих XML, а они не менялись — без полной пересборки
+        # event_subscriptions.source_type_sets, role_flags, common_module_props,
+        # constants, templates и declared_register_records остались бы пустыми, и
+        # `index info` отрапортовал бы успех.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 15:
+        if old_version < 16:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -7487,19 +8351,9 @@ class IndexBuilder:
                     # Каталог регистров считаем ОДИН раз перед циклом (тот же фильтр,
                     # что и на полной сборке — иначе инкремент вернул бы мусорные имена).
                     known_registers = _known_register_names(base)
-                    new_movements: list[tuple[str, str, str, str]] = []
-                    for r in results:
-                        if r.movements and r.info.object_name:
-                            for reg_name, source, fpath in r.movements:
-                                if source == "manager_code" and reg_name.lower() not in known_registers:
-                                    continue
-                                new_movements.append((r.info.object_name, reg_name, source, fpath))
+                    new_movements, _dropped = _movement_rows_for_insert(results, known_registers)
                     if new_movements:
-                        conn.executemany(
-                            "INSERT INTO register_movements "
-                            "(document_name, register_name, source, file) VALUES (?, ?, ?, ?)",
-                            new_movements,
-                        )
+                        conn.executemany(_MOVEMENTS_INSERT_SQL, new_movements)
 
                 # Update meta
                 new_paths_hash = _paths_hash(sorted(disk_files.keys()))
@@ -7542,7 +8396,8 @@ class IndexBuilder:
                 "CREATE TABLE IF NOT EXISTS event_subscriptions ("
                 "id INTEGER PRIMARY KEY, name TEXT NOT NULL, synonym TEXT, "
                 "event TEXT, handler_module TEXT, handler_procedure TEXT, "
-                "source_types TEXT, source_count INTEGER, file TEXT);\n"
+                "source_types TEXT, source_count INTEGER, file TEXT, "
+                "source_type_sets TEXT);\n"
                 "CREATE TABLE IF NOT EXISTS scheduled_jobs ("
                 "id INTEGER PRIMARY KEY, name TEXT NOT NULL, synonym TEXT, "
                 "method_name TEXT, handler_module TEXT, handler_procedure TEXT, "
@@ -7671,7 +8526,9 @@ class IndexBuilder:
             "CREATE INDEX IF NOT EXISTS idx_rr_object ON role_rights(object_name COLLATE NOCASE);\n"
         )
         conn.execute("DELETE FROM role_rights")
-        role_rights = _collect_role_rights(base_path)
+        _role_data = _collect_role_data(base_path)
+        role_rights = _role_data.rights
+        _insert_role_flags(conn, _role_data)
         if role_rights:
             conn.executemany(
                 "INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
@@ -8012,19 +8869,9 @@ class IndexBuilder:
                             pass
                     # Каталог регистров считаем ОДИН раз перед циклом (см. полную сборку).
                     known_registers = _known_register_names(base)
-                    new_movements: list[tuple[str, str, str, str]] = []
-                    for r in results:
-                        if r.movements and r.info.object_name:
-                            for reg_name, source, fpath in r.movements:
-                                if source == "manager_code" and reg_name.lower() not in known_registers:
-                                    continue
-                                new_movements.append((r.info.object_name, reg_name, source, fpath))
+                    new_movements, _dropped = _movement_rows_for_insert(results, known_registers)
                     if new_movements:
-                        conn.executemany(
-                            "INSERT INTO register_movements "
-                            "(document_name, register_name, source, file) VALUES (?, ?, ?, ?)",
-                            new_movements,
-                        )
+                        conn.executemany(_MOVEMENTS_INSERT_SQL, new_movements)
 
         # --- Update bsl_count, paths_hash, built_at ---
         stored_count_row = conn.execute("SELECT value FROM index_meta WHERE key = 'bsl_count'").fetchone()
@@ -8145,6 +8992,11 @@ class IndexBuilder:
                     collect_defined_types="DefinedTypes" in fallback_categories,
                     collect_pvh_types="ChartsOfCharacteristicTypes" in fallback_categories,
                     collect_metadata_refs_categories=ref_cats,
+                    # v16: собираем ровно то, что будет вставлено ниже
+                    # (_insert_metadata_tables_selective считает то же условие).
+                    collect_common_modules="CommonModules" in fallback_categories,
+                    collect_constants="Constants" in fallback_categories,
+                    collect_templates=bool(fallback_categories),
                 )
                 _insert_metadata_tables_selective(conn, md_tables, fallback_categories)
 
@@ -8188,7 +9040,9 @@ class IndexBuilder:
                 conn.execute("DELETE FROM role_rights")
             except sqlite3.OperationalError:
                 pass
-            role_rights = _collect_role_rights(base_path)
+            _role_data = _collect_role_data(base_path)
+            role_rights = _role_data.rights
+            _insert_role_flags(conn, _role_data)
             if role_rights:
                 conn.executemany(
                     "INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
@@ -8958,6 +9812,13 @@ def _zero_stats() -> dict:
         "defined_types": 0,
         "characteristic_types": 0,
         "metadata_code_usages": 0,
+        # v16: объявленный состав конфигурации
+        "declared_register_records": 0,
+        "role_flags": 0,
+        "role_exclusions": 0,
+        "common_module_props": 0,
+        "constants": 0,
+        "templates": 0,
         "git_head_commit": None,
         "git_accelerated": False,
     }
@@ -9009,6 +9870,18 @@ class IndexReader:
         # the exact (resolved) call-graph mode on it — otherwise get_callers must
         # not touch callee_key at all (would raise "no such column").
         self._has_callee_key = self._probe_callee_key()
+        # v16 (v1.38.0): тот же приём однократной пробы — на v15-базе нет ни
+        # шести новых таблиц, ни трёх новых колонок. Без гейта новый SELECT дал
+        # бы sqlite3.OperationalError, который @_transient_safe деградирует в
+        # None, и ЦЕЛЫЙ домен (например, подписки) молча ушёл бы в живой
+        # XML-разбор ещё до пересборки. Проба читается ОДИН раз: срок жизни
+        # гейта — от открытия ридера до rlm_end. Сессия, пережившая
+        # `rlm_index update`, до конца жизни останется на старом наборе
+        # SELECT-ов, хотя база уже v16, — осознанный размен против чтения
+        # index_meta в каждом горячем маршруте; граница названа в HELPERS.md.
+        self._builder_version = self._probe_builder_version()
+        # Кеш раскрытия определяемых типов (см. _defined_type_members).
+        self._defined_type_cache: dict[str, list[str] | None] = {}
 
     def _probe_callee_key(self) -> bool:
         try:
@@ -9016,6 +9889,27 @@ class IndexReader:
             return any(c["name"] == "callee_key" for c in cols)
         except sqlite3.Error:
             return False
+
+    def _probe_builder_version(self) -> int:
+        try:
+            row = self._conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
+            return int(row["value"]) if row and row["value"] is not None else 0
+        except (sqlite3.Error, TypeError, ValueError):
+            return 0
+
+    @property
+    def builder_version(self) -> int:
+        """Поколение схемы, прочитанное ОДИН раз при открытии ридера.
+
+        Публично, потому что по нему гейтятся не только SELECT-ы внутри ридера,
+        но и read-time решения хелперов («канал недоступен» против «канал пуст»).
+        """
+        return self._builder_version
+
+    @property
+    def has_declared_composition(self) -> bool:
+        """v16-таблицы и колонки объявленного состава доступны."""
+        return self._builder_version >= 16
 
     @property
     def has_calls(self) -> bool:
@@ -9825,13 +10719,19 @@ class IndexReader:
     def get_register_movements(self, document_name: str) -> list[dict] | None:
         """Get register movements for a given document.
 
-        Returns list of {register_name, source, file} or None if table empty/missing.
+        Returns list of {register_name, source, file, evidence, kind} or None if
+        table empty/missing.
+
+        v16: ``evidence`` — ограниченный фрагмент кода, доказавший строку; ``kind``
+        заполнен ТОЛЬКО у ``source='unresolved'``. На индексе v15 обеих колонок
+        НЕТ, поэтому SELECT гейтится поколением, а оба поля приходят ``None``:
+        правило «строка из индекса несёт доказательство» было бы прямым
+        противоречием с решением обслуживать открытый v15 старым SELECT-ом.
         """
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    "SELECT DISTINCT register_name, source, file "
-                    "FROM register_movements WHERE document_name = ? COLLATE NOCASE",
+                    _MOVEMENTS_SELECT_SQL(self.has_declared_composition, "document_name"),
                     (document_name,),
                 ).fetchall()
             except sqlite3.OperationalError:
@@ -9853,7 +10753,13 @@ class IndexReader:
             # adapted come from quoted-name regexes and are trusted. Empty/missing table → None
             # is decided above, so an all-noise document returns [] (authoritative), never None.
             return [
-                {"register_name": r["register_name"], "source": r["source"], "file": r["file"]}
+                {
+                    "register_name": r["register_name"],
+                    "source": r["source"],
+                    "file": r["file"],
+                    "evidence": _row_opt(r, "evidence"),
+                    "kind": _row_opt(r, "kind"),
+                }
                 for r in rows
                 if not (r["source"] == "code" and (r["register_name"] or "").lower() in _MOVEMENT_METHOD_NOISE)
             ]
@@ -9867,7 +10773,8 @@ class IndexReader:
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    "SELECT document_name, source, file FROM register_movements WHERE register_name = ? COLLATE NOCASE",
+                    "SELECT document_name, source, file FROM register_movements "
+                    "WHERE register_name = ? COLLATE NOCASE AND source <> 'unresolved'",
                     (register_name,),
                 ).fetchall()
             except sqlite3.OperationalError:
@@ -10496,6 +11403,21 @@ class IndexReader:
                 except sqlite3.Error:
                     stats[table] = 0
 
+            # v16 (Задача 11 + Задачи 7/8): объявленный состав конфигурации
+            for table in (
+                "declared_register_records",
+                "role_flags",
+                "role_exclusions",
+                "common_module_props",
+                "constants",
+                "templates",
+            ):
+                try:
+                    row = self._conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()  # noqa: S608
+                    stats[table] = row["cnt"] if row else 0
+                except sqlite3.Error:
+                    stats[table] = 0
+
             # Git acceleration info
             meta_row = self._conn.execute("SELECT value FROM index_meta WHERE key = 'git_head_commit'").fetchone()
             stats["git_head_commit"] = meta_row["value"] if meta_row else None
@@ -10880,6 +11802,30 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    def _defined_type_members(self, name: str) -> list[str] | None:
+        """Состав определяемого типа каноническими ссылками; ``None`` — раскрыть нечем.
+
+        **INTERNAL, LOCKLESS: вызывающий ОБЯЗАН держать ``self._lock``.** Оба
+        вызывающих (``get_event_subscriptions`` и ``get_event_subscriptions_exact``)
+        передают этот метод классификатору ИЗ-ПОД своего ``with self._lock``, поэтому
+        внутри идёт ``_find_defined_type_locked``, а не публичный
+        ``find_defined_type``: тот берёт ТОТ ЖЕ ``threading.Lock`` (не ``RLock``), и
+        повторный захват вешал бы поток НАВСЕГДА. Тот же контракт и та же причина,
+        что у пары ``_resolve_target_key`` / ``resolve_target_identity``.
+
+        Кеш на время жизни ридера: раскрытие набора ``DefinedType.X`` спрашивается
+        по строке подписки, а подписок сотни — без кеша один запрос дал бы сотни
+        одинаковых SELECT-ов.
+        """
+        key = name.lower()
+        cached = self._defined_type_cache.get(key, _UNSET)
+        if cached is not _UNSET:
+            return cached  # type: ignore[return-value]
+        row = self._find_defined_type_locked(name)
+        members = row.get("types") if row else None
+        self._defined_type_cache[key] = members
+        return members
+
     @_transient_safe(lambda: None)
     def get_event_subscriptions(
         self,
@@ -10887,6 +11833,7 @@ class IndexReader:
         custom_only: bool = False,
         event_filter: list[str] | str | None = None,
         object_ref: str = "",
+        target_refs: tuple[str, ...] | list[str] | None = None,
     ) -> list[dict] | None:
         """Get event subscriptions from the index, optionally filtered.
 
@@ -10919,10 +11866,7 @@ class IndexReader:
                 # NB: НЕТ WHERE по событию (v1.28.0). Фильтр уехал в Python и применяется
                 # ПОСЛЕ классификации exact/partial — см. развёрнутый комментарий ниже.
                 # Таблица мала (сотни строк), полное чтение дешево.
-                rows = self._conn.execute(
-                    "SELECT name, synonym, event, handler_module, handler_procedure, "
-                    "source_types, source_count, file FROM event_subscriptions"
-                ).fetchall()
+                rows = self._conn.execute(_ES_SELECT_SQL(self.has_declared_composition)).fetchall()
             except sqlite3.OperationalError:
                 return None
 
@@ -10938,11 +11882,8 @@ class IndexReader:
             entries: list[tuple[dict, list[str]]] = []
 
             for r in rows:
-                source_types: list[str] = []
-                try:
-                    source_types = json.loads(r["source_types"]) if r["source_types"] else []
-                except (ValueError, TypeError):
-                    pass
+                source_types = _json_list(r["source_types"])
+                source_type_sets = _row_type_sets(r)
 
                 handler_module = r["handler_module"] or ""
                 handler_procedure = r["handler_procedure"] or ""
@@ -10954,6 +11895,7 @@ class IndexReader:
                             "name": r["name"],
                             "synonym": r["synonym"] or "",
                             "source_types": source_types,
+                            "source_type_sets": source_type_sets,
                             "source_count": r["source_count"] or 0,
                             "event": r["event"] or "",
                             "handler": handler,
@@ -10972,7 +11914,9 @@ class IndexReader:
                 return [s for s in items if any(ev in (s.get("event") or "").lower() for ev in evs)]
 
             if not name_lower and not ref_lower:
-                compact = [{k: v for k, v in e.items() if k != "source_types"} for e, _ in entries]
+                compact = [
+                    {k: v for k, v in e.items() if k not in ("source_types", "source_type_sets")} for e, _ in entries
+                ]
                 return _apply_event_filter(compact)
 
             # v1.28.0: EXACT-С-ФОЛБЭКОМ.
@@ -10987,26 +11931,48 @@ class IndexReader:
             # точная подписка без нужного события выпадает ДО классификации, exact-набор
             # пустеет и partial-фолбэк воскрешает омонима.
             # Universal (пустой source_types) — catch-all, включается ВСЕГДА.
+            #
+            # v16: между exact и partial встала группа ``set`` — подписка на НАБОР
+            # типов. Она НЕ универсальна (типизирована, просто набором), включается
+            # ВСЕГДА, как universal, и наличием exact не подавляется: набор — это
+            # доказанное типовое совпадение, а не нечёткое. ``universal`` теперь
+            # означает ДЕЙСТВИТЕЛЬНО пустой источник — ни типов, ни наборов.
+            refs = list(target_refs or ()) or ([object_ref] if object_ref else [])
             exact_hits: list[dict] = []
+            set_hits: list[dict] = []
             partial_hits: list[dict] = []
             universal: list[dict] = []
 
-            for entry, source_types in entries:
-                if not source_types:
-                    universal.append({**entry, "scope": "universal"})
+            for entry, _types in entries:
+                verdict = classify_subscription_row(
+                    entry["source_types"],
+                    entry["source_type_sets"],
+                    object_name=object_name,
+                    object_ref=object_ref,
+                    target_refs=refs,
+                    defined_type_members=self._defined_type_members,
+                )
+                if verdict is None:
                     continue
-                if ref_lower:
-                    if any(t and canonicalize_type_ref(t).lower() == ref_lower for t in source_types):
-                        exact_hits.append({**entry, "scope": "exact"})
-                    continue  # типизированный вход — без partial-фолбэка
-                names = [(t.split(".", 1)[1] if "." in t else t).lower() for t in source_types if t]
-                if any(n == name_lower for n in names):
-                    exact_hits.append({**entry, "scope": "exact"})
-                elif any(name_lower in n for n in names):
-                    partial_hits.append({**entry, "scope": "partial"})
+                scope, matched_via, matched_types, matched_sets = verdict
+                row = {
+                    **entry,
+                    "scope": scope,
+                    "matched_via": matched_via,
+                    "matched_types": matched_types,
+                    "matched_sets": matched_sets,
+                }
+                if scope == "universal":
+                    universal.append(row)
+                elif scope == "exact":
+                    exact_hits.append(row)
+                elif scope == "set":
+                    set_hits.append(row)
+                else:
+                    partial_hits.append(row)
 
             matched = exact_hits if exact_hits else partial_hits
-            return _apply_event_filter(matched + universal)
+            return _apply_event_filter(matched + set_hits + universal)
 
     @_transient_safe(lambda: None)
     def get_event_subscriptions_exact(self, object_ref: str) -> list[dict] | None:
@@ -11030,24 +11996,17 @@ class IndexReader:
             universal, or ``None`` if the table is empty/missing. ``[]`` when present but
             nothing matches (and no universal subscriptions exist).
         """
-        ref_lower = object_ref.lower()
         with self._lock:
             try:
-                rows = self._conn.execute(
-                    "SELECT name, synonym, event, handler_module, handler_procedure, "
-                    "source_types, source_count, file FROM event_subscriptions"
-                ).fetchall()
+                rows = self._conn.execute(_ES_SELECT_SQL(self.has_declared_composition)).fetchall()
             except sqlite3.OperationalError:
                 return None
             if not rows:
                 return None
             result: list[dict] = []
             for r in rows:
-                source_types: list[str] = []
-                try:
-                    source_types = json.loads(r["source_types"]) if r["source_types"] else []
-                except (ValueError, TypeError):
-                    pass
+                source_types = _json_list(r["source_types"])
+                source_type_sets = _row_type_sets(r)
                 # #2 (v1.28.0): a subscription with EMPTY source_types is a *universal*
                 # catch-all — it fires for ANY source, so it applies to this object too.
                 # Silently dropping it (the old ``if not any(...)``) undercounted the
@@ -11055,9 +12014,23 @@ class IndexReader:
                 # catch-all subscriptions the count was off by a large factor).
                 # A NON-empty source_types still needs an EXACT canonical match (no
                 # substring re-introduction); ``scope`` marks the two apart for the caller.
-                if source_types and not any(t and canonicalize_type_ref(t).lower() == ref_lower for t in source_types):
+                #
+                # v16: это ТРЕТИЙ матчер подписок, и он обязан классифицировать так же,
+                # как два остальных, — иначе сводка секции `roles`/`subscriptions`
+                # профиля разойдётся с `find_event_subscriptions` на одних и тех же
+                # строках. Классификатор один на всех.
+                verdict = classify_subscription_row(
+                    source_types,
+                    source_type_sets,
+                    object_ref=object_ref,
+                    target_refs=(object_ref,),
+                    defined_type_members=self._defined_type_members,
+                )
+                if verdict is None or verdict[0] == "partial":
+                    # partial здесь недостижим (вход типизированный), но отбрасываем
+                    # явно: контракт метода — «ТОЧНО этот объект либо universal».
                     continue
-                scope = "exact" if source_types else "universal"
+                scope, matched_via, matched_types, matched_sets = verdict
                 handler_module = r["handler_module"] or ""
                 handler_procedure = r["handler_procedure"] or ""
                 handler = f"CommonModule.{handler_module}.{handler_procedure}" if handler_module else handler_procedure
@@ -11066,18 +12039,23 @@ class IndexReader:
                         "name": r["name"],
                         "synonym": r["synonym"] or "",
                         "source_types": source_types,
+                        "source_type_sets": source_type_sets,
                         "source_count": r["source_count"] or 0,
                         "event": r["event"] or "",
                         "handler": handler,
                         "handler_module": handler_module,
                         "handler_procedure": handler_procedure,
                         "scope": scope,
+                        "matched_via": matched_via,
+                        "matched_types": matched_types,
+                        "matched_sets": matched_sets,
                         "file": r["file"] or "",
                     }
                 )
-            # Stable: exact before universal so a limited preview always shows the
-            # explicit-source subscriptions first (universal is the long catch-all tail).
-            result.sort(key=lambda d: 0 if d["scope"] == "exact" else 1)
+            # Stable: exact before set before universal so a limited preview always shows
+            # the explicit-source subscriptions first (universal is the long catch-all tail).
+            _order = {"exact": 0, "set": 1, "universal": 2}
+            result.sort(key=lambda d: _order.get(d["scope"], 3))
             return result
 
     @_transient_safe(lambda: None)
@@ -11386,7 +12364,10 @@ class IndexReader:
             features = {r["key"]: str(r["value"]) == "1" for r in feature_rows}
             # Таблица физически есть и при build_metadata=False, но пустой ответ
             # тогда не является обратным поиском. None переводит helper в честную
-            # live-ветку с reverse_lookup_supported=False.
+            # live-ветку. С v1.38.0 она отвечает и на ОБРАТНЫЙ вопрос
+            # (`match='content'` через подстрочный префильтр), поэтому флаг
+            # `reverse_lookup_supported` на ней True, а неполноту прохода называет
+            # `_meta.live_scan.truncated`.
             #
             # Дефолты РАЗНЫЕ намеренно. `has_metadata` при отсутствии ключа —
             # False, как у `get_build_capabilities`: безопасная сторона здесь —
@@ -12094,25 +13075,231 @@ class IndexReader:
             by_kind = {r["usage_kind"]: r["cnt"] for r in rows}
             return {"total": sum(by_kind.values()), "by_kind": by_kind}
 
+    # ── v16: объявленный состав конфигурации ──────────────────────────────
+    #
+    # Все методы гейтятся ``has_declared_composition`` (однократная проба
+    # поколения при открытии ридера): на v15-базе таблиц нет, и безусловный
+    # SELECT дал бы OperationalError, который ``@_transient_safe`` деградирует в
+    # ``None`` — неотличимо от «таблица пуста». ``None`` здесь означает РОВНО
+    # «канал недоступен», а ``[]`` — «доступен и пуст».
+
     @_transient_safe(lambda: None)
-    def find_defined_type(self, name: str) -> dict | None:
-        """Look up a DefinedType by name. Returns {name, types: list[str], path}
-        or None if table missing or not found."""
+    def get_declared_register_records(self, document_ref: str) -> list[str] | None:
+        """Объявленный состав движений документа — канонические ссылки регистров."""
+        if not self.has_declared_composition:
+            return None
         with self._lock:
-            try:
-                row = self._conn.execute(
-                    "SELECT name, type_refs_json, path FROM defined_types WHERE py_lower(name) = py_lower(?)",
-                    (name,),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                return None
+            rows = self._conn.execute(
+                "SELECT register_ref FROM declared_register_records "
+                "WHERE py_lower(document_ref) = py_lower(?) ORDER BY register_ref",
+                (document_ref,),
+            ).fetchall()
+            return [r["register_ref"] for r in rows]
+
+    @_transient_safe(lambda: None)
+    def get_common_module_props(self, name: str = "", flag: str = "") -> list[dict] | None:
+        """Свойства общих модулей.
+
+        ``flag`` — имя булева свойства (``privileged``, ``global``, ``server_call``…)
+        ЛИБО значение ``ReturnValuesReuse`` (``DuringSession``, ``DuringRequest``,
+        ``DontUse``). Редкие значения и есть самые полезные: на боевой конфигурации
+        привилегированных модулей 2, глобальных 40 при 3918 общих модулях.
+        """
+        if not self.has_declared_composition:
+            return None
+        sql = (
+            "SELECT module_name, global_, server, server_call, privileged, external_connection, "
+            "client_managed, client_ordinary, return_values_reuse, file FROM common_module_props"
+        )
+        where: list[str] = []
+        params: list = []
+        if name:
+            where.append("py_lower(module_name) LIKE py_lower(?)")
+            params.append(f"%{name}%")
+        flag_key = (flag or "").strip()
+        if flag_key:
+            column = _COMMON_MODULE_FLAG_COLUMNS.get(flag_key.lower())
+            if column:
+                where.append(f"{column} = 1")  # noqa: S608 — колонка из белого списка
+            else:
+                where.append("py_lower(return_values_reuse) = py_lower(?)")
+                params.append(flag_key)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY module_name"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+            return [
+                {
+                    "module_name": r["module_name"],
+                    "global": bool(r["global_"]),
+                    "server": bool(r["server"]),
+                    "server_call": bool(r["server_call"]),
+                    "privileged": bool(r["privileged"]),
+                    "external_connection": bool(r["external_connection"]),
+                    "client_managed": bool(r["client_managed"]),
+                    "client_ordinary": bool(r["client_ordinary"]),
+                    "return_values_reuse": r["return_values_reuse"] or "",
+                    "file": r["file"],
+                }
+                for r in rows
+            ]
+
+    @_transient_safe(lambda: None)
+    def get_constant(self, name: str) -> dict | None:
+        """Константа по ТОЧНОМУ имени: ``{name, synonym, value_type, file}``."""
+        if not self.has_declared_composition:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT name, synonym, value_type, file FROM constants WHERE py_lower(name) = py_lower(?)",
+                (name,),
+            ).fetchone()
             if row is None:
                 return None
-            try:
-                types = json.loads(row["type_refs_json"])
-            except (ValueError, TypeError):
-                types = []
-            return {"name": row["name"], "types": types, "path": row["path"]}
+            return {
+                "name": row["name"],
+                "synonym": row["synonym"] or "",
+                "value_type": row["value_type"] or "",
+                "file": row["file"],
+            }
+
+    @_transient_safe(lambda: None)
+    def get_templates(
+        self,
+        owner: str = "",
+        name: str = "",
+        template_type: str = "",
+        limit: int = 200,
+    ) -> dict | None:
+        """Страница макетов И полное число совпавших — ОДНИМ запросом.
+
+        Returns:
+            ``{"templates": [{owner_ref, name, synonym, template_type, file}],
+            "total": int}`` либо ``None`` (индекс старше v16 / таблицы нет).
+            ``owner_ref`` пуст у ОБЩИХ макетов.
+
+        **Почему один запрос, а не выдача плюс отдельный COUNT.** Два независимых
+        SELECT-а — это два снимка: между ними пересборка на месте (а она в проекте
+        объявлена безопасной под ОТКРЫТЫМ read-only ридером) успевает сменить
+        поколение таблицы, и страница поехала бы из одного, а ``total`` — из
+        другого. Хуже того, отдельный счёт может штатно деградировать в ``None``
+        через ``@_transient_safe``, и вызывающему остаётся либо выдумать ``total``,
+        либо объявить неполноту — то есть у ответа появляется состояние, которого
+        он не обязан иметь.
+
+        ``COUNT(*) OVER ()`` вычисляется ДО ``LIMIT`` (оконные функции — последний
+        шаг перед ним), поэтому одна выборка даёт и страницу, и ПОЛНЫЙ счёт из
+        ОДНОГО снимка. Требует SQLite ≥ 3.25 (2018); проект требует Python ≥ 3.10
+        (2021), так что порог заведомо ниже любого поддерживаемого окружения.
+        """
+        if not self.has_declared_composition:
+            return None
+        where: list[str] = []
+        params: list = []
+        if owner:
+            where.append("py_lower(owner_ref) = py_lower(?)")
+            params.append(owner)
+        if name:
+            where.append("py_lower(name) LIKE py_lower(?)")
+            params.append(f"%{name}%")
+        if template_type:
+            where.append("py_lower(template_type) = py_lower(?)")
+            params.append(template_type)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        sql = (
+            "SELECT owner_ref, name, synonym, template_type, file, COUNT(*) OVER () AS match_total "
+            f"FROM templates{clause} ORDER BY owner_ref, name LIMIT ?"  # noqa: S608 — clause из литералов
+        )
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+            return {
+                "templates": [
+                    {
+                        "owner_ref": r["owner_ref"] or "",
+                        "name": r["name"],
+                        "synonym": r["synonym"] or "",
+                        "template_type": r["template_type"] or "",
+                        "file": r["file"],
+                    }
+                    for r in rows
+                ],
+                # Пустая выборка — честный ноль: строк нет, значит и совпадений нет.
+                "total": int(rows[0]["match_total"]) if rows else 0,
+            }
+
+    @_transient_safe(lambda: None)
+    def get_flagged_roles(self) -> list[dict] | None:
+        """Роли с взведённым ``setForNewObjects``: ``[{role_name, file}]``."""
+        if not self.has_declared_composition:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role_name, file FROM role_flags WHERE set_for_new_objects = 1 ORDER BY role_name"
+            ).fetchall()
+            return [{"role_name": r["role_name"], "file": r["file"]} for r in rows]
+
+    @_transient_safe(lambda: None)
+    def get_role_exclusions(self, object_name: str = "", role_name: str = "") -> list[dict] | None:
+        """Исключения флагованных ролей. ``object_name`` сравнивается ТОЧНО."""
+        if not self.has_declared_composition:
+            return None
+        sql = "SELECT role_name, object_name, right_name, file FROM role_exclusions"
+        where: list[str] = []
+        params: list = []
+        if object_name:
+            where.append("py_lower(object_name) = py_lower(?)")
+            params.append(object_name)
+        if role_name:
+            where.append("py_lower(role_name) = py_lower(?)")
+            params.append(role_name)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY role_name, object_name, right_name"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+            return [
+                {
+                    "role_name": r["role_name"],
+                    "object_name": r["object_name"],
+                    "right_name": r["right_name"],
+                    "file": r["file"],
+                }
+                for r in rows
+            ]
+
+    def _find_defined_type_locked(self, name: str) -> dict | None:
+        """INTERNAL, LOCKLESS вариант ``find_defined_type``: caller ДЕРЖИТ ``self._lock``.
+
+        Выделен ради ``_defined_type_members``, который зовётся классификатором
+        подписок уже из-под ридерского lock: ``self._lock`` — плоский
+        ``threading.Lock``, не ``RLock``, и повторный захват = вечное зависание.
+        Внешний вызывающий обязан брать ПУБЛИЧНЫЙ ``find_defined_type``.
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT name, type_refs_json, path FROM defined_types WHERE py_lower(name) = py_lower(?)",
+                (name,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if row is None:
+            return None
+        try:
+            types = json.loads(row["type_refs_json"])
+        except (ValueError, TypeError):
+            types = []
+        return {"name": row["name"], "types": types, "path": row["path"]}
+
+    @_transient_safe(lambda: None)
+    def find_defined_type(self, name: str) -> dict | None:
+        """Public, LOCKED wrapper over ``_find_defined_type_locked``.
+
+        Returns {name, types: list[str], path} or None if table missing or not found.
+        """
+        with self._lock:
+            return self._find_defined_type_locked(name)
 
     def close(self) -> None:
         """Close the database connection."""

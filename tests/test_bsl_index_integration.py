@@ -323,8 +323,14 @@ class TestIndexReaderNewMethods:
         result = built_index.get_event_subscriptions("ТестовыйДокумент")
         assert result is not None
         assert len(result) >= 1
-        # Filtered result includes source_types
+        # Ридер по-прежнему отдаёт ПОЛНЫЙ source_types: усечение адресного ответа
+        # (v1.38.0, Задача 5) живёт на границе хелпера — одной точкой на обе ветки,
+        # иначе index и live разошлись бы формой строки.
         assert "source_types" in result[0]
+        # v1.38.0: строка называет, ПОЧЕМУ она подобрана.
+        assert result[0]["matched_via"] == "type"
+        assert result[0]["matched_types"]
+        assert result[0]["matched_sets"] == []
 
     def test_get_event_subscriptions_no_match(self, built_index):
         # Our subscription has specific source_types (DocumentObject.ТестовыйДокумент),

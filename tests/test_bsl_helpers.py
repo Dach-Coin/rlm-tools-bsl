@@ -1811,12 +1811,43 @@ def test_find_event_subscriptions_all():
 
 
 def test_find_event_subscriptions_filtered():
+    """v1.38.0: адресный вопрос НЕ тащит весь список источников.
+
+    Раньше строка ехала с полным ``source_types`` (на боевых до 1376 элементов),
+    и ответ обрезался по ``max_output_chars`` ДО измерительной строки. Теперь по
+    умолчанию едут только ``matched_types`` — типы, ИЗ-ЗА которых строка подобрана,
+    — плюс прежний ``source_count``; полный список отдаётся по явному флагу.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)
         result = bsl["find_event_subscriptions"]("АвансовыйОтчет")
         assert len(result) >= 1
-        # With filter, source_types should be included
-        assert "source_types" in result[0]
+        exact = [r for r in result if r["scope"] == "exact"]
+        assert exact, "точная подписка на документ обязана найтись"
+        row = exact[0]
+        assert "source_types" not in row
+        assert "source_type_sets" not in row
+        assert row["matched_types"], "не названы типы, из-за которых строка подобрана"
+        assert row["matched_via"] == "type"
+        assert row["source_count"] >= len(row["matched_types"])
+
+        full = bsl["find_event_subscriptions"]("АвансовыйОтчет", include_source_types=True)
+        full_exact = [r for r in full if r["scope"] == "exact"]
+        assert "source_types" in full_exact[0]
+        # Режется ТОЛЬКО сериализация: набор строк не изменился.
+        assert [r["name"] for r in full] == [r["name"] for r in result]
+
+
+def test_find_event_subscriptions_overview_is_unchanged():
+    """Безадресный вызов формы не менял: ни scope, ни source_types, ни наборов."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        result = bsl["find_event_subscriptions"]()
+        assert len(result) >= 1
+        for row in result:
+            assert "source_types" not in row
+            assert "source_type_sets" not in row
+            assert "scope" not in row
 
 
 def test_find_event_subscriptions_no_match():
@@ -2427,13 +2458,19 @@ def test_find_module_optional_filters(bsl_env):
     assert all(m["module_type"] == mt for m in filtered)
     # Case-insensitive.
     assert len(fm("МойМодуль", module_type=mt.upper())) == len(filtered)
-    # Nonexistent type → empty (no error).
-    assert fm("МойМодуль", module_type="НесуществующийТип") == []
+    # v1.38.0 (Задача 4): НЕСУЩЕСТВУЮЩЕЕ значение — НАЗВАННЫЙ отказ с перечнем
+    # допустимых, а не молчаливый ноль. Молчаливый ноль неотличим от честного
+    # «таких модулей нет», и агент делал из него ложный отрицательный вывод.
+    with pytest.raises(ValueError) as exc:
+        fm("МойМодуль", module_type="НесуществующийТип")
+    assert "ObjectModule" in str(exc.value)
 
     # Category filter likewise.
     by_cat = fm("МойМодуль", category=cat)
     assert by_cat and all(m["category"] == cat for m in by_cat)
-    assert fm("МойМодуль", category="НетТакойКатегории") == []
+    with pytest.raises(ValueError) as exc:
+        fm("МойМодуль", category="НетТакойКатегории")
+    assert "CommonModules" in str(exc.value)
 
     # Filter-only call WITHOUT a positional name must NOT raise (Codex finding):
     # find_module(module_type=...) is the exact agent guess. name is optional.
@@ -4088,15 +4125,19 @@ def test_profile_exact_ref_no_collision():
 
 
 def test_profile_subscriptions_summary_split_and_exact_first():
-    """#2 (v1.28.0): subscriptions.summary раскладывает exact/universal; exact-first
-    сортировка гарантирует, что явные подписки видны в items даже при малом limit."""
+    """#2 (v1.28.0): subscriptions.summary раскладывает exact/set/universal; exact-first
+    сортировка гарантирует, что явные подписки видны в items даже при малом limit.
+
+    v1.38.0: третий ключ `set` (подписка на НАБОР типов). Без него сумма
+    exact+universal перестала бы сходиться с `subscriptions` на конфигурации с
+    наборами, то есть сводка молча теряла бы часть собственных строк."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
         try:
             subs = bsl["get_object_profile"]("РеализацияТоваров")["sections"]["subscriptions"]
             assert subs["status"] == "ok"
             # summary раскладывает: 1 exact (ПодпискаРеализация) + 1 universal (ПодпискаUniversal).
-            assert subs["summary"] == {"subscriptions": 2, "exact": 1, "universal": 1}
+            assert subs["summary"] == {"subscriptions": 2, "exact": 1, "set": 0, "universal": 1}
             assert subs["total"] == 2
             # каждый item несёт scope.
             assert {i["scope"] for i in subs["items"]} == {"exact", "universal"}
@@ -4107,7 +4148,7 @@ def test_profile_subscriptions_summary_split_and_exact_first():
             assert subs1["items"][0]["name"] == "ПодпискаРеализация"
             assert subs1["items"][0]["scope"] == "exact"
             # но summary остаётся полным (счёт по всем rows, не по усечённым items).
-            assert subs1["summary"] == {"subscriptions": 2, "exact": 1, "universal": 1}
+            assert subs1["summary"] == {"subscriptions": 2, "exact": 1, "set": 0, "universal": 1}
         finally:
             if reader:
                 reader.close()
@@ -9476,7 +9517,14 @@ def test_oversized_first_delegate_cannot_bypass_the_serialized_page_cap():
     его имя нельзя: обрезанный receiver выглядел бы исполнимым, но адресовал бы уже
     другой объект. Поэтому oversized-строка целиком остаётся за границей первой
     страницы, а ``delegates_total``/``delegates_truncated`` честно это называют.
+
+    v1.38.0: литерал ``1200`` заменён ИМПОРТОМ вынесенной на уровень модуля
+    константы — дублирование литерала и было причиной, по которой гард протух при
+    подъёме потолка. Плюс явное утверждение, что oversized-строка всё ещё НЕ
+    помещается: без него тест молча стал бы вакуумным при следующем подъёме.
     """
+    from rlm_tools_bsl.bsl_helpers import _DELEGATES_PAGE_CHARS
+
     receiver = ".".join(f"ДлинныйПолучатель{i:03d}" for i in range(100))
     module = (
         "Процедура ОбработкаПроведения(Отказ, РежимПроведения)\n"
@@ -9488,10 +9536,61 @@ def test_oversized_first_delegate_cannot_bypass_the_serialized_page_cap():
         try:
             meta = bsl["find_register_movements"]("ТестДок")["_meta"]
             serialized = json.dumps(meta["delegates"], ensure_ascii=False, sort_keys=True, default=str)
-            assert len(serialized) <= 1200, len(serialized)
+            assert len(serialized) <= _DELEGATES_PAGE_CHARS, len(serialized)
             assert meta["delegates"] == [], meta["delegates"]
             assert meta["delegates_total"] >= 1, meta
             assert meta["delegates_truncated"] is True, meta
+        finally:
+            reader.close()
+
+    # Гард против ВАКУУМА: строка обязана оставаться НЕвместимой. Иначе тест
+    # продолжал бы проходить, ничего не проверяя.
+    oversized_row = [
+        {
+            "receiver": receiver,
+            "method": "ЗаписатьДвижения",
+            "kind": "unresolved",
+            "homonym_module": None,
+            "stale_homonym_module": None,
+            "platform_method_name": None,
+        }
+    ]
+    assert len(json.dumps(oversized_row, ensure_ascii=False, sort_keys=True, default=str)) > _DELEGATES_PAGE_CHARS, (
+        "oversized-строка стала помещаться в страницу — тест вакуумный, пересоберите фикстуру"
+    )
+
+
+def test_six_manager_module_delegates_with_erp_length_names_fit_the_page():
+    """v1.38.0 (Задача 1): счётный и символьный потолки СОГЛАСОВАНЫ.
+
+    До релиза первым всегда срабатывал символьный (1200), и заявленные «до шести»
+    делегатов были недостижимы в принципе: строка `manager_module` на реальных
+    ERP-именах сериализуется в ~281 символ вместе с `module_path`, то есть шесть
+    строк давали 1698 при потолке 1200 — помещалось ЧЕТЫРЕ.
+    """
+    from rlm_tools_bsl.bsl_helpers import _DELEGATES_PAGE_CHARS, _DELEGATES_PAGE_MAX
+
+    # Имена ERP-длины: «ОтражениеДокументовВРегламентированномУчетеСервер» и т.п.
+    modules = {f"ОтражениеДокументовВРегламентированномУчетеСервер{i}": "" for i in range(_DELEGATES_PAGE_MAX)}
+    calls = "\n".join(
+        f"    {name}.ОтразитьДокументВРегламентированномУчете{i}(ЭтотОбъект, Отказ);" for i, name in enumerate(modules)
+    )
+    body = f"Процедура ОбработкаПроведения(Отказ, РежимПроведения)\n{calls}\nКонецПроцедуры\n"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": body}, extra_common_modules=modules)
+        try:
+            meta = bsl["find_register_movements"]("ТестДок")["_meta"]
+            assert meta["delegates_total"] == _DELEGATES_PAGE_MAX, meta
+            assert len(meta["delegates"]) == _DELEGATES_PAGE_MAX, meta["delegates"]
+            assert meta["delegates_truncated"] is False, meta
+            # Гард против вакуума: на ПРЕЖНЕМ потолке (1200) эта же страница НЕ
+            # помещалась — иначе тест ничего не доказывал бы о подъёме.
+            serialized = json.dumps(meta["delegates"], ensure_ascii=False, sort_keys=True, default=str)
+            assert len(serialized) > 1200, (
+                f"страница сериализуется в {len(serialized)} символов — фикстура стала помещаться "
+                "в прежний потолок, и тест больше не доказывает согласование потолков"
+            )
+            assert len(serialized) <= _DELEGATES_PAGE_CHARS, len(serialized)
         finally:
             reader.close()
 

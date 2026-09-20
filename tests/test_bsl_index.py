@@ -2636,7 +2636,12 @@ def test_manager_create_recordset_is_extracted():
         "    Наб.Записать();\n"
         "КонецПроцедуры\n"
     )
-    assert ("МойРегистр", "manager_code", "m.bsl") in rows
+    # v1.38.0: строка выросла до пятёрки (evidence + kind), поэтому сверяем
+    # первые три поля — прежний контракт извлечения — и отдельно доказательство.
+    hit = [r for r in rows if r[:3] == ("МойРегистр", "manager_code", "m.bsl")]
+    assert hit, rows
+    assert "СоздатьНаборЗаписей" in hit[0][3], "evidence обязан нести доказавший фрагмент"
+    assert hit[0][4] is None, "kind заполняется ТОЛЬКО у строк source='unresolved'"
 
 
 def test_manager_create_recordset_all_register_kinds():
@@ -2647,7 +2652,7 @@ def test_manager_create_recordset_all_register_kinds():
         ("РегистрыСведений", "Р4"),
     ):
         rows = _mgr(f"Н = {coll}.{reg}.СоздатьНаборЗаписей();\n")
-        assert (reg, "manager_code", "m.bsl") in rows, coll
+        assert any(r[:3] == (reg, "manager_code", "m.bsl") for r in rows), coll
 
 
 def test_manager_commented_create_recordset_is_not_extracted():
@@ -2705,5 +2710,9 @@ def test_manager_recordset_requires_left_boundary():
     assert not [r for r in _mgr("Н = МоиРегистрыСведений.Мой.СоздатьНаборЗаписей();\n") if r[1] == "manager_code"]
     assert not [r for r in _mgr("Н = Обертка.РегистрыСведений.Мой.СоздатьНаборЗаписей();\n") if r[1] == "manager_code"]
     # регресс-гард: законные формы по-прежнему находятся
-    assert ("Мой", "manager_code", "m.bsl") in _mgr("    Н = РегистрыСведений.Мой.СоздатьНаборЗаписей();\n")
-    assert ("Foo", "manager_code", "m.bsl") in _mgr("X = InformationRegisters.Foo.CreateRecordSet();\n")
+    assert any(
+        r[:3] == ("Мой", "manager_code", "m.bsl") for r in _mgr("    Н = РегистрыСведений.Мой.СоздатьНаборЗаписей();\n")
+    )
+    assert any(
+        r[:3] == ("Foo", "manager_code", "m.bsl") for r in _mgr("X = InformationRegisters.Foo.CreateRecordSet();\n")
+    )

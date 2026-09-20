@@ -427,10 +427,14 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
             search_paths = [target]
         elif _is_broad_directory(target):
             raise ValueError(
-                f"grep on '{path}' would scan too many files and timeout. "
-                "Use safe_grep(pattern, 'ModuleHint') or "
-                "find_module('name') to get specific file paths first, "
-                "then grep(pattern, 'path/to/specific/file.bsl')."
+                f"grep on '{path}' would scan too many files (больше {_BROAD_DIR_THRESHOLD}) and timeout. "
+                # Точное число файлов назвать нельзя: счётчик выходит досрочно на
+                # 5001-м по построению, а точный подсчёт означал бы полный обход на КАЖДОМ отказе.
+                "Вопрос «в скольких модулях конфигурации встречается X» решает "
+                "count_matches(pattern, file_types='bsl'): считает СЕРВЕР и отдаёт ЧИСЛА, "
+                "тела модулей в контекст не едут. "
+                "Для СТРОК в известном модуле: safe_grep(pattern, 'ModuleHint') либо "
+                "find_module('name') → grep(pattern, 'path/to/specific/file.bsl')."
             )
         else:
             explicit_file = False

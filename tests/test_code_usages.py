@@ -69,13 +69,36 @@ class TestExtractor:
         rows = _extract_code_usages(['Т = Тип("DocumentRef.Заказ");'])
         assert ("Document.Заказ", None, "ref_type", 1) in rows
 
-    def test_builder_extraction_keeps_pre_1_28_case_contract(self):
-        """Public canonicalization accepts case variants, persisted BUILD does not widen."""
+    def test_builder_extraction_is_case_symmetric_with_public_lookup(self):
+        """v1.38.0 (Задача 10): сборка канонизирует ТАК ЖЕ, как публичный поиск.
+
+        До релиза BUILD шёл с ``fold_case=False``, то есть множество входов у
+        сборщика и у публичной нормализации расходилось. Миграция оплачена бампом
+        ``BUILDER_VERSION`` 15 → 16.
+
+        Роста полноты релиз НЕ заявляет: на выборке 3000 файлов боевой
+        конфигурации складывание регистра дало НОЛЬ новых строк — английская ветка
+        коллекций уже регистронезависима и срабатывает раньше.
+        """
         assert canonicalize_type_ref("documentref.Заказ") == "Document.Заказ"
         exact = _extract_code_usages(['Т = Тип("DocumentRef.Заказ");'])
         lower = _extract_code_usages(['Т = Тип("documentref.Заказ");'])
         assert ("Document.Заказ", None, "ref_type", 1) in exact
-        assert ("Document.Заказ", None, "ref_type", 1) not in lower
+        assert ("Document.Заказ", None, "ref_type", 1) in lower
+        # Русская форма как была, так и осталась — её берёт отдельная карта.
+        ru = _extract_code_usages(['Т = Тип("ДокументСсылка.Заказ");'])
+        assert ("Document.Заказ", None, "ref_type", 1) in ru
+
+    def test_js_literal_still_yields_a_query_row_and_that_is_expected(self):
+        """ИЗВЕСТНАЯ ГРАНИЦА, закреплённая, чтобы её не приняли за регресс.
+
+        Регистронезависимый вход означает, что JavaScript из строковых литералов
+        попадает в ``metadata_code_usages`` как ``query``. Масштаб на боевой
+        конфигурации — 71 строка из 457 863 (0.02 %); фильтр стоил бы дороже, чем
+        даёт, а неточный выбросил бы настоящие ссылки.
+        """
+        rows = _extract_code_usages(["HTML = \"document.getElementById('x')\";"])
+        assert any(r[2] == "query" and r[0].startswith("Document.") for r in rows), rows
 
     def test_query_with_tabular_section_member(self):
         rows = _extract_code_usages(['Текст = "ИЗ Документ.ПриобретениеТоваровУслуг.Товары";'])

@@ -268,6 +268,156 @@ _CANONICAL_REF_HEADS = (
 _CANONICAL_REF_HEAD_BY_CASEFOLD = {head.casefold(): head for head in _CANONICAL_REF_HEADS}
 
 
+def _strip_cfg_prefix(raw: str) -> str:
+    """Снять служебный префикс ``cfg:`` с токена типа-источника подписки."""
+    s = (raw or "").strip()
+    return s[4:] if s.startswith("cfg:") else s
+
+
+def is_type_set_token(token: str) -> bool:
+    """Токен-источник подписки задаёт НАБОР типов, а не конкретный тип.
+
+    Два признака, и ОБА обязательны:
+
+    * токен без точки — платформенный набор (``DocumentObject``,
+      ``AccumulationRegisterRecordSet``, ``ConstantValueManager``);
+    * токен с головой ``DefinedType`` — определяемый тип. Он ТОЧЕЧНЫЙ, поэтому
+      правило «набор == токен без точки» потеряло бы на EDT все 90 боевых
+      источников вида ``DefinedType.X``: они остались бы в ``source_types`` и
+      продолжали бы молча исчезать из ответа.
+    """
+    s = (token or "").strip()
+    if not s:
+        return False
+    if "." not in s:
+        return True
+    return s.split(".", 1)[0].casefold() == "definedtype"
+
+
+def type_set_category(token: str) -> str:
+    """Категория, которую задаёт ПЛАТФОРМЕННЫЙ набор типов: ``DocumentObject`` → ``Document``.
+
+    Раскрытие идёт ТЕМ ЖЕ публичным канонизатором, которым пользуется матчер
+    подписок: ``canonicalize_type_ref(token + ".X")`` отдаёт категорию по уже
+    существующей карте ``_REF_CANONICAL_PREFIXES``. Правило «отбросить суффикс и
+    посмотреть в карту категорий» отвергнуто: оно завело бы ВТОРОЙ источник истины
+    рядом с существующим и на ``ConstantValueManager`` давало бы ``ConstantValue``,
+    которого нет ни в одной карте.
+
+    Пустая строка = токен вне карты. На двух боевых конфигурациях таких ровно три:
+    ``SequenceRecordSet``, ``RecalculationRecordSet``, ``DocumentJournalManager``.
+    """
+    canon = canonicalize_type_ref(f"{(token or '').strip()}.X")
+    if not canon.endswith(".X"):
+        return ""
+    head = canon[:-2]
+    return "" if head == "DefinedType" else head
+
+
+def match_type_sets(
+    source_type_sets,
+    target_refs,
+    defined_type_members=None,
+) -> tuple[list[str], list[str]]:
+    """Какие НАБОРЫ типов подписки покрывают спрошенный объект.
+
+    Args:
+        source_type_sets: токены наборов из ``event_subscriptions.source_type_sets``.
+        target_refs: канонические ссылки спрошенного объекта (``Document.X``).
+            Их может быть НЕСКОЛЬКО — у голого имени-омонима.
+        defined_type_members: ``name -> list[str] | None`` — состав определяемого
+            типа каноническими ссылками; ``None`` означает «раскрыть нечем».
+
+    Returns:
+        ``(matched, unresolved)``. ``unresolved`` — токены, по которым вопрос НЕ
+        закрыт (набора нет в карте, определяемый тип неизвестен либо категорию
+        спрошенного объекта разрешить не удалось). Молчание здесь хуже отказа:
+        сегодня такая строка либо ложно ``universal``, либо исчезает совсем.
+    """
+    matched: list[str] = []
+    unresolved: list[str] = []
+    refs_lower = {r.lower() for r in (target_refs or []) if r}
+    heads_lower = {r.split(".", 1)[0] for r in refs_lower if "." in r}
+    for token in source_type_sets or []:
+        t = (token or "").strip()
+        if not t:
+            continue
+        if not refs_lower:
+            unresolved.append(t)
+            continue
+        if "." in t and t.split(".", 1)[0].casefold() == "definedtype":
+            members = defined_type_members(t.split(".", 1)[1]) if defined_type_members else None
+            if members is None:
+                unresolved.append(t)
+            elif any((m or "").lower() in refs_lower for m in members):
+                matched.append(t)
+            continue
+        head = type_set_category(t)
+        if not head:
+            unresolved.append(t)
+        elif head.lower() in heads_lower:
+            matched.append(t)
+    return matched, unresolved
+
+
+def classify_subscription_row(
+    source_types,
+    source_type_sets,
+    *,
+    object_name: str = "",
+    object_ref: str = "",
+    target_refs=(),
+    defined_type_members=None,
+) -> tuple[str, str, list[str], list[str]] | None:
+    """Классификация ОДНОЙ строки подписки относительно спрошенного объекта.
+
+    ЕДИНСТВЕННЫЙ классификатор на всех четырёх потребителей подписок
+    (``find_event_subscriptions`` живьём, ``IndexReader.get_event_subscriptions``,
+    ``get_event_subscriptions_exact`` за секцией профиля и
+    ``find_references_to_object(kinds=['event_subscription_source'])``) — иначе они
+    разойдутся, как уже расходились ветки индекса и live.
+
+    Порядок: ``exact`` (по типу) → ``set`` → ``partial`` → ``universal``.
+
+    Returns:
+        ``(scope, matched_via, matched_types, matched_sets)`` либо ``None``, если
+        строка к объекту не относится. ``scope`` ∈ ``exact|set|partial|universal``,
+        ``matched_via`` ∈ ``type|set|set_unresolved|none``.
+    """
+    types = [t for t in (source_types or []) if t]
+    sets = [t for t in (source_type_sets or []) if t]
+    if not types and not sets:
+        return "universal", "none", [], []
+
+    name_lower = (object_name or "").lower()
+    ref_lower = (object_ref or "").lower()
+
+    exact_types: list[str] = []
+    partial_types: list[str] = []
+    if ref_lower:
+        exact_types = [t for t in types if canonicalize_type_ref(t).lower() == ref_lower]
+    elif name_lower:
+        for t in types:
+            n = (t.split(".", 1)[1] if "." in t else t).lower()
+            if n == name_lower:
+                exact_types.append(t)
+            elif name_lower in n:
+                partial_types.append(t)
+
+    matched_sets, unresolved_sets = match_type_sets(sets, target_refs, defined_type_members)
+
+    if exact_types:
+        return "exact", "type", exact_types, matched_sets
+    if matched_sets:
+        return "set", "set", [], matched_sets
+    if unresolved_sets:
+        # Набор не раскрыт — вопрос по строке НЕ закрыт, и молчать о ней нельзя.
+        return "set", "set_unresolved", [], unresolved_sets
+    if partial_types:
+        return "partial", "type", partial_types, []
+    return None
+
+
 def canonicalize_type_ref(type_str: str, *, fold_case: bool = True) -> str:
     """Convert 1C reference type form to canonical metadata reference.
 
@@ -512,6 +662,14 @@ def _build_ru_reftype_map() -> dict[str, str]:
 _CODE_MANAGER_COLLECTIONS: dict[str, str] = _build_manager_collection_map()
 _CODE_QUERY_COLLECTIONS: dict[str, str] = _build_query_collection_map()
 _RU_REFTYPE_TO_CANONICAL: dict[str, str] = _build_ru_reftype_map()
+
+# Категория-папка → голова канонической ссылки: ``Documents`` → ``Document``,
+# ``ChartsOfAccounts`` → ``ChartOfAccounts``. Производная от того же
+# ``_RU_META_FORMS``, поэтому второго источника истины не появляется, а правило
+# «отбросить хвостовую s» (оно неверно для ChartsOf*) не заводится вовсе.
+CATEGORY_TO_REF_HEAD: dict[str, str] = {
+    forms["en_plural"]: prefix.rstrip(".") for prefix, forms in _RU_META_FORMS.items() if forms.get("en_plural")
+}
 
 
 def _cf_parse_attributes(parent, ns: dict = _NS_CF) -> list[dict]:
@@ -768,6 +926,39 @@ def _parse_cf_xml(root) -> dict:
                             }
                         )
 
+        # Templates (v16): в XML ВЛАДЕЛЬЦА макет представлен ТОЛЬКО именем
+        # (<ChildObjects><Template><Properties><Name>), а синоним и тип лежат в
+        # отдельном описателе Templates/<Имя>.xml. Живой ответ описатели НЕ
+        # открывает (иначе это N файлов на вызов), поэтому synonym и
+        # template_type здесь None — форма строки та же, значения беднее, и эта
+        # асимметрия идёт от раскладки формата, а не от решения.
+        cf_templates: list[dict] = []
+        for tmpl_el in search_el.findall("md:Template", ns):
+            tmpl_props = tmpl_el.find("md:Properties", ns)
+            if tmpl_props is None:
+                continue
+            tmpl_name = _xml_find_text(tmpl_props, "md:Name", ns)
+            if tmpl_name:
+                cf_templates.append({"name": tmpl_name, "synonym": None, "template_type": None})
+        if cf_templates:
+            result["templates"] = cf_templates
+
+        # Document.RegisterRecords (v16) — ОБЪЯВЛЕННЫЙ состав движений.
+        # <RegisterRecords><xr:Item xsi:type="xr:MDObjectRef">AccumulationRegister.X</xr:Item>…</RegisterRecords>
+        # Это ОРТОГОНАЛЬНАЯ ось к выведенным из кода движениям, а не их исправление:
+        # на боевой Реализации выведено 35 регистров, объявлено 54, пересечение 16.
+        if meta_tag == "Document":
+            rr_el = props.find("md:RegisterRecords", ns)
+            if rr_el is not None:
+                declared: list[str] = []
+                for child in rr_el:
+                    if child.text:
+                        canon = canonicalize_type_ref(child.text.strip())
+                        if canon and canon not in declared:
+                            declared.append(canon)
+                if declared:
+                    result["register_records"] = declared
+
         # Document.Posting (Allow / Deny / UseSelectively).
         # CF stores it as <Posting>Allow</Posting> in Properties; check namespaced and bare tags.
         if meta_tag == "Document":
@@ -966,22 +1157,39 @@ def _parse_mdo_xml(root) -> dict:
                         }
                     )
 
-    # Forms, commands, templates — list names
+    # Forms, commands — list names
     forms = []
     commands = []
-    templates = []
     for ch in root:
         local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
         if local == "forms" and ch.text:
             forms.append(ch.text.strip())
         elif local == "commands" and ch.text:
             commands.append(ch.text.strip())
-        elif local == "templates" and ch.text:
-            templates.append(ch.text.strip())
     if forms:
         result["forms"] = forms
     if commands:
         result["commands"] = commands
+
+    # Templates (v16). `<templates>` в EDT — ВЛОЖЕННЫЙ блок с <name>/<synonym>/
+    # <templateType>, а не текстовый узел. Прежний `ch.text` давал пробел перед
+    # <name>, то есть ключ существовал и ВРАЛ: на боевом документе он равнялся
+    # `['', '']`. Форма строки — та же, что у CF-ветки: {name, synonym, template_type}.
+    templates = []
+    for ch in root:
+        local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
+        if local != "templates":
+            continue
+        t_name = _xml_direct_text(ch, "name")
+        if not t_name:
+            continue
+        templates.append(
+            {
+                "name": t_name,
+                "synonym": _mdo_find_synonym(ch),
+                "template_type": _xml_direct_text(ch, "templateType") or DEFAULT_TEMPLATE_TYPE,
+            }
+        )
     if templates:
         result["templates"] = templates
 
@@ -1044,6 +1252,19 @@ def _parse_mdo_xml(root) -> dict:
                                 "used_in_suffix": "Type",
                             }
                         )
+
+    # Document.registerRecords (v16) — ОБЪЯВЛЕННЫЙ состав движений.
+    # EDT: повторяющийся <registerRecords>AccumulationRegister.X</registerRecords>.
+    if meta_tag == "Document":
+        declared: list[str] = []
+        for ch in root:
+            local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
+            if local == "registerRecords" and ch.text:
+                canon = canonicalize_type_ref(ch.text.strip())
+                if canon and canon not in declared:
+                    declared.append(canon)
+        if declared:
+            result["register_records"] = declared
 
     # Document.posting (Allow / Deny / UseSelectively).
     # EDT хранит признак проводимости как:
@@ -1134,21 +1355,29 @@ def _parse_cf_event_subscription(xml_content: str) -> dict | None:
     handler = _xml_find_text(props, "md:Handler", ns)
 
     # Source types: <Source><v8:Type>cfg:DocumentObject.Name</v8:Type>...</Source>
+    # Наборы: <Source><v8:TypeSet>cfg:DocumentObject</v8:TypeSet></Source> — узел
+    # авторитетен сам по себе. Три боевые подписки несут ОБА узла сразу, поэтому
+    # перечень и набор ОБЪЕДИНЯЮТСЯ, а не выбирают друг друга.
     source_types: list[str] = []
+    source_type_sets: list[str] = []
     source_el = props.find("md:Source", ns)
     if source_el is not None:
         for type_el in source_el.findall("v8:Type", ns):
             if type_el.text:
-                raw = type_el.text.strip()
-                # Strip cfg: prefix
-                if raw.startswith("cfg:"):
-                    raw = raw[4:]
-                source_types.append(raw)
+                raw = _strip_cfg_prefix(type_el.text)
+                # Та же проверка ФОРМЫ токена, что у EDT: в боевом CF внутри
+                # <v8:Type> лежат бесточечные *Manager, и без неё они молча
+                # исчезали бы из ответа (матчер сравнивает часть после точки).
+                (source_type_sets if is_type_set_token(raw) else source_types).append(raw)
+        for set_el in source_el.findall("v8:TypeSet", ns):
+            if set_el.text:
+                source_type_sets.append(_strip_cfg_prefix(set_el.text))
 
     return {
         "name": name,
         "synonym": synonym,
         "source_types": source_types,
+        "source_type_sets": source_type_sets,
         "event": event,
         "handler": handler,
     }
@@ -1171,20 +1400,25 @@ def _parse_mdo_event_subscription(xml_content: str) -> dict | None:
     handler = _xml_direct_text(root, "handler")
 
     # Source types: <source><types>DocumentObject.Name</types>...</source>
+    # Отдельного узла под набор в EDT НЕТ: и перечень, и набор лежат в <types>,
+    # различает их ФОРМА токена (см. is_type_set_token).
     source_types: list[str] = []
+    source_type_sets: list[str] = []
     for ch in root:
         local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
         if local == "source":
             for t in ch:
                 t_local = t.tag.split("}")[-1] if "}" in t.tag else t.tag
                 if t_local == "types" and t.text:
-                    source_types.append(t.text.strip())
+                    raw = _strip_cfg_prefix(t.text)
+                    (source_type_sets if is_type_set_token(raw) else source_types).append(raw)
             break
 
     return {
         "name": name,
         "synonym": synonym,
         "source_types": source_types,
+        "source_type_sets": source_type_sets,
         "event": event,
         "handler": handler,
     }
@@ -2332,6 +2566,263 @@ def parse_rights_xml(xml_content: str, object_filter: str = "") -> list[dict]:
         break  # Found working namespace, stop trying
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# v16: свойства общих модулей, константы, макеты
+# ---------------------------------------------------------------------------
+
+# Булевы свойства общего модуля: ключ результата → (CF-тег, EDT-тег).
+_COMMON_MODULE_FLAGS: tuple[tuple[str, str, str], ...] = (
+    ("global_", "Global", "global"),
+    ("server", "Server", "server"),
+    ("server_call", "ServerCall", "serverCall"),
+    ("privileged", "Privileged", "privileged"),
+    ("external_connection", "ExternalConnection", "externalConnection"),
+    ("client_managed", "ClientManagedApplication", "clientManagedApplication"),
+    ("client_ordinary", "ClientOrdinaryApplication", "clientOrdinaryApplication"),
+)
+
+# Отсутствие узла <returnValuesReuse> означает DontUse, а не «неизвестно», — ТО ЖЕ
+# правило, что у булевых флагов выше и у <templateType> ниже. Поле не булево,
+# поэтому под общий `_bool_text` оно не попадало и было единственным в этом
+# парсере, где дефолт EDT остался неразвёрнутым.
+#
+# Замер на боевых корнях: CF выписывает узел ВСЕГДА (3918 из 3918 общих модулей:
+# DontUse 3676, DuringSession 219, DuringRequest 23), EDT — только у 198 из 3309
+# (DuringSession 178, DuringRequest 20), то есть 3111 модулей опускают дефолт.
+# Без нормализации одна и та же конфигурация отвечала `DontUse` на CF и пустой
+# строкой на EDT, а документированный `find_common_modules(flag='DontUse')` на
+# EDT молча возвращал НОЛЬ при девяноста четырёх процентах подходящих модулей.
+#
+# Дефолт применяется в ОБЕИХ ветках (как `DEFAULT_TEMPLATE_TYPE`): на CF узел
+# сегодня есть всегда, но отдавать там пустую строку на неполной выгрузке значило
+# бы вернуть ровно то расхождение, которое эта константа и закрывает.
+DEFAULT_RETURN_VALUES_REUSE = "DontUse"
+
+# Отсутствие узла <templateType> означает SpreadsheetDocument, а не «неизвестно»:
+# EDT опускает значение по умолчанию (у 10 052 блоков из 13 287 узла нет вовсе),
+# а CF выписывает тип всегда, и доли в обеих выгрузках совпадают. Набор значений
+# ОТКРЫТ (``DataCompositionAppearanceTemplate`` не встретился в CF-выборке вовсе),
+# поэтому тип хранится строкой, а enum'а в коде не заводится.
+DEFAULT_TEMPLATE_TYPE = "SpreadsheetDocument"
+
+
+def _bool_text(value: str | None) -> bool:
+    return bool(value) and value.strip().lower() == "true"
+
+
+def parse_common_module_props(xml_content: str) -> dict | None:
+    """Свойства общего модуля из CF-XML или EDT-.mdo.
+
+    **Отсутствие узла означает ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ, а не «неизвестно».** EDT
+    опускает дефолты целиком (CF выписывает их явно), и прочтение «нет узла =
+    неизвестно» дало бы два разных ответа на одну конфигурацию. Правило одно на
+    ВСЕ свойства: у булевых флагов дефолт `False`, у `return_values_reuse` —
+    ``DEFAULT_RETURN_VALUES_REUSE`` (``DontUse``); последнее не булево, поэтому под
+    общий ``_bool_text`` не попадает и нормализуется явно.
+
+    Returns:
+        ``{name, synonym, global_, server, server_call, privileged,
+        external_connection, client_managed, client_ordinary,
+        return_values_reuse}`` либо ``None``. ``return_values_reuse`` НИКОГДА не
+        пуст у успешно разобранного модуля.
+    """
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return None
+
+    if _MDO_NS_URI in xml_content:
+        if (root.tag.split("}")[-1] if "}" in root.tag else root.tag) != "CommonModule":
+            return None
+        name = _xml_direct_text(root, "name")
+        if not name:
+            return None
+        out: dict = {"name": name, "synonym": _mdo_find_synonym(root)}
+        for key, _cf_tag, edt_tag in _COMMON_MODULE_FLAGS:
+            out[key] = _bool_text(_xml_direct_text(root, edt_tag))
+        out["return_values_reuse"] = _xml_direct_text(root, "returnValuesReuse") or DEFAULT_RETURN_VALUES_REUSE
+        return out
+
+    props = None
+    for meta_el in root:
+        if (meta_el.tag.split("}")[-1] if "}" in meta_el.tag else meta_el.tag) != "CommonModule":
+            continue
+        props = meta_el.find("md:Properties", _NS_CF)
+        if props is None:
+            for ch in meta_el:
+                if ch.tag.endswith("Properties"):
+                    props = ch
+                    break
+        break
+    if props is None:
+        return None
+    name = _xml_find_text(props, "md:Name", _NS_CF)
+    if not name:
+        return None
+    out = {"name": name, "synonym": _cf_find_synonym(props, _NS_CF)}
+    for key, cf_tag, _edt_tag in _COMMON_MODULE_FLAGS:
+        out[key] = _bool_text(_xml_find_text(props, f"md:{cf_tag}", _NS_CF))
+    out["return_values_reuse"] = _xml_find_text(props, "md:ReturnValuesReuse", _NS_CF) or DEFAULT_RETURN_VALUES_REUSE
+    return out
+
+
+def parse_constant_xml(xml_content: str) -> dict | None:
+    """Константа: имя, синоним и ТИП ЗНАЧЕНИЯ — обе ветки, CF и EDT.
+
+    Тип разбирается ТЕМ ЖЕ путём, что типы реквизитов (``_cf_parse_type`` /
+    ``_mdo_parse_type`` плюс ``normalize_type_string``), и канонизации НЕ
+    проходит. Канонизация была бы двойной ошибкой: ``canonicalize_type_ref`` по
+    контракту отдаёт ПУСТУЮ строку на примитивах (``xs:boolean``, ``xs:string``,
+    ``xs:decimal``…), а константы преимущественно примитивные — колонка оказалась
+    бы пустой почти везде; на ссылочном типе она дала бы ``Catalog.X`` там, где
+    соседний реквизит в ТОМ ЖЕ ответе ``get_object_full_structure`` показывает
+    ``CatalogRef.X``.
+    """
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return None
+
+    if _MDO_NS_URI in xml_content:
+        if (root.tag.split("}")[-1] if "}" in root.tag else root.tag) != "Constant":
+            return None
+        name = _xml_direct_text(root, "name")
+        if not name:
+            return None
+        return {
+            "name": name,
+            "synonym": _mdo_find_synonym(root),
+            "value_type": normalize_type_string(_mdo_parse_type(root)),
+        }
+
+    for meta_el in root:
+        if (meta_el.tag.split("}")[-1] if "}" in meta_el.tag else meta_el.tag) != "Constant":
+            continue
+        props = meta_el.find("md:Properties", _NS_CF)
+        if props is None:
+            for ch in meta_el:
+                if ch.tag.endswith("Properties"):
+                    props = ch
+                    break
+        if props is None:
+            return None
+        name = _xml_find_text(props, "md:Name", _NS_CF)
+        if not name:
+            return None
+        return {
+            "name": name,
+            "synonym": _cf_find_synonym(props, _NS_CF),
+            "value_type": normalize_type_string(_cf_parse_type(props, _NS_CF)),
+        }
+    return None
+
+
+def parse_template_descriptor(xml_content: str) -> dict | None:
+    """Описатель ОТДЕЛЬНОГО макета: CF ``Templates/<Имя>.xml`` либо общий макет.
+
+    Три раскладки, а не две: общий макет EDT — корень ``mdclass:CommonTemplate``
+    БЕЗ вложенного блока ``<templates>`` (проверено: ноль файлов с ним), имя,
+    синоним и тип лежат прямо в корне. Разбор блоков внутри владельца эту
+    раскладку не покрывает.
+
+    Returns: ``{name, synonym, template_type}`` либо ``None``.
+    """
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return None
+
+    if _MDO_NS_URI in xml_content:
+        if (root.tag.split("}")[-1] if "}" in root.tag else root.tag) not in ("CommonTemplate", "Template"):
+            return None
+        name = _xml_direct_text(root, "name")
+        if not name:
+            return None
+        return {
+            "name": name,
+            "synonym": _mdo_find_synonym(root),
+            "template_type": _xml_direct_text(root, "templateType") or DEFAULT_TEMPLATE_TYPE,
+        }
+
+    for meta_el in root:
+        if (meta_el.tag.split("}")[-1] if "}" in meta_el.tag else meta_el.tag) not in ("Template", "CommonTemplate"):
+            continue
+        props = meta_el.find("md:Properties", _NS_CF)
+        if props is None:
+            for ch in meta_el:
+                if ch.tag.endswith("Properties"):
+                    props = ch
+                    break
+        if props is None:
+            return None
+        name = _xml_find_text(props, "md:Name", _NS_CF)
+        if not name:
+            return None
+        return {
+            "name": name,
+            "synonym": _cf_find_synonym(props, _NS_CF),
+            "template_type": _xml_find_text(props, "md:TemplateType", _NS_CF) or DEFAULT_TEMPLATE_TYPE,
+        }
+    return None
+
+
+def parse_rights_meta(xml_content: str) -> dict:
+    """Флаг уровня роли ``setForNewObjects`` и ИСКЛЮЧЕНИЯ (права со значением false).
+
+    ``parse_rights_xml`` возвращает только ВЫДАННЫЕ права, поэтому роль, которая
+    раздаёт права флагом уровня роли, из ответа исчезала целиком: явная запись
+    объекта у такой роли перечисляет ИСКЛЮЧЕНИЯ, и все права в ней ``false``.
+
+    Контракт ``parse_rights_xml`` НЕ трогается — его ``list[dict]`` читают
+    несколько вызывающих.
+
+    **``setForAttributesByDefault`` здесь НЕ используется.** На боевой
+    конфигурации он взведён у 2136 ролей из 2159, то есть это норма, и он про
+    РЕКВИЗИТЫ объекта, права на который уже выданы. Считать его признаком
+    покрытия значило бы пометить каждую роль покрывающей каждый объект.
+
+    Returns:
+        ``{"set_for_new_objects": bool, "exclusions": [{"object": str, "rights": [str]}]}``
+    """
+    out: dict = {"set_for_new_objects": False, "exclusions": []}
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return out
+
+    root_ns = root.tag.split("}")[0].lstrip("{") if "}" in root.tag else ""
+    ns_candidates = [{"r": root_ns}] if root_ns else []
+    ns_candidates.extend({"r": uri} for uri in _NS_RIGHTS_VERSIONS)
+
+    for ch in root:
+        local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
+        if local == "setForNewObjects":
+            out["set_for_new_objects"] = bool(ch.text and ch.text.strip().lower() == "true")
+            break
+
+    for ns in ns_candidates:
+        obj_elements = root.findall("r:object", ns)
+        if not obj_elements:
+            continue
+        for obj_el in obj_elements:
+            name_el = obj_el.find("r:name", ns)
+            if name_el is None or not name_el.text:
+                continue
+            denied: list[str] = []
+            for right_el in obj_el.findall("r:right", ns):
+                right_name_el = right_el.find("r:name", ns)
+                right_value_el = right_el.find("r:value", ns)
+                if right_name_el is None or right_value_el is None or not right_name_el.text:
+                    continue
+                if right_value_el.text and right_value_el.text.strip().lower() == "false":
+                    denied.append(right_name_el.text.strip())
+            if denied:
+                out["exclusions"].append({"object": name_el.text.strip(), "rights": denied})
+        break
+
+    return out
 
 
 # ---------------------------------------------------------------------------

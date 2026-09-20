@@ -29,7 +29,7 @@ BEFORE YOU START: check rlm_start response — warnings, extension_context, dete
 
 Step 0 — UNDERSTAND: decode the business question
   BUSINESS RECIPE? Follow it.
-  No recipe? → analyze_subsystem('Подсистема'); current-root; uncut known rows:all direct:!content_truncated&subsystems_found==len(subsystems);live:no reverse
+  No recipe? → analyze_subsystem('Подсистема'); current-root; uncut known rows:all direct:!content_truncated&subsystems_found==len(subsystems)
 
 Step 1 — DISCOVER: find what you need
   search(query)                          → BROAD first pass: methods + objects + regions + headers + attributes + predefined
@@ -388,13 +388,13 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "pair": ("find_references_to_object", "find_event_subscriptions"),
         "summary": "домен подписки по source_types vs поиск по фрагменту",
         "when_a": (
-            "find_references_to_object(ref, kinds=['event_subscription_source']) строится ТОЛЬКО "
-            "из НЕПУСТОГО source_types, поэтому universal-подписки (без указанного источника) в "
-            "домен не входят вовсе."
+            "find_references_to_object(ref, kinds=['event_subscription_source']) строится из "
+            "НЕПУСТОГО source_types плюс раскрытых НА ЧТЕНИИ наборов типов (v1.38.0), поэтому "
+            "universal-подписки (без источника вовсе) в домен не входят."
         ),
         "when_b": (
             "find_event_subscriptions(фрагмент) включает их всегда и различает охват: "
-            "scope ∈ exact | partial | universal."
+            "scope ∈ exact | set | partial | universal, а ПОЧЕМУ строка подобрана — matched_via."
         ),
         "rule": (
             "Это РАЗНЫЕ вопросы, а не расхождение хелперов: на боевой конфигурации 13 exact "

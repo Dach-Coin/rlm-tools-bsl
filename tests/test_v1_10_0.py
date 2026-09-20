@@ -285,11 +285,16 @@ def test_find_event_subscriptions_filter_falls_back_when_index_empty(bsl_env):
         """Index reader where event_subscriptions table EXISTS but is empty
         (stale index scenario)."""
 
-        def get_event_subscriptions(self, object_name="", custom_only=False, event_filter=None, object_ref=""):
+        def get_event_subscriptions(
+            self, object_name="", custom_only=False, event_filter=None, object_ref="", target_refs=None
+        ):
             # Имитируем реальное поведение IndexReader после фикса:
             # пустая таблица → None независимо от наличия event_filter.
             # object_ref — keyword-параметр реального ридера с v1.28.0 (category-aware
-            # матчинг); двойник обязан повторять сигнатуру, иначе TypeError вместо фолбэка.
+            # матчинг); target_refs — с v1.38.0 (раскрытие НАБОРОВ типов на голом
+            # имени-омониме). Двойник обязан повторять сигнатуру, иначе TypeError
+            # вместо фолбэка: хелпер зовёт ридер БЕЗ try/except, и несовпадение
+            # сигнатуры роняет весь вызов вместо ухода в live.
             return None
 
     # Создаём реальные подписки на диске

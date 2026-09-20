@@ -249,6 +249,19 @@ def _cmd_build(args: argparse.Namespace) -> None:
         print(f"  DefTypes:   {stats['defined_types']}")
     if stats.get("characteristic_types"):
         print(f"  CharTypes:  {stats['characteristic_types']}")
+    # v16: объявленный состав конфигурации
+    if stats.get("declared_register_records"):
+        print(f"  DeclRegRec: {stats['declared_register_records']}")
+    if stats.get("role_flags"):
+        print(f"  RoleFlags:  {stats['role_flags']}")
+    if stats.get("role_exclusions"):
+        print(f"  RoleExcl:   {stats['role_exclusions']}")
+    if stats.get("common_module_props"):
+        print(f"  CommonMod:  {stats['common_module_props']}")
+    if stats.get("constants"):
+        print(f"  Constants:  {stats['constants']}")
+    if stats.get("templates"):
+        print(f"  Templates:  {stats['templates']}")
     # Code-derived (built even with --no-metadata) — kept outside the metadata block.
     if stats.get("metadata_code_usages"):
         print(f"  CodeUsages: {stats['metadata_code_usages']}")
@@ -409,6 +422,19 @@ def _cmd_info(args: argparse.Namespace) -> None:
         print(f"  DefTypes:   {stats['defined_types']}")
     if stats.get("characteristic_types"):
         print(f"  CharTypes:  {stats['characteristic_types']}")
+    # v16: объявленный состав конфигурации
+    if stats.get("declared_register_records"):
+        print(f"  DeclRegRec: {stats['declared_register_records']}")
+    if stats.get("role_flags"):
+        print(f"  RoleFlags:  {stats['role_flags']}")
+    if stats.get("role_exclusions"):
+        print(f"  RoleExcl:   {stats['role_exclusions']}")
+    if stats.get("common_module_props"):
+        print(f"  CommonMod:  {stats['common_module_props']}")
+    if stats.get("constants"):
+        print(f"  Constants:  {stats['constants']}")
+    if stats.get("templates"):
+        print(f"  Templates:  {stats['templates']}")
     # Code-derived (built even with --no-metadata) — kept outside the metadata block.
     if stats.get("metadata_code_usages"):
         print(f"  CodeUsages: {stats['metadata_code_usages']}")
