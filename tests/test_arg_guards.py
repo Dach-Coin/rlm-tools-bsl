@@ -309,6 +309,47 @@ def test_float_is_truncated_not_rejected(guarded_bsl):
     assert len(guarded_bsl["search_regions"]("Служебные", 2.5)) == 2
 
 
+def test_negative_fraction_restores_default_not_zero(guarded_bsl):
+    """Граница ДВУХ правил соседа сверху (v1.39.0).
+
+    Усечение и отсечение диапазона тянут в разные стороны, и порядок между ними
+    наблюдаем: `int()` усекает К НУЛЮ, поэтому `int(-0.5)` = 0 — усечение САМО
+    переносит значение из запрещённой области в разрешённую. Пока минимум
+    проверялся ПОСЛЕ усечения, `-0.5` молча становился валидным нулём: выдача
+    пустая, предупреждения в логе нет, хотя контракт обещает дефолт на ЛЮБОЕ
+    отрицательное. Целым `-1` этот случай не ловится — оно краснеет и при старом
+    порядке проверок.
+    """
+    assert len(guarded_bsl["search_regions"]("Служебные", -0.5)) == 200
+    assert len(guarded_bsl["search_regions"]("Служебные", -0.999)) == 200
+    # И правило соседа сверху при этом НЕ отменено.
+    assert len(guarded_bsl["search_regions"]("Служебные", 2.5)) == 2
+
+
+def test_every_numeric_normalizer_judges_the_sign_before_truncating():
+    """Правило «отрицательное → дефолт» живёт в ТРЁХ копиях — и все три обязаны его держать.
+
+    Копии существуют не по недосмотру: `_normalize_role_details_limit` заведён
+    ОТДЕЛЬНО от `_coerce_bound` (иначе `±inf` ронял бы `int()`), а
+    `Sandbox._note_saturation` зеркалит разбор, потому что считает эффективный
+    лимит уже ПОСЛЕ хелпера. Но порядок «усечение против проверки знака» у всех
+    трёх наблюдаем одинаково, и разъехаться им нельзя: починка двух из трёх
+    меняет одну несогласованность на другую, менее заметную.
+
+    Проверяется именно ДРОБНОЕ отрицательное: целое `-1` краснеет и при обратном
+    порядке проверок, поэтому оно этот дефект не ловит.
+    """
+    from rlm_tools_bsl.bsl_index import _ROLE_DETAILS_DEFAULT, _normalize_role_details_limit
+
+    value, warning = _normalize_role_details_limit(-0.5)
+    assert value == _ROLE_DETAILS_DEFAULT, f"details_limit=-0.5 дал {value}, а не дефолт"
+    assert warning, "подмена обязана быть названа — иначе она молчаливая"
+    # Усечение положительной дроби при этом СОХРАНЕНО.
+    assert _normalize_role_details_limit(2.5)[0] == 2
+    # И ноль остаётся валидным: это осознанно запрошенная пустая детализация.
+    assert _normalize_role_details_limit(0) == (0, None)
+
+
 def test_bool_is_not_silently_treated_as_int(guarded_bsl):
     """bool — подкласс int: `True` без явной проверки прошёл бы как limit=1."""
     assert len(guarded_bsl["search_regions"]("Служебные", True)) == 200

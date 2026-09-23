@@ -220,8 +220,12 @@ def test_no_get_index_info_no_hint():
 # ---------------------------------------------------------------------------
 
 
-def _regions_sandbox(tmp_path, monkeypatch):
+def _regions_sandbox(tmp_path, monkeypatch, regions: int = 3):
     """Проект с тремя областями — достаточно, чтобы упереться в limit=2.
+
+    `regions` поднимается только там, где нужен ДЕФОЛТНЫЙ эффективный лимит
+    (200): на трёх областях зеркало и хелпер дают одинаковый ответ «не
+    насытилось» при любом разборе limit, и расхождение между ними ненаблюдаемо.
 
     `tmp_path`, а не TemporaryDirectory: IndexReader держит файл БД открытым, и на
     Windows авто-очистка временного каталога падает с PermissionError.
@@ -233,8 +237,8 @@ def _regions_sandbox(tmp_path, monkeypatch):
 
     obj = tmp_path / "CommonModules" / "М" / "Ext"
     obj.mkdir(parents=True)
-    (obj / "Module.bsl").write_text(
-        """#Область А
+    if regions == 3:
+        body = """#Область А
 Процедура П1()
 КонецПроцедуры
 #КонецОбласти
@@ -246,9 +250,11 @@ def _regions_sandbox(tmp_path, monkeypatch):
 Процедура П3()
 КонецПроцедуры
 #КонецОбласти
-""",
-        encoding="utf-8-sig",
-    )
+"""
+    else:
+        one = "#Область Обл{i}\nПроцедура П{i}()\nКонецПроцедуры\n#КонецОбласти\n"
+        body = "".join(one.format(i=i) for i in range(regions))
+    (obj / "Module.bsl").write_text(body, encoding="utf-8-sig")
     (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
     monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".index"))
     db = IndexBuilder().build(str(tmp_path), build_calls=False, build_fts=False, build_synonyms=False)
@@ -297,6 +303,33 @@ def test_limit_coercion_mirrors_helper_guard(tmp_path, monkeypatch):
         hit = sb.execute("rows = search_regions('', limit=3.0)\nprint(len(rows))")
         assert hit.error is None and "3" in hit.stdout
         assert any(h["id"] == "list_truncated:search_regions" for h in (hit.efficiency_hints or []))
+    finally:
+        reader.close()
+
+
+def test_limit_coercion_mirrors_negative_fraction(tmp_path, monkeypatch):
+    """Зеркало обязано судить отрицательное ДО `int()` — как и сам `_coerce_bound`.
+
+    `int()` усекает К НУЛЮ, поэтому `int(-0.5)` = 0. Пока зеркало усекало первым,
+    оно считало эффективным лимитом НОЛЬ и глушило подсказку через ветку
+    «агент сам попросил ноль строк», — тогда как хелпер восстанавливает дефолт 200
+    и реально отдаёт 200 строк. То есть срез был, а сигнала о нём не было.
+
+    Двести областей здесь обязательны: на трёх фикстурах обе стороны молчат при
+    любом разборе `limit`, и расхождение ненаблюдаемо.
+    """
+    sb, reader = _regions_sandbox(tmp_path, monkeypatch, regions=250)
+    try:
+        res = sb.execute("rows = search_regions('', limit=-0.5)\nprint(len(rows))")
+        assert res.error is None, res.error
+        assert "200" in res.stdout, res.stdout
+        hints = res.efficiency_hints or []
+        assert any(h["id"] == "list_truncated:search_regions" for h in hints), (
+            f"срез на 200 строках есть, а сигнала нет: {[h['id'] for h in hints]}"
+        )
+        # Целое отрицательное ведёт себя ТАК ЖЕ — иначе граница правила разъехалась бы.
+        res_int = sb.execute("rows = search_regions('', limit=-1)\nprint(len(rows))")
+        assert any(h["id"] == "list_truncated:search_regions" for h in (res_int.efficiency_hints or []))
     finally:
         reader.close()
 

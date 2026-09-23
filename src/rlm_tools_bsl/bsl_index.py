@@ -5638,6 +5638,15 @@ def _normalize_role_details_limit(value) -> tuple[int, str | None]:
             return _ROLE_DETAILS_MAX, f"details_limit: +inf — ограничил до {_ROLE_DETAILS_MAX}."
         if value == float("-inf"):
             return _ROLE_DETAILS_DEFAULT, f"details_limit: -inf — использую {_ROLE_DETAILS_DEFAULT}."
+        if value < 0:
+            # Отрицательное судится ДО `int()` (v1.39.0): `int()` усекает К НУЛЮ,
+            # поэтому `int(-0.5)` = 0, и проверка после усечения отрицательную
+            # ДРОБЬ не видела вовсе — `-0.5` молча давал пустую детализацию вместо
+            # дефолта, хотя докстринг выше обещает обратное. Та же правка сделана
+            # в `_coerce_bound` и в его зеркале `Sandbox._note_saturation`.
+            return _ROLE_DETAILS_DEFAULT, (
+                f"details_limit: отрицательное {value!r} — использую {_ROLE_DETAILS_DEFAULT}."
+            )
         value = int(value)
     if value < 0:
         return _ROLE_DETAILS_DEFAULT, (f"details_limit: отрицательное {value!r} — использую {_ROLE_DETAILS_DEFAULT}.")
@@ -13097,19 +13106,44 @@ class IndexReader:
             return [r["register_ref"] for r in rows]
 
     @_transient_safe(lambda: None)
-    def get_common_module_props(self, name: str = "", flag: str = "") -> list[dict] | None:
-        """Свойства общих модулей.
+    def get_common_module_props(self, name: str = "", flag: str = "", limit: int = 200) -> dict | None:
+        """Страница свойств общих модулей И полное число совпавших — ОДНИМ запросом.
 
         ``flag`` — имя булева свойства (``privileged``, ``global``, ``server_call``…)
         ЛИБО значение ``ReturnValuesReuse`` (``DuringSession``, ``DuringRequest``,
         ``DontUse``). Редкие значения и есть самые полезные: на боевой конфигурации
         привилегированных модулей 2, глобальных 40 при 3918 общих модулях.
+
+        Args:
+            name: фрагмент имени модуля (пусто = все).
+            flag: см. выше; пусто = без фильтра по свойству.
+            limit: размер страницы. ``0`` даёт пустую страницу при сохранённом
+                   ``total``; отрицательное отсекается (``LIMIT -1`` в SQLite —
+                   это «без ограничения», а неограниченный дамп здесь запрещён).
+
+        Returns:
+            ``{"modules": [{module_name, global, server, server_call, privileged,
+            external_connection, client_managed, client_ordinary,
+            return_values_reuse, file}], "total": int}`` либо ``None`` (индекс
+            старше v16 / таблицы нет / транзиентное состояние пересборки).
+            ``total`` — сколько ВСЕГО совпало, а не длина страницы.
+
+        **Форма возврата сменилась в v1.39.0** (было — голый ``list``): до релиза
+        ``LIMIT`` не ставился вовсе, и `flag='DontUse'` отдавал 3 835 строк одним
+        ответом. Приём взят у соседнего ``get_templates``: страница и ПОЛНЫЙ счёт
+        читаются ``COUNT(*) OVER ()`` из ОДНОГО снимка, поэтому пересборка на месте
+        (безопасная под открытым RO-ридером) не может развести их по поколениям.
+        В SQL уезжает ``max(1, limit)``, а страница режется в Python: оконный счёт
+        приезжает КОЛОНКОЙ строки, и при ``LIMIT 0`` он обнулился бы вместе с ней —
+        ноль совпадений и ноль запрошенных строк обязаны выглядеть по-разному.
         """
         if not self.has_declared_composition:
             return None
+        eff_limit = max(0, int(limit))
         sql = (
             "SELECT module_name, global_, server, server_call, privileged, external_connection, "
-            "client_managed, client_ordinary, return_values_reuse, file FROM common_module_props"
+            "client_managed, client_ordinary, return_values_reuse, file, COUNT(*) OVER () AS match_total "
+            "FROM common_module_props"
         )
         where: list[str] = []
         params: list = []
@@ -13126,24 +13160,30 @@ class IndexReader:
                 params.append(flag_key)
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY module_name"
+        sql += " ORDER BY module_name LIMIT ?"
+        params.append(max(1, eff_limit))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
-            return [
-                {
-                    "module_name": r["module_name"],
-                    "global": bool(r["global_"]),
-                    "server": bool(r["server"]),
-                    "server_call": bool(r["server_call"]),
-                    "privileged": bool(r["privileged"]),
-                    "external_connection": bool(r["external_connection"]),
-                    "client_managed": bool(r["client_managed"]),
-                    "client_ordinary": bool(r["client_ordinary"]),
-                    "return_values_reuse": r["return_values_reuse"] or "",
-                    "file": r["file"],
-                }
-                for r in rows
-            ]
+            return {
+                "modules": [
+                    {
+                        "module_name": r["module_name"],
+                        "global": bool(r["global_"]),
+                        "server": bool(r["server"]),
+                        "server_call": bool(r["server_call"]),
+                        "privileged": bool(r["privileged"]),
+                        "external_connection": bool(r["external_connection"]),
+                        "client_managed": bool(r["client_managed"]),
+                        "client_ordinary": bool(r["client_ordinary"]),
+                        "return_values_reuse": r["return_values_reuse"] or "",
+                        "file": r["file"],
+                    }
+                    for r in rows[:eff_limit]
+                ],
+                # Пустая выборка — честный ноль. Пустая СТРАНИЦА при limit=0 — нет:
+                # счёт берётся из строки, прочитанной ДО среза.
+                "total": int(rows[0]["match_total"]) if rows else 0,
+            }
 
     @_transient_safe(lambda: None)
     def get_constant(self, name: str) -> dict | None:
@@ -13192,9 +13232,20 @@ class IndexReader:
         шаг перед ним), поэтому одна выборка даёт и страницу, и ПОЛНЫЙ счёт из
         ОДНОГО снимка. Требует SQLite ≥ 3.25 (2018); проект требует Python ≥ 3.10
         (2021), так что порог заведомо ниже любого поддерживаемого окружения.
+
+        **``limit=0`` не имеет права обнулить счёт (v1.39.0).** Оконный счётчик
+        приезжает КОЛОНКОЙ строки: при ``LIMIT 0`` строк нет, и формула
+        ``rows[0]["match_total"] if rows else 0`` выдала бы честный на вид ноль там,
+        где совпадений три. Поэтому в SQL уезжает ``max(1, limit)``, а страница
+        режется в Python — цена ровно одна лишняя прочитанная строка на запросе,
+        который страницы не просил. Отрицательное значение тоже отсекается: в SQLite
+        ``LIMIT -1`` означает «без ограничения», и отдавать через него весь набор
+        запрещено политикой проекта (см. ``_coerce_bound`` в ``bsl_helpers``).
         """
         if not self.has_declared_composition:
             return None
+        # Публичная граница страницы; в SQL уедет max(1, …) — см. докстринг.
+        eff_limit = max(0, int(limit))
         where: list[str] = []
         params: list = []
         if owner:
@@ -13211,7 +13262,7 @@ class IndexReader:
             "SELECT owner_ref, name, synonym, template_type, file, COUNT(*) OVER () AS match_total "
             f"FROM templates{clause} ORDER BY owner_ref, name LIMIT ?"  # noqa: S608 — clause из литералов
         )
-        params.append(int(limit))
+        params.append(max(1, eff_limit))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
             return {
@@ -13223,9 +13274,11 @@ class IndexReader:
                         "template_type": r["template_type"] or "",
                         "file": r["file"],
                     }
-                    for r in rows
+                    for r in rows[:eff_limit]
                 ],
                 # Пустая выборка — честный ноль: строк нет, значит и совпадений нет.
+                # А вот пустая СТРАНИЦА при limit=0 — не ноль: счёт берётся из
+                # прочитанной строки ДО среза, иначе он бы обнулился вместе с ней.
                 "total": int(rows[0]["match_total"]) if rows else 0,
             }
 

@@ -1011,7 +1011,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "full": [
             "get_overrides() → перехваты конфигурации. СНАЧАЛА partial: False — total/агрегаты по полному выбранному источнику; True — только по прочитанной части, причины в _meta.failed_extension_roots. overrides = отсортированный срез 200, total/truncated сигналят обрезку; сводку по срезу не строй",
             "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file исполним в read_procedure",
-            "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_objects/unique_methods — ИМЕНА, unique_object_methods — ПАРЫ",
+            "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_* — ЧИСЛА: unique_objects/unique_methods СЧИТАЮТ ИМЕНА, unique_object_methods — ПАРЫ объект+метод",
             "target_method_line=None — валидно: перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения) без текстового объявления в базовом модуле либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
             "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",

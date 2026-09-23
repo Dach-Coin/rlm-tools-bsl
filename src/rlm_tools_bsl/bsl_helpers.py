@@ -2,6 +2,7 @@ from __future__ import annotations
 import bisect
 import collections
 import concurrent.futures
+import inspect
 import json
 import logging
 import math
@@ -2135,7 +2136,9 @@ def make_bsl_helpers(
 
         ``bool`` отсекается ДО ``int``: он подкласс ``int`` и ``True`` молча прошёл
         бы как ``1``. ``float`` с дробной частью усекается — согласовано с уже
-        принятым ``int(depth)`` в ``find_call_hierarchy``.
+        принятым ``int(depth)`` в ``find_call_hierarchy``. Но диапазон судится по
+        ИСХОДНОМУ значению, а не по усечённому: ``int()`` усекает К НУЛЮ, поэтому
+        ``-0.5`` иначе молча становился бы валидным ``0`` (v1.39.0).
         """
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
             return default, (
@@ -2154,11 +2157,24 @@ def make_bsl_helpers(
             return default, (
                 f"{param}={value!r} не является конечным числом — использован дефолт {default}. Сигнатура: {sig}."
             )
-        ivalue = int(value)
-        if ivalue < minimum:
+        # Диапазон судится по ИСХОДНОМУ значению, а НЕ по усечённому. `int()`
+        # усекает К НУЛЮ, поэтому `int(-0.5)` даёт 0 — то есть усечение само
+        # переносит значение из запрещённой области в разрешённую, и проверка
+        # после него отрицательную дробь не видит вовсе: `-0.5` молча становился
+        # валидным нулём, без предупреждения, хотя контракт обещает дефолт на
+        # ЛЮБОЕ отрицательное. Задетый интервал — ровно (minimum-1, minimum).
+        # Правило усечения при этом СОХРАНЕНО и не подменено откатом к дефолту:
+        # `2.5` по-прежнему даёт 2 (прибито `test_float_is_truncated_not_rejected`),
+        # потому что при `value >= minimum >= 0` усечение к нулю ниже минимума
+        # увести уже не может.
+        if value < minimum:
             return default, (
                 f"{param}={value!r} вне диапазона (минимум {minimum}) — использован дефолт {default}. Сигнатура: {sig}."
             )
+        ivalue = int(value)
+        # `maximum` остаётся ПОСЛЕ усечения намеренно: выход за верхнюю границу —
+        # это валидное «хочу больше потолка», и усечение дробной части там никуда
+        # не переносит (`100.7` при потолке 100 усекается ВНУТРЬ разрешённого).
         if maximum is not None and ivalue > maximum:
             return maximum, (f"{param}={value!r} превышает максимум {maximum} — усечен. Сигнатура: {sig}.")
         return ivalue, None
@@ -16878,7 +16894,7 @@ def make_bsl_helpers(
 
     # ── v16: свойства общих модулей и макеты ──────────────────────────────
 
-    def find_common_modules(name: str = "", flag: str = "") -> dict:
+    def find_common_modules(name: str = "", flag: str = "", limit: int = 200) -> dict:
         """Общие модули с их ОБЪЯВЛЕННЫМИ свойствами (Глобальный, Привилегированный, …).
 
         Args:
@@ -16889,11 +16905,25 @@ def make_bsl_helpers(
                   (``DuringSession`` / ``DuringRequest`` / ``DontUse``).
                   Редкие значения и есть самые полезные: на боевой конфигурации
                   привилегированных модулей 2, глобальных 40 при 3918 общих.
+            limit: размер страницы (v1.39.0). Некорректное значение (``None``,
+                  строка, список, ``NaN``/``inf``, отрицательное, ``bool``) не
+                  роняет вызов, а восстанавливает документированный дефолт 200 —
+                  конвенция v1.30.0; предупреждение уходит только в лог, потому
+                  что набор ключей ответа публичный. ``0`` валиден и означает
+                  ПУСТУЮ страницу при сохранённом ``total``.
 
         Returns:
-            ``{modules, total, source, partial, _meta}``. Без индекса выполняется
-            ЖИВОЙ скан описателей (на боевой конфигурации 3918 XML — порядок уже
-            оплачиваемых живых проходов), ответ помечается ``partial=True``.
+            ``{modules, total, truncated, source, partial, _meta}``. Без индекса
+            выполняется ЖИВОЙ скан описателей (на боевой конфигурации 3918 XML —
+            порядок уже оплачиваемых живых проходов), ответ помечается
+            ``partial=True``.
+
+            **``total`` и ``len(modules)`` больше НЕ синонимы (v1.39.0).** ``total``
+            — сколько ВСЕГО совпало, ``modules`` — страница размером ``limit``;
+            ``truncated`` отвечает, урезана ли страница относительно счёта (ровно
+            ``limit`` совпадений усечением НЕ объявляются). Оси независимы:
+            ``partial=True`` означает, что сам счёт — нижняя оценка успешно
+            прочитанной части, и остаётся верным даже при ``truncated=False``.
 
         **Отсутствие узла в EDT означает ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ, а не «неизвестно»**:
         EDT опускает дефолты целиком, CF выписывает их явно, и прочтение «нет узла =
@@ -16904,21 +16934,50 @@ def make_bsl_helpers(
         out: dict = {
             "modules": [],
             "total": 0,
+            # Ключ объявляется ЗДЕСЬ, а не по месту вычисления: у живой ветки есть
+            # ранний выход (нет каталога CommonModules), и обещанный подписью ключ
+            # обязан быть и на нём.
+            "truncated": False,
             "source": "unavailable",
             "partial": False,
             "_meta": {"index_used": False, "reason": None},
         }
-        rows = None
+        eff_limit, _wl = _coerce_bound(limit, 200, "limit", "find_common_modules(name='', flag='', limit=200)")
+        _warn_bound(_wl)
+        # Ридеру уходит НЕ ноль: оконный счёт приезжает колонкой строки, и `LIMIT 0`
+        # обнулил бы его вместе с ней. Публичную границу держит срез ниже.
+        reader_limit = max(1, eff_limit)
+        page = None
         if idx_reader is not None:
             try:
-                rows = idx_reader.get_common_module_props(name=name, flag=flag)
+                if _cm_props_limit_mode() == "kw":
+                    page = idx_reader.get_common_module_props(name=name, flag=flag, limit=reader_limit)
+                else:
+                    page = idx_reader.get_common_module_props(name=name, flag=flag)
             except Exception:
-                rows = None
-        if rows is not None:
-            out["modules"] = rows
-            out["total"] = len(rows)
+                page = None
+        if page is not None:
             out["source"] = "index"
             out["_meta"]["index_used"] = True
+            if isinstance(page, dict):
+                # Штатный маршрут: страница и ПОЛНОЕ число совпавших пришли ОДНИМ
+                # запросом, то есть из одного снимка. Срез — граница ПУБЛИЧНОГО
+                # обещания: штатный ридер уже отдал нужный размер (NOOP), а
+                # сторонний, который `limit` принимает, но игнорирует, не сможет
+                # вернуть больше запрошенного; его `total` сохраняется как пришёл.
+                out["modules"] = (page.get("modules") or [])[:eff_limit]
+                out["total"] = int(page.get("total") or 0)
+            else:
+                # Ридер СТАРОЙ сигнатуры отдал голый список. Он полон по построению
+                # (LIMIT там не ставился вовсе), поэтому `total` здесь ТОЧЕН, а
+                # страница режется в Python.
+                rows = list(page or [])
+                out["modules"] = rows[:eff_limit]
+                out["total"] = len(rows)
+            # Сравнение со СЧЁТОМ найденной части, а не `len(rows) >= limit`:
+            # последнее объявляло бы усечение и тогда, когда совпадений ровно
+            # `limit`. Та же формула, что у соседнего find_templates.
+            out["truncated"] = out["total"] > len(out["modules"])
             return out
 
         # Живой фолбэк — тот же приём, что у find_defined_types: скан описателей.
@@ -16972,9 +17031,55 @@ def make_bsl_helpers(
                 elif row["return_values_reuse"].lower() != flag_lower:
                     continue
             collected.append(row)
-        out["modules"] = collected
+        # Порядок ОБЯЗАН совпасть с индексным `ORDER BY module_name`, иначе одна
+        # конфигурация до и после сборки индекса отдавала бы РАЗНЫЕ 200 строк:
+        # `sorted(Path)` на Windows сравнивает приведённые к нижнему регистру
+        # строки, а SQLite — байты. Пока `limit` не было, порядок был ненаблюдаем.
+        collected.sort(key=lambda r: r["module_name"])
+        # Раннего выхода из скана по `limit` нет намеренно: он сделал бы `total`
+        # неполным даже относительно успешно прочитанной части, то есть убрал бы
+        # ровно тот счёт, который живая ветка может дать честно.
         out["total"] = len(collected)
+        out["modules"] = collected[:eff_limit]
+        out["truncated"] = out["total"] > len(out["modules"])
         return out
+
+    # Принимает ли ридер `limit`, выясняется ОДИН раз за сессию — интроспекцией
+    # СИГНАТУРЫ, а не пробным вызовом: повтор по пойманному `TypeError` неотличим
+    # от внутреннего `TypeError` самого ридера и менял бы и число обращений к
+    # чужому объекту, и результат (один вызов + живой скан против двух вызовов +
+    # source='index'). Дискриминатор по тексту исключения отвергнут отдельно:
+    # сообщение исключения контрактом не является.
+    _cm_limit_mode: str | None = None  # None = ещё не спрашивали
+
+    def _cm_props_limit_mode() -> str:
+        """``kw`` — звать ридера с ``limit``; ``legacy`` — старая сигнатура без него."""
+        nonlocal _cm_limit_mode
+        if _cm_limit_mode is None:
+            # СТАДИЯ 1 — можно ли вообще прочитать сигнатуру. Отказ здесь значит
+            # «объект непрозрачен», а НЕ «параметра нет»: часть C-реализованных
+            # вызываемых сигнатуры не отдаёт. Свалить это в `legacy` нельзя —
+            # неинспектируемый ридер, который `limit` ПРИНИМАЕТ, получил бы вызов
+            # без него и молча отдал свою страницу по умолчанию, то есть
+            # запрошенный limit был бы проигнорирован, а ответ выдан за полный.
+            # Поэтому трактуем как `kw`: делается ОДИН вызов с `limit`, и если он
+            # падает — общий `except` уводит в живой скан с объявленной
+            # деградацией (`source='live'`, `partial=True`), без повтора.
+            try:
+                sig = inspect.signature(idx_reader.get_common_module_props)
+            except (TypeError, ValueError):
+                _cm_limit_mode = "kw"
+            else:
+                # СТАДИЯ 2 — прочитанная сигнатура принимает `limit`? Здесь
+                # `TypeError` означает ПРОТИВОПОЛОЖНОЕ: спросили и узнали, что
+                # параметра нет. Один `except TypeError` на оба вопроса увёл бы
+                # первый случай в `legacy` молча.
+                try:
+                    sig.bind(name="", flag="", limit=1)
+                    _cm_limit_mode = "kw"
+                except TypeError:
+                    _cm_limit_mode = "legacy"
+        return _cm_limit_mode
 
     def find_templates(owner: str = "", name: str = "", template_type: str = "", limit: int = 200) -> dict:
         """Поиск МАКЕТА по имени/типу/владельцу во всей конфигурации.
@@ -16992,6 +17097,12 @@ def make_bsl_helpers(
             template_type: точное значение типа (``SpreadsheetDocument``,
                    ``DataCompositionSchema``, ``TextDocument``, ``BinaryData``, …).
                    Набор ОТКРЫТ: неизвестное значение хранится как есть.
+            limit: размер страницы. Некорректное значение (``None``, строка,
+                   список, ``NaN``/``inf``, отрицательное, ``bool``) не роняет
+                   вызов, а восстанавливает документированный дефолт 200 —
+                   конвенция v1.30.0; предупреждение уходит только в лог, потому
+                   что набор ключей ответа публичный. ``0`` валиден и означает
+                   ПУСТУЮ страницу при сохранённом ``total``.
 
         Returns:
             ``{templates, total, truncated, source, partial, _meta}``.
@@ -17017,12 +17128,20 @@ def make_bsl_helpers(
             from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref as _ctr
 
             owner_ref = _ctr(canon) or canon
-        eff_limit = max(1, int(limit))
+        eff_limit, _wl = _coerce_bound(
+            limit, 200, "limit", "find_templates(owner='', name='', template_type='', limit=200)"
+        )
+        _warn_bound(_wl)
+        # Ридеру уходит НЕ ноль: `COUNT(*) OVER ()` приезжает колонкой строки, и
+        # `LIMIT 0` обнулил бы вместе с ней полный счёт. Публичную границу держит
+        # срез ниже — он же сохраняет прежнее предусловие сторонних адаптеров,
+        # которые до v1.39.0 нуля не видели никогда.
+        reader_limit = max(1, eff_limit)
         page = None
         if idx_reader is not None:
             try:
                 page = idx_reader.get_templates(
-                    owner=owner_ref, name=name, template_type=template_type, limit=eff_limit
+                    owner=owner_ref, name=name, template_type=template_type, limit=reader_limit
                 )
             except Exception:
                 page = None
@@ -17044,7 +17163,11 @@ def make_bsl_helpers(
             # запросом, то есть из одного снимка. `total` — сколько всего совпало,
             # а не длина страницы: иначе вызов по умолчанию отвечал бы «макетов
             # 200» там, где их 15 452.
-            out["templates"] = page.get("templates") or []
+            # Срез — граница ПУБЛИЧНОГО обещания: штатный ридер уже отдал нужный
+            # размер (здесь это NOOP), а сторонний, который `limit` принимает, но
+            # игнорирует, не сможет вернуть больше запрошенного. Пришедший `total`
+            # при этом сохраняется как есть.
+            out["templates"] = (page.get("templates") or [])[:eff_limit]
             out["total"] = int(page.get("total") or 0)
             # Сравнение с ПОЛНЫМ числом, а не `len(rows) >= limit`: последнее
             # объявляло бы усечение и тогда, когда совпадений ровно `limit`.
@@ -17057,9 +17180,11 @@ def make_bsl_helpers(
         # переделывался. Неполнота объявляется, а `truncated` берётся
         # КОНСЕРВАТИВНО: ложное «возможно, не всё» безопасно, ложное «всё» — нет.
         rows = list(page or [])
-        out["templates"] = rows
+        out["templates"] = rows[:eff_limit]
         out["total"] = len(rows)
-        out["truncated"] = len(rows) >= eff_limit
+        # Два независимых повода объявить усечение: ридер насытил свою страницу
+        # (за ней может быть ещё) либо наш публичный срез отбросил строки.
+        out["truncated"] = len(rows) >= reader_limit or len(rows) > len(out["templates"])
         out["partial"] = True
         out["_meta"]["reason"] = "template_total_unavailable"
         out["hint"] = (
@@ -17137,7 +17262,7 @@ def make_bsl_helpers(
     _reg(
         "find_common_modules",
         find_common_modules,
-        "find_common_modules(name='', flag='') -> {modules:[dict], total, source, partial}"
+        "find_common_modules(name='', flag='', limit=200) -> {modules:[dict], total, truncated, source, partial}"
         "  # flag: privileged|global|…|ReturnValuesReuse",
         "discovery",
         ["общий модуль", "common module", "привилегированн", "privileged", "глобальн", "повторное использование"],
@@ -17152,6 +17277,11 @@ def make_bsl_helpers(
         "      print(m['module_name'], m['file'])\n"
         "  # Кеш повторного использования возвращаемых значений — тем же аргументом:\n"
         "  reuse = find_common_modules(flag='DuringSession')\n"
+        "  # СТРАНИЦА, а не весь набор: total — сколько ВСЕГО совпало, modules — limit строк.\n"
+        "  #   truncated=True → подними limit либо сузь name (flag='DontUse' — 3835 строк).\n"
+        "  #   Ровно limit совпадений усечением НЕ объявляются.\n"
+        "  # partial и truncated ОРТОГОНАЛЬНЫ: при partial=True сам total — нижняя оценка\n"
+        "  #   прочитанной части, и это верно даже при truncated=False.\n"
         "  # Без индекса выполняется живой скан описателей: source='live', partial=True.\n"
         "  # EDT ОПУСКАЕТ дефолты целиком — отсутствие узла читается как ЗНАЧЕНИЕ ПО\n"
         "  #   УМОЛЧАНИЮ, а не как «неизвестно», иначе два формата дали бы разные ответы:\n"
@@ -18565,7 +18695,8 @@ def make_bsl_helpers(
         get_overrides,
         "get_overrides(object_name='', method_name='', limit=200, offset=0) -> {overrides, total, offset,"
         " returned, has_more, truncated, partial, source, by_annotation/by_object_top/by_extension_top="
-        "dict{имя:N}, unique_objects/unique_methods=ИМЕНА, unique_object_methods=ПАРЫ}"
+        "dict{имя:N}, unique_objects/unique_methods=N имён, unique_object_methods=N пар,"
+        " unique_extensions=N}"
         "  # stats full iff partial=False; row.extension_file — исполним",
         "extension",
         ["перехват", "override", "расширен", "extension", "вместо", "после", "перед"],
@@ -18575,6 +18706,10 @@ def make_bsl_helpers(
         "      print(f\"  {ov['target_method']} <- {ov['annotation']} {ov.get('extension_name', '')}\")\n"
         "  # by_annotation / by_object_top / by_extension_top — это DICT {имя: количество},\n"
         "  # НЕ список записей: итерируй .items(), а срезом бери list(d.items())[:5].\n"
+        "  # unique_* — ЧИСЛА, а не списки: len() по ним падает.\n"
+        "  #   unique_objects/unique_methods считают ИМЕНА: Документы.Заказ и Справочники.Заказ\n"
+        "  #   схлопываются в одно. unique_object_methods считает ПАРЫ с учётом категории и\n"
+        "  #   потому их различает (на боевой 130 имён против 189 пар).\n"
         "  # Дочитать за пределы страницы (v1.34.0): while result['has_more']:\n"
         "  #     result = get_overrides(offset=result['offset'] + result['returned'])\n"
         "  # has_more = «есть следующая страница»; truncated = «список неполон относительно\n"
