@@ -1115,6 +1115,10 @@ def test_reader_fixtures_smoke(request, fixture_name):
 #                          + пропущенный unique_extensions),
 #            find_common_modules +22 (limit/truncated) -> факт 12 117 при пороге 12 393.
 #            Порог НЕ двигается: прибавка внутри запаса, оставленного v1.38.0.
+#   v1.40.0: find_attributes +28, find_predefined +28 (object_name — ТОЧНОЕ имя),
+#            find_print_forms +55 (presentation|None, presentation_source, delegate,
+#            _meta.delegates), get_module_outline +16, get_object_modules +16
+#            (loc=Σ строк методов) -> факт 12 260 при пороге 12 393. Порог НЕ двигается.
 _SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557
 
 
@@ -2354,7 +2358,8 @@ def test_object_modules_registered_sig_exact():
     from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 
     sig = build_helper_metadata_snapshot()["get_object_modules"]["sig"]
-    assert len(sig) == 467
+    # v1.40.0: 467 -> 483 — `loc=Σ строк методов` (+16), осознанное расширение контракта.
+    assert len(sig) == 483
     assert "orphan_methods?" in sig
     assert "# ДЕШЕВЫЙ КОД-СКЕЛЕТ объекта за 1 вызов" not in sig
 

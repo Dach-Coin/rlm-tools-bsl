@@ -535,9 +535,15 @@ def _fit_execute_error_to_frame(message: dict, ipc_max_bytes: int) -> None:
     payload["error"] = _replace_surrogates(error[:prefix_end]) + _ERROR_TRUNCATION_MARKER
 
 
-def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, quota_value, quota_lock, boot: dict):
+def sandbox_worker_main(
+    conn, out_buf, out_published, out_truncated, out_lock, quota_value, quota_lock, boot: dict, scan_ledger=None
+):
     """Top-level spawn target. ``boot`` — только примитивы (trusted bootstrap);
-    вся конфигурация сессии приходит первым ``init``-frame по JSON IPC."""
+    вся конфигурация сессии приходит первым ``init``-frame по JSON IPC.
+
+    ``scan_ledger`` (v1.40.0) — разделяемый журнал общего бюджета потоков обхода,
+    доверенный bootstrap-handle (как ``quota_value``); слот и бюджет — в ``boot``.
+    Прямой вызов с восемью аргументами — без бюджета, как до релиза."""
     stdio_detached, stdio_detail = _detach_stdio()
     # Предупреждения, испущенные ДО первого execute, решаются явно: handler ставится
     # ДО `_build_session`, очередь живёт с этого момента и сбрасывается в `init_ok`
@@ -600,10 +606,20 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
 
             _time.sleep(float(test_delay))
 
+        scan_lease = None
+        if scan_ledger is not None:
+            from rlm_tools_bsl._scan_budget import ScanLease
+
+            scan_lease = ScanLease(scan_ledger, boot.get("scan_slot"), int(boot.get("scan_total", 0)))
         try:
             sandbox, idx_reader, llm_tools, index_loaded, index_warning = _build_session(
-                payload, out_buf, out_published, out_truncated, out_lock, quota_value, quota_lock
+                payload, out_buf, out_published, out_truncated, out_lock, quota_value, quota_lock, scan_lease
             )
+            # Test-only хук (v1.40.0): взять потоки у аренды и не отдавать — модель
+            # «обход идёт». _rlm_start это поле никогда не заполняет.
+            hold = int(payload.get("test_scan_hold_extra") or 0)
+            if hold > 0 and scan_lease is not None:
+                scan_lease.acquire(hold)
             registry_snapshot = sandbox.registry_metadata_snapshot()
             detected_prefixes, prefixes_source = _compute_prefixes(sandbox, idx_reader)
             # v1.36.0: worker-процесс уже lifecycle-владелец Sandbox; при
@@ -690,7 +706,9 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
             pass
 
 
-def _build_session(payload: dict, out_buf, out_published, out_truncated, out_lock, quota_value, quota_lock):
+def _build_session(
+    payload: dict, out_buf, out_published, out_truncated, out_lock, quota_value, quota_lock, scan_lease=None
+):
     """Реконструировать FormatInfo, открыть собственный reader, создать Sandbox.
 
     Race parent-check → worker-open (§8.3): недоступный индекс НЕ валит init —
@@ -757,6 +775,8 @@ def _build_session(payload: dict, out_buf, out_published, out_truncated, out_loc
         current_config_name=payload.get("current_config_name") or "",
         current_config_root=payload.get("current_config_root") or "",
         extension_name_by_root=dict(payload.get("extension_name_by_root") or {}),
+        # v1.40.0: аренда СВОЕГО слота общего бюджета обхода.
+        scan_lease=scan_lease,
     )
     # reset() на каждый execute делает command loop; сохранить ссылку.
     sandbox._shared_stdout_writer = writer

@@ -619,6 +619,8 @@ def _create_session_backend(
         )
         return backend, True
 
+    from rlm_tools_bsl._scan_budget import get_scan_ledger
+
     sandbox = Sandbox(
         base_path=resolved,
         max_output_chars=max_output_chars,
@@ -632,6 +634,9 @@ def _create_session_backend(
         current_config_name=current_config_name,
         current_config_root=current_config_root,
         extension_name_by_root=dict(extension_name_by_root or {}),
+        # v1.40.0: ОДНА аренда общего бюджета обхода на все inline-сессии процесса.
+        # Сессии она не принадлежит, поэтому закрытию backend-а освобождать нечего.
+        scan_lease=get_scan_ledger().inline_lease(),
     )
     backend = InlineSandboxBackend(
         sandbox,

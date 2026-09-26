@@ -60,9 +60,12 @@ class TestCanIndexGlob:
         result = _can_index_glob("Documents/MyDoc/ObjectModule.bsl")
         assert result == ("exact", {"path": "Documents/MyDoc/ObjectModule.bsl"})
 
-    def test_name_wildcard_with_ext(self):
+    def test_name_exact_with_ext(self):
+        # v1.40.0: `**/Name.ext` — ТОЧНОЕ имя файла (стратегия `name_exact`), а не
+        # префикс `name_wildcard`: прежняя стратегия отдавала и `ConfigurationExtra.mdo`,
+        # тогда как та же маска без индекса (pathlib) — только точное имя.
         result = _can_index_glob("**/Configuration.mdo")
-        assert result == ("name_wildcard", {"name_prefix": "Configuration", "ext": ".mdo"})
+        assert result == ("name_exact", {"filename": "Configuration.mdo"})
 
     def test_name_wildcard_any_ext(self):
         result = _can_index_glob("**/MyFile.*")

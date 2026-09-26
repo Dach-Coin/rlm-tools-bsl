@@ -5,6 +5,7 @@ import pathlib
 import re
 import threading
 
+from rlm_tools_bsl._arg_guards import coerce_bound
 from rlm_tools_bsl.regex_safety import NESTED_QUANTIFIER_ERROR, has_catastrophic_nesting
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,7 @@ def _scan_workers() -> int:
     return min(32, n)  # больше 32 УСЕКАЕТСЯ, а не откатывается к дефолту
 
 
-def scan_bsl_tree(root: pathlib.Path) -> tuple[list[str], int]:
+def scan_bsl_tree(root: pathlib.Path, lease=None) -> tuple[list[str], int]:
     """Канон ``walk``: прямой обход дерева *root* поверх ``os.scandir``.
 
     Семантика повторяет прежний обход внутри live-каталога BSL-хелперов (резолв
@@ -110,12 +111,27 @@ def scan_bsl_tree(root: pathlib.Path) -> tuple[list[str], int]:
     сам), поэтому параллельная ветка его не обязана воспроизводить; СОСТАВ и
     число ошибок обязаны совпадать — это закреплено тестами эквивалентности.
 
+    **v1.40.0 — общий бюджет потоков** (``lease`` — ``_scan_budget.ScanLease``):
+    ширину обхода задаёт по-прежнему ``RLM_SCAN_WORKERS``, но ДОПОЛНИТЕЛЬНЫЕ
+    потоки (сверх вызывающего) берутся у аренды общего журнала процессов сервера
+    (``RLM_SCAN_WORKERS_TOTAL``). Выдача 0 — прежний последовательный обход, а не
+    ожидание. Выданное возвращается в ``finally`` при любом исходе обхода.
+    ``lease=None`` — прежнее поведение без бюджета (прямые embedding/test-вызовы).
+
     Returns: ``(absolute_paths, enumeration_errors)``.
     """
     workers = _scan_workers()
     if workers == 1:
         return _scan_bsl_tree_serial(root)
-    return _scan_bsl_tree_parallel(root, workers)
+    extra = workers - 1
+    granted = extra if lease is None else lease.acquire(extra)
+    try:
+        if granted <= 0:
+            return _scan_bsl_tree_serial(root)
+        return _scan_bsl_tree_parallel(root, granted + 1)
+    finally:
+        if lease is not None and granted > 0:
+            lease.release(granted)
 
 
 def _scan_bsl_tree_serial(root: pathlib.Path) -> tuple[list[str], int]:
@@ -313,7 +329,9 @@ def _scan_bsl_tree_parallel(root: pathlib.Path, workers: int) -> tuple[list[str]
     return found, errors
 
 
-def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = None) -> tuple[dict, callable]:
+def make_helpers(
+    base_path: str, idx_reader=None, *, _private_io: dict | None = None, _scan_lease=None
+) -> tuple[dict, callable]:
     """Generic (non-BSL) sandbox toolbox.
 
     ``_private_io`` (v1.34.0) — opt-in sink для ПРИВАТНЫХ status-aware каналов.
@@ -322,6 +340,9 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
     ``Sandbox`` и передаёт напрямую в ``make_bsl_helpers``. Публичный
     ``grep(pattern, path=".")`` остаётся двухаргументным — служебный kwarg из
     кода песочницы по-прежнему даёт ``TypeError``.
+
+    ``_scan_lease`` (v1.40.0) — аренда общего бюджета потоков обхода
+    (``_scan_budget.ScanLease``) для канона ``walk``; ``None`` — без бюджета.
     """
     base = pathlib.Path(base_path).resolve()
     _file_cache: collections.OrderedDict[str, str] = collections.OrderedDict()
@@ -522,6 +543,14 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
         Returns:
             Dict with 'matches' (grouped by file) and 'files' (full contents).
         """
+        # v1.40.0: некорректный числовой аргумент — документированный дефолт, а не
+        # падение (`None > 0`) и не «showing -1» при `max_files=-1`.
+        _sig = "grep_read(pattern, path='.', max_files=10, context_lines=0)"
+        max_files, _wf = coerce_bound(max_files, 10, "max_files", _sig)
+        context_lines, _wc = coerce_bound(context_lines, 0, "context_lines", _sig)
+        for _w in (_wf, _wc):
+            if _w:
+                logger.warning("arg-guard: %s", _w)
         results = grep(pattern, path)
         if not results:
             return {"matches": {}, "files": {}, "summary": "No matches found."}
@@ -683,6 +712,10 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
 
         Uses SQLite index for fast tree rendering when available.
         """
+        # v1.40.0: `None`/строка роняли сравнение глубины — теперь дефолт 3.
+        max_depth, _w = coerce_bound(max_depth, 3, "max_depth", "tree(path='.', max_depth=3)")
+        if _w:
+            logger.warning("arg-guard: %s", _w)
         if idx_reader is not None:
             try:
                 norm_path = path.replace("\\", "/").strip("/") if path != "." else ""
@@ -756,7 +789,10 @@ def make_helpers(base_path: str, idx_reader=None, *, _private_io: dict | None = 
             except OSError:
                 return [], 1
         if route_canon == "walk":
-            return scan_bsl_tree(base)
+            # Аренда передаётся ТОЛЬКО когда она есть: тесты и embedding подменяют
+            # `helpers.scan_bsl_tree` одноаргументной функцией, и безусловный kwarg
+            # уронил бы их TypeError.
+            return scan_bsl_tree(base) if _scan_lease is None else scan_bsl_tree(base, lease=_scan_lease)
         raise ValueError(f"unknown route_canon: {route_canon!r}")
 
     if _private_io is not None:

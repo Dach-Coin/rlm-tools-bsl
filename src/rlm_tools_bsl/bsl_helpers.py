@@ -5,7 +5,6 @@ import concurrent.futures
 import inspect
 import json
 import logging
-import math
 import os
 import re
 import threading
@@ -14,6 +13,7 @@ import warnings
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from rlm_tools_bsl._arg_guards import UNBOUNDED_PAGE, coerce_bound as _coerce_bound, coerce_optional_bound
 from rlm_tools_bsl.format_detector import parse_bsl_path, BslFileInfo, FormatInfo
 from rlm_tools_bsl.bsl_knowledge import (
     BSL_DECL_PREFIX_RE,
@@ -746,6 +746,240 @@ def _build_outline_tree(
     return outline, (orphan_methods if include_methods else [])
 
 
+def _exact_object_rows(rows, obj_name: str, category: str) -> list[dict]:
+    """Строки ридера ТОЧНО этого объекта (и этой категории, если она задана).
+
+    v1.40.0: ридеры уже фильтруют ``object_name`` точно, но ``get_predefined_items``
+    категорию не принимает, ``get_form_elements`` её не фильтрует, а сторонний
+    ридер прежнего API мог оставить ``object_name`` подстрокой. Фильтр в Python —
+    одна точка правила для всех трёх случаев.
+
+    Строку, в которой ридер ключа НЕ отдал (``None``), фильтр не судит и оставляет:
+    ридер спрашивали именно про этот объект, а отбросить строку по отсутствующему
+    полю значило бы сломать минимальный сторонний ридер (форм — ``{form_name}``).
+    У боевого ридера оба столбца ``NOT NULL``, и фильтр работает всегда.
+    """
+    want = obj_name.lower()
+    cat = (category or "").lower()
+
+    def _keep(r) -> bool:
+        name = r.get("object_name")
+        if name is not None and name.lower() != want:
+            return False
+        row_cat = r.get("category")
+        return not cat or row_cat is None or row_cat.lower() == cat
+
+    return [r for r in rows or [] if _keep(r)]
+
+
+def _exact_object_page(fetch, obj_name: str, category: str, limit: int) -> list[dict] | None:
+    """``fetch(limit)`` -> строки ридера | ``None`` (таблицы нет). Срез — ПОСЛЕ фильтра.
+
+    Ридер режет ``LIMIT`` ДО фильтра в Python, поэтому омоним другой категории (или
+    подстрочные соседи у стороннего ридера) может занять всю страницу: 2000
+    предопределённых справочника ``X`` вытеснили бы единственный элемент плана видов
+    характеристик ``X``. Полный набор добирается, только когда страница ПОЛНА и фильтр
+    из неё что-то выбросил — на обычном объекте второго чтения нет.
+    """
+    rows = fetch(limit)
+    if rows is None:
+        return None
+    kept = _exact_object_rows(rows, obj_name, category)
+    if len(rows) >= limit and len(kept) < len(rows):
+        # Страница полна, и фильтр её проредил: нужные строки могли не войти.
+        kept = _exact_object_rows(fetch(UNBOUNDED_PAGE) or [], obj_name, category)
+    return kept[:limit]
+
+
+# ── Печатные команды (v1.40.0) ────────────────────────────────────────────────
+# Прежний разбор склеивал идентификаторы и представления ПО ПОЗИЦИИ в сыром теле
+# процедуры: любая команда без литерального НСтр(...) сдвигала все последующие, и
+# команда получала ЧУЖОЕ представление. Теперь представление ищется в блоке СВОЕЙ
+# команды, а все структурные решения принимаются по маске без комментариев и строк.
+_PF_PARAM_RE = re.compile(r"ДобавитьКомандыПечати\s*\(\s*(?:Знач\s+)?(\w+)", re.IGNORECASE)
+# Помощник — по ТОЧНОМУ имени; квалификатор (Обработки.X.) входит в совпадение.
+_PF_HELPER_RE = re.compile(r"(?<![\w.])(?P<recv>(?:\w+\s*\.\s*)*)ДобавитьКомандуПечати\s*\(", re.IGNORECASE)
+# Делегирование списка: имя метода ОКАНЧИВАЕТСЯ на ДобавитьКомандыПечати.
+_PF_LIST_DELEGATE_RE = re.compile(
+    r"(?<![\w.])(?P<recv>(?:\w+\s*\.\s*)+)(?P<meth>\w*ДобавитьКомандыПечати)\s*\(", re.IGNORECASE
+)
+# Начало инструкции: только там `V =` — присваивание, а не сравнение. Начало СТРОКИ
+# началом инструкции не является: выражение `Если А И` продолжается на следующей строке.
+_PF_STMT_START = r"(?:;|(?<!\w)(?:Тогда|Иначе|Цикл|Попытка|Исключение|Then|Else|Do|Try|Except)(?!\w))"
+# Строка препроцессора (`#Область`, `#Если … Тогда`, `#КонецОбласти`) — в структурной маске
+# гасится, как комментарий: между `;` и следующей инструкцией она не должна стоять стеной.
+_PF_DIRECTIVE_RE = re.compile(r"(?m)^[ \t]*#.*$")
+# Весь вызов НСтр(...) целиком, с единственным аргументом-литералом; язык ru ищется
+# ВНУТРИ, а не только первым: НСтр("en = 'Receipt'; ru = 'Чек'") — законная форма.
+# `NStr` — английское имя той же функции: без него литерал ложно объявлялся бы
+# вычисляемым (`computed`).
+_PF_NSTR_RE = re.compile(r'(?:НСтр|NStr)\s*\(\s*"((?:[^"]|"")*)"\s*\)', re.IGNORECASE)
+_PF_RU_RE = re.compile(r"(?<!\w)ru\s*=\s*'((?:[^']|'')*)'", re.IGNORECASE)
+_PF_PLAIN_LITERAL_RE = re.compile(r'"((?:[^"]|"")*)"')
+# Конец выражения. Литерал — значение, только если выражение на нём и кончается: дальше
+# `;`, ключевое слово конца блока (перед ним `;` в 1С необязательна) или конец текста.
+# В `"Акт " + Номер()` литерал — лишь начало выражения, а не его значение.
+_PF_EXPR_END_RE = re.compile(
+    r"\s*(?:;|\Z|(?<!\w)(?:КонецЕсли|ИначеЕсли|Иначе|КонецЦикла|Исключение|КонецПопытки|КонецПроцедуры"
+    r"|КонецФункции|EndIf|ElsIf|Else|EndDo|Except|EndTry|EndProcedure|EndFunction)(?!\w))",
+    re.IGNORECASE,
+)
+# Идентификатор — непустой литерал целиком, а не \w+: БСП допускает список
+# «Акт,Счет», и прежний \w+ терял такую команду целиком.
+_PF_ID_LITERAL_RE = re.compile(r'"((?:[^"]|"")+)"')
+
+
+def _pf_unquote(value: str) -> str:
+    """Литерал 1С: удвоенная кавычка внутри строки — одна кавычка."""
+    return value.replace('""', '"')
+
+
+def _pf_presentation(text: str, pos: int, code: str | None = None) -> tuple[str | None, str]:
+    """Значение `Представление = …` / третьего аргумента помощника, начиная с `pos`.
+
+    ``НСтр`` с языком ``ru`` либо строковый литерал — ``literal``, но только когда он и
+    есть ВСЁ выражение: конец выражения проверяется по структурной маске ``code`` тех же
+    смещений (без неё — по самому ``text``). ``НСтр`` без ``ru``, вызов функции,
+    переменная, склейка (``"Акт " + Номер()``) — ``(None, 'computed')``: значение
+    вычисляется во время исполнения и статически не читается.
+    """
+    code = text if code is None else code
+    rest = text[pos:]
+    start = pos + len(rest) - len(rest.lstrip())
+    m = _PF_NSTR_RE.match(text, start)
+    if m and _PF_EXPR_END_RE.match(code, m.end()):
+        ru = _PF_RU_RE.search(_pf_unquote(m.group(1)))
+        return (ru.group(1).replace("''", "'"), "literal") if ru else (None, "computed")
+    m = _PF_PLAIN_LITERAL_RE.match(text, start)
+    if m and _PF_EXPR_END_RE.match(code, m.end()):
+        return _pf_unquote(m.group(1)), "literal"
+    return None, "computed"
+
+
+def _pf_call_args(text: str, start: int) -> list[str]:
+    """Аргументы вызова от позиции сразу после `(` — балансом скобок и кавычек
+    (`""` внутри строки 1С — экранированная кавычка). Регулярка `[^,]+` рвётся на
+    `НСтр("…, …")`, поэтому аргументы разбираются посимвольно."""
+    args: list[str] = []
+    cur: list[str] = []
+    depth, i, in_str = 0, start, False
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            cur.append(ch)
+            if ch == '"':
+                if text[i + 1 : i + 2] == '"':
+                    cur.append('"')
+                    i += 1
+                else:
+                    in_str = False
+        elif ch == '"':
+            in_str = True
+            cur.append(ch)
+        elif ch == "(":
+            depth += 1
+            cur.append(ch)
+        elif ch == ")":
+            if depth == 0:
+                args.append("".join(cur))
+                return args
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    return args  # незакрытый вызов: что успели разобрать
+
+
+def _parse_print_commands(body: str, path: str) -> tuple[list[dict], list[str]]:
+    """Печатные команды процедуры ``ДобавитьКомандыПечати`` → ``(строки, делегаты)``.
+
+    Две маски ОДНОЙ длины (приём v1.33.0). СТРУКТУРА — начала блоков, их границы,
+    якоря свойств, вызовы — ищется по полной маске: содержимое строк погашено, и
+    «; К = …» внутри литерала блок не рвёт. ЗНАЧЕНИЯ литералов читаются по маске с
+    содержимым строк — по тем же смещениям.
+    """
+    lines = body.splitlines()
+    code = _PF_DIRECTIVE_RE.sub(lambda m: " " * len(m.group(0)), "\n".join(mask_comments_and_strings(lines)))
+    text = "\n".join(mask_comments_and_strings(lines, keep_string_content=True))
+    events: list[tuple[int, dict]] = []
+
+    def _row(name, presentation, source, delegate):
+        return {
+            "name": name,
+            "presentation": presentation,
+            "presentation_source": source,
+            "delegate": delegate,
+            "file": path,
+        }
+
+    # 1. Блоки: V = <Команды>.Добавить(), где <Команды> — первый параметр процедуры.
+    #    Строка чужой таблицы (`НоваяСтрока = ТаблицаНастроек.Добавить()`) блока не
+    #    начинает и печатной командой не становится.
+    pm = _PF_PARAM_RE.search(code)
+    coll = re.escape(pm.group(1) if pm else "КомандыПечати")
+    block_re = re.compile(rf"(?<![\w.])(?P<var>\w+)\s*=\s*{coll}\s*\.\s*(?:Добавить|Add)\s*\(\s*\)", re.IGNORECASE)
+    starts = list(block_re.finditer(code))
+    for i, b in enumerate(starts):
+        var = b.group("var")
+        v = re.escape(var)
+        # Конец блока — следующее начало блока V либо ЛЮБОЕ присваивание V в начале
+        # инструкции (переиспользование переменной под строку, которую вернул делегат).
+        ends = [len(code)]
+        nxt = next((x.start() for x in starts[i + 1 :] if x.group("var").casefold() == var.casefold()), None)
+        if nxt is not None:
+            ends.append(nxt)
+        again = re.compile(rf"{_PF_STMT_START}\s*{v}\s*=", re.IGNORECASE).search(code, b.end())
+        if again:
+            ends.append(again.start())
+        lo, hi = b.end(), min(ends)
+        # Присваивание свойства — только в начале инструкции: в `Если К.Представление =
+        # "X" Тогда` знак `=` — сравнение, и литерал условия представлением не становится.
+        id_m = re.compile(rf"{_PF_STMT_START}\s*{v}\s*\.\s*Идентификатор\s*=\s*(?=\")", re.IGNORECASE).search(
+            code, lo, hi
+        )
+        id_lit = _PF_ID_LITERAL_RE.match(text, id_m.end()) if id_m else None
+        if not id_lit:
+            continue
+        pres_m = re.compile(rf"{_PF_STMT_START}\s*{v}\s*\.\s*Представление\s*=\s*", re.IGNORECASE).search(code, lo, hi)
+        presentation, source = _pf_presentation(text, pres_m.end(), code) if pres_m else (None, "not_set")
+        events.append((id_m.start(), _row(_pf_unquote(id_lit.group(1)), presentation, source, None)))
+
+    # 2. Вызовы-помощники ДобавитьКомандуПечати(Команды, "Ид"[, представление]):
+    #    вызов найден по полной маске, аргументы разобраны по маске с содержимым строк.
+    for m in _PF_HELPER_RE.finditer(code):
+        args = _pf_call_args(text, m.end())
+        if len(args) < 2:
+            continue
+        id_lit = _PF_ID_LITERAL_RE.fullmatch(args[1].strip())
+        if not id_lit:
+            continue
+        name = _pf_unquote(id_lit.group(1))
+        recv = re.sub(r"\s+", "", m.group("recv")).rstrip(".")
+        if len(args) >= 3:
+            presentation, source = _pf_presentation(args[2], 0)
+            row = _row(name, presentation, source, None)
+        elif recv:
+            row = _row(name, None, "delegate", recv)
+        else:
+            row = _row(name, None, "not_set", None)
+        events.append((m.start(), row))
+
+    # 3. Делегирование всего списка — хелпер туда не ходит, но называет, КУДА не ходил.
+    delegates = [re.sub(r"\s+", "", m.group("recv")) + m.group("meth") for m in _PF_LIST_DELEGATE_RE.finditer(code)]
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for _pos, row in sorted(events, key=lambda e: e[0]):
+        if row["name"] not in seen:
+            seen.add(row["name"])
+            rows.append(row)
+    return rows, delegates
+
+
 def make_bsl_helpers(
     base_path: str,
     resolve_safe,  # callable: str -> pathlib.Path
@@ -765,6 +999,7 @@ def make_bsl_helpers(
     current_config_name: str = "",
     current_config_root: str = "",
     extension_name_by_root: dict[str, str] | None = None,
+    scan_lease=None,
 ) -> dict:
     """Creates BSL helper functions for sandbox namespace.
     Internal _bsl_index is built lazily on first find_module() call.
@@ -789,6 +1024,10 @@ def make_bsl_helpers(
     отсутствие молча проглоченного отказа чтения/перечисления нельзя, и
     потребители честно получают ``read_status_complete=False``. Публичный
     ``grep_fn`` ВСЕГДА вызывается прежней двухаргументной формой.
+
+    ``scan_lease`` (v1.40.0) — аренда общего бюджета потоков обхода
+    (``_scan_budget.ScanLease``) для прямого обхода дерева без ``catalog_scan_fn``;
+    ``None`` — без бюджета, как раньше.
 
     ``glob_files_fs_fn`` (v1.36.0) — такой же приватный канал: FS-only реализация
     ``glob_files`` ТЕКУЩЕГО корня. Нужна там, где ответ объявлен живым
@@ -1330,7 +1569,13 @@ def make_bsl_helpers(
             else:
                 # `idx_reader is not None`: production-callback сам index-backed и
                 # повторил бы stale-список, который live-fallback обязан обойти.
-                value = _scan_bsl_tree(_base_path_resolved)
+                # Аренда — ТОЛЬКО когда она есть (подмена обхода одноаргументной
+                # функцией в тестах/embedding не должна получать TypeError).
+                value = (
+                    _scan_bsl_tree(_base_path_resolved)
+                    if scan_lease is None
+                    else _scan_bsl_tree(_base_path_resolved, lease=scan_lease)
+                )
             _main_scan_cache[route_canon] = value
             return value
 
@@ -2106,78 +2351,6 @@ def make_bsl_helpers(
                     out[str(x)] = {"error": f"{type(exc).__name__}: {exc}"}
             return out
         return fn(arg)
-
-    def _coerce_bound(
-        value,
-        default: int,
-        param: str,
-        sig: str,
-        *,
-        minimum: int = 0,
-        maximum: int | None = None,
-    ) -> tuple[int, str | None]:
-        """Нормализовать limit/offset-подобный параметр на ГРАНИЦЕ хелпера (v1.30.0).
-
-        Возвращает ``(int, warning|None)``. Политика унаследована от int-гарда
-        ``module_hint`` (v1.18.0, см. ``_find_callers_context_one``): НЕ угадывать
-        сдвиг аргументов, НЕ падать — вернуть ДОКУМЕНТИРОВАННЫЙ дефолт и явно
-        назвать сигнатуру.
-
-        Зачем вообще: эти значения уезжают в ``LIMIT ? OFFSET ?`` ридера, а SQLite
-        требует у LIMIT целое — ``None`` там даёт ``IntegrityError: datatype
-        mismatch``, а не «без ограничения». Часть хелперов вдобавок считает
-        ``offset + limit`` и падает раньше SQL. Гард стоит ДО обращения к
-        ``idx_reader``, поэтому ``bsl_index.py`` править не требуется.
-
-        Отрицательные значения ОТСЕКАЮТСЯ намеренно: в SQLite ``LIMIT -1`` — это
-        «без ограничения», и через него сегодня достижим дамп десятков тысяч строк
-        в песочницу с ограниченным ``max_output_chars`` (вплоть до срабатывания
-        таймаута и убийства воркера). ``0`` при этом остаётся валидным.
-
-        ``bool`` отсекается ДО ``int``: он подкласс ``int`` и ``True`` молча прошёл
-        бы как ``1``. ``float`` с дробной частью усекается — согласовано с уже
-        принятым ``int(depth)`` в ``find_call_hierarchy``. Но диапазон судится по
-        ИСХОДНОМУ значению, а не по усечённому: ``int()`` усекает К НУЛЮ, поэтому
-        ``-0.5`` иначе молча становился бы валидным ``0`` (v1.39.0).
-        """
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
-            return default, (
-                f"{param} ожидался целым, получено {type(value).__name__}={value!r} — "
-                f"использован дефолт {default}. Сигнатура: {sig}."
-            )
-        if isinstance(value, float) and math.isinf(value):
-            # `int(inf)` бросает OverflowError, то есть ТОТАЛЬНЫЙ гард падал сам —
-            # ровно на том входе, ради которого и существует. Семантика взята у
-            # соседнего `_normalize_role_details_limit`, чтобы два нормализатора
-            # одного проекта не разошлись: `+inf` — это «хочу всё», то есть упор в
-            # потолок (а без потолка — дефолт, потому что безлимит здесь запрещён
-            # намеренно, см. про LIMIT -1 выше); `-inf` — нижняя ошибка, дефолт.
-            if value > 0 and maximum is not None:
-                return maximum, (f"{param}=+inf превышает максимум {maximum} — усечен. Сигнатура: {sig}.")
-            return default, (
-                f"{param}={value!r} не является конечным числом — использован дефолт {default}. Сигнатура: {sig}."
-            )
-        # Диапазон судится по ИСХОДНОМУ значению, а НЕ по усечённому. `int()`
-        # усекает К НУЛЮ, поэтому `int(-0.5)` даёт 0 — то есть усечение само
-        # переносит значение из запрещённой области в разрешённую, и проверка
-        # после него отрицательную дробь не видит вовсе: `-0.5` молча становился
-        # валидным нулём, без предупреждения, хотя контракт обещает дефолт на
-        # ЛЮБОЕ отрицательное. Задетый интервал — ровно (minimum-1, minimum).
-        # Правило усечения при этом СОХРАНЕНО и не подменено откатом к дефолту:
-        # `2.5` по-прежнему даёт 2 (прибито `test_float_is_truncated_not_rejected`),
-        # потому что при `value >= minimum >= 0` усечение к нулю ниже минимума
-        # увести уже не может.
-        if value < minimum:
-            return default, (
-                f"{param}={value!r} вне диапазона (минимум {minimum}) — использован дефолт {default}. Сигнатура: {sig}."
-            )
-        ivalue = int(value)
-        # `maximum` остаётся ПОСЛЕ усечения намеренно: выход за верхнюю границу —
-        # это валидное «хочу больше потолка», и усечение дробной части там никуда
-        # не переносит (`100.7` при потолке 100 усекается ВНУТРЬ разрешённого).
-        if maximum is not None and ivalue > maximum:
-            return maximum, (f"{param}={value!r} превышает максимум {maximum} — усечен. Сигнатура: {sig}.")
-        return ivalue, None
 
     def _warn_bound(warning: str | None) -> None:
         """Единая точка логирования для хелперов БЕЗ пригодного ``_meta``.
@@ -3146,7 +3319,10 @@ def make_bsl_helpers(
             elif root is not None:
                 root_success[root] = root_success.get(root, 0) + 1
 
-        result_cap = None if _result_cap is None else max(0, int(_result_cap))
+        # v1.40.0: `None` — внутреннее «без cap»; мусор больше не роняет вызов
+        # `int(...)`, а тоже означает «без cap» (семейство «None = без ограничения»).
+        result_cap, _w_cap = coerce_optional_bound(_result_cap, "_result_cap", "safe_grep(..., _result_cap=None)")
+        _warn_bound(_w_cap)
         results: list[dict] = []
         truncated = result_cap == 0
         py_paths: list[str] = list(paths)  # files still needing the Python path
@@ -4279,6 +4455,10 @@ def make_bsl_helpers(
             depth_int = int(depth)
         except (TypeError, ValueError):
             depth_int = 2
+        except OverflowError:
+            # ±inf: int() бросает OverflowError — это выход за диапазон, а не «не число»,
+            # поэтому применяется тот же clamp, что и к конечному значению ниже.
+            depth_int = 3 if depth > 0 else 1
         depth_int = max(1, min(3, depth_int))
 
         result: dict = {
@@ -4499,6 +4679,9 @@ def make_bsl_helpers(
             max_depth_int = int(max_depth)
         except (TypeError, ValueError):
             max_depth_int = 4
+        except OverflowError:
+            # ±inf — выход за диапазон, а не «не число»: тот же clamp, что ниже.
+            max_depth_int = 8 if max_depth > 0 else 1
         max_depth_int = max(1, min(8, max_depth_int))
 
         # --- Cheap ambiguity guard (v1.25.0) --------------------------------
@@ -5506,7 +5689,7 @@ def make_bsl_helpers(
         Returns:
             {
               "path", "category", "object_name", "module_type", "owner",
-              "totals": {"methods", "exports", "regions", "loc"},
+              "totals": {"methods", "exports", "regions", "loc"},   # loc — см. ниже
               "outline": [{region, line, end_line, totals:{methods, exports},
                            children:[...], methods:[...]}],   # methods iff include_methods
               "orphan_methods": [...],                        # present iff include_methods
@@ -5514,6 +5697,14 @@ def make_bsl_helpers(
                         "resolved_from_name": bool,           # P3: всегда (False на path-пути)
                         "chosen_module", "chosen_reason", "candidates", "ambiguous"}  # iff by name
             }
+
+        ``totals.loc`` (v1.40.0 — определение) — СУММА пролётов методов:
+        ``end_line − line + 1`` каждого метода, то есть строки от объявления до
+        ``КонецПроцедуры``/``КонецФункции`` включительно, со всеми пустыми строками и
+        комментариями ВНУТРИ методов (сборщик и живая ветка считают одинаково). Код
+        уровня модуля (``Перем``, раздел инициализации) и комментарии между методами в
+        ``loc`` НЕ входят. Строки файла — ``code_metrics(path)['total_lines']``, без
+        пустых и комментариев — ``['code_lines']``: три числа разные по определению.
 
         ``_meta`` mirrors ``get_object_full_structure``: ``index_used=True`` → tree
         built from the index; otherwise ``fallback_reason`` is one of
@@ -6804,32 +6995,27 @@ def make_bsl_helpers(
             yield m.get("category") or "", m.get("object_name") or "", True
 
         # ── Pass 2: live glob по категориям (всегда exact, имя файла = name) ─
+        def _real_hits(pattern: str) -> list[str]:
+            # v1.40.0: индексный glob_files на НУЛЕВОМ результате маски без `*` отдаёт
+            # строку-подсказку «[hint: … matched directories but no files …]», и каскад
+            # принимал её за попадание: на индексной сессии любое неразрешённое имя
+            # становилось `Enums/<имя>`, а строгий префикс типа — «найденным» объектом
+            # запрошенной категории. Приём — тот же, что у `_valid_files`
+            # в find_exchange_plan_content.
+            try:
+                return [h for h in glob_files_fn(pattern) if not h.startswith("[hint:")]
+            except Exception:
+                return []
+
         for cat in _METADATA_ONLY_CATEGORIES:
             if pc is not None and cat.lower() != pc:
                 continue
-            # Try CF directory layout: {Cat}/{name}/Ext/*.xml
-            try:
-                hits = glob_files_fn(f"{cat}/{name}/Ext/*.xml")
-            except Exception:
-                hits = []
-            if hits:
-                yield cat, name, True
-                continue
-            # Try EDT layout: {Cat}/{name}/{name}.mdo
-            try:
-                hits = glob_files_fn(f"{cat}/{name}/{name}.mdo")
-            except Exception:
-                hits = []
-            if hits:
-                yield cat, name, True
-                continue
-            # Try CF sibling-only layout: {Cat}/{name}.xml
-            try:
-                hits = glob_files_fn(f"{cat}/{name}.xml")
-            except Exception:
-                hits = []
-            if hits:
-                yield cat, name, True
+            # CF directory layout {Cat}/{name}/Ext/*.xml, EDT {Cat}/{name}/{name}.mdo,
+            # CF sibling-only {Cat}/{name}.xml — первое попадание решает.
+            for pattern in (f"{cat}/{name}/Ext/*.xml", f"{cat}/{name}/{name}.mdo", f"{cat}/{name}.xml"):
+                if _real_hits(pattern):
+                    yield cat, name, True
+                    break
 
         # ── Pass 3: close-match fallback ────────────────────────────────
         # prefer_category is STRICT: if no exact match exists in the requested category
@@ -6908,6 +7094,24 @@ def make_bsl_helpers(
         except Exception:
             return ""
 
+    _REF_HEAD_TO_CATEGORY = {head: folder for folder, head in _CATEGORY_TO_REF_HEAD.items()}
+
+    def _split_typed_name(raw: str) -> tuple[str, str]:
+        """``('Documents', 'X')`` для ``'Документ.X'`` / ``'документ.X'`` / ``'Document.X'``;
+        ``('', X)`` иначе, где X — то, что отдал бы прежний ``_strip_meta_prefix``.
+
+        Через ``_normalize_object_ref``, а НЕ через ``_strip_meta_prefix``: второй
+        регистрозависим (``'документ.X'`` не снимается), и префикс в нижнем регистре
+        молча давал бы ноль. Имя без известного префикса (``'Подсистема.X'``,
+        ``'Documents/X'``) возвращается тем же, что отдавал ``_strip_meta_prefix``.
+        """
+        canon, _ = _normalize_object_ref(raw)
+        head, dot, rest = canon.partition(".")
+        category = _REF_HEAD_TO_CATEGORY.get(head, "") if dot else ""
+        if category and rest:
+            return category, rest
+        return "", _strip_meta_prefix(raw)
+
     def get_object_full_structure(name: str, category_hint: str | None = None) -> dict:
         """Aggregating helper: full object structure in one call.
 
@@ -6982,7 +7186,15 @@ def make_bsl_helpers(
            forms:[str],
            _meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}
         """
-        name = _strip_meta_prefix(name)
+        # v1.40.0: префикс типа — КАТЕГОРИЯ, и она строгая. Раньше префикс срезался и
+        # выбрасывался: на точном омониме `РегистрНакопления.X` отвечал ДОКУМЕНТОМ `X`
+        # (первая категория каскада). Повтор без фильтра остаётся только для явного
+        # `category_hint` (его передаёт профиль, уже разрешивший объект сам) — то же
+        # правило строгости, что у `prefer_category` в самом каскаде.
+        typed_category, name = _split_typed_name(name)
+        strict = category_hint is None and bool(typed_category)
+        if strict:
+            category_hint = typed_category
 
         # --- Resolve (category, object_name) via metadata-first cascade ---
         # find_module() работает только по BSL-модулям, поэтому XML-only объекты
@@ -6990,12 +7202,13 @@ def make_bsl_helpers(
         # через него не находятся. Каскад: index metadata → index synonyms →
         # index enum_values → BSL modules → live glob по категориям.
         category, obj_name = _resolve_object_for_full_structure(name, prefer_category=category_hint)
-        if not category and not obj_name and category_hint:
+        if not category and not obj_name and category_hint and not strict:
             # Object not present in the hinted category → retry unfiltered (find it anywhere).
             category, obj_name = _resolve_object_for_full_structure(name)
         if not category and not obj_name:
+            where = f" в категории {category_hint}" if strict else ""
             return {
-                "error": f"Объект '{name}' не найден",
+                "error": f"Объект '{name}' не найден{where}",
                 "_meta": {"index_used": False, "fallback_reason": "object_not_found", "ts_synonyms_available": False},
             }
         category = category or ""
@@ -7219,8 +7432,15 @@ def make_bsl_helpers(
         # --- Index path ---
         attrs_rows: list[dict] | None = None
         if idx_reader is not None:
+            # v1.40.0: строки — ТОЧНО этого объекта этой категории (страховка для
+            # стороннего ридера прежнего API); срез страницы — после фильтра.
             try:
-                attrs_rows = idx_reader.get_object_attributes(object_name=obj_name, category=category, limit=2000)
+                attrs_rows = _exact_object_page(
+                    lambda lim: idx_reader.get_object_attributes(object_name=obj_name, category=category, limit=lim),
+                    obj_name,
+                    category,
+                    2000,
+                )
             except Exception:
                 attrs_rows = None
 
@@ -7257,8 +7477,16 @@ def make_bsl_helpers(
                 )
 
             # Predefined items
+            # Категорию ридер предопределённых не принимает (и расширять его сигнатуру
+            # нельзя: сторонний ридер без параметра уронил бы вызов в except и оставил бы
+            # секцию пустой) — она применяется фильтром, с добором прореженной страницы.
             try:
-                pi_rows = idx_reader.get_predefined_items(object_name=obj_name, limit=2000)
+                pi_rows = _exact_object_page(
+                    lambda lim: idx_reader.get_predefined_items(object_name=obj_name, limit=lim),
+                    obj_name,
+                    category,
+                    2000,
+                )
             except Exception:
                 pi_rows = None
             if pi_rows:
@@ -7287,8 +7515,10 @@ def make_bsl_helpers(
                         break
 
             # Forms from form_elements (distinct form_name).
+            # v1.40.0: ридер форм фильтрует только имя — без категории агрегат собирал
+            # формы ВСЕХ одноимённых объектов (у регистра — формы плана счетов).
             try:
-                fe_rows = idx_reader.get_form_elements(object_name=obj_name)
+                fe_rows = _exact_object_rows(idx_reader.get_form_elements(object_name=obj_name), obj_name, category)
             except Exception:
                 fe_rows = None
             if fe_rows:
@@ -8747,9 +8977,13 @@ def make_bsl_helpers(
         if limit is None:
             return result
 
-        # Paginated mode — return top-level dict.
+        # Paginated mode — return top-level dict. v1.40.0: некорректный limit
+        # (строка, NaN, ±inf, отрицательное, bool) — вся выборка одной страницей
+        # вместо падения `int(...)` / молча пустой страницы на `-1`.
+        page_size, _w = coerce_optional_bound(limit, "limit", "find_event_subscriptions(object_name, ..., limit=None)")
+        _warn_bound(_w)
         total = len(result)
-        page = result[: max(0, int(limit))]
+        page = result[:page_size]
         return {
             "subscriptions": page,
             "total": total,
@@ -11880,11 +12114,27 @@ def make_bsl_helpers(
     def find_print_forms(object_name: str) -> dict:
         """Find print forms registered for an object by parsing ДобавитьКомандыПечати in ManagerModule.
 
-        Returns: dict with object, print_forms list."""
+        v1.40.0: представление берётся из блока СВОЕЙ команды (раньше — склейка по
+        позиции, и команда получала чужое). Строка — ``{name, presentation,
+        presentation_source, delegate, file}``, все ключи безусловны:
+        ``presentation_source`` — ``literal`` (всё выражение — литерал / ``НСтр`` с
+        ``ru``), ``computed`` (вычисляется: функция, переменная, склейка, ``НСтр`` без
+        ``ru``), ``delegate`` (команду добавил помощник другого модуля, ``delegate``
+        называет его), ``not_set``
+        (представление в этом модуле не присваивается). ``presentation=None`` значит
+        «не литерал в этом модуле», а не «пустое представление». Порядок строк —
+        порядок в коде; кавычки 1С декодируются. ``_meta.delegates`` — вызовы,
+        которым процедура передаёт ВЕСЬ список (``Модуль.ДобавитьКомандыПечати(…)``):
+        туда хелпер не ходит, но называет их.
+
+        Returns: dict with object, print_forms list, _meta."""
         object_name = _strip_meta_prefix(object_name)
+        rows: list[dict] = []
+        delegates: list[str] = []
         result: dict = {
             "object": object_name,
-            "print_forms": [],
+            "print_forms": rows,
+            "_meta": {"delegates": delegates},
         }
 
         modules = find_by_type("Documents", object_name)
@@ -11894,49 +12144,20 @@ def make_bsl_helpers(
             modules = find_module(object_name)
             mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
 
+        seen_ids: set[str] = set()
         for mod in mgr_modules:
             path = mod["path"]
             body = read_procedure(path, "ДобавитьКомандыПечати")
-            if body:
-                # Pattern 1: helper-function style (ERP 1.x / UPP)
-                #   ДобавитьКомандуПечати(КомандыПечати, "Ид", НСтр("ru = 'Представление'"))
-                print_re = re.compile(
-                    r'ДобавитьКомандуПечати\([^,]+,\s*"(\w+)"(?:,\s*НСтр\("ru\s*=\s*\'([^\']+)\')?',
-                    re.IGNORECASE,
-                )
-                for m in print_re.finditer(body):
-                    result["print_forms"].append(
-                        {
-                            "name": m.group(1),
-                            "presentation": m.group(2) or "",
-                            "file": path,
-                        }
-                    )
-
-                # Pattern 2: property-style (ERP 2.x)
-                #   КомандаПечати.Идентификатор = "Ид";
-                #   КомандаПечати.Представление = НСтр("ru = 'Текст'");
-                seen_ids = {pf["name"] for pf in result["print_forms"]}
-                id_re = re.compile(
-                    r'КомандаПечати\.Идентификатор\s*=\s*"(\w+)"',
-                    re.IGNORECASE,
-                )
-                pres_re = re.compile(
-                    r"КомандаПечати\.Представление\s*=\s*НСтр\(\"ru\s*=\s*'([^']+)'",
-                    re.IGNORECASE,
-                )
-                ids = id_re.findall(body)
-                presentations = pres_re.findall(body)
-                for i, name in enumerate(ids):
-                    if name not in seen_ids:
-                        result["print_forms"].append(
-                            {
-                                "name": name,
-                                "presentation": presentations[i] if i < len(presentations) else "",
-                                "file": path,
-                            }
-                        )
-                        seen_ids.add(name)
+            if not body:
+                continue
+            mod_rows, mod_delegates = _parse_print_commands(body, path)
+            for row in mod_rows:
+                if row["name"] not in seen_ids:
+                    seen_ids.add(row["name"])
+                    rows.append(row)
+            for d in mod_delegates:
+                if d not in delegates:
+                    delegates.append(d)
 
         return result
 
@@ -12460,6 +12681,115 @@ def make_bsl_helpers(
             out.append(rec)
         return out
 
+    def _attr_rows_from_object_xml(object_path: str, name: str, category: str, kind: str) -> list[dict]:
+        """Живые строки реквизитов ОДНОГО объекта ``Category/Name`` (без среза ``limit``).
+
+        Тело прежней живой ветки ``_find_attributes_core`` без изменений логики —
+        v1.40.0 вынес его, чтобы разбирать ВСЕ точные омонимы имени, а не первый.
+        """
+        from rlm_tools_bsl.bsl_xml_parsers import normalize_type_string as _nts
+
+        try:
+            resolved = _resolve_object_xml(object_path)
+            content = _ext_read_file(resolved)
+            parsed = parse_metadata_xml(content)
+        except Exception:
+            return []
+        if not parsed:
+            return []
+
+        def _make_type(raw: str) -> list[str]:
+            import json as _json
+
+            return _json.loads(_nts(raw))
+
+        results = []
+        obj_short = object_path.split("/")[-1]
+        cat = object_path.split("/")[0]
+
+        # Validate category if provided
+        if category and category.lower() != cat.lower():
+            return []
+
+        for attr in parsed.get("attributes", []):
+            if name and (
+                name.lower() not in attr.get("name", "").lower() and name.lower() not in attr.get("synonym", "").lower()
+            ):
+                continue
+            if kind and kind != "attribute":
+                continue
+            results.append(
+                {
+                    "object_name": obj_short,
+                    "category": cat,
+                    "attr_name": attr.get("name", ""),
+                    "attr_synonym": attr.get("synonym", ""),
+                    "attr_type": _make_type(attr.get("type", "")),
+                    "attr_kind": "attribute",
+                    "ts_name": None,
+                    "source_file": resolved,
+                }
+            )
+        for dim in parsed.get("dimensions", []):
+            if name and (
+                name.lower() not in dim.get("name", "").lower() and name.lower() not in dim.get("synonym", "").lower()
+            ):
+                continue
+            if kind and kind != "dimension":
+                continue
+            results.append(
+                {
+                    "object_name": obj_short,
+                    "category": cat,
+                    "attr_name": dim.get("name", ""),
+                    "attr_synonym": dim.get("synonym", ""),
+                    "attr_type": _make_type(dim.get("type", "")),
+                    "attr_kind": "dimension",
+                    "ts_name": None,
+                    "source_file": resolved,
+                }
+            )
+        for res in parsed.get("resources", []):
+            if name and (
+                name.lower() not in res.get("name", "").lower() and name.lower() not in res.get("synonym", "").lower()
+            ):
+                continue
+            if kind and kind != "resource":
+                continue
+            results.append(
+                {
+                    "object_name": obj_short,
+                    "category": cat,
+                    "attr_name": res.get("name", ""),
+                    "attr_synonym": res.get("synonym", ""),
+                    "attr_type": _make_type(res.get("type", "")),
+                    "attr_kind": "resource",
+                    "ts_name": None,
+                    "source_file": resolved,
+                }
+            )
+        for ts in parsed.get("tabular_sections", []):
+            for ta in ts.get("attributes", []):
+                if name and (
+                    name.lower() not in ta.get("name", "").lower() and name.lower() not in ta.get("synonym", "").lower()
+                ):
+                    continue
+                if kind and kind != "ts_attribute":
+                    continue
+                results.append(
+                    {
+                        "object_name": obj_short,
+                        "category": cat,
+                        "attr_name": ta.get("name", ""),
+                        "attr_synonym": ta.get("synonym", ""),
+                        "attr_type": _make_type(ta.get("type", "")),
+                        "attr_kind": "ts_attribute",
+                        "ts_name": ts.get("name", ""),
+                        "source_file": resolved,
+                    }
+                )
+        return results
+
     def find_attributes(
         name: str = "", object_name: str = "", category: str = "", kind: str = "", limit: int = 500
     ) -> list[dict]:
@@ -12479,8 +12809,12 @@ def make_bsl_helpers(
         _warn_bound(_w)
         if kind:
             kind = kind.lower()
-        if object_name:
-            object_name = _strip_meta_prefix(object_name)
+        # v1.40.0: object_name — ТОЧНОЕ имя; префикс типа ('Документ.X', регистр
+        # префикса не важен) сужает до категории, если `category` не передан явно.
+        if object_name and "/" not in object_name:
+            typed_category, object_name = _split_typed_name(object_name)
+            if typed_category and not category:
+                category = typed_category
 
         # Build extension state lazily when extensions are configured — the
         # ext attribute/predefined live-fallbacks depend on _extension_metadata_xml.
@@ -12491,13 +12825,21 @@ def make_bsl_helpers(
 
         # Fast path: index (None = table missing, [] = authoritative for name-only)
         if idx_reader is not None:
-            results = idx_reader.get_object_attributes(
-                attr_name=name,
-                object_name=object_name,
-                category=category,
-                kind=kind,
-                limit=limit,
-            )
+
+            def _fetch(lim):
+                return idx_reader.get_object_attributes(
+                    attr_name=name,
+                    object_name=object_name,
+                    category=category,
+                    kind=kind,
+                    limit=lim,
+                )
+
+            if object_name and not has_path:
+                # Страховка от стороннего ридера прежнего API (подстрока); срез — после фильтра.
+                results = _exact_object_page(_fetch, object_name, category, limit)
+            else:
+                results = _fetch(limit)
             if results:
                 results = [_AttrRecord(r) for r in results]
             if results is not None:
@@ -12533,130 +12875,29 @@ def make_bsl_helpers(
                     return results
                 # object_name given but empty result — try auto-resolve below
 
-        # Auto-resolve category via find_module (same pattern as analyze_object)
+        # Живая ветка (v1.40.0): все ТОЧНЫЕ категории имени каскадом метаданных, а не
+        # find_module — тот видит только объекты с BSL-модулем, и XML-only объект без
+        # индекса не находился вовсе. Голое имя — все точные омонимы (раньше — первый).
         if object_name and not has_path:
-            modules = find_module(object_name)
-            exact = [m for m in modules if (m.get("object_name") or "").lower() == object_name.lower()]
-            if exact:
-                cat = exact[0].get("category", "")
-                if cat:
-                    object_name = f"{cat}/{object_name}"
-                    has_path = True
+            object_paths = [
+                f"{c}/{object_name}"
+                for c in _resolve_object_categories(object_name)
+                if not category or c.lower() == category.lower()
+            ]
+            if not object_paths:
+                # Auto-resolve via extension metadata for XML-only ext objects (no .bsl).
+                ext_resolved = _resolve_object_name_from_extension_metadata(object_name)
+                if ext_resolved is not None and (not category or ext_resolved[0].lower() == category.lower()):
+                    object_paths = [ext_resolved[1]]
+        elif has_path:
+            object_paths = [object_name]
+        else:
+            object_paths = []
 
-        # Auto-resolve via extension metadata for XML-only ext objects (no .bsl).
-        if object_name and not has_path:
-            ext_resolved = _resolve_object_name_from_extension_metadata(object_name)
-            if ext_resolved is not None:
-                object_name = ext_resolved[1]
-                has_path = True
-
-        # Fallback: live XML parse via _resolve_object_xml (same as parse_object_xml)
-        if has_path:
-            from rlm_tools_bsl.bsl_xml_parsers import normalize_type_string as _nts
-
-            try:
-                resolved = _resolve_object_xml(object_name)
-                content = _ext_read_file(resolved)
-                parsed = parse_metadata_xml(content)
-            except Exception:
-                return []
-            if not parsed:
-                return []
-
-            def _make_type(raw: str) -> list[str]:
-                import json as _json
-
-                return _json.loads(_nts(raw))
-
+        if object_paths:
             results = []
-            obj_short = object_name.split("/")[-1]
-            cat = object_name.split("/")[0]
-
-            # Validate category if provided
-            if category and category.lower() != cat.lower():
-                return []
-
-            for attr in parsed.get("attributes", []):
-                if name and (
-                    name.lower() not in attr.get("name", "").lower()
-                    and name.lower() not in attr.get("synonym", "").lower()
-                ):
-                    continue
-                if kind and kind != "attribute":
-                    continue
-                results.append(
-                    {
-                        "object_name": obj_short,
-                        "category": cat,
-                        "attr_name": attr.get("name", ""),
-                        "attr_synonym": attr.get("synonym", ""),
-                        "attr_type": _make_type(attr.get("type", "")),
-                        "attr_kind": "attribute",
-                        "ts_name": None,
-                        "source_file": resolved,
-                    }
-                )
-            for dim in parsed.get("dimensions", []):
-                if name and (
-                    name.lower() not in dim.get("name", "").lower()
-                    and name.lower() not in dim.get("synonym", "").lower()
-                ):
-                    continue
-                if kind and kind != "dimension":
-                    continue
-                results.append(
-                    {
-                        "object_name": obj_short,
-                        "category": cat,
-                        "attr_name": dim.get("name", ""),
-                        "attr_synonym": dim.get("synonym", ""),
-                        "attr_type": _make_type(dim.get("type", "")),
-                        "attr_kind": "dimension",
-                        "ts_name": None,
-                        "source_file": resolved,
-                    }
-                )
-            for res in parsed.get("resources", []):
-                if name and (
-                    name.lower() not in res.get("name", "").lower()
-                    and name.lower() not in res.get("synonym", "").lower()
-                ):
-                    continue
-                if kind and kind != "resource":
-                    continue
-                results.append(
-                    {
-                        "object_name": obj_short,
-                        "category": cat,
-                        "attr_name": res.get("name", ""),
-                        "attr_synonym": res.get("synonym", ""),
-                        "attr_type": _make_type(res.get("type", "")),
-                        "attr_kind": "resource",
-                        "ts_name": None,
-                        "source_file": resolved,
-                    }
-                )
-            for ts in parsed.get("tabular_sections", []):
-                for ta in ts.get("attributes", []):
-                    if name and (
-                        name.lower() not in ta.get("name", "").lower()
-                        and name.lower() not in ta.get("synonym", "").lower()
-                    ):
-                        continue
-                    if kind and kind != "ts_attribute":
-                        continue
-                    results.append(
-                        {
-                            "object_name": obj_short,
-                            "category": cat,
-                            "attr_name": ta.get("name", ""),
-                            "attr_synonym": ta.get("synonym", ""),
-                            "attr_type": _make_type(ta.get("type", "")),
-                            "attr_kind": "ts_attribute",
-                            "ts_name": ts.get("name", ""),
-                            "source_file": resolved,
-                        }
-                    )
+            for object_path in object_paths:
+                results.extend(_attr_rows_from_object_xml(object_path, name, category, kind))
             return [_AttrRecord(r) for r in results[:limit]]
 
         # No idx_reader, no object_name → scan extension metadata as the only live source.
@@ -12720,15 +12961,28 @@ def make_bsl_helpers(
     def _find_predefined_core(name: str = "", object_name: str = "", limit: int = 500) -> list[dict]:
         limit, _w = _coerce_bound(limit, 500, "limit", "find_predefined(name='', object_name='', limit=500)")
         _warn_bound(_w)
-        if object_name:
-            object_name = _strip_meta_prefix(object_name)
+        # v1.40.0: object_name — ТОЧНОЕ имя; префикс типа сужает до категории. Параметра
+        # `category` нет ни у хелпера, ни у ридера (расширять ридер нельзя: сторонний
+        # ридер без параметра уронил бы вызов), поэтому категория применяется фильтром.
+        typed_category = ""
+        if object_name and "/" not in object_name:
+            typed_category, object_name = _split_typed_name(object_name)
         if _ext_roots_resolved:
             _ensure_index()
         has_path = object_name and "/" in object_name
 
         # Fast path: index (None = table missing, [] = authoritative for name-only)
         if idx_reader is not None:
-            results = idx_reader.get_predefined_items(item_name=name, object_name=object_name, limit=limit)
+
+            def _fetch(lim):
+                return idx_reader.get_predefined_items(item_name=name, object_name=object_name, limit=lim)
+
+            if object_name and not has_path:
+                # Сужение по префиксу типа + страховка от стороннего ридера прежнего API;
+                # срез страницы — ПОСЛЕ фильтра.
+                results = _exact_object_page(_fetch, object_name, typed_category, limit)
+            else:
+                results = _fetch(limit)
             if results is not None:
                 if results:  # non-empty — authoritative for main config
                     # Merge ext rows BEFORE truncation (codex round 5).
@@ -12775,67 +13029,67 @@ def make_bsl_helpers(
                     )
             return []
 
-        # Auto-resolve category via find_module (same pattern as analyze_object)
+        # Живая ветка (v1.40.0): все ТОЧНЫЕ категории имени каскадом метаданных, а не
+        # find_module (тот не видит объекты без BSL-модуля); голое имя — все омонимы.
         if not has_path:
-            modules = find_module(object_name)
-            exact = [m for m in modules if (m.get("object_name") or "").lower() == object_name.lower()]
-            if exact:
-                cat = exact[0].get("category", "")
-                if cat:
-                    object_name = f"{cat}/{object_name}"
-                    has_path = True
+            object_paths = [
+                f"{c}/{object_name}"
+                for c in _resolve_object_categories(object_name)
+                if not typed_category or c.lower() == typed_category.lower()
+            ]
+            if not object_paths:
+                # Auto-resolve via extension metadata for XML-only ext objects (no .bsl).
+                ext_resolved = _resolve_object_name_from_extension_metadata(object_name)
+                if ext_resolved is not None and (
+                    not typed_category or ext_resolved[0].lower() == typed_category.lower()
+                ):
+                    object_paths = [ext_resolved[1]]
+        else:
+            object_paths = [object_name]
 
-        # Auto-resolve via extension metadata for XML-only ext objects (no .bsl).
-        if not has_path:
-            ext_resolved = _resolve_object_name_from_extension_metadata(object_name)
-            if ext_resolved is not None:
-                object_name = ext_resolved[1]
-                has_path = True
-
-        if not has_path:
+        if not object_paths:
             return []
 
         from rlm_tools_bsl.bsl_xml_parsers import parse_predefined_items as _ppi
 
-        obj_short = object_name.split("/")[-1]
-        candidates = _predefined_candidates(object_name)
-
-        for p in candidates:
-            try:
-                if not _ext_resolve_safe(p).exists():
+        results: list[dict] = []
+        for object_path in object_paths:
+            obj_short = object_path.split("/")[-1]
+            for p in _predefined_candidates(object_path):
+                try:
+                    if not _ext_resolve_safe(p).exists():
+                        continue
+                except Exception:
                     continue
-            except Exception:
-                continue
-            try:
-                content = _ext_read_file(p)
-            except Exception:
-                continue
-            items = _ppi(content)
-            if not items:
-                continue
-            results = []
-            for item in items:
-                if (
-                    name
-                    and name.lower() not in item["name"].lower()
-                    and name.lower() not in item.get("synonym", "").lower()
-                ):
+                try:
+                    content = _ext_read_file(p)
+                except Exception:
                     continue
-                results.append(
-                    {
-                        "object_name": obj_short,
-                        "category": object_name.split("/")[0] if "/" in object_name else "",
-                        "item_name": item["name"],
-                        "item_synonym": item.get("synonym", ""),
-                        "types": item.get("types", []),
-                        "item_code": item.get("code", ""),
-                        "is_folder": item.get("is_folder", False),
-                        "source_file": p,
-                    }
-                )
-            return results[:limit]
-
-        return []
+                items = _ppi(content)
+                if not items:
+                    continue
+                for item in items:
+                    if (
+                        name
+                        and name.lower() not in item["name"].lower()
+                        and name.lower() not in item.get("synonym", "").lower()
+                    ):
+                        continue
+                    results.append(
+                        {
+                            "object_name": obj_short,
+                            "category": object_path.split("/")[0] if "/" in object_path else "",
+                            "item_name": item["name"],
+                            "item_synonym": item.get("synonym", ""),
+                            "types": item.get("types", []),
+                            "item_code": item.get("code", ""),
+                            "is_folder": item.get("is_folder", False),
+                            "source_file": p,
+                        }
+                    )
+                # Первый кандидат с элементами решает — как и раньше, но для КАЖДОГО пути.
+                break
+        return results[:limit]
 
     _fo_lazy = LazyList()
 
@@ -13247,7 +13501,9 @@ def make_bsl_helpers(
             plain["_meta"] = _fo_meta()
             return plain
         # Per-bucket cap (#6): each list truncated independently to ``limit``.
-        n = max(0, int(limit))
+        # v1.40.0: некорректный limit — вся выборка одной страницей, а не падение.
+        n, _w = coerce_optional_bound(limit, "limit", "find_functional_options(object_name, ..., limit=None)")
+        _warn_bound(_w)
         xp, cp = xml_options[:n], code_options[:n]
         page = {
             "object": object_name,
@@ -15957,6 +16213,9 @@ def make_bsl_helpers(
             max_depth_int = int(max_depth)
         except (TypeError, ValueError):
             max_depth_int = 4
+        except OverflowError:
+            # ±inf — выход за диапазон, а не «не число»: тот же clamp, что ниже.
+            max_depth_int = 8 if max_depth > 0 else 1
         max_depth_int = max(1, min(8, max_depth_int))
 
         from_canon, _ = _normalize_object_ref(from_object)
@@ -17625,7 +17884,7 @@ def make_bsl_helpers(
         "get_module_outline",
         get_module_outline,
         "get_module_outline(path|object_name, include_methods=True, no_live=False) -> {path, category, object_name, owner, "
-        "module_type, totals:{methods, exports, regions, loc}, outline:[{region, line, end_line, totals:{methods, "
+        "module_type, totals:{methods, exports, regions, loc=Σ строк методов}, outline:[{region, line, end_line, totals:{methods, "
         "exports}, children:[...], methods:[...]}], orphan_methods, _meta:{index_used, fallback_reason, "
         "skipped_live?, resolved_from_name, chosen_module?, candidates?, ambiguous?}}",
         "code",
@@ -17653,6 +17912,9 @@ def make_bsl_helpers(
         "          print(r['region'], r['totals'])  # {'methods': N, 'exports': M}\n"
         "      # затем нырнуть в нужную область с include_methods=True или read_procedure(path, name)\n"
         "  # totals модуля: {methods, exports, regions, loc}; orphan_methods — код вне любой #Область.\n"
+        "  # loc — СУММА строк МЕТОДОВ (от объявления до КонецПроцедуры включительно), а НЕ строк\n"
+        "  #   файла: код уровня модуля и комментарии между методами не входят. Строки файла —\n"
+        "  #   code_metrics(path)['total_lines'], без пустых и комментариев — ['code_lines'].\n"
         "  # _meta.index_used=False + fallback_reason — индекс недоступен/устарел (отработал live-парсинг).",
     )
     _reg(
@@ -17812,7 +18074,7 @@ def make_bsl_helpers(
     _reg(
         "find_attributes",
         find_attributes,
-        "find_attributes(name='', object_name='', category='', kind='', limit=500) -> [{object_name, category, attr_name, attr_synonym, attr_type, attr_kind, ts_name, owner}]",
+        "find_attributes(name='', object_name='', category='', kind='', limit=500) -> [{object_name, category, attr_name, attr_synonym, attr_type, attr_kind, ts_name, owner}]  # object_name — ТОЧНОЕ имя",
         "xml",
         [
             "реквизит",
@@ -17831,6 +18093,8 @@ def make_bsl_helpers(
         "  results = find_attributes('Организация')\n"
         "  for r in results:\n"
         "      print(r['object_name'], r['attr_name'], r['attr_type'])\n"
+        "  # object_name — ТОЧНОЕ имя объекта; голое имя — все омонимы, 'Документ.X' сужает до категории;\n"
+        "  # фрагмент имени — через search_objects.\n"
         "  # All attributes of a document:\n"
         "  attrs = find_attributes(object_name='РеализацияТоваровУслуг')\n"
         "  # Only dimensions of a register:\n"
@@ -17841,7 +18105,7 @@ def make_bsl_helpers(
     _reg(
         "find_predefined",
         find_predefined,
-        "find_predefined(name='', object_name='', limit=500) -> [{object_name, category, item_name, item_synonym, types, item_code, owner}]",
+        "find_predefined(name='', object_name='', limit=500) -> [{object_name, category, item_name, item_synonym, types, item_code, owner}]  # object_name — ТОЧНОЕ имя",
         "xml",
         ["предопределённ", "predefined", "субконто", "subconto", "счёт", "account", "предопределенн"],
         "FIND PREDEFINED ITEMS:\n"
@@ -17849,6 +18113,8 @@ def make_bsl_helpers(
         "  items = find_predefined('РеализуемыеАктивы')\n"
         "  for i in items:\n"
         "      print(i['item_name'], i['types'])\n"
+        "  # object_name — ТОЧНОЕ имя объекта; голое имя — все омонимы, 'Документ.X' сужает до категории;\n"
+        "  # фрагмент имени — через search_objects.\n"
         "  # All predefined of an object:\n"
         "  all_sub = find_predefined(object_name='ВидыСубконтоХозрасчетные')\n"
         "  # Predefined of a catalog:\n"
@@ -17967,7 +18233,7 @@ def make_bsl_helpers(
         "get_object_modules",
         get_object_modules,
         "get_object_modules(name, include_methods=False, no_live=False) -> {object_name, category, "
-        "modules:[{path, module_type, form_name, owner, totals:{methods,exports,regions,loc}, "
+        "modules:[{path, module_type, form_name, owner, totals:{methods,exports,regions,loc=Σ строк методов}, "
         "outline:[{region, line, end_line, totals, children, methods?}], "
         "overrides:{count, methods:[...]}, orphan_methods?, _meta:{index_used, fallback_reason, skipped_live}}], "
         "totals:{modules, methods, exports, overrides}, _meta:{index_used, modules_truncated, modules_skipped_live}} | {error, _meta}",
@@ -17995,6 +18261,9 @@ def make_bsl_helpers(
         "          for r in m['outline']:\n"
         "              print(f\"    #Область {r['region']} {r['totals']}\")\n"
         "  # затем нырнуть: get_object_modules(name, include_methods=True) ИЛИ read_procedure(m['path'], 'Метод')\n"
+        "  # loc — СУММА строк МЕТОДОВ (от объявления до КонецПроцедуры включительно), а НЕ строк\n"
+        "  #   файла: код уровня модуля и комментарии между методами не входят. Строки файла —\n"
+        "  #   code_metrics(path)['total_lines'], без пустых и комментариев — ['code_lines'].\n"
         "  # ИМЕНА МЕТОДОВ (v1.36.0): при include_methods=True у КАЖДОЙ строки модуля есть\n"
         "  #   m['orphan_methods'] — методы ВНЕ любой #Область (форма как у get_module_outline:\n"
         "  #   {name, type, is_export, line, end_line, loc}). На модуле БЕЗ единой области там\n"
@@ -18257,13 +18526,20 @@ def make_bsl_helpers(
     _reg(
         "find_print_forms",
         find_print_forms,
-        "find_print_forms(obj_name) -> {print_forms: [{name, presentation}]}",
+        "find_print_forms(obj_name) -> {print_forms: [{name, presentation|None, presentation_source, delegate}], _meta:{delegates}}",
         "business",
         ["печат", "print", "макет", "template", "накладн"],
         "FIND PRINT FORMS:\n"
         "  result = find_print_forms('РеализацияТоваровУслуг')\n"
         "  for p in result['print_forms']:\n"
-        "      print(f\"  {p['name']}: {p['presentation']}\")",
+        "      print(f\"  {p['name']}: {p['presentation']} [{p['presentation_source']}]\")\n"
+        "  # presentation_source: literal — выражение целиком литерал/НСтр с ru; computed —\n"
+        "  #   вычисляется (функция, переменная, склейка, НСтр без ru); delegate — команду\n"
+        "  #   добавил помощник другого модуля (p['delegate']); not_set — представление\n"
+        "  #   в модуле не задано.\n"
+        "  # presentation=None — «не литерал в этом модуле», а НЕ пустое представление.\n"
+        "  # _meta.delegates — модули, которым передан ВЕСЬ список команд: хелпер туда\n"
+        "  #   не ходит, их команды ищи find_print_forms/read_procedure по этим модулям.",
     )
     _reg(
         "find_functional_options",

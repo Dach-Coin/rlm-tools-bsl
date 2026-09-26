@@ -6,7 +6,6 @@ import contextlib
 import builtins
 import difflib
 import functools
-import math
 import pathlib
 import re
 import signal
@@ -16,6 +15,7 @@ import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from rlm_tools_bsl._arg_guards import coerce_bound
 from rlm_tools_bsl.helpers import make_helpers
 from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
 
@@ -247,6 +247,7 @@ class Sandbox:
         current_config_name: str = "",
         current_config_root: str = "",
         extension_name_by_root: dict[str, str] | None = None,
+        scan_lease=None,
     ):
         # Топология корней (v1.34.0) проверяется ДО построения namespace и до
         # любого обращения к ридеру/ФС, но ТОЛЬКО на активном BSL-пути:
@@ -280,6 +281,10 @@ class Sandbox:
         # in-memory capture. Возвращаемый объект обязан поддерживать write/flush,
         # getvalue() и атрибут truncated (см. BoundedTextCapture).
         self._output_capture_factory = output_capture_factory
+        # v1.40.0: аренда общего бюджета потоков обхода дерева (`_scan_budget`).
+        # Inline-сессии процесса делят ОДНУ аренду (слот процесса-сервера), worker —
+        # свою; None — прямое создание (тесты/embedding), бюджета нет, как раньше.
+        self._scan_lease = scan_lease
         # Defense-in-depth: сериализация execute ОДНОГО Sandbox (parent сериализует
         # сессию своим session execution lock, но прямые пользователи класса/tests
         # не обязаны об этом знать — §14.3 плана).
@@ -353,7 +358,9 @@ class Sandbox:
         # Приватные status-aware каналы (v1.34.0): sink остаётся ЛОКАЛЬНЫМ, в
         # namespace уезжает только публичный helper dict.
         private_io: dict = {}
-        helpers, self._resolve_safe = make_helpers(self._base_path, idx_reader=self._idx_reader, _private_io=private_io)
+        helpers, self._resolve_safe = make_helpers(
+            self._base_path, idx_reader=self._idx_reader, _private_io=private_io, _scan_lease=self._scan_lease
+        )
         self._namespace.update(self._wrap_helpers(helpers))
 
         bsl_helpers: dict = {}
@@ -376,6 +383,7 @@ class Sandbox:
                 current_config_name=self._current_config_name,
                 current_config_root=self._current_config_root,
                 extension_name_by_root=self._extension_name_by_root,
+                scan_lease=self._scan_lease,
             )
             # Прогреватель — не хелпер: он не должен ни попасть в namespace
             # агента, ни считаться вызовом хелпера. `_wrap_helpers` приватные
@@ -529,33 +537,12 @@ class Sandbox:
             return
         pos, default = spec
         limit = kwargs.get("limit", args[pos] if len(args) > pos else default)
-        # Зеркалим `_coerce_bound` хелпера, иначе подсказка разойдётся с реальностью
-        # в обе стороны: вызов с limit="200" реально усёкся бы по 200 строкам, а
-        # молчали бы; и наоборот — limit=250.0 хелпер ПРИНИМАЕТ (усекает до 250),
-        # так что подстановка дефолта 200 дала бы ложный хинт на 230 строках.
-        if isinstance(limit, bool) or not isinstance(limit, (int, float)) or limit != limit:
-            limit = default  # bool / не-число / NaN
-        elif isinstance(limit, float) and math.isinf(limit):
-            # ±inf: `int(inf)` бросает OverflowError, и зеркало падало ПОСЛЕ уже успешно
-            # выполненного хелпера — терялся весь rlm_execute вместе с готовым ответом.
-            # `_coerce_bound` на этом входе отдаёт `maximum` (если он задан) либо дефолт;
-            # НИ ОДИН из шести хелперов реестра `maximum` не передаёт, поэтому здесь
-            # дефолт — это ТОЧНОЕ значение, которым хелпер и ограничился.
-            # `isinstance(..., float)` обязателен и списан с того же `_coerce_bound`:
-            # `math.isinf` на БОЛЬШОМ int (`10**400`) сам бросает OverflowError, то есть
-            # без него зеркало меняло бы одно падение на другое — на входе, который до
-            # правки отрабатывал штатно (`int` в Python произвольной точности).
-            limit = default
-        elif limit < 0:
-            # Отрицательное судится ДО `int()` — ровно как в `_coerce_bound` (v1.39.0).
-            # `int()` усекает К НУЛЮ, поэтому `int(-0.5)` = 0, и проверка после
-            # усечения отрицательную ДРОБЬ не видела вовсе: зеркало считало
-            # эффективным лимитом ноль и глушило подсказку веткой «агент сам
-            # попросил ноль строк», тогда как хелпер восстанавливает дефолт и
-            # реально отдаёт полную страницу. Срез был, сигнала о нём — нет.
-            limit = default
-        else:
-            limit = int(limit)  # float усекается — как в _coerce_bound
+        # Эффективный лимит считает ТА ЖЕ функция, что у хелпера (v1.40.0): прежняя
+        # собственная копия разбора обязана была совпадать с `_coerce_bound` и уже
+        # дважды расходилась с ним (±inf, отрицательная дробь). Вызов с limit="200"
+        # хелпер восстанавливает к дефолту, а limit=250.0 — ПРИНИМАЕТ и усекает до
+        # 250; подсказка обязана знать ровно это значение.
+        limit, _ = coerce_bound(limit, default, "limit", "")
         if limit <= 0:
             # limit=0 для `_coerce_bound` валиден и даёт пустую выдачу. Формально это
             # усечение, но сигнализировать нечего: агент сам попросил ноль строк.
@@ -671,8 +658,9 @@ class Sandbox:
                         "trigger": f"get_index_info() as session call #{min(gii_seqs)} (payload already in rlm_start.index)",
                         "message": (
                             "builder_version/has_*/counts уже пришли в rlm_start.index (поле index) — "
-                            "не трать execute на get_index_info() на старте; отдельный вызов нужен лишь "
-                            "для has_regions/has_module_headers/extension_overrides."
+                            "не трать execute на get_index_info() на старте. has_regions/has_module_headers/"
+                            "has_extension_overrides следуют из builder_version (>= 8 / 8 / 9); число перехватов — "
+                            "get_overrides()['total'] (полное при partial=False)."
                         ),
                     }
                 )

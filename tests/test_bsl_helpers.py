@@ -5723,7 +5723,14 @@ def test_find_register_movements_finds_post_build_main_handler():
 
             # Compact-профиль сохраняет свой index-prefilter: новый module-row не
             # превращает дешёвую секцию в дополнительный live-анализ обработчика.
-            section = bsl["get_object_profile"]("тестдок", sections=["registers"])["sections"]["registers"]
+            # v1.40.0: имя в ТОЧНОМ регистре. Документа нет ни в одной индексной таблице
+            # (ни реквизитов, ни синонима, ни модуля), и до v1.40.0 профиль «находил» его
+            # только потому, что каскад принимал подсказку индексного glob_files за
+            # попадание — `тестдок` резолвился в `Enums/тестдок`, и проверка ниже была
+            # вакуумной. Регистронезависимого пути к такому объекту индекс не даёт.
+            prof = bsl["get_object_profile"]("ТестДок", sections=["registers"])
+            assert prof["category"] == "Documents", prof
+            section = prof["sections"]["registers"]
             assert "posting_handler_present" not in section["summary"], section
         finally:
             reader.close()

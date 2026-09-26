@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 from multiprocessing.sharedctypes import RawArray, RawValue
 
+from rlm_tools_bsl._scan_budget import get_scan_ledger, scan_workers_total
 from rlm_tools_bsl._sandbox_protocol import (
     LOG_RECORD_MAX_CHARS,
     LOG_RECORDS_MAX,
@@ -303,6 +304,12 @@ class ProcessBackendConfig:
     current_config_name: str = ""
     current_config_root: str = ""
     extension_name_by_root: dict = field(default_factory=dict)
+    # v1.40.0, ТОЛЬКО для Python test API (образец — test_init_delay_seconds): при
+    # > 0 worker сразу после сборки сессии берёт столько потоков из своей аренды
+    # общего бюджета обхода и НЕ отдаёт — детерминированная модель «обход идёт».
+    # Production-код _rlm_start это поле никогда не заполняет. В конце dataclass по
+    # тому же правилу, что и поля v1.34.0 выше.
+    test_scan_hold_extra: int = 0
 
     @classmethod
     def from_env(cls, **overrides) -> "ProcessBackendConfig":
@@ -512,6 +519,11 @@ class ProcessSandboxBackend:
     """Backend одной сессии: один долгоживущий worker-процесс (§5.3)."""
 
     mode = "process"
+    # Слот общего бюджета обхода (v1.40.0) — классовые дефолты: объект, собранный в
+    # обход конструктора (`__new__` в тестах lifecycle-путей), слотом не владеет, и
+    # точки финализации должны это переносить.
+    _scan_ledger = None
+    _scan_slot: int | None = None
 
     def __init__(self, config: ProcessBackendConfig, *, startup_register=None, startup_unregister=None):
         self._cfg = config
@@ -559,6 +571,11 @@ class ProcessSandboxBackend:
         # параллельный shutdown и может бросить до присваивания backend в
         # `_rlm_start` — тогда запись забирает startup_unregister-callback.
         self._startup_log_records: list[str] = []
+        # Слот общего бюджета потоков обхода (v1.40.0). Хранится ЭКЗЕМПЛЯР журнала, из
+        # которого слот выдан: освобождение через get_scan_ledger() при подмене
+        # синглтона (тесты) вернуло бы слот в чужой пул.
+        self._scan_ledger = None
+        self._scan_slot: int | None = None
         tracked = False
         if startup_register is not None:
             if not startup_register(self):
@@ -567,6 +584,10 @@ class ProcessSandboxBackend:
                 self._finalized = True
                 raise SandboxClosedError("sandbox registration was revoked before worker startup")
             tracked = True
+        # Слот — ПОСЛЕ успешной регистрации: у ветки отозванной регистрации его ещё
+        # нет, и освобождать там нечего. Пул исчерпан — None (выдача всегда 0).
+        self._scan_ledger = get_scan_ledger()
+        self._scan_slot = self._scan_ledger.allocate()
         try:
             self._start_worker()
             # Once an initializing backend is lifecycle-visible, shutdown may
@@ -583,7 +604,27 @@ class ProcessSandboxBackend:
         except Exception:
             if tracked and startup_unregister is not None:
                 startup_unregister(self)
+            elif not tracked:
+                # Неотслеживаемый backend (прямое создание — тесты, embedding) никто
+                # не финализирует: слот возвращается здесь, но только при мёртвом
+                # корне — живой писатель слота продолжал бы в него писать.
+                proc = self._proc
+                if proc is None or not proc.is_alive():
+                    self._release_scan_slot()
             raise
+
+    def _reclaim_scan_slot(self) -> None:
+        """Обнулить удержание слота. ТОЛЬКО после подтверждённой смерти корня worker-а:
+        писателя слота больше нет, и его незакрытые потоки не должны сжимать бюджет."""
+        if self._scan_ledger is not None:
+            self._scan_ledger.reclaim(self._scan_slot)
+
+    def _release_scan_slot(self) -> None:
+        """Вернуть слот в пул (backend финализирован). Идемпотентно: повторный вызов
+        из reaper-а или второй точки финализации ничего не делает."""
+        slot, self._scan_slot = self._scan_slot, None
+        if self._scan_ledger is not None and slot is not None:
+            self._scan_ledger.release_slot(slot)
 
     @property
     def startup_log_records(self) -> list[str]:
@@ -752,7 +793,14 @@ class ProcessSandboxBackend:
                         "ipc_max_bytes": cfg.ipc_max_bytes,
                         "generation": gen,
                         "expected_parent_pid": os.getpid(),
+                        # v1.40.0: слот и бюджет общего журнала обхода — примитивы.
+                        "scan_slot": self._scan_slot,
+                        "scan_total": scan_workers_total(),
                     },
+                    # Журнал — доверенный bootstrap-handle, как quota_value (не JSON).
+                    # Процессно-локальный журнал (разделяемая память недоступна) в
+                    # spawn не передаётся: worker идёт без бюджета, как до v1.40.0.
+                    self._scan_ledger.array if self._scan_ledger is not None and self._scan_ledger.shared else None,
                 ),
                 # daemon — только страховочный пояс к явному shutdown-циклу (§13.6);
                 # mp-daemon не мешает subprocess-детям вроде git.
@@ -819,6 +867,7 @@ class ProcessSandboxBackend:
                 "memory_mb": cfg.memory_mb,
                 "test_llm_provider": cfg.test_llm_provider,
                 "test_init_delay_seconds": cfg.test_init_delay_seconds,
+                "test_scan_hold_extra": cfg.test_scan_hold_extra,
                 # v1.34.0: additive JSON-примитивы; версия протокола не меняется,
                 # отсутствие ключей у старого synthetic payload читается как
                 # совместимый default (current root == base).
@@ -982,6 +1031,11 @@ class ProcessSandboxBackend:
                         pass
                 proc.kill()
                 proc.join(1.0)
+        except Exception:
+            pass
+        try:
+            if not proc.is_alive():
+                self._reclaim_scan_slot()
         except Exception:
             pass
         # request_close() can race with Windows Job assignment: it sees the
@@ -1387,6 +1441,10 @@ class ProcessSandboxBackend:
                 pass
         # После kill+join читаем raw counter (без старого lock — §12.2.6).
         self._sync_llm_quota()
+        # v1.40.0: потоки убитого поколения возвращает родитель — иначе бюджет сжался
+        # бы навсегда (свой `finally` убитый обход уже не выполнит).
+        if proc is None or not proc.is_alive():
+            self._reclaim_scan_slot()
         self._close_runtime_handles()
         with self._state_lock:
             if self._state not in ("closing", "closed"):
@@ -1561,6 +1619,8 @@ class ProcessSandboxBackend:
             raise SandboxStartupError(
                 "previous sandbox worker cleanup is incomplete; lazy restart deferred to the next execute"
             )
+        # Корень прежнего поколения мёртв: его удержание не должно достаться новому.
+        self._reclaim_scan_slot()
         self._proc = None
         self._tree_cleanup_confirmed_target = None
 
@@ -1594,6 +1654,7 @@ class ProcessSandboxBackend:
         with self._state_lock:
             self._state = "closed"
         self._finalized = True
+        self._release_scan_slot()
 
     def _close_runtime_handles(self) -> bool:
         """Закрыть IPC/Job handles; False означает, что Job надо повторить."""
@@ -1729,6 +1790,10 @@ class ProcessSandboxBackend:
         ):
             self._kill_tree_raw(proc, wait=False)
         self._sync_llm_quota()
+        if proc is None or not proc.is_alive():
+            # Остаточный backend (корень мёртв, дерево не подтверждено) держит СЛОТ,
+            # но с нулём — бюджет не сжимается.
+            self._reclaim_scan_slot()
         # Флаг СОХРАНЯЕТСЯ между вызовами: после первой неудачной попытки корень
         # уже мёртв, kill-ветка выше не выполнится, и локальная переменная снова
         # оказалась бы True — backend закрылся бы при живых потомках.
@@ -1755,5 +1820,6 @@ class ProcessSandboxBackend:
         with self._state_lock:
             self._state = "closed"
         self._finalized = True
+        self._release_scan_slot()
         report.closed = True
         return report
