@@ -1235,7 +1235,17 @@ class TestEntryPointAndEnvFile:
         env = {k: v for k, v in os.environ.items() if k not in ("RLM_STRATEGY_MODE", "RLM_CATALOG_MODE")}
         env["RLM_CONFIG_FILE"] = str(cfg)
         env.update(extra_env or {})
-        res = subprocess.run([sys.executable, "-c", self._PROBE], capture_output=True, text=True, env=env, timeout=180)
+        # Сервер пишет UTF-8. Без явной кодировки text=True декодирует кодировкой системы: на
+        # Windows-раннере это cp1252, поток чтения stderr падает на кириллице и stderr = None.
+        res = subprocess.run(
+            [sys.executable, "-c", self._PROBE],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=180,
+        )
         assert res.returncode == 0, res.stderr[-800:]
         line = next(ln for ln in res.stdout.splitlines() if ln.startswith("RESULT "))
         return json.loads(line[len("RESULT ") :]), res.stderr
