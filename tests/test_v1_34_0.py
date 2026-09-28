@@ -2860,9 +2860,9 @@ class TestCoverageLegendSection:
     def test_help_tool_is_registered_only_in_slim(self):
         """Предпосылка предыдущего теста, проверенная ИСПОЛНЕНИЕМ, а не по комментарию.
 
-        Гейт стоит на import-time (`if get_strategy_mode() == "slim"`), поэтому режим
-        проверяется в ОТДЕЛЬНЫХ процессах: monkeypatch внутри уже импортированного
-        модуля его не переключит.
+        Регистрацию решает `_sync_rlm_help_registration()` при импорте (и ещё раз в
+        `main()` после загрузки `.env`, v1.41.0), поэтому режим проверяется в ОТДЕЛЬНЫХ
+        процессах: monkeypatch внутри уже импортированного модуля его не переключит.
         """
         import subprocess
         import sys

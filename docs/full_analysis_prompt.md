@@ -1201,7 +1201,7 @@ extension directory next to it. Index v12 recommended (`rlm-bsl-index index buil
 Сценарий:
 
 1. **Стартовая разведка**:
-   - Открой сессию rlm_start(project=..., effort='high').
+   - Открой сессию rlm_start(project=..., query=..., domains=['весь каталог'], effort='high').
    - Из ответа зафиксируй: формат (CF / EDT), число BSL-файлов, что отдало
      поле extension_context (роль текущей конфигурации, перечень соседних
      компонентов с их именами/префиксами/путями, если они есть).

@@ -64,7 +64,7 @@ rlm_index(action="info", project="ERP")                # → build_status: "buil
 Промпт: "Какие подписки на события есть в конфигурации ERP?"
 
 ```
-rlm_start(query="Какие подписки на события есть в конфигурации?", project="ERP")
+rlm_start(query="Какие подписки на события есть в конфигурации?", project="ERP", domains=["документ"])
 ```
 
 ## Пошаговый пример: VSCode + Kilo Code (от нуля до первого вопроса)

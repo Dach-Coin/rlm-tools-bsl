@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -111,9 +113,15 @@ from rlm_tools_bsl.format_detector import detect_format
 # `compact`, а `get_strategy("high", …)` — `full`. Без этих ячеек правки
 # `full`-формы девяти доменов не мерило бы НИЧТО. Числа сняты ДО первой правки
 # релиза на нетронутом дереве (`29e5e0d`).
+#
+# v1.41.0 — slim-ячейки ре-бэйслайнятся ВНИЗ, на факт (правило плана релиза: иначе
+# освобождённые символы молча съела бы следующая правка). Из slim ушли compact index
+# хелперов и строка «INSTANT from index: …», HELP переписан, добавлен блок доменов
+# хелперов; прямой вызов без выбора доменов — «только ядро», поэтому под рецептом
+# «проведение» стоит строка о попутной догрузке домена «документ». Full не двигается.
 _BASELINES = {
-    ("slim", ""): 7146,
-    ("slim", "проведение"): 7990,
+    ("slim", ""): 6084,
+    ("slim", "проведение"): 7201,
     ("full", ""): 33858,
     ("full", "проведение"): 35597,
     ("full", "права"): 35667,
@@ -138,40 +146,46 @@ _BASELINES = {
 # next edit trips the guard on its own merits rather than on inherited saturation.
 # v1.34.0: slim НЕ ре-бэйслайнится (см. пояснение к _BASELINES) — прежний потолок
 # 21725 держится. full двигается на измеренную величину.
-_PAYLOAD_BASELINES = {"slim": 20691, "full": 48037}
+# v1.41.0: slim — ВНИЗ на факт. Ячейка `query=''` идёт через внутренний `_rlm_start` без
+# `domains`, то есть мерит старт «только ядро» (прежде — весь каталог, 20 691).
+_PAYLOAD_BASELINES = {"slim": 8709, "full": 48037}
 # Domain-matched whole-payload бэйслайны (v1.34.0). Заполняются измерением ниже —
 # см. test_domain_matched_rlm_start_payload_within_budget. «проведение» осознанно
 # фиксируется отдельно: там потолок +5% был превышен ещё ДО релиза.
 _DOMAIN_PAYLOAD_BASELINES: dict[tuple[str, str], int] = {
     # «права» — рамка Задачи 8 (доменный рецепт инлайнится в стратегию и уезжает в
     # payload). Ре-бэйслайн осознанный, по ИЗМЕРЕННОЙ serialized delta.
-    ("slim", "права"): 22308,
+    ("slim", "права"): 10358,
     ("full", "права"): 48546,
     # «проведение» фиксируется ОТДЕЛЬНО и осознанно: на этом маршруте объявленный
     # +5% был превышен ещё ДО v1.34.0 (пре-существующее состояние вне изменяемого
     # пути — Задачи 1/2 этот рецепт СОКРАЩАЮТ). Маскировать его общим ре-бэйслайном
     # ячеек «права» нельзя.
-    ("slim", "проведение"): 22631,
+    ("slim", "проведение"): 10490,
     ("full", "проведение"): 48864,
     # v1.37.0: остальные СЕМЬ доменов, чьи рецепты правит релиз, бюджетом не мерил
     # НИКТО — они росли бы вне любого гарда. Числа сняты ДО первой правки релиза на
     # нетронутом дереве (`29e5e0d`), поэтому «бэйслайн» не вобрал в себя уже
     # сделанный рост.
-    ("slim", "расширения"): 22363,
+    ("slim", "расширения"): 10323,
     ("full", "расширения"): 50143,
-    ("slim", "структура объекта"): 22004,
+    ("slim", "структура объекта"): 10363,
     ("full", "структура объекта"): 49328,
-    ("slim", "события формы"): 21988,
+    ("slim", "события формы"): 9656,
     ("full", "события формы"): 48825,
-    ("slim", "ссылки"): 22142,
+    ("slim", "ссылки"): 10026,
     ("full", "ссылки"): 49993,
-    ("slim", "ввод на основании"): 21927,
+    ("slim", "ввод на основании"): 9351,
     ("full", "ввод на основании"): 48760,
-    ("slim", "иерархия вызовов"): 22664,
+    ("slim", "иерархия вызовов"): 10647,
     ("full", "иерархия вызовов"): 50321,
-    ("slim", "достижимость"): 22217,
+    ("slim", "достижимость"): 10480,
     ("full", "достижимость"): 49055,
 }
+# v1.41.0: slim-строки выше ре-бэйслайнены ВНИЗ, на факт. Внутренний `_rlm_start` без
+# `domains` — «только ядро»; при строгом совпадении темы к нему добавляются подписи
+# хелперов compact-шагов рецепта и строка о попутной догрузке домена темы — ячейки мерят
+# весь этот ответ целиком.
 
 # Девять доменов `_BUSINESS_RECIPES`, чьи рецепты правит v1.37.0.
 _BUDGET_DOMAINS = (
@@ -369,18 +383,28 @@ def _payload_fixture(monkeypatch, tmp_path, mode):
 
     monkeypatch.setattr("rlm_tools_bsl.server.detect_extension_context", _clean_ctx)
 
-    def _start(query, effort):
-        raw = _rlm_start(path=str(tmp_path), query=query, effort=effort)
+    def _start(query, effort, domains=None):
+        raw = _rlm_start(path=str(tmp_path), query=query, effort=effort, domains=domains)
         return raw, json.loads(raw)
 
     return _start
 
 
-def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_git_search=False, effort="auto"):
+def _run_payload_budget(
+    monkeypatch,
+    tmp_path,
+    mode,
+    query,
+    baseline,
+    require_git_search=False,
+    effort="auto",
+    domains=None,
+    expect_helpers=(),
+):
     from rlm_tools_bsl.server import _rlm_end
 
     start = _payload_fixture(monkeypatch, tmp_path, mode)
-    raw, data = start(query, effort)
+    raw, data = start(query, effort, domains)
     try:
         assert not data["extension_context"]["nearby_extensions"], "budget config must be extension-free"
         # Бюджет обязан меряться на поддерживаемом дереве: на чужом формате
@@ -392,8 +416,11 @@ def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_gi
             f"{mode}/{query or '(none)'} rlm_start payload {measured} > {ceiling} (+5% of {baseline}). "
             "available_functions / index / strategy grew — trim or re-baseline intentionally."
         )
-        # the new aggregate signature lives on available_functions — confirm it is present
-        assert any("get_object_profile(name" in s for s in data["available_functions"])
+        # v1.41.0: в slim без выбора доменов — только ядро, поэтому ячейка проверяет
+        # хелпер ядра (прежде — get_object_profile, которого в ядре нет); доменные ячейки
+        # проверяют свои хелперы.
+        for sig_head in ("find_module(", *expect_helpers):
+            assert any(s.startswith(sig_head) for s in data["available_functions"]), sig_head
         has_git_search = any(s.startswith("git_search(") for s in data["available_functions"])
         if require_git_search:
             assert has_git_search, "фикстура деградировала в non-git — бюджетная защита git_search.sig стала бы ложной"
@@ -491,20 +518,26 @@ def test_compact_recipe_overhead_within_plan_limit(monkeypatch, tmp_path, mode):
     """
     from rlm_tools_bsl.server import _rlm_end
 
+    from rlm_tools_bsl.bsl_strategy_data import domain_of_topic
+
     start = _payload_fixture(monkeypatch, tmp_path, mode)
     limit = _RECIPE_OVERHEAD_LIMITS[mode]
 
-    def _measure(query, effort):
-        raw, data = start(query, effort)
+    def _measure(query, effort, domains):
+        raw, data = start(query, effort, domains)
         try:
             return _pathfree_len(raw, data["resolved_path"])
         finally:
             _rlm_end(data["session_id"])
 
-    base = _measure("", "auto")
     grown = []
     for domain in _BUDGET_DOMAINS:
-        overhead = _measure(domain, _DOMAIN_EFFORT) - base
+        # v1.41.0: оба старта получают домен ТЕМЫ. Иначе при невыданном домене под
+        # рецептом стояла бы строка о догрузке, а в available_functions — подписи шагов,
+        # и разность перестала бы быть ровно текстом рецепта. Full значение не читает.
+        topic_domains = [domain_of_topic(domain)]
+        base = _measure("", "auto", topic_domains)
+        overhead = _measure(domain, _DOMAIN_EFFORT, topic_domains) - base
         frozen = _RECIPE_OVERHEAD_BASELINES[(mode, domain)]
         if overhead - frozen > limit:
             grown.append(f"{domain}: {frozen} -> {overhead} (+{overhead - frozen} > {limit})")
@@ -541,7 +574,11 @@ def test_full_form_recipe_overhead_within_plan_limit(_fmt_info, monkeypatch):
 # baseline; git — optional runtime capability, поэтому среда без него скипается тем
 # же способом, что и tests/test_sandbox_parity.py. Production coverage это не
 # ослабляет: там сама git-ветка недостижима, а non-git baseline выполняется всегда.
-_GIT_PAYLOAD_BASELINES = {"slim": 22814, "full": 49528}
+# v1.41.0: git-ячейка передаёт `domains=['весь каталог']`, чтобы по-прежнему защищать
+# подпись `git_search` в available_functions и git-блок стратегии (в «только ядро» их
+# нет); slim ре-бэйслайнен ВНИЗ на факт (без compact index, строки INSTANT и прежнего
+# HELP), full значение не читает и не двигается.
+_GIT_PAYLOAD_BASELINES = {"slim": 21384, "full": 49528}
 
 
 @pytest.mark.skipif(not shutil.which("git"), reason="git недоступен")
@@ -563,6 +600,7 @@ def test_git_backed_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode)
         query="",
         baseline=_GIT_PAYLOAD_BASELINES[mode],
         require_git_search=True,
+        domains=["весь каталог"],
     )
 
 
@@ -580,7 +618,8 @@ def test_git_backed_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode)
 # короткой: db_path содержит root, и обратный порядок оставил бы хвосты.
 #
 # Бэйслайны сняты прогоном ЭТОГО ЖЕ теста на НЕТРОНУТОМ коде.
-_MISSING_INDEX_PAYLOAD_BASELINES = {"slim": 19995, "full": 47154}
+# v1.41.0: slim ВНИЗ на факт — внутренний старт без `domains` («только ядро»).
+_MISSING_INDEX_PAYLOAD_BASELINES = {"slim": 7620, "full": 47154}
 
 # Тот же однопроцедурный модуль, что и у фикстуры с индексом.
 _BUDGET_MODULE_BSL = "Процедура П() Экспорт\nКонецПроцедуры\n"
@@ -650,8 +689,10 @@ def test_missing_index_rlm_start_payload_within_budget(monkeypatch, tmp_path, mo
 
 # ── v1.33.0: длинные пояснения переехали из sig в recipe ────────────────────
 #
-# `sig` уходит агенту на КАЖДОМ старте и лежит в бюджете, `recipe` — нет
-# (его отдаёт rlm_help по запросу). Шесть самых длинных sig занимали 4166
+# `sig` уходит агенту до первого вызова или вместе с первым ответом и лежит в бюджете,
+# `recipe` — нет (его отдаёт rlm_help по запросу). v1.41.0: подпись приходит в ядре, с
+# выбранным доменом на старте либо в `signatures` первого ответа `rlm_execute` — но
+# приходит всегда, поэтому потолки подписей не меняются. Шесть самых длинных sig занимали 4166
 # символов из 12727 всего available_functions; запаса под контракты v1.33.0
 # при этом не оставалось (slim+рецепт 49 символов, full payload 244).
 _SIG_CEILINGS = {
@@ -684,7 +725,8 @@ _SIG_CEILINGS = {
     "find_functional_options": 430,
     # Четыре подписи, несущие предупреждения о ложном отрицательном выводе
     # (см. test_sigs_warn_about_false_negative_answers). Потолок нужен именно им:
-    # предупреждение тянет текст вверх, а sig уходит агенту на КАЖДОМ старте.
+    # предупреждение тянет текст вверх, а sig доходит до агента в каждой сессии, где
+    # хелпер нужен (ядро, домен на старте или signatures первого ответа).
     # Запас к фактическому размеру ~10%: смысл дописывать можно, растекаться — нет.
     "parse_form": 510,
     "search_regions": 550,
@@ -698,8 +740,9 @@ def test_long_sigs_are_trimmed(helper, ceiling):
     """v1.33.0: длинные пояснения переехали в recipe (не в бюджете), sig несёт имена
     ключей/параметров И критические pre-call предупреждения — те, без которых агент
     делает ЛОЖНЫЙ вывод из ответа (см. test_sigs_warn_about_false_negative_answers:
-    рецепт читают не всегда, sig уходит на каждом старте). Всё остальное — в recipe.
-    Растить обратно нельзя — бюджет старта на пределе."""
+    рецепт читают не всегда, а sig приходит до первого вызова — в ядре или с доменом — либо
+    вместе с первым ответом в `signatures`). Всё остальное — в recipe. Растить обратно
+    нельзя: подпись оплачивается в каждой сессии, где хелпер выдан."""
     snap = build_helper_metadata_snapshot()
     sig = snap[helper]["sig"]
     assert len(sig) <= ceiling, f"{helper} sig = {len(sig)} > {ceiling}: перенеси пояснение в recipe"
@@ -748,7 +791,8 @@ def _sig_says(sig: str, alternatives: tuple[str, ...], helper: str, what: str) -
 def test_sigs_warn_about_false_negative_answers():
     """Предупреждения о ЛОЖНОМ отрицательном выводе обязаны жить в sig, а не в рецепте.
 
-    Рецепт (`rlm_help`) читают не всегда, а sig уходит агенту на КАЖДОМ старте.
+    Рецепт (`rlm_help`) читают не всегда, а sig агент получает всегда: до первого вызова
+    (ядро, домен на старте) либо вместе с первым ответом (`signatures`, v1.41.0).
     Каждое предупреждение обязано нести ТРИ вещи: причину, границы (где именно ответ
     неполон) и ДЕЙСТВИЕ — без действия предупреждение агента не спасает.
 
@@ -835,3 +879,317 @@ def test_sigs_warn_about_false_negative_answers():
 
     sig = snap["find_register_movements"]["sig"]
     _sig_says(sig, ("_meta.delegates",), "find_register_movements", "ДЕЙСТВИЕ (где имена делегатов)")
+
+
+# ── v1.41.0: домены хелперов — новые ячейки ─────────────────────────────────
+#
+# Старт больше не несёт весь каталог подписей: ядро плюс выбранные агентом домены.
+# Каждая ячейка ниже мерит ВЕСЬ сериализованный ответ `rlm_start` (как соседние
+# ячейки), а не сумму независимых потолков частей. Имена словарей — `_HELPER_DOMAIN_…`,
+# чтобы не путать их с `_DOMAIN_PAYLOAD_BASELINES` (там ТЕМЫ рецептов). Числа — факт
+# после задач 2–7 плана релиза; гард — прежний `_DRIFT` (+5 %). Только slim: в full
+# значение `domains` не читается.
+
+_HELPER_DOMAIN_PAYLOAD_BASELINES: dict[tuple[str, ...], int] = {
+    ("документ",): 14345,
+    ("структура",): 13248,
+    ("код",): 12987,
+    ("связи",): 13099,
+    ("расширения",): 11969,
+    ("поиск",): 11492,
+    # Самая тяжёлая пара (§3.3 плана): верхняя граница выбора «на стыке двух доменов».
+    ("структура", "связи"): 17108,
+    ("весь каталог",): 20267,
+}
+
+# Хелпер из каждого выбранного домена, которого нет в ядре: ячейка обязана мерить
+# ответ, где подписи домена действительно выданы.
+_HELPER_DOMAIN_MARKERS = {
+    "документ": "find_register_movements(",
+    "структура": "parse_form(",
+    "код": "find_path(",
+    "связи": "find_references_to_object(",
+    "расширения": "get_overrides(",
+    "поиск": "search_regions(",
+    "весь каталог": "get_object_profile(",
+}
+
+# RLM_CATALOG_MODE=all: весь каталог без выбора агентом, блока доменов нет.
+_CATALOG_ALL_PAYLOAD_BASELINE = 20181
+
+
+@pytest.mark.parametrize("domains", sorted(_HELPER_DOMAIN_PAYLOAD_BASELINES))
+def test_helper_domain_rlm_start_payload_within_budget(monkeypatch, tmp_path, domains):
+    _run_payload_budget(
+        monkeypatch,
+        tmp_path,
+        "slim",
+        query="",
+        baseline=_HELPER_DOMAIN_PAYLOAD_BASELINES[domains],
+        domains=list(domains),
+        expect_helpers=tuple(_HELPER_DOMAIN_MARKERS[d] for d in domains),
+    )
+
+
+def test_catalog_all_mode_rlm_start_payload_within_budget(monkeypatch, tmp_path):
+    monkeypatch.setenv("RLM_CATALOG_MODE", "all")
+    _run_payload_budget(
+        monkeypatch,
+        tmp_path,
+        "slim",
+        query="",
+        baseline=_CATALOG_ALL_PAYLOAD_BASELINE,
+        expect_helpers=("get_object_profile(", "find_path("),
+    )
+
+
+# Комбинированный старт с непустым запросом: планка пустого старта к такому ответу
+# неприменима — сумма включает текст compact-рецепта, а при невыданном домене темы ещё
+# и подписи его шагов и строку догрузки. Ключ — (домены | "all", запрос-тема).
+_HELPER_DOMAIN_QUERY_PAYLOAD_BASELINES: dict[tuple[tuple[str, ...] | str, str], int] = {
+    # каждый домен с рецептом СВОЕЙ темы (у «поиска» тем нет)
+    (("документ",), "проведение"): 15377,
+    (("структура",), "структура объекта"): 13630,
+    (("код",), "иерархия вызовов"): 14015,
+    (("связи",), "права"): 13765,
+    (("расширения",), "расширения"): 12719,
+    # «только ядро» и тяжёлая пара с рецептом НЕвыданной темы
+    ((), "проведение"): 10490,
+    (("структура", "связи"), "проведение"): 18233,
+    # RLM_CATALOG_MODE=all с тем же запросом
+    ("all", "проведение"): 21213,
+}
+
+
+@pytest.mark.parametrize("key", sorted(_HELPER_DOMAIN_QUERY_PAYLOAD_BASELINES, key=repr))
+def test_helper_domain_query_rlm_start_payload_within_budget(monkeypatch, tmp_path, key):
+    domains, query = key
+    if domains == "all":
+        monkeypatch.setenv("RLM_CATALOG_MODE", "all")
+        domains = None
+    _run_payload_budget(
+        monkeypatch,
+        tmp_path,
+        "slim",
+        query=query,
+        baseline=_HELPER_DOMAIN_QUERY_PAYLOAD_BASELINES[key],
+        effort=_DOMAIN_EFFORT,
+        domains=None if domains is None else list(domains),
+    )
+
+
+# ── v1.41.0: потолки отдельных текстов — по факту, `ceil10(факт × 1,10)` ────
+
+
+def _ceil10_110(fact: int) -> int:
+    """Потолок отдельного текста по правилу проекта: ceil10(факт × 1,10) — в целых,
+    без погрешности плавающей точки (100 × 1.1 в float даёт 110.00000000000001)."""
+    grown = (fact * 11 + 9) // 10
+    return (grown + 9) // 10 * 10
+
+
+# Ответ `rlm_help(domain=[ключ])` целиком — по каждому домену.
+_HELP_DOMAIN_FACTS = {
+    "документ": 6236,
+    "структура": 4675,
+    "код": 4872,
+    "связи": 4988,
+    "расширения": 3390,
+    "поиск": 3379,
+    "весь каталог": 12610,
+}
+
+# Ответ `rlm_help(topic=…, format='full')` вместе с подписями его шагов и code_hint.
+_HELP_TOPIC_FULL_FACTS = {
+    "себестоимость": 2418,
+    "проведение": 4288,
+    "распределение": 2391,
+    "печать": 2265,
+    "права": 3717,
+    "интеграция": 2092,
+    "события формы": 2126,
+    "ссылки": 3058,
+    "перечисления": 1613,
+    "ввод на основании": 1518,
+    "структура объекта": 2741,
+    "тип реквизита": 1053,
+    "иерархия вызовов": 3785,
+    "расширения": 4677,
+    "достижимость": 2769,
+    "путь данных": 1558,
+}
+
+# Compact-справка по теме (её зовут без сессии или после старта с `[]`).
+_HELP_TOPIC_COMPACT_FACTS = {
+    "себестоимость": 1141,
+    "проведение": 1869,
+    "распределение": 1255,
+    "печать": 906,
+    "права": 1751,
+    "интеграция": 1710,
+    "события формы": 1183,
+    "ссылки": 2180,
+    "перечисления": 792,
+    "ввод на основании": 532,
+    "структура объекта": 2009,
+    "тип реквизита": 944,
+    "иерархия вызовов": 2798,
+    "расширения": 2913,
+    "достижимость": 1673,
+    "путь данных": 656,
+}
+
+# Добавка к available_functions от подписей compact-шагов рецепта при невыданном
+# домене темы: сериализованные подписи вне ядра (кавычки и разделитель — как в JSON).
+_RECIPE_STEP_SIGNATURES_FACTS = {
+    "себестоимость": 393,
+    "проведение": 656,
+    "распределение": 697,
+    "печать": 430,
+    "права": 896,
+    "интеграция": 129,
+    "события формы": 486,
+    "ссылки": 702,
+    "перечисления": 336,
+    "ввод на основании": 187,
+    "структура объекта": 1177,
+    "тип реквизита": 359,
+    "иерархия вызовов": 827,
+    "расширения": 767,
+    "достижимость": 1075,
+    "путь данных": 314,
+}
+
+
+def test_rule_helper_matches_the_project_convention():
+    assert _ceil10_110(308) == 340 and _ceil10_110(100) == 110 and _ceil10_110(4675) == 5150
+
+
+@pytest.mark.parametrize("domain", sorted(_HELP_DOMAIN_FACTS))
+def test_help_domain_answer_within_budget(domain):
+    from rlm_tools_bsl.server import _rlm_help_dispatch
+
+    out = _rlm_help_dispatch(domain=[domain])
+    ceiling = _ceil10_110(_HELP_DOMAIN_FACTS[domain])
+    assert len(out) <= ceiling, f"rlm_help(domain={domain!r}) = {len(out)} > {ceiling}"
+
+
+@pytest.mark.parametrize("topic", sorted(_HELP_TOPIC_FULL_FACTS))
+def test_help_topic_answers_within_budget(topic):
+    from rlm_tools_bsl.server import _rlm_help_dispatch
+
+    full = _rlm_help_dispatch(topic=topic, format="full")
+    assert len(full) <= _ceil10_110(_HELP_TOPIC_FULL_FACTS[topic]), (topic, len(full))
+    compact = _rlm_help_dispatch(topic=topic)
+    assert len(compact) <= _ceil10_110(_HELP_TOPIC_COMPACT_FACTS[topic]), (topic, len(compact))
+
+
+@pytest.mark.parametrize("topic", sorted(_RECIPE_STEP_SIGNATURES_FACTS))
+def test_recipe_step_signatures_within_budget(topic):
+    from rlm_tools_bsl.bsl_knowledge import slim_recipe_step_helpers
+    from rlm_tools_bsl.bsl_strategy_data import HELPER_CORE
+
+    snap = build_helper_metadata_snapshot()
+    extra = [n for n in slim_recipe_step_helpers(topic, snap) if n not in HELPER_CORE]
+    size = sum(len(json.dumps(snap[n]["sig"], ensure_ascii=False)) + 2 for n in extra)
+    assert size <= _ceil10_110(_RECIPE_STEP_SIGNATURES_FACTS[topic]), (topic, size)
+
+
+# ── v1.41.0: схемы MCP-тулов ────────────────────────────────────────────────
+#
+# Размер схемы — `len(json.dumps({name, description, inputSchema}, ensure_ascii=False))`
+# по выдаче `mcp.list_tools()` (§1.1 плана). Схемы rlm_start и rlm_execute от режима не
+# зависят — они меряются в процессе pytest; rlm_help регистрируется только в slim, а
+# conftest ставит full непомеченным тестам, поэтому сумма и схема справки снимаются в
+# подпроцессе с явным RLM_STRATEGY_MODE=slim. Общие потолки — из плана, не по факту:
+# четыре схемы ≤ 8 500, все шесть ≤ 10 000, докстринги ≤ 850, описания полей без
+# rlm_start.domains ≤ 1 800, инструкция сервера ≤ 220.
+
+_SCHEMA_FACTS = {"rlm_start": 4621, "rlm_execute": 1133, "rlm_help": 1518}
+
+_SCHEMA_PROBE = (
+    "import asyncio, json\n"
+    "import rlm_tools_bsl.server as s\n"
+    "out = {'instructions': len(s.mcp.instructions or ''), 'tools': {}}\n"
+    "for t in asyncio.run(s.mcp.list_tools()):\n"
+    "    props = t.inputSchema.get('properties') or {}\n"
+    "    out['tools'][t.name] = {\n"
+    "        'schema': len(json.dumps({'name': t.name, 'description': t.description, 'inputSchema': t.inputSchema}, ensure_ascii=False)),\n"
+    "        'doc': len(t.description or ''),\n"
+    "        'fields': {k: len(v.get('description') or '') for k, v in props.items()},\n"
+    "        'domains_desc': props.get('domains', {}).get('description', ''),\n"
+    "        'title': t.inputSchema.get('title'),\n"
+    "    }\n"
+    "print(json.dumps(out, ensure_ascii=False))\n"
+)
+
+
+@pytest.fixture(scope="module")
+def slim_schemas():
+    env = dict(os.environ, RLM_STRATEGY_MODE="slim", PYTHONIOENCODING="utf-8")
+    res = subprocess.run(
+        [sys.executable, "-c", _SCHEMA_PROBE], capture_output=True, text=True, encoding="utf-8", env=env, timeout=180
+    )
+    assert res.returncode == 0, res.stderr[-400:]
+    return json.loads(res.stdout.strip().splitlines()[-1])
+
+
+def test_tool_schemas_within_plan_limits(slim_schemas):
+    tools = slim_schemas["tools"]
+    assert set(tools) == {"rlm_start", "rlm_execute", "rlm_end", "rlm_help", "rlm_projects", "rlm_index"}
+    four = sum(tools[n]["schema"] for n in ("rlm_start", "rlm_execute", "rlm_help", "rlm_end"))
+    six = sum(t["schema"] for t in tools.values())
+    assert four <= 8500, f"четыре схемы {four} > 8500"
+    assert six <= 10000, f"шесть схем {six} > 10000"
+    docs = sum(t["doc"] for t in tools.values())
+    assert docs <= 850, f"докстринги шести тулов {docs} > 850"
+    fields = sum(
+        size
+        for name, t in tools.items()
+        for field, size in t["fields"].items()
+        if not (name == "rlm_start" and field == "domains")
+    )
+    assert fields <= 1800, f"описания полей без rlm_start.domains {fields} > 1800"
+    assert slim_schemas["instructions"] <= 220, slim_schemas["instructions"]
+
+
+def test_tool_schema_titles_name_their_tools(slim_schemas):
+    """Заголовок схемы аргументов — `<имя тула>Arguments`: FastMCP берёт его из имени
+    функции, и перенос `rlm_help` в приватную функцию не имеет права протечь в схему."""
+    for name, t in slim_schemas["tools"].items():
+        assert t["title"] == f"{name}Arguments", (name, t["title"])
+
+
+def test_domain_table_lives_in_the_rlm_start_field(slim_schemas):
+    """Таблица доменов обязана быть в описании поля, а не только в документации:
+    агент видит её ДО выбора."""
+    from rlm_tools_bsl.bsl_strategy_data import domains_param_description, render_domain_table
+
+    desc = slim_schemas["tools"]["rlm_start"]["domains_desc"]
+    assert desc == domains_param_description()
+    assert render_domain_table(with_names=True) in desc
+    assert len(desc) <= 3000
+    assert "domains=[...] к ближайшему rlm_execute" in desc, "маршрут попутной догрузки"
+
+
+def test_password_requirement_stays_in_mutating_tools_fields(slim_schemas):
+    fields = slim_schemas["tools"]
+    assert fields["rlm_projects"]["fields"]["password"] and fields["rlm_index"]["fields"]["confirm"]
+
+
+def test_rlm_help_schema_within_budget(slim_schemas):
+    size = slim_schemas["tools"]["rlm_help"]["schema"]
+    assert size <= _ceil10_110(_SCHEMA_FACTS["rlm_help"]), size
+
+
+@pytest.mark.parametrize("tool", ["rlm_start", "rlm_execute"])
+def test_mode_independent_tool_schema_within_budget(tool):
+    import asyncio
+
+    from rlm_tools_bsl.server import mcp
+
+    t = next(t for t in asyncio.run(mcp.list_tools()) if t.name == tool)
+    size = len(
+        json.dumps({"name": t.name, "description": t.description, "inputSchema": t.inputSchema}, ensure_ascii=False)
+    )
+    assert size <= _ceil10_110(_SCHEMA_FACTS[tool]), (tool, size)

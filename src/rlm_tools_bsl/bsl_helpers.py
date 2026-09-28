@@ -12790,6 +12790,56 @@ def make_bsl_helpers(
                 )
         return results
 
+    def _refuse_object_name_as_element_name(
+        helper: str, element: str, name: str, category: str = "", *, name_search_exact: bool
+    ) -> None:
+        """Названный отказ вместо молчаливого нуля (v1.41.0): первый позиционный
+        аргумент ``find_attributes``/``find_predefined`` — имя ЭЛЕМЕНТА, а по памяти
+        туда кладут имя объекта. Зовут только публичные хелперы на ПУСТОМ ответе без
+        ``object_name``; внутренние потребители (``search``) берут строки без стража.
+
+        Отказ — только при ``name_search_exact`` (поиск по имени элемента прошёл по
+        таблице индекса) и только для СУЩЕСТВУЮЩЕГО объекта (с учётом ``category``):
+        голое имя — объект с таким именем; ссылка ``Документ.X`` или путь
+        ``Категория/Имя`` — объект в этой категории. Без индекса поиск по основной
+        конфигурации невозможен, а ``name`` ищется подстрокой и в имени, и в СИНОНИМЕ
+        элемента — пустой ответ там ничего не доказывает, и диагноз не выводится ни из
+        одноимённого объекта, ни из формы строки.
+
+        Категории точного имени — объединение каскада основной конфигурации и
+        метаданных расширений: XML-only объект расширения бывает омонимом объекта
+        основной конфигурации другой категории, и фильтр категории не должен его терять.
+        Текст не утверждает, что элементов с таким именем нет, — только что ответ пуст.
+        """
+        raw = (name or "").strip()
+        if not raw or not name_search_exact:
+            return
+        head, slash, tail = raw.partition("/")
+        if slash and tail and _normalize_category(head) in {c.lower() for c in _known_categories()}:
+            wanted_category, bare = head, tail
+        else:
+            wanted_category, bare = _split_typed_name(raw)
+        target = bare.lower()
+        ext_categories = [cat for cat, obj_name, _rel in (_extension_metadata_xml or ()) if obj_name.lower() == target]
+        cats = list(dict.fromkeys([*_resolve_object_categories(bare), *ext_categories]))
+        for flt in (wanted_category, category):
+            if flt:
+                cats = [c for c in cats if _normalize_category(c) == _normalize_category(flt)]
+        if cats:
+            raise ValueError(
+                f"{helper}: ответ пуст, а {raw!r} — объект ({', '.join(cats)}). Первый аргумент — имя "
+                f"ЭЛЕМЕНТА ({element}); для объекта: {helper}(object_name={raw!r})."
+            )
+
+    _FIND_ATTRIBUTES_SIG = "find_attributes(name='', object_name='', category='', kind='', limit=500)"
+    _FIND_PREDEFINED_SIG = "find_predefined(name='', object_name='', limit=500)"
+
+    def _find_attributes_rows(
+        name: str = "", object_name: str = "", category: str = "", kind: str = "", limit: int = 500
+    ) -> list[dict]:
+        """Строки ``find_attributes`` без стража (для внутренних потребителей)."""
+        return _attr_rows_with_owner(_find_attributes_core(name, object_name, category, kind, limit))
+
     def find_attributes(
         name: str = "", object_name: str = "", category: str = "", kind: str = "", limit: int = 500
     ) -> list[dict]:
@@ -12797,8 +12847,21 @@ def make_bsl_helpers(
 
         v1.34.0: каждая строка несёт ``owner`` (``"main"`` | ``"extension:<Имя>"``).
         Name-only index+live merge уже смешивает main и CFE, а провенанс раньше
-        приходилось выковыривать из ``source_file`` регуляркой."""
-        return _attr_rows_with_owner(_find_attributes_core(name, object_name, category, kind, limit))
+        приходилось выковыривать из ``source_file`` регуляркой.
+
+        v1.41.0: имя объекта в ``name`` (пустой ответ) — ``ValueError`` с маршрутом
+        ``object_name=`` вместо молчаливого нуля. Решение — по НОРМАЛИЗОВАННОМУ ``limit``:
+        ``0.5`` — это законная пустая страница (0), ``None`` — дефолт 500."""
+        limit, _w = _coerce_bound(limit, 500, "limit", _FIND_ATTRIBUTES_SIG)
+        _warn_bound(_w)
+        rows = _find_attributes_rows(name, object_name, category, kind, limit)
+        if not rows and name and not object_name and not kind and limit:
+            exact = idx_reader is not None and (
+                idx_reader.get_object_attributes(attr_name=name, object_name="", category=category, kind="", limit=1)
+                is not None
+            )
+            _refuse_object_name_as_element_name("find_attributes", "реквизита", name, category, name_search_exact=exact)
+        return rows
 
     def _find_attributes_core(
         name: str = "", object_name: str = "", category: str = "", kind: str = "", limit: int = 500
@@ -12955,7 +13018,25 @@ def make_bsl_helpers(
     def find_predefined(name: str = "", object_name: str = "", limit: int = 500) -> list[dict]:
         """Find predefined items of ChartsOfCharacteristicTypes, Catalogs, ChartsOfAccounts.
 
-        v1.34.0: каждая строка несёт ``owner`` (``"main"`` | ``"extension:<Имя>"``)."""
+        v1.34.0: каждая строка несёт ``owner`` (``"main"`` | ``"extension:<Имя>"``).
+
+        v1.41.0: имя объекта в ``name`` (пустой ответ) — ``ValueError`` с маршрутом
+        ``object_name=`` вместо молчаливого нуля; решение — по нормализованному ``limit``,
+        голое имя — только при поиске по таблице индекса (как у ``find_attributes``)."""
+        limit, _w = _coerce_bound(limit, 500, "limit", _FIND_PREDEFINED_SIG)
+        _warn_bound(_w)
+        rows = _find_predefined_rows(name, object_name, limit)
+        if not rows and name and not object_name and limit:
+            exact = idx_reader is not None and (
+                idx_reader.get_predefined_items(item_name=name, object_name="", limit=1) is not None
+            )
+            _refuse_object_name_as_element_name(
+                "find_predefined", "предопределенного элемента", name, name_search_exact=exact
+            )
+        return rows
+
+    def _find_predefined_rows(name: str = "", object_name: str = "", limit: int = 500) -> list[dict]:
+        """Строки ``find_predefined`` без стража (для внутренних потребителей)."""
         return _attr_rows_with_owner(_find_predefined_core(name, object_name, limit))
 
     def _find_predefined_core(name: str = "", object_name: str = "", limit: int = 500) -> list[dict]:
@@ -14612,7 +14693,9 @@ def make_bsl_helpers(
                     )
 
         if scope in ("all", "attributes"):
-            _attrs = find_attributes(name=query) if query else find_attributes()
+            # Строки без стража: поиск объекта по имени (search('ИмяОбъекта')) законно даёт
+            # пустой набор реквизитов с таким именем — это не ошибка аргумента.
+            _attrs = _find_attributes_rows(name=query) if query else _find_attributes_rows()
             for a in _attrs[:per_source]:
                 type_str = ", ".join(a["attr_type"]) if a["attr_type"] else ""
                 results.append(
@@ -14628,7 +14711,7 @@ def make_bsl_helpers(
                 )
 
         if scope in ("all", "predefined"):
-            _preds = find_predefined(name=query) if query else find_predefined()
+            _preds = _find_predefined_rows(name=query) if query else _find_predefined_rows()
             for p in _preds[:per_source]:
                 type_str = ", ".join(p["types"]) if p.get("types") else ""
                 results.append(
@@ -15234,6 +15317,15 @@ def make_bsl_helpers(
 
         diagnostics: dict = {}
         overrides = _feo(extension_path, object_name or None, diagnostics=diagnostics)
+        # v1.41.0: несуществующий корень — названный отказ, а не total=0 с partial=True:
+        # туда по памяти кладут имя объекта или `../`-путь из extension_file, и тихий ноль
+        # читался как «перехватов нет». Нечитаемые файлы существующего корня — прежний partial.
+        if diagnostics.get("root_available") is False:
+            raise ValueError(
+                f"find_ext_overrides: каталога расширения {extension_path!r} нет. Первый аргумент — "
+                "путь КАТАЛОГА расширения: detect_extensions()['nearby_extensions'][i]['path']; "
+                "перехваты объекта по всем расширениям — get_overrides('ИмяОбъекта')."
+            )
         # Provenance: сырые live-строки не несут ни имени расширения, ни его корня, а
         # ЗДЕСЬ они известны точно — это переданный root. Без явной подстановки единый
         # shape соблюдался бы формально (ключ есть), но пустым: объединение выдачи по

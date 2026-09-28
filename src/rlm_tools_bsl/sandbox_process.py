@@ -252,6 +252,10 @@ def _start_process(proc, child_conn, deadline: float) -> None:
 # Разумный потолок seq в helper_calls: JSON-integer не ограничен по длине, а
 # бесконечно большое значение не имеет смысла и раздувает ответ.
 _MAX_SEQ = 2**31 - 1
+# Потолки формы снимка реестра из init_ok (v1.41.0): хелперов в каталоге — десятки,
+# имя — идентификатор Python.
+_REGISTRY_SNAPSHOT_MAX = 512
+_REGISTRY_NAME_MAX = 64
 
 
 def format_info_to_payload(format_info) -> dict | None:
@@ -879,6 +883,9 @@ class ProcessSandboxBackend:
             init_frame = encode_frame(make_message("init", request_id, gen, init_payload), cfg.ipc_max_bytes)
             self._send_bytes_with_deadline(parent_conn, init_frame, deadline)
             payload = self._wait_init_response(parent_conn, proc, deadline, request_id, gen)
+            # v1.41.0: форма снимка реестра — до принятия init_ok (и при ленивом
+            # перезапуске): нарушение уходит в ветку SandboxProtocolError ниже.
+            self._validate_registry_snapshot(payload)
         except _SpawnStartTimeout as exc:
             # Process.start() всё ещё может исполняться в retired broker-thread.
             # Parent IPC закрываем здесь, а child_conn и возможный поздний worker
@@ -1245,6 +1252,37 @@ class ProcessSandboxBackend:
                 return self._build_result(payload, gen)
             except SandboxProtocolError as exc:
                 return self._handle_worker_loss("protocol_error", f"SandboxProtocolError: {exc}")
+
+    @staticmethod
+    def _validate_registry_snapshot(payload: dict) -> None:
+        """Форма ``init_ok.registry_snapshot`` — ДО принятия каждого ``init_ok`` (v1.41.0).
+
+        Сервер строит из имён снимка представление реестра сессии, по которому
+        выдаются подписи. Тексты подписей агенту всё равно берутся из каталога
+        родителя, но неверная форма (список вместо записи, не-идентификатор вместо
+        имени, поле не того типа) иначе всплыла бы исключением уже в
+        ``_finish_rlm_execute``. Здесь она — нарушение протокола и управляемый отказ
+        запуска, в том числе при ленивом перезапуске. Имя в текст ошибки не попадает:
+        строка пришла от воркера и не ограничена.
+        """
+        snap = payload.get("registry_snapshot")
+        if snap is None:
+            return
+        if not isinstance(snap, dict):
+            raise SandboxProtocolError("init_ok.registry_snapshot is not a mapping")
+        if len(snap) > _REGISTRY_SNAPSHOT_MAX:
+            raise SandboxProtocolError(f"init_ok.registry_snapshot has more than {_REGISTRY_SNAPSHOT_MAX} entries")
+        for name, entry in snap.items():
+            if not isinstance(name, str) or not name.isidentifier() or len(name) > _REGISTRY_NAME_MAX:
+                raise SandboxProtocolError("init_ok.registry_snapshot has an invalid helper name")
+            if not isinstance(entry, dict):
+                raise SandboxProtocolError("init_ok.registry_snapshot entry is not a mapping")
+            for field_name in ("sig", "cat", "recipe"):
+                if not isinstance(entry.get(field_name), str):
+                    raise SandboxProtocolError(f"init_ok.registry_snapshot entry field '{field_name}' is not a string")
+            kw = entry.get("kw")
+            if not isinstance(kw, list) or not all(isinstance(k, str) for k in kw):
+                raise SandboxProtocolError("init_ok.registry_snapshot entry field 'kw' is not a list of strings")
 
     @staticmethod
     def _validate_log_records(payload: dict, frame_type: str) -> list[str]:

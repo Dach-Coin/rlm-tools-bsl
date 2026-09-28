@@ -16,13 +16,17 @@ pytestmark = pytest.mark.strategy_mode_slim
 
 
 # ── Token / size budget on representative inputs ────────────────────────────
+#
+# v1.41.0: верхние границы опущены до ceil10(факт × 1,10) — из slim ушли compact index и
+# строка INSTANT, HELP переписан, добавлен блок доменов; прежняя полоса «< 9000»
+# позволила бы следующей правке молча съесть освобождённые ~3 тыс. символов.
 
 
 def test_slim_size_baseline():
     s = get_strategy("medium", None)
     # Slim strategy with no registry / no idx_stats is still substantive
     # (HELP block, workflow pointer, batching, no-index INDEX block, effort).
-    assert 800 < len(s) < 9000, f"baseline length out of expected band: {len(s)}"
+    assert 800 < len(s) <= 4990, f"baseline length out of expected band: {len(s)}"
 
 
 def test_slim_size_realistic_high():
@@ -32,7 +36,7 @@ def test_slim_size_realistic_high():
         registry=_MOCK_REGISTRY,
         idx_stats=_REALISTIC_IDX_STATS,
     )
-    assert 800 < len(s) < 9000, f"realistic length out of expected band: {len(s)}"
+    assert 800 < len(s) <= 6670, f"realistic length out of expected band: {len(s)}"
 
 
 def test_slim_size_with_recipe():
@@ -43,7 +47,7 @@ def test_slim_size_with_recipe():
         idx_stats=_REALISTIC_IDX_STATS,
         query="себестоимость",
     )
-    assert 800 < len(s) < 9000
+    assert 800 < len(s) <= 7390, len(s)
 
 
 # ── Slim-only markers ───────────────────────────────────────────────────────
@@ -74,12 +78,18 @@ def test_slim_contains_disambiguation_pointer_not_full_block():
     assert "find_callers_context" in s
 
 
-def test_slim_contains_compact_helpers_index():
+def test_slim_contains_helper_domains_block():
+    """v1.41.0: compact index (имена по категориям) заменён блоком доменов хелперов —
+    подписи выбранных доменов уже в available_functions, имена всех доменов — в описании
+    параметра rlm_start.domains."""
     s = get_strategy("medium", None, registry=_MOCK_REGISTRY)
-    # New compact helpers index — single line per category, no full sigs.
-    assert "== HELPERS (compact index" in s
-    # Old "== HELPERS (call help" header must be gone in slim.
+    assert "== HELPERS (compact index" not in s
     assert "== HELPERS (call help" not in s
+    assert "== ДОМЕНЫ ХЕЛПЕРОВ ==" in s
+    # Без выбора (прямой вызов) — «только ядро»: ключи доменов и маршрут догрузки.
+    assert "Загружено только ядро" in s
+    assert "документ | структура | код | связи | расширения | поиск | весь каталог" in s
+    assert "rlm_execute" in s and "signatures" in s
 
 
 def test_slim_recipe_is_compact_even_on_high_effort():

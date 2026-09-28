@@ -43,7 +43,6 @@ from rlm_tools_bsl.format_detector import (
 )
 from rlm_tools_bsl.extension_detector import (
     ConfigRole,
-    _ext_list_cap,
     detect_extension_context,
     filter_alias_extension_infos,
     find_extension_overrides,
@@ -60,12 +59,31 @@ from rlm_tools_bsl.bsl_knowledge import (
     _get_helper_details,
     _get_section,
     _get_topic_recipe,
+    catalog_mode_env_warning,
+    ext_list_display_cap,
+    get_catalog_mode,
     get_strategy,
     get_strategy_mode,
     list_categories,
     list_sections,
     list_topics,
+    slim_recipe_step_helpers,
+    slim_recipe_topic,
     summarize_extensions_by_overrides,
+)
+from rlm_tools_bsl.bsl_strategy_data import (
+    ALL_CATALOG,
+    ALLOWED_DOMAIN_VALUES,
+    CONDITIONAL_HELPERS,
+    DOMAIN_KEYS_TEXT,
+    HELPER_CORE,
+    HELPER_DOMAINS,
+    DomainChoice,
+    domain_helper_names,
+    domain_of_topic,
+    domains_param_description,
+    normalize_domains,
+    recipe_mentions,
 )
 from rlm_tools_bsl.bsl_index import (
     BUILDER_VERSION,
@@ -92,17 +110,16 @@ _INDEX_STATUS_LABELS = {
 }
 logger = logging.getLogger(__name__)
 
+# v1.41.0: инструкция сервера — не больше 220 символов (задача 9 плана): предпочтение
+# перед сырым grep, порядок rlm_start → rlm_execute, явный выбор доменов для BSL в slim
+# и справка по надобности. Перечень ключей живёт в описании rlm_start.domains и в ответе
+# на ошибочный старт — сюда не дублируется.
 mcp = FastMCP(
     "rlm-tools-bsl",
     stateless_http=True,
     instructions=(
-        "1C/BSL code search & navigation backend. Prefer these tools over raw grep or reading "
-        "files whenever a task touches 1C source: finding modules / objects / methods, call "
-        "graphs (who calls what), references and usages of metadata objects, full-text search, "
-        "and form / metadata XML parsing. A deterministic SQLite index answers in milliseconds "
-        "even on 23K+ file configs and keeps file bodies on the server. Start with "
-        "rlm_start(query=..., project=...) or rlm_start(query=..., path=...), then run the "
-        "helpers via rlm_execute; rlm_help() lists the available recipes and helpers."
+        "Search and navigation over 1C/BSL sources. Prefer these tools over raw grep: rlm_start "
+        "(for BSL in slim — with domains), then rlm_execute; rlm_help — as needed."
     ),
 )
 # FastMCP 1.x не принимает version в конструкторе, а низкоуровневый сервер без неё
@@ -664,6 +681,26 @@ def _drain_startup_log_records(session_id: str, backend) -> None:
         logger.warning("sandbox: session=%s %s", session_id, record)
 
 
+def _start_extension_warnings(ext_context, ext_total: int, ext_shown: int) -> list[str]:
+    """Предупреждения о расширениях для ОТВЕТА rlm_start (v1.41.0).
+
+    Поимённый список (имя, назначение, префикс, путь) ответ уже несёт в
+    ``extension_context.nearby_extensions``, аннотации перехвата объясняет блок
+    стратегии — прежний warning повторял и то и другое. Для MAIN с соседями —
+    одна строка: сколько, где список и, при усечении, как получить полный.
+    ``_build_warnings`` не трогается: его же отдаёт хелпер ``detect_extensions()``,
+    у которого ``extension_context`` нет. Сессии на расширении — прежние строки.
+    """
+    if ext_context.current.role != ConfigRole.MAIN or not ext_context.nearby_extensions:
+        return list(ext_context.warnings)
+    if ext_shown < ext_total:
+        return [
+            f"{ext_total} extensions detected near main config — top {ext_shown} by overrides in "
+            "extension_context.nearby_extensions; complete list — detect_extensions()."
+        ]
+    return [f"{ext_total} extension(s) detected near main config — see extension_context.nearby_extensions."]
+
+
 def _session_warnings(source_support: SourceSupport, ext_warnings: list[str]) -> list[str]:
     """Предупреждение о неподдерживаемом формате идёт ПЕРВЫМ (v1.32.0):
     агент читает warnings[0] и не должен узнать про чужой формат после
@@ -673,6 +710,166 @@ def _session_warnings(source_support: SourceSupport, ext_warnings: list[str]) ->
     if source_support is SourceSupport.FOREIGN_NO_BSL:
         return [GENERIC_MODE_SESSION_WARNING, *ext_warnings]
     return list(ext_warnings)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#              Домены хелперов: выдача подписей (v1.41.0)
+# ─────────────────────────────────────────────────────────────────────
+
+# Файловые и LLM-хелперы живут вне реестра BSL-хелперов и выдаются всегда: файловые —
+# в каждой сессии, LLM — если провайдер настроен.
+_FILE_HELPER_SIGNATURES = (
+    "read_file(path) -> str (numbered: '  42 | code')",
+    "read_files(paths) -> dict[path, str] — BATCH: читай N файлов одним вызовом вместо N×read_file (numbered)",
+    "grep(pattern, path='.') -> list[dict] keys: file, line, text  # пути через /",
+    "grep_summary(pattern, path='.') -> compact grouped string  # пути через /",
+    "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files (numbered), summary}  # пути через /",
+    "glob_files(pattern) -> list[str]  # пути через /",
+    "tree(path='.', max_depth=3) -> str",
+    "find_files(name) -> list[str]  # пути через /",
+)
+_LLM_HELPER_SIGNATURES = (
+    "llm_query(prompt, context='')",
+    "llm_query_batched(prompts, context='')",
+)
+# Сколько исчезнувших после перезапуска воркера имён перечислять в registry_changed.
+_REGISTRY_CHANGED_MAX = 10
+# Описание параметра rlm_execute.domains (≤ 300): попутная догрузка без отдельного хода.
+_EXECUTE_DOMAINS_DESCRIPTION = (
+    "Догрузить домены хелперов: их подписи придут в signatures ЭТОГО ответа — используй их в "
+    "следующем вызове. Пример: domains=['связи']; ключи — в rlm_start.domains."
+)
+
+
+def _registry_view(worker_names) -> dict[str, dict]:
+    """Представление реестра сессии: имена — из реестра воркера, пересечённые с
+    каталогом родителя (чужие отбрасываются), записи — из каталога.
+
+    Питает ``available_functions``, стратегию (таблицу хелперов full и git-блок) и
+    ``signatures`` — текст подписи от воркера не попадает агенту нигде. В норме
+    тексты совпадают (воркер строит срез из того же каталога), поэтому full-ответ
+    побайтно прежний.
+    """
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    catalog = build_helper_metadata_snapshot()
+    return {name: catalog[name] for name in worker_names if isinstance(name, str) and name in catalog}
+
+
+def _domains_required_error(choice: DomainChoice) -> dict:
+    """Отказ slim/BSL-старта без явного выбора доменов (до создания сессии)."""
+    out: dict = {
+        "error": (
+            "Для BSL-проекта в slim нужен явный выбор доменов хелперов — параметр domains у rlm_start. "
+            f"Ключи: {DOMAIN_KEYS_TEXT}. Пример: domains=['код'] (узкий вопрос) или domains=[] (только ядро)."
+        ),
+        "allowed_domains": list(ALLOWED_DOMAIN_VALUES),
+    }
+    if choice.ignored_total:
+        out["domains_ignored"] = choice.ignored_summary()
+    return out
+
+
+def _session_domains_log_value(session) -> str:
+    """Итог выдачи для журнала: ключи | core | весь каталог | - (нет BSL-реестра)."""
+    if not session.registry_view:
+        return "-"
+    if session.catalog_all_at_start or ALL_CATALOG in session.helper_domains:
+        return ALL_CATALOG
+    return ",".join(session.helper_domains) if session.helper_domains else "core"
+
+
+def _session_wanted_helpers(session) -> set[str]:
+    """Имена, которые сессия должна видеть по своему способу выдачи: весь каталог
+    или ядро плюс выбранные домены (в пределах живого реестра)."""
+    view = session.registry_view
+    if session.catalog_all_at_start or ALL_CATALOG in session.helper_domains:
+        return set(view)
+    return (set(HELPER_CORE) | domain_helper_names(session.helper_domains)) & set(view)
+
+
+def _deliver_signatures(session, backend, result, requested_domains) -> tuple[dict, str]:
+    """Подписи в ответе ``rlm_execute``: попутная догрузка, вызов по имени, смена
+    поколения воркера. Возвращает ``(дополнительные ключи ответа, поля журнала)``.
+
+    Состояние сессии меняется только здесь и только под ``execution_lock``
+    (вызывается из ``_finish_rlm_execute``, то есть в ответе, прошедшем выполнение).
+    """
+    extra: dict = {}
+    log = ""
+    if not session.registry_view and not backend.registry_names:
+        return extra, log  # generic: BSL-реестра нет, выдавать нечего
+
+    domain_group: list[str] = []
+    # 1. Смена поколения воркера: после перезапуска снимок реестра новый, а наличие
+    #    git_search определяется при создании хелперов заново.
+    if result.generation != session.registry_generation:
+        old_view = session.registry_view
+        new_view = _registry_view(backend.registry_names)
+        removed = [name for name in old_view if name not in new_view]
+        session.registry_view = new_view
+        session.registry_generation = result.generation
+        session.delivered_helpers &= set(new_view)
+        wanted = _session_wanted_helpers(session)
+        domain_group.extend(n for n in new_view if n not in old_view and n in wanted)
+        if removed:
+            extra["registry_changed"] = {"removed": removed[:_REGISTRY_CHANGED_MAX]}
+            if len(removed) > _REGISTRY_CHANGED_MAX:
+                extra["registry_changed"]["removed_total"] = len(removed)
+    view = session.registry_view
+    delivered_before = set(session.delivered_helpers)
+
+    # 2. Попутная догрузка доменов. Весь каталог уже выдан на старте (full, all,
+    #    выбор «весь каталог») — параметр не читается вовсе.
+    domains_active = not session.catalog_all_at_start and ALL_CATALOG not in session.helper_domains
+    if requested_domains is not None and domains_active:
+        choice = normalize_domains(requested_domains)
+        new_keys: list[str] = []
+        if choice.all_catalog:
+            new_keys = [ALL_CATALOG]
+            target = set(view)
+        else:
+            new_keys = [k for k in choice.keys if k not in session.helper_domains]
+            target = domain_helper_names(choice.keys) & set(view)
+        if new_keys:
+            session.helper_domains.extend(new_keys)
+            session.domains_added += 1
+            log += f" domains+=<{','.join(new_keys)}>"
+        domain_group.extend(n for n in view if n in target and n not in delivered_before and n not in domain_group)
+        if choice.ignored_total:
+            extra["domains_ignored"] = {**choice.ignored_summary(), "allowed": list(ALLOWED_DOMAIN_VALUES)}
+            log += f" domains_ignored=<{choice.ignored_log_value()}>"
+    domain_group = [n for n in view if n in set(domain_group)]
+
+    # 3. Вызов по имени. При hard timeout / потере воркера история вызовов неизвестна:
+    #    начатые вызовы узнать нельзя, поэтому подписи по имени выданными не считаются,
+    #    а журнал пишет outside=unknown вместо заключения «промахов не было».
+    state = result.sandbox_state or {}
+    by_name: list[str] = []
+    if state.get("status") == "terminated":
+        session.outside_unknown_executes += 1
+        log += " outside=unknown"
+    else:
+        called = {h.name for h in result.helper_calls}
+        outside = [n for n in view if n in called and n not in delivered_before]
+        if outside:
+            session.outside_helpers.extend(outside)
+            log += f" outside={','.join(outside)}"
+        by_name = [n for n in outside if n not in domain_group]
+
+    # 4. Ответ: сначала домены, затем вызванные по имени — без повторов. Подпись,
+    #    целиком стоящая в тексте ошибки (подсказка о неверном аргументе), не
+    #    дублируется, но выданной считается.
+    error_text = result.error or ""
+    signatures: list[str] = []
+    for name in (*domain_group, *by_name):
+        session.delivered_helpers.add(name)
+        sig = view[name]["sig"]
+        if sig not in error_text:
+            signatures.append(sig)
+    if signatures:
+        extra = {"signatures": signatures, **extra}
+    return extra, log
 
 
 def _rlm_start(
@@ -685,6 +882,8 @@ def _rlm_start(
     execution_timeout_seconds: int = 45,
     include_metadata: bool = False,
     project: str | None = None,
+    domains: list[str] | str | None = None,
+    require_domains: bool = False,
 ) -> str:
     t0 = time.monotonic()
     with _sandboxes_lock:
@@ -770,6 +969,35 @@ def _rlm_start(
         sandbox_mode = get_sandbox_mode()
     except SandboxConfigError as e:
         return json.dumps({"error": f"Sandbox configuration error: {e}"}, ensure_ascii=False)
+
+    # Гейт неподдерживаемых форматов (v1.32.0): классификация ВСЕГДА по живому
+    # диску — index fast path тут не помогает, чужое дерево могло получить индекс
+    # до появления гейта. Замеры: боевые cf/edt 0.4-1.4 мс. v1.41.0: классификация
+    # идёт ДО создания сессии — выбор доменов проверяется только для BSL (generic
+    # выясняется по пути), а отказ из-за выбора не должен оставлять ни сессии, ни
+    # backend. Результат переиспользуется ниже, второго обхода нет.
+    try:
+        source_support = classify_source(resolved)
+    except Exception as e:
+        logger.error("rlm_start: source classification failed for path=%s: %s", resolved, e, exc_info=True)
+        return json.dumps({"error": f"Session init failed: {type(e).__name__}: {e}"}, ensure_ascii=False)
+    generic_mode = source_support is SourceSupport.FOREIGN_NO_BSL
+
+    # v1.41.0: выбор доменов хелперов. Режимы стратегии и каталога читаются ОДИН раз
+    # на старт; в full, при RLM_CATALOG_MODE=all и в generic значение не читается
+    # вовсе (прежний вызов без domains проходит). Публичный тул требует явный выбор
+    # (require_domains); прямой _rlm_start(domains=None) означает «только ядро».
+    strategy_mode = get_strategy_mode()
+    catalog_mode = get_catalog_mode()
+    domains_mode = strategy_mode == "slim" and catalog_mode == "domains" and not generic_mode
+    domain_choice = normalize_domains(domains) if domains_mode else None
+    if domain_choice is not None and require_domains and not (domain_choice.recognized or domain_choice.explicit_empty):
+        logger.info(
+            "rlm_start: session=- domains=<rejected> ignored=<%s>%s",
+            domain_choice.ignored_log_value(),
+            _log_text_field("query", query),
+        )
+        return json.dumps(_domains_required_error(domain_choice), ensure_ascii=False)
 
     effort, max_llm_calls, max_execute_calls = resolve_session_limits(effort, query, max_llm_calls, max_execute_calls)
     # effort_config нужен дальше (safe_grep_max_files / guidance) — от ИТОГОВОГО effort
@@ -953,11 +1181,8 @@ def _rlm_start(
             sum(len(v) for v in ext_overrides.values()),
         )
 
-        # Гейт неподдерживаемых форматов (v1.32.0): классификация ВСЕГДА по живому
-        # диску — index fast path тут не помогает, чужое дерево могло получить
-        # индекс до появления гейта. Замеры: боевые cf/edt 0.4-1.4 мс.
-        source_support = classify_source(resolved)
-        generic_mode = source_support is SourceSupport.FOREIGN_NO_BSL
+        # Классификация формата сделана до создания сессии (v1.41.0) — здесь только
+        # диагностика с уже известным session_id.
         if source_support is not SourceSupport.SUPPORTED:
             logger.warning(
                 "rlm_start: session=%s unsupported source format: source_support=%s",
@@ -1050,7 +1275,25 @@ def _rlm_start(
         src_prefixes = backend.prefixes_source
         t_prefixes = time.monotonic() - t_step
 
-        bsl_registry = backend.registry_snapshot
+        # v1.41.0: представление реестра сессии — имена от воркера, тексты из каталога
+        # родителя. Оно же питает стратегию, available_functions и signatures.
+        bsl_registry = _registry_view(backend.registry_names)
+        # Какие подписи выдаются на старте. Весь каталог — в full, при
+        # RLM_CATALOG_MODE=all и при выборе «весь каталог»; иначе ядро + выбранные
+        # домены + подписи шагов строго совпавшего рецепта, если домен его темы не
+        # выбран (иначе первый доменный шаг рецепта был бы вызовом вслепую).
+        catalog_all = (
+            strategy_mode == "full" or catalog_mode == "all" or bool(domain_choice and domain_choice.all_catalog)
+        )
+        if generic_mode or catalog_all:
+            delivered = set(bsl_registry)
+        else:
+            choice = domain_choice or DomainChoice()
+            wanted = set(HELPER_CORE) | domain_helper_names(choice.keys)
+            recipe_topic = slim_recipe_topic(query)
+            if recipe_topic and domain_of_topic(recipe_topic) not in choice.keys:
+                wanted |= set(slim_recipe_step_helpers(recipe_topic, bsl_registry))
+            delivered = wanted & set(bsl_registry)
         t_step = time.monotonic()
         if generic_mode:
             # BSL-хелперов в namespace нет — маршрутная карта не имеет права
@@ -1067,6 +1310,8 @@ def _rlm_start(
                 idx_stats=idx_stats,
                 idx_warnings=idx_warnings,
                 query=query,
+                domain_choice=domain_choice,
+                catalog_mode=catalog_mode,
             )
         t_strategy = time.monotonic() - t_step
 
@@ -1085,6 +1330,14 @@ def _rlm_start(
         # prepend идёт ПОСЛЕ баннера лимитов (иначе баннер оказался бы выше).
         if source_support is SourceSupport.FOREIGN_WITH_BSL:
             strategy = UNSUPPORTED_FORMAT_SESSION_WARNING + "\n\n" + strategy
+
+        # Состояние выдачи — ДО публикации сессии (v1.41.0): после неё его меняет
+        # только _rlm_execute под execution_lock.
+        session.registry_view = bsl_registry
+        session.registry_generation = backend.generation
+        session.catalog_all_at_start = catalog_all
+        session.helper_domains = list(domain_choice.keys) if domain_choice is not None and not catalog_all else []
+        session.delivered_helpers = set(delivered)
 
         # Публикация атомарна с проверкой владельца: TTL-эвикция и shutdown не
         # могут оставить backend без соответствующей живой Session (§13.3).
@@ -1121,36 +1374,31 @@ def _rlm_start(
             ensure_ascii=False,
         )
 
-    # Build available_functions from registry (BSL helpers) + static IO helpers
-    available_functions = [entry["sig"] for entry in bsl_registry.values()]
-    available_functions.extend(
-        [
-            "read_file(path) -> str (numbered: '  42 | code')",
-            "read_files(paths) -> dict[path, str] — BATCH: читай N файлов одним вызовом вместо N×read_file (numbered)",
-            "grep(pattern, path='.') -> list[dict] keys: file, line, text  # пути через /",
-            "grep_summary(pattern, path='.') -> compact grouped string  # пути через /",
-            "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files (numbered), summary}  # пути через /",
-            "glob_files(pattern) -> list[str]  # пути через /",
-            "tree(path='.', max_depth=3) -> str",
-            "find_files(name) -> list[str]  # пути через /",
-        ]
-    )
+    # available_functions: подписи выданных BSL-хелперов в порядке реестра, затем
+    # восемь файловых, затем LLM (если провайдер настроен). v1.41.0: в slim/domains —
+    # ядро + выбранные домены, а не весь каталог.
+    available_functions = [entry["sig"] for name, entry in bsl_registry.items() if name in delivered]
+    available_functions.extend(_FILE_HELPER_SIGNATURES)
     if has_llm_tools:
-        available_functions.extend(
-            [
-                "llm_query(prompt, context='')",
-                "llm_query_batched(prompts, context='')",
-            ]
-        )
+        available_functions.extend(_LLM_HELPER_SIGNATURES)
+
+    # Ключ domains — только в slim-сессии с BSL-хелперами: в full и generic ответ прежний.
+    domains_key: dict | None = None
+    if strategy_mode == "slim" and not generic_mode:
+        if catalog_mode == "all":
+            domains_key = DomainChoice(all_catalog=True).response_key()
+        elif domain_choice is not None:
+            domains_key = domain_choice.response_key()
 
     # На extreme-extension конфигах (напр. 155 расш) сериализация полного списка
     # расширений в ответ раздувала rlm_start выше токен-лимита. Усекаем агент-facing
     # поле до top-N по overrides; питание песочницы (ext_paths_for_sandbox) — полное.
     # Режем ТОЛЬКО ветку MAIN (как Site 1 _build_warnings и Site 3 _extension_strategy):
     # для EXTENSION/UNKNOWN-сессий nearby_extensions = соседи, их не усекаем (план).
+    # v1.41.0: порог по режиму (5 в slim, 20 в full); явный RLM_EXT_LIST_CAP — он.
     if ext_context.current.role == ConfigRole.MAIN:
         shown_exts, ext_total, ext_shown = summarize_extensions_by_overrides(
-            ext_context.nearby_extensions, ext_overrides, _ext_list_cap()
+            ext_context.nearby_extensions, ext_overrides, ext_list_display_cap()
         )
     else:
         shown_exts = list(ext_context.nearby_extensions)
@@ -1286,7 +1534,7 @@ def _rlm_start(
     response: dict = {
         "session_id": session_id,
         "resolved_path": resolved,
-        "warnings": _session_warnings(source_support, ext_context.warnings),
+        "warnings": _session_warnings(source_support, _start_extension_warnings(ext_context, ext_total, ext_shown)),
         "config_format": format_info.format_label,
         "source_support": source_support.value,
         "extension_context": {
@@ -1329,6 +1577,7 @@ def _rlm_start(
             # изоляция — в inline hard-kill таймаута не гарантируется.
             "sandbox_mode": backend.mode,
         },
+        **({"domains": domains_key} if domains_key is not None else {}),
         "available_functions": available_functions,
         "strategy": strategy,
     }
@@ -1361,6 +1610,15 @@ def _rlm_start(
         src_format,
         src_ext,
         src_prefixes,
+    )
+    # v1.41.0: тип выбора сессии — метрика нарезки доменов. query=<…> стоит последним
+    # и подчиняется тому же выключателю RLM_LOG_EXECUTE_CODE, что и code=<…>.
+    logger.info(
+        "rlm_start: session=%s domains=<%s> ignored=<%s>%s",
+        session_id,
+        _session_domains_log_value(session),
+        domain_choice.ignored_log_value() if domain_choice is not None else "-",
+        _log_text_field("query", query),
     )
     result_json = json.dumps(response, ensure_ascii=False)
     out_chars = len(result_json)
@@ -1455,12 +1713,8 @@ def resolve_session_limits(
 _DEFAULT_EXECUTE_CODE_LOG_CAP = 300
 
 
-def _execute_code_log_field(code: str) -> str:
-    """Return a ``code=<...>`` suffix for the rlm_execute completion log line.
-
-    The executed ``code`` IS the agent's query — helper calls with their
-    parameters (``find_object("…")`` etc.). Logging it lets us later analyse
-    which queries recur and where helpers could be improved.
+def _log_text_field(name: str, text: str) -> str:
+    """Return a `` <name>=<...>`` suffix with agent-supplied text for a log line.
 
     Controlled by ``RLM_LOG_EXECUTE_CODE`` (default: ON, capped):
       * unset / ``1`` / ``true`` / ``on`` / ``yes`` / ``all`` → default cap
@@ -1469,8 +1723,9 @@ def _execute_code_log_field(code: str) -> str:
       * positive integer ``N`` → cap at ``N`` chars (``<= 0`` → disabled)
 
     Newlines are flattened to ``⏎`` so the whole event stays one log line
-    (grep-/parse-friendly). The log handlers are UTF-8, so Cyrillic in the code
-    (object names) and the ``⏎``/``…`` markers are safe.
+    (grep-/parse-friendly). The log handlers are UTF-8, so Cyrillic in the text
+    (object names) and the ``⏎``/``…`` markers are safe. The field is meant to be
+    the LAST one on its line, so a parser can cut the user text off by its marker.
     """
     raw = os.environ.get("RLM_LOG_EXECUTE_CODE")
     cap = _DEFAULT_EXECUTE_CODE_LOG_CAP
@@ -1485,10 +1740,21 @@ def _execute_code_log_field(code: str) -> str:
                 cap = _DEFAULT_EXECUTE_CODE_LOG_CAP
             if cap <= 0:
                 return ""
-    flat = code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "⏎")
+    flat = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "⏎")
     if len(flat) > cap:
         flat = flat[:cap] + "…"
-    return f" code=<{flat}>"
+    return f" {name}=<{flat}>"
+
+
+def _execute_code_log_field(code: str) -> str:
+    """Return a ``code=<...>`` suffix for the rlm_execute completion log line.
+
+    The executed ``code`` IS the agent's query — helper calls with their
+    parameters (``find_object("…")`` etc.). Logging it lets us later analyse
+    which queries recur and where helpers could be improved. v1.41.0: the same
+    switch (``RLM_LOG_EXECUTE_CODE``) and rules govern ``query=<…>`` of rlm_start.
+    """
+    return _log_text_field("code", code)
 
 
 def _rlm_execute(
@@ -1496,6 +1762,7 @@ def _rlm_execute(
     code: str,
     detail_level: Literal["compact", "usage", "full"] = "compact",
     max_new_variables: int = 20,
+    domains: list[str] | str | None = None,
 ) -> str:
     t0 = time.monotonic()
     logger.info("rlm_execute: session=%s code_len=%d", session_id, len(code))
@@ -1564,10 +1831,10 @@ def _rlm_execute(
         # Монотонная синхронизация LLM usage из backend (shared counter переживает
         # kill; accounting никогда не уменьшается по данным worker — §12.2.5).
         session.llm_calls_used = max(session.llm_calls_used, backend.llm_calls_used)
-        return _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0)
+        return _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0, domains)
 
 
-def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0) -> str:
+def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0, domains=None) -> str:
     session_id = session.session_id
     # Runtime WARNING+ из воркера — ПОСЛЕ возврата валидированного результата, но ДО
     # сериализации public response. Параметризованный вызов логгера; в ответ агенту
@@ -1592,6 +1859,10 @@ def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_va
         "stdout": result.stdout,
         "error": result.error,
     }
+    # v1.41.0: подписи, которых агент ещё не получал (попутная догрузка доменов,
+    # первый вызов хелпера по имени, новые хелперы после перезапуска воркера).
+    delivery, delivery_log = _deliver_signatures(session, backend, result, domains)
+    response.update(delivery)
 
     if result.helper_calls:
         duplicates = [
@@ -1671,8 +1942,10 @@ def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_va
         sandbox_log += f" sandbox_state={state.get('status')}:{state.get('reason')} hard_timeout={state.get('reason') == 'timeout'}"
     if backend.worker_pid is not None:
         sandbox_log += f" pid={backend.worker_pid}"
+    # Поля выдачи подписей (domains+= / domains_ignored / outside=) стоят ПЕРЕД code=<…>,
+    # который остаётся последним; от RLM_LOG_HELPERS они не зависят.
     logger.info(
-        "rlm_execute: session=%s call=%d/%d error=%s elapsed=%.2fs out_chars=%d out_tokens~%d%s%s%s%s",
+        "rlm_execute: session=%s call=%d/%d error=%s elapsed=%.2fs out_chars=%d out_tokens~%d%s%s%s%s%s",
         session_id,
         session.execute_calls,
         session.max_execute_calls,
@@ -1683,107 +1956,91 @@ def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_va
         helpers_summary,
         hints_log,
         sandbox_log,
+        delivery_log,
         _execute_code_log_field(code),
     )
     return result_json
 
 
-def _rlm_end(session_id: str) -> str:
-    session = session_manager.get(session_id)
-    if session:
+def _log_session_end(session_id: str, session) -> None:
+    """Итоговая строка ``rlm_end`` — после отцепления сессии.
+
+    Новый execute после отцепления не проходит ``_session_backend_is_current`` и
+    счётчиков не меняет. Занятый ``execution_lock`` значит, что execute, начатый до
+    ``rlm_end``, ещё идёт (inline не прерывает запущенный код) и допишет счётчики
+    после этой строки: она помечается ``in_flight=1``, вклад вызова — в его
+    собственной строке ``rlm_execute``. Замок берётся только без ожидания.
+    """
+    in_flight = not session.execution_lock.acquire(blocking=False)
+    try:
         total_chars = session.total_in_chars + session.total_out_chars
+        # v1.41.0: итог выдачи подписей — метрика качества нарезки доменов.
         logger.info(
-            "rlm_end: session=%s calls=%d in_chars=%d out_chars=%d total_chars=%d total_tokens~%d",
+            "rlm_end: session=%s calls=%d in_chars=%d out_chars=%d total_chars=%d total_tokens~%d "
+            "domains=<%s> added=%d outside=%d outside_unknown=%d%s",
             session_id,
             session.execute_calls,
             session.total_in_chars,
             session.total_out_chars,
             total_chars,
             int(total_chars / 1.75),
+            _session_domains_log_value(session),
+            session.domains_added,
+            len(session.outside_helpers),
+            session.outside_unknown_executes,
+            " in_flight=1" if in_flight else "",
         )
-    else:
+    finally:
+        if not in_flight:
+            session.execution_lock.release()
+
+
+def _rlm_end(session_id: str) -> str:
+    session = session_manager.get(session_id)
+    if not session:
         logger.info("rlm_end: session=%s (not found)", session_id)
     # Двухфазный идемпотентный teardown (§9.3): detach → неблокирующий
-    # request_close → reaper. Session execution lock НЕ берётся; success
+    # request_close → reaper. Session execution lock НЕ ждётся; success
     # возвращается, не дожидаясь kill_grace/join/освобождения SQLite handle.
     session_manager.end(session_id)
     _release_session_resources(session_id, reason="rlm_end")
+    if session:
+        _log_session_end(session_id, session)
     return json.dumps({"success": True}, ensure_ascii=False)
 
 
 @mcp.tool()
 async def rlm_start(
-    query: Annotated[str, Field(description="What you want to find or analyze in the BSL codebase")],
+    query: str,
+    # v1.41.0: схема ОДНА на все режимы и от окружения не зависит — поле в ней
+    # необязательно (generic выясняется только по пути, режим из .env читается после
+    # импорта). Обязательность для slim/BSL/domains проверяет сервер после
+    # классификации пути, до создания сессии.
+    domains: Annotated[
+        list[str] | str | None,
+        Field(description=domains_param_description()),
+    ] = None,
+    # Описания полей (задача 9 плана): только поведение, которого не видно в схеме, —
+    # имя, тип, Literal, границы и дефолт агент читает из самой inputSchema.
     path: Annotated[
         str | None,
-        Field(
-            description=(
-                "Absolute path to a 1C configuration root, or to a parent container "
-                "directory that holds the main configuration in a direct subdirectory "
-                "(alongside optional extension subdirectories). The main configuration "
-                "root is auto-detected; if multiple main configs are found in direct "
-                "subdirectories without one named 'cf', an error listing the candidates "
-                "is returned."
-            )
-        ),
+        Field(description="Корень конфигурации 1С или каталог-контейнер с ней."),
     ] = None,
-    project: Annotated[str | None, Field(description="Project name from the registry (alternative to path)")] = None,
+    project: Annotated[str | None, Field(description="Имя из реестра (rlm_projects) — вместо path.")] = None,
     effort: Annotated[
         str,
-        Field(
-            description="Analysis depth. 'auto' (default) — the server picks medium, or high for multi-aspect queries (lifecycle / mechanism / end-to-end). Or force a tier: low / medium / high / max. The admin can hard-lock depth via RLM_FORCE_EFFORT; the effective value is returned as 'effective_effort'."
-        ),
+        Field(description="auto|low|medium|high|max; auto — medium или high по запросу; итог — в effective_effort."),
     ] = "auto",
-    max_output_chars: Annotated[
-        int, Field(description="Max characters per execute output", ge=100, le=100_000)
-    ] = 15_000,
-    max_llm_calls: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="Override max llm_query calls. Wins over the effort preset and the RLM_MAX_LLM_CALLS server default.",
-        ),
-    ] = None,
-    max_execute_calls: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="Override max rlm_execute calls. Wins over the effort preset and the RLM_MAX_EXECUTE_CALLS server default.",
-        ),
-    ] = None,
-    execution_timeout_seconds: Annotated[
-        int, Field(description="Per-rlm_execute timeout in seconds", ge=1, le=300)
-    ] = 45,
+    max_output_chars: Annotated[int, Field(ge=100, le=100_000)] = 15_000,
+    max_llm_calls: Annotated[int | None, Field(ge=1)] = None,
+    max_execute_calls: Annotated[int | None, Field(ge=1)] = None,
+    execution_timeout_seconds: Annotated[int, Field(ge=1, le=300)] = 45,
     include_metadata: Annotated[
         bool,
-        Field(
-            description="Scan directory and include file counts/types in response (slow on large configs, disabled by default)"
-        ),
+        Field(description="Счетчики файлов по типам; медленно на больших конфигурациях."),
     ] = False,
 ) -> str:
-    """Open a fast, token-efficient search & navigation session over a 1C/BSL codebase. Returns JSON with session_id.
-    Reach for this INSTEAD of raw grep or reading files whenever you need to find or navigate anything in 1C source:
-    locate a module / object / method, find who calls a procedure (call graph), find references or usages of a
-    metadata object, run full-text search, or parse forms and metadata XML. A deterministic SQLite index answers in
-    milliseconds even on 23K+ file configs, and file bodies stay on the server -- only your print() output enters context.
-    You can specify either 'path' (absolute filesystem path) or 'project' (name from the project registry).
-    If you don't know the path, call rlm_projects(action='list') first to see registered projects,
-    then use rlm_start(project='name', query='...').
-    If the user mentions a project by name -- always try project parameter first.
-    If the path is not registered, the response will include a project_hint suggesting to register it.
-    Then call rlm_execute(session_id, code) where code is Python that calls helper functions and uses print() to output results.
-    In the default 'slim' strategy mode the returned strategy is condensed; for detailed recipes,
-    helper-comparison rules and per-step menus you MUST call rlm_help(...) BEFORE running rlm_execute
-    on non-trivial queries. (In legacy 'full' mode (RLM_STRATEGY_MODE=full) rlm_help is not exposed
-    and the strategy contains everything inline.)
-    Analysis depth defaults to 'auto': the server picks medium for simple lookups and high for multi-aspect
-    queries; pass effort=low/medium/high/max to force a tier. RLM_MAX_EXECUTE_CALLS / RLM_MAX_LLM_CALLS set
-    server-side default call limits (an explicit max_execute_calls / max_llm_calls you pass still wins); the
-    admin can hard-lock depth via RLM_FORCE_EFFORT. Effective depth/limits are echoed in 'effective_effort' and 'limits'.
-    On configs with very many extensions (> RLM_EXT_LIST_CAP, default 20) the 'extension_context.nearby_extensions'
-    field is truncated to the top-N by overrides and carries 'nearby_extensions_truncated'/'nearby_extensions_total'/
-    'extensions_hint'; call detect_extensions() for the full extension list (get_overrides() returns the first 200 overrides + total/truncated — check truncated; search and overrides scanning are unaffected).
-    IMPORTANT: For large 1C configs (23K+ files), NEVER grep on broad paths -- use find_module() first."""
+    """Opens analysis of 1C/BSL sources by project or path and query; for BSL in slim, choose domains. Then work via rlm_execute."""
     return await anyio.to_thread.run_sync(
         lambda: _rlm_start(
             path=path,
@@ -1795,61 +2052,56 @@ async def rlm_start(
             execution_timeout_seconds=execution_timeout_seconds,
             include_metadata=include_metadata,
             project=project,
+            domains=domains,
+            require_domains=True,
         )
     )
 
 
 @mcp.tool()
 async def rlm_execute(
-    session_id: Annotated[str, Field(description="Session ID from rlm_start")],
+    session_id: str,
     code: Annotated[
         str,
-        Field(
-            description=(
-                "Python code to execute. IMPORTANT: Batch multiple related operations into each call. "
-                "Object overview in ONE call: get_object_profile(name) (structure+modules+registers+"
-                "subscriptions+roles+functional_options). Batch reads: read_files([p1,p2]), "
-                "read_procedure(path, ['ProcA','ProcB']). A good call does several related ops + prints a "
-                "summary; a bad call does just one grep or one read_file. Variables persist between calls."
-            )
-        ),
+        Field(description="Python с хелперами; связанные операции — одним вызовом."),
     ],
     detail_level: Annotated[
         Literal["compact", "usage", "full"],
-        Field(
-            description="Response payload level: compact=stdout+error, usage=add usage metrics, full=add variable details"
-        ),
+        Field(description="usage — плюс счетчики вызовов, full — плюс переменные."),
     ] = "compact",
-    max_new_variables: Annotated[
-        int,
-        Field(
-            description="When detail_level=full, cap returned new_variables list to this size",
-            ge=1,
-            le=200,
-        ),
-    ] = 20,
+    max_new_variables: Annotated[int, Field(ge=1, le=200)] = 20,
+    domains: Annotated[
+        list[str] | str | None,
+        Field(description=_EXECUTE_DOMAINS_DESCRIPTION),
+    ] = None,
 ) -> str:
-    """Run the BSL search & navigation helpers (find_module, find_callers_context, find_references_to_object,
-    find_code_usages, git_search, parse_form, ...) by executing Python in the sandbox -- this is how you actually
-    search and navigate the 1C codebase after rlm_start. Variables persist between calls. Use print() to see results.
-    The full helper list with signatures is returned by rlm_start in the `available_functions` array.
-    In the default 'slim' strategy mode call rlm_help(...) for detailed recipes, helper-comparison rules
-    and per-step menus; in 'full' mode the strategy contains everything inline.
-    CRITICAL: grep on path='.' ALWAYS times out on large 1C configs — use find_module() first."""
-    return await anyio.to_thread.run_sync(lambda: _rlm_execute(session_id, code, detail_level, max_new_variables))
+    """Runs Python with helpers in the session: output via print(), variables persist. Signatures of helpers not seen yet arrive in the signatures key."""
+    return await anyio.to_thread.run_sync(
+        lambda: _rlm_execute(session_id, code, detail_level, max_new_variables, domains)
+    )
 
 
 @mcp.tool()
 async def rlm_end(
-    session_id: Annotated[str, Field(description="Session ID to end")],
+    session_id: str,
 ) -> str:
-    """End an RLM exploration session and free resources."""
+    """Closes the session and frees its resources."""
     return await anyio.to_thread.run_sync(lambda: _rlm_end(session_id))
 
 
 # ─────────────────────────────────────────────────────────────────────
 #                          rlm_help (slim mode)
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _help_signatures(names, snapshot: dict) -> dict:
+    """Подписи хелперов для справки без состояния сессии: тексты из статического
+    каталога, ``git_search`` помечается условным (таблица статична, реестр живой)."""
+    out: dict = {"signatures": [snapshot[name]["sig"] for name in names]}
+    conditional = {name: note for name, note in CONDITIONAL_HELPERS.items() if name in names}
+    if conditional:
+        out["conditional"] = conditional
+    return out
 
 
 def _rlm_help_dispatch(
@@ -1859,20 +2111,26 @@ def _rlm_help_dispatch(
     section: str | None = None,
     format: str = "compact",
     include_code: bool = True,
+    domain: list[str] | str | None = None,
 ) -> str:
-    """Dispatch ``rlm_help`` arguments to one of six modes (see table below)
+    """Dispatch ``rlm_help`` arguments to one of seven modes (see table below)
     and return a JSON string. Pure function: does not touch the active session
     and uses the cached static helper-metadata snapshot.
 
     Mode priority (top-down — first match wins, later args ignored with a
     warning attached to the JSON response):
 
-    1. all-empty            → menu        (topics/categories/sections/helper count)
-    2. topic given          → topic       (recipe via _match_recipe; alias-aware)
-    3. section=='disambiguation' → disambiguation (filtered by `helpers` if given)
-    4. section given        → section     (raw text)
-    5. helpers given        → helpers     (per-helper details, optional category filter)
-    6. category given       → category    (one-line per helper in that category)
+    1. all-empty            → menu        (topics/categories/sections/domains/helper count)
+    2. domain given         → domain      (signatures of helper domains, no core; v1.41.0)
+    3. topic given          → topic       (recipe via _match_recipe; alias-aware; + signatures
+                                           of the helpers its returned steps mention)
+    4. section=='disambiguation' → disambiguation (filtered by `helpers` if given)
+    5. section given        → section     (raw text)
+    6. helpers given        → helpers     (per-helper details, optional category filter)
+    7. category given       → category    (one-line per helper in that category)
+
+    Подписи, прочитанные через справку, сервер выданными НЕ считает: справка без
+    состояния, иначе ей нужны были бы сессия и замок против параллельного execute.
     """
     from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 
@@ -1885,14 +2143,16 @@ def _rlm_help_dispatch(
                 warnings.append(f"argument '{arg_name}' ignored when '{kept}' is given")
 
     # Mode 1: menu
-    if not (topic or helpers or category or section):
+    if not (topic or helpers or category or section or domain):
         result = {
             "available_topics": list_topics(),
             "available_categories": list_categories(),
             "available_sections": list_sections(),
+            "available_domains": {key: d["label"] for key, d in HELPER_DOMAINS.items()} | {ALL_CATALOG: "все подписи"},
             "helpers_count": len(snapshot),
             "hint": (
-                "rlm_help(topic='проведение'|'печать'|'обмен'|...) → recipe for a domain. "
+                "rlm_help(topic='проведение'|'печать'|'обмен'|...) → recipe for a topic. "
+                "rlm_help(domain='код') → signatures of a helper domain. "
                 "rlm_help(category='discovery'|'code'|...) → list helpers in a category. "
                 "rlm_help(helpers=['name1','name2']) → details. "
                 "rlm_help(section='workflow'|'disambiguation'|'performance'|'batching'|'io'|'critical'). "
@@ -1902,7 +2162,33 @@ def _rlm_help_dispatch(
         }
         return json.dumps({"mode": "menu", "result": result, "warnings": warnings}, ensure_ascii=False)
 
-    # Mode 2: topic
+    # Mode 2: domain (v1.41.0) — подписи доменов хелперов без ядра, их темы рецептов.
+    if domain:
+        _emit({"topic": topic, "helpers": helpers, "category": category, "section": section}, "domain")
+        choice = normalize_domains(domain)
+        if not choice.recognized:
+            return json.dumps(
+                {
+                    "mode": "domain",
+                    "result": {"error": "unknown", "allowed": list(ALLOWED_DOMAIN_VALUES), **choice.ignored_summary()},
+                    "warnings": warnings,
+                },
+                ensure_ascii=False,
+            )
+        keys = list(HELPER_DOMAINS) if choice.all_catalog else list(choice.keys)
+        wanted = domain_helper_names(keys)
+        names = [name for name in snapshot if name in wanted and name not in HELPER_CORE]
+        result = {
+            "domains": choice.selected(),
+            "topics": {key: list(HELPER_DOMAINS[key]["topics"]) for key in keys if HELPER_DOMAINS[key]["topics"]},
+            **_help_signatures(names, snapshot),
+        }
+        if choice.ignored_total:
+            result.update(choice.ignored_summary())
+            result["allowed"] = list(ALLOWED_DOMAIN_VALUES)
+        return json.dumps({"mode": "domain", "result": result, "warnings": warnings}, ensure_ascii=False)
+
+    # Mode 3: topic
     if topic:
         _emit({"helpers": helpers, "category": category, "section": section}, "topic")
         recipe = _get_topic_recipe(topic, format=format, include_code=include_code)
@@ -1916,9 +2202,13 @@ def _rlm_help_dispatch(
                 },
                 ensure_ascii=False,
             )
+        # v1.41.0: подписи хелперов, упомянутых в ВОЗВРАЩЁННЫХ шагах и code_hint, —
+        # контракт до вызова, в каком бы домене агент ни начал сессию.
+        text = "\n".join([*recipe["steps"], recipe.get("code_hint") or ""])
+        recipe.update(_help_signatures(recipe_mentions(text, recipe["topic"], snapshot), snapshot))
         return json.dumps({"mode": "topic", "result": recipe, "warnings": warnings}, ensure_ascii=False)
 
-    # Mode 3: section=='disambiguation' (structured array)
+    # Mode 4: section=='disambiguation' (structured array)
     if section == "disambiguation":
         _emit({"category": category}, "section='disambiguation'")
         pairs = _get_disambiguation(filter_helpers=helpers)
@@ -1927,7 +2217,7 @@ def _rlm_help_dispatch(
             ensure_ascii=False,
         )
 
-    # Mode 4: section
+    # Mode 5: section
     if section:
         _emit({"helpers": helpers, "category": category}, f"section='{section}'")
         try:
@@ -1950,7 +2240,7 @@ def _rlm_help_dispatch(
             ensure_ascii=False,
         )
 
-    # Mode 5: helpers (optional category filter — AND, drops mismatches silently from result)
+    # Mode 6: helpers (optional category filter — AND, drops mismatches silently from result)
     if helpers:
         items: list[dict] = []
         dropped_by_category: list[tuple[str, str]] = []
@@ -1974,7 +2264,7 @@ def _rlm_help_dispatch(
             warnings.append(f"helpers dropped — not in requested category '{category}': {names_part}")
         return json.dumps({"mode": "helpers", "result": items, "warnings": warnings}, ensure_ascii=False)
 
-    # Mode 6: category
+    # Mode 7: category
     if category:
         cats = list_categories()
         if category not in cats:
@@ -2006,150 +2296,131 @@ def _rlm_help_dispatch(
 
 # Registered as an MCP tool only in slim mode. In RLM_STRATEGY_MODE=full the
 # tool list does not include rlm_help — agents see the legacy strategy with
-# all rules inlined and no extra tool to call. Mode is read once at module
-# import time; FastMCP caches the tool list, so changing the env later
-# requires a server restart.
-if get_strategy_mode() == "slim":
-
-    @mcp.tool()
-    async def rlm_help(
-        topic: Annotated[
-            str | None,
-            Field(
-                description=(
-                    "Business domain or alias to fetch a recipe for. "
-                    "Supported domains include: 'проведение', 'печать', 'права', 'интеграция' "
-                    "(aliases: 'обмен', 'синхронизация', 'exchange'), 'события формы' "
-                    "(aliases: 'формы', 'обработчики формы', 'элементы формы'), 'ссылки' "
-                    "(aliases: 'найти ссылки', 'where used', 'где используется в коде', 'code usages'), "
-                    "'перечисления' (alias: 'enum'), "
-                    "'ввод на основании', 'структура объекта' (alias: 'карточка объекта'), "
-                    "'тип реквизита' (alias: 'субконто'), 'себестоимость', 'распределение', "
-                    "'достижимость' (aliases: 'reachability', 'путь вызовов', 'доходит ли'), "
-                    "'путь данных' (aliases: 'data path', 'как связаны', 'граф данных'). "
-                    "Use rlm_help() with no args to see the full menu."
-                )
-            ),
-        ] = None,
-        helpers: Annotated[
-            list[str] | None,
-            Field(
-                description="Helper names to fetch full sigs+kw+recipes for (e.g. ['find_callers_context','parse_form'])"
-            ),
-        ] = None,
-        category: Annotated[
-            Literal["discovery", "code", "xml", "composite", "business", "extension", "navigation"] | None,
-            Field(description="Helper category to list (one-line entries: name+sig, no recipes)"),
-        ] = None,
-        section: Annotated[
-            Literal["workflow", "disambiguation", "performance", "batching", "io", "critical", "coverage"] | None,
-            Field(
-                description=(
-                    "Strategy section to fetch. 'disambiguation' returns a structured array of "
-                    "overlapping-helper pairs (use with helpers=[a,b] to narrow to one pair). "
-                    "'coverage' — как читать полноту ответа (source/owner/extensions_included/"
-                    "total_exact/partial/index_coverage/truncated/scope). "
-                    "Other values return raw text."
-                )
-            ),
-        ] = None,
-        format: Annotated[
-            Literal["compact", "full"],
-            Field(description="For topics: 'compact' = 3-4 quick steps, 'full' = 7-9 steps + code_hint"),
-        ] = "compact",
-        include_code: Annotated[
-            bool,
-            Field(description="Include code_hint Python snippet for topics that have it (default true)"),
-        ] = True,
-    ) -> str:
-        """Slim-mode helper companion to rlm_start. Returns details about helpers, business
-        recipes and strategy sections that were intentionally omitted from the slim
-        rlm_start strategy. Call this BEFORE rlm_execute on any non-trivial query.
-
-        Six dispatch modes (priority order):
-          - menu       — no args → list of topics/categories/sections + helper count.
-          - topic      — domain/alias → 3-4 (compact) or 7-9 (full) steps + optional code_hint.
-          - disambiguation — section='disambiguation' → array of overlapping-helper pairs;
-                             pass helpers=[a,b] to narrow to one pair.
-          - section    — section='workflow'|'performance'|'batching'|'io'|'critical' → raw text.
-          - helpers    — list[str] of names → details with category+kw+recipe.
-          - category   — single category → list of helpers in it (name+sig, no recipes).
-
-        Output is JSON: {mode, result, warnings: list[str]}. `warnings` is always a list
-        (empty if no argument conflicts) — when arguments overlap, the higher-priority
-        mode wins and lower-priority args are recorded in `warnings`."""
-        out = await anyio.to_thread.run_sync(
-            lambda: _rlm_help_dispatch(
-                topic=topic,
-                helpers=helpers,
-                category=category,
-                section=section,
-                format=format,
-                include_code=include_code,
-            )
+# all rules inlined and no extra tool to call.
+#
+# v1.41.0: функция определена НЕЗАВИСИМО от режима, а регистрацию согласует
+# `_sync_rlm_help_registration()`: при импорте — по окружению процесса (как раньше),
+# и ещё раз в `main()` сразу после загрузки `.env` — иначе режим, заданный только в
+# `.env`, менял бы стратегию, но не список тулов. Публичное имя модуля `rlm_help`
+# появляется и исчезает ВМЕСТЕ с регистрацией: реестр FastMCP и атрибут модуля не
+# расходятся (это проверяет test_v1_34_0.py::test_help_tool_is_registered_only_in_slim).
+async def _rlm_help_tool(
+    topic: Annotated[
+        str | None,
+        Field(description="Тема или алиас (список — в меню)."),
+    ] = None,
+    helpers: Annotated[
+        list[str] | None,
+        Field(description="Имена: подпись и рецепт."),
+    ] = None,
+    category: Literal["discovery", "code", "xml", "composite", "business", "extension", "navigation"] | None = None,
+    section: Annotated[
+        Literal["workflow", "disambiguation", "performance", "batching", "io", "critical", "coverage"] | None,
+        Field(description="disambiguation с helpers=[a, b] — одна пара; coverage — как читать полноту ответа."),
+    ] = None,
+    format: Annotated[
+        Literal["compact", "full"],
+        Field(description="Для темы: full — 7–9 шагов и code_hint."),
+    ] = "compact",
+    include_code: bool = True,
+    domain: Annotated[
+        list[str] | str | None,
+        Field(description="Ключи как у rlm_start.domains: подписи домена без ядра. Сессию не меняет."),
+    ] = None,
+) -> str:
+    """On-demand help: topic recipe, helper contract, helper domain or strategy section. No arguments — menu."""
+    out = await anyio.to_thread.run_sync(
+        lambda: _rlm_help_dispatch(
+            topic=topic,
+            helpers=helpers,
+            category=category,
+            section=section,
+            format=format,
+            include_code=include_code,
+            domain=domain,
         )
+    )
+    try:
+        parsed = json.loads(out)
+        mode = parsed.get("mode", "?")
+        warnings_count = len(parsed.get("warnings", []) or [])
+    except Exception:
+        mode = "?"
+        warnings_count = 0
+    helpers_count = len(helpers) if helpers else 0
+    domains_log = ""
+    if domain:
+        choice = normalize_domains(domain)
+        domains_log = f" domains=<{choice.log_value() if choice.recognized else '-'}>"
+    logger.info(
+        "rlm_help: mode=%s topic=%s category=%s section=%s helpers=%d format=%s out_chars=%d warnings=%d%s",
+        mode,
+        topic,
+        category,
+        section,
+        helpers_count,
+        format,
+        len(out),
+        warnings_count,
+        domains_log,
+    )
+    return out
+
+
+# FastMCP называет модель аргументов по имени функции (`<имя>Arguments`): без этого
+# в схеме тула оказался бы заголовок `_rlm_help_toolArguments`.
+_rlm_help_tool.__name__ = _rlm_help_tool.__qualname__ = "rlm_help"
+
+
+def _sync_rlm_help_registration() -> bool:
+    """Согласовать наличие тула ``rlm_help`` с итоговым режимом стратегии (v1.41.0).
+
+    Идемпотентно; возвращает, зарегистрирован ли тул после вызова. До запуска
+    транспорта ``add_tool`` добавляет имя в ``list_tools()``, а ``remove_tool`` его
+    убирает (проверено на установленном FastMCP). Признак регистрации — публичное
+    имя модуля: оно и реестр FastMCP меняются только здесь и только вместе.
+    """
+    want = get_strategy_mode() == "slim"
+    has = "rlm_help" in globals()
+    if want and not has:
+        mcp.add_tool(_rlm_help_tool, name="rlm_help")
+        globals()["rlm_help"] = _rlm_help_tool
+    elif has and not want:
         try:
-            parsed = json.loads(out)
-            mode = parsed.get("mode", "?")
-            warnings_count = len(parsed.get("warnings", []) or [])
-        except Exception:
-            mode = "?"
-            warnings_count = 0
-        helpers_count = len(helpers) if helpers else 0
-        logger.info(
-            "rlm_help: mode=%s topic=%s category=%s section=%s helpers=%d format=%s out_chars=%d warnings=%d",
-            mode,
-            topic,
-            category,
-            section,
-            helpers_count,
-            format,
-            len(out),
-            warnings_count,
-        )
-        return out
+            mcp.remove_tool("rlm_help")
+        except Exception:  # pragma: no cover - тула уже нет в реестре
+            pass
+        globals().pop("rlm_help", None)
+    return want
+
+
+# При импорте — по окружению процесса (прямой импорт в тестах и встраивании).
+_sync_rlm_help_registration()
 
 
 @mcp.tool()
 async def rlm_projects(
-    action: Annotated[
-        Literal["list", "add", "remove", "rename", "update"],
-        Field(description="Action to perform on the project registry"),
-    ],
-    name: Annotated[str | None, Field(description="Project name (required for add/remove/rename/update)")] = None,
+    action: Literal["list", "add", "remove", "rename", "update"],
+    name: Annotated[str | None, Field(description="Для add/remove/rename/update.")] = None,
     path: Annotated[
         str | None,
-        Field(
-            description=(
-                "Absolute filesystem path to a 1C configuration root, or to a parent "
-                "container directory with the main configuration in a direct subdirectory "
-                "(required for 'add'). Auto-detection of the main configuration mirrors "
-                "rlm_start; if multiple candidates exist without a 'cf' subdirectory, "
-                "an error is returned."
-            )
-        ),
+        Field(description="Корень конфигурации или каталог-контейнер (для add/update)."),
     ] = None,
-    description: Annotated[str | None, Field(description="Optional project description")] = None,
-    new_name: Annotated[str | None, Field(description="New name for rename action")] = None,
+    description: str | None = None,
+    new_name: str | None = None,
     password: Annotated[
         str | None,
         Field(
-            description="Project password. For 'add': sets the initial password (required). "
-            "For 'remove/rename/update': current password for confirmation. "
-            "Ask the user for their project password when server returns approval_required."
+            description=(
+                "Пароль проекта: add задает, остальные изменения подтверждают. Не выдумывай — спроси у пользователя."
+            )
         ),
     ] = None,
     clear_password: Annotated[
-        bool, Field(description="Remove project password (disables all MCP mutations until new password is set)")
+        bool, Field(description="Снять пароль: изменения через MCP закроются до нового.")
     ] = False,
 ) -> str:
-    """Manage the server-side project registry -- a mapping of human-readable project names to filesystem paths.
-    Use 'list' to see all registered 1C projects, 'add' to register a new project (name + path + password),
-    'remove' to unregister, 'rename' to change a project's display name, 'update' to change path or description.
-    After registering a project, you can open sessions via rlm_start(project='name') instead of specifying the full path.
-    When the user mentions a project by name, call list first to find available projects.
-    Password is required for all mutating operations. For 'add' it sets the initial password.
-    For 'remove/rename/update' it confirms the operation with the current password."""
+    """Finds or changes registered projects (name → source path). Changes require the project password — ask the user for it."""
 
     # === MCP password enforcement ===
 
@@ -2379,40 +2650,22 @@ def _rlm_projects(
 
 @mcp.tool()
 async def rlm_index(
-    action: Annotated[
-        Literal["build", "update", "info", "drop"],
-        Field(description="Action to perform on the index"),
-    ],
+    action: Literal["build", "update", "info", "drop"],
     path: Annotated[
         str | None,
-        Field(
-            description=(
-                "Absolute path to a 1C configuration root, or to a parent container "
-                "directory that holds the main configuration in a direct subdirectory. "
-                "The main configuration is auto-detected; multiple candidates without a "
-                "direct 'cf' subdirectory return an error listing the candidates."
-            )
-        ),
+        Field(description="Только для info; build/update/drop — через project."),
     ] = None,
-    project: Annotated[str | None, Field(description="Project name from the registry")] = None,
-    no_calls: Annotated[bool, Field(description="Skip call graph (build only)")] = False,
-    no_metadata: Annotated[bool, Field(description="Skip L2 metadata (build only)")] = False,
-    no_fts: Annotated[bool, Field(description="Skip FTS5 full-text index (build only)")] = False,
-    no_synonyms: Annotated[bool, Field(description="Skip object synonyms (build only)")] = False,
+    project: str | None = None,
+    no_calls: bool = False,
+    no_metadata: bool = False,
+    no_fts: bool = False,
+    no_synonyms: bool = False,
     confirm: Annotated[
         str | None,
-        Field(
-            description="Project password for build/update/drop confirmation. "
-            "Ask the user for their project password when server returns approval_required."
-        ),
+        Field(description="Пароль проекта для build/update/drop — спроси у пользователя."),
     ] = None,
 ) -> str:
-    """Manage the BSL method index — build, update, get info, or drop.
-    build/update run in background and return {"started": true} immediately;
-    check progress with info (build_status field). CLI 'rlm-bsl-index' remains synchronous.
-    Provide either 'path' (filesystem path) or 'project' (registered project name).
-    'build', 'update' and 'drop' require a registered project with password —
-    ask the user for the project password."""
+    """Builds, updates, shows or drops the index; build and update run in the background, status via info. Changes require a registered project and its password."""
     logger.info(
         "rlm_index: action=%s project=%s path=%s confirm=%s",
         action,
@@ -3178,12 +3431,13 @@ def _log_effective_env(transport: str) -> None:
             except Exception as exc:
                 log_target = f"<неизвестен: {exc}>"
         logger.info(
-            "startup: version=%s transport=%s sandbox_mode=%s strategy_mode=%s "
+            "startup: version=%s transport=%s sandbox_mode=%s strategy_mode=%s catalog_mode=%s "
             "RLM_CONFIG_FILE=%s RLM_INDEX_DIR=%s index_root=%s (%s) cache_root=%s log=%s",
             version,
             transport,
             get_sandbox_mode(),
             get_strategy_mode(),
+            get_catalog_mode(),
             _env_display("RLM_CONFIG_FILE"),
             _env_display("RLM_INDEX_DIR"),
             index_root,
@@ -3229,6 +3483,12 @@ def main():
     config_file_was_set = "RLM_CONFIG_FILE" in os.environ
     config_file_before_env = os.environ.get("RLM_CONFIG_FILE")
     load_project_env()
+    # v1.41.0: регистрация rlm_help решалась по RLM_STRATEGY_MODE при импорте, то
+    # есть ДО загрузки .env — режим только из .env менял стратегию, но не список
+    # тулов. Согласуем сразу после загрузки, до первого list_tools(). Загрузку .env
+    # на импорт не переносим: service-команды сохраняют RLM_CONFIG_FILE вызывающего,
+    # а --version работающей службы не требует.
+    _sync_rlm_help_registration()
 
     parser = argparse.ArgumentParser(description="rlm-tools-bsl MCP server")
     parser.add_argument(
@@ -3389,6 +3649,11 @@ def main():
     # не имеет права лишить агента хелпера целиком.
     for llm_env_warning in validate_llm_env():
         logger.warning("%s", llm_env_warning)
+    # v1.41.0: невалидный RLM_CATALOG_MODE — откат к domains с предупреждением. Здесь,
+    # а не при импорте: при импорте предупреждение ушло бы мимо server.log.
+    catalog_warning = catalog_mode_env_warning()
+    if catalog_warning:
+        logger.warning("%s", catalog_warning)
 
     # One-shot per server start: migrate legacy index directories from the
     # pre-v1.9.2 home-based location into the new RLM_CONFIG_FILE-aware root.

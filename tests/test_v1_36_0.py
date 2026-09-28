@@ -2583,7 +2583,7 @@ class TestGitSearchPerFileCap:
         assert "_meta" not in res and "hint" not in res
 
     def test_registered_sig_does_not_advertise_narrowing(self):
-        """Агент читает `sig` на КАЖДОМ старте, а рецепт — по запросу. Ложный совет
+        """Агент получает `sig` всегда (старт или signatures), а рецепт — по запросу. Ложный совет
         в подписи опаснее, чем в hint: именно он и есть «инструкция по умолчанию»."""
         from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 

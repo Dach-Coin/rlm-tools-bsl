@@ -209,7 +209,8 @@ def test_slim_strategy_bounded_with_many_extensions(monkeypatch):
     assert "EXTENSIONS DETECTED" in s
     assert "get_overrides(" in s
     assert "== HELP ==" in s  # slim-маркер на месте
-    assert len(s) < 12000, f"slim-стратегия раздута расширениями: {len(s)}"
+    # v1.41.0: ceil10(факт × 1,10) — прежняя полоса «< 12000» не защищала освобождённое место.
+    assert len(s) <= 7750, f"slim-стратегия раздута расширениями: {len(s)}"
 
 
 def test_full_strategy_also_bounded_with_many_extensions(monkeypatch):

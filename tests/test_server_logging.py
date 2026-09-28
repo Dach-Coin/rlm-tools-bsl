@@ -190,7 +190,16 @@ def test_startup_line_present_for_both_transports(caplog, argv, _restore_mcp_set
     lines = _startup_lines(caplog)
     assert len(lines) == 1, lines
     line = lines[0]
-    for key in ("version=", "transport=", "sandbox_mode=", "strategy_mode=", "index_root=", "cache_root=", "log="):
+    for key in (
+        "version=",
+        "transport=",
+        "sandbox_mode=",
+        "strategy_mode=",
+        "catalog_mode=",
+        "index_root=",
+        "cache_root=",
+        "log=",
+    ):
         assert key in line, (key, line)
 
 

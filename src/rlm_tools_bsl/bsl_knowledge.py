@@ -7,7 +7,12 @@ from dataclasses import dataclass
 
 from rlm_tools_bsl.bsl_strategy_data import (
     DISAMBIGUATION_PAIRS,
+    DOMAIN_KEYS_TEXT,
+    HELPER_DOMAINS,
     STRATEGY_SECTIONS,
+    DomainChoice,
+    domain_of_topic,
+    recipe_mentions,
 )
 
 
@@ -723,7 +728,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
             "get_object_profile('ДокИмя') → за 1 вызов: регистры (registers) + подписки (subscriptions) + структура + модули + роли",
-            "registers.summary: main_code_registers_suppressed_by_cfe>0 — handler-only main не active; code_registers=0 ≠ непроводимый: смотри posting_handler_present. Posting=Deny определяет только find_register_movements.is_postable. Исполняй hint: сервер назвал регистры и классифицировал получателя (МОДУЛЬ/ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН); неподтвержденный МОДУЛЬ молча даст ЧУЖОЕ тело, для НЕ ОПОЗНАН дал tree-search. module_hint точно — rel_path; category=='CommonModules' — ТАВТОЛОГИЯ его фильтра. declared_registers — ОБЪЯВЛЕННЫЙ состав, ось отдельная от кода; unresolved — неразрешимые. find_call_hierarchy движений не найдет: обработчик зовет ПЛАТФОРМА",
+            "code_registers=0 ≠ непроводимый: при posting_handler_present движения могут писать делегаты (а могут и не писаться) — проверь hint и найденные тела. Непроводимый — только find_register_movements('ДокИмя').is_postable=False. ОбработкаПроведения зовет ПЛАТФОРМА: callers=0 — норма, но ЯВНЫЙ BSL-вызов хелперы покажут; call-хелперами трассируй делегата из hint",
+            "метка получателя в hint — ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН: модуль по имени не угадывай, одноименный отдаст ЧУЖОЕ тело; category=='CommonModules' после module_hint='ОбщийМодуль.X' не подтверждение — ТАВТОЛОГИЯ его фильтра",
             "поток целиком → get_object_profile('ДокИмя', include_flow=True)",
         ],
         "full": [
@@ -1263,6 +1269,40 @@ def _match_recipe(query: str) -> str | None:
     return None
 
 
+def _starts_word(text: str, needle: str) -> bool:
+    """``needle`` встречается в ``text`` с начала слова: перед ним нет буквы или цифры."""
+    return re.search(r"(?<![^\W_])" + re.escape(needle), text) is not None
+
+
+def slim_recipe_topic(query: str) -> str | None:
+    """Строгое сопоставление темы рецепта для slim-старта (v1.41.0).
+
+    Тот же порядок приоритетов, что у ``_match_recipe`` (сначала темы, затем алиасы),
+    но совпадение засчитывается только с начала слова: подстрочный матч ловил алиас
+    «формы» в слове «платформы» и вставлял агенту чужой рецепт. Одна функция выбирает
+    тему и для текста рецепта, и для подписей его шагов — разойтись они не могут.
+    Full-стратегия и справка ``rlm_help(topic=…)`` остаются на ``_match_recipe``.
+    """
+    if not query:
+        return None
+    q = query.lower()
+    for topic in _BUSINESS_RECIPES:
+        if _starts_word(q, topic):
+            return topic
+    for alias, topic in _RECIPE_ALIASES.items():
+        if _starts_word(q, alias):
+            return topic
+    return None
+
+
+def slim_recipe_step_helpers(topic: str, names) -> list[str]:
+    """Хелперы из ``names``, упомянутые в compact-шагах рецепта темы, в порядке ``names``."""
+    recipe = _BUSINESS_RECIPES.get(topic)
+    if not recipe:
+        return []
+    return recipe_mentions("\n".join(recipe.get("compact") or []), topic, names)
+
+
 def get_strategy(
     effort: str,
     format_info,
@@ -1273,6 +1313,9 @@ def get_strategy(
     idx_stats: dict | None = None,
     idx_warnings: list[str] | None = None,
     query: str = "",
+    *,
+    domain_choice: DomainChoice | None = None,
+    catalog_mode: str | None = None,
 ) -> str:
     """Public strategy builder. Routes to slim or full mode based on
     ``RLM_STRATEGY_MODE`` env var.
@@ -1284,28 +1327,66 @@ def get_strategy(
         which is token-bounded in both modes (see _build_full_strategy).
 
     Unknown values fall back to ``slim``.
+
+    ``domain_choice`` / ``catalog_mode`` (v1.41.0) читает только slim-сборщик: выбор
+    доменов агентом и режим каталога, прочитанный сервером ОДИН раз на старте.
+    Full-сборщик их не получает — его вывод побайтно прежний.
     """
     mode = os.environ.get("RLM_STRATEGY_MODE", "slim").lower()
     if mode not in ("slim", "full"):
         mode = "slim"
-    builder = _build_full_strategy if mode == "full" else _build_slim_strategy
-    return builder(
-        effort,
-        format_info,
-        detected_prefixes,
-        extension_context,
-        ext_overrides,
-        registry,
-        idx_stats,
-        idx_warnings,
-        query,
-    )
+    args = (effort, format_info, detected_prefixes, extension_context, ext_overrides, registry, idx_stats, idx_warnings)
+    if mode == "full":
+        return _build_full_strategy(*args, query)
+    return _build_slim_strategy(*args, query, domain_choice=domain_choice, catalog_mode=catalog_mode)
 
 
 def get_strategy_mode() -> str:
     """Resolved strategy mode for the current environment ('slim' or 'full')."""
     mode = os.environ.get("RLM_STRATEGY_MODE", "slim").lower()
     return mode if mode in ("slim", "full") else "slim"
+
+
+_CATALOG_MODES = ("domains", "all")
+
+
+def get_catalog_mode() -> str:
+    """Режим выдачи каталога подписей в slim (v1.41.0): ``domains`` | ``all``.
+
+    ``domains`` (по умолчанию) — ядро плюс домены, выбранные агентом в
+    ``rlm_start(domains=…)``; ``all`` — весь каталог в каждой slim-сессии и прежний
+    вызов без ``domains``. Читается при вызове, поэтому значение из ``.env``, который
+    ``main()`` загружает после импорта сервера, действует; невалидное — ``domains``.
+    В full не действует: там каталог всегда целиком.
+    """
+    raw = os.environ.get("RLM_CATALOG_MODE", "").strip().lower()
+    return raw if raw in _CATALOG_MODES else "domains"
+
+
+def catalog_mode_env_warning() -> str | None:
+    """Текст предупреждения о нераспознанном ``RLM_CATALOG_MODE`` (None — всё в порядке)."""
+    raw = os.environ.get("RLM_CATALOG_MODE")
+    if raw is None or not raw.strip() or raw.strip().lower() in _CATALOG_MODES:
+        return None
+    return f"RLM_CATALOG_MODE={raw!r} не распознан (ожидается domains|all) — используется domains"
+
+
+def ext_list_display_cap() -> int:
+    """Порог списка расширений в поле ``nearby_extensions`` и в блоке стратегии (v1.41.0).
+
+    Явный ``RLM_EXT_LIST_CAP`` действует, как прежде (``<=0`` — без лимита). Не задан
+    или не число — 5 в slim и 20 в full. Предупреждения ``_build_warnings`` и ответ
+    хелпера ``detect_extensions()`` этот порог НЕ используют: там по-прежнему
+    ``extension_detector._ext_list_cap()`` (20 по умолчанию) — переменная режима
+    стратегии не должна менять ответ хелпера.
+    """
+    raw = os.environ.get("RLM_EXT_LIST_CAP", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return 5 if get_strategy_mode() == "slim" else 20
 
 
 # --- Generic mode: чужой формат исходников БЕЗ единого .bsl (v1.32.0) ---
@@ -1580,17 +1661,18 @@ def _build_full_strategy(
 #                        SLIM STRATEGY (v1.10.x)
 # ─────────────────────────────────────────────────────────────────────
 
+# v1.41.0: требование «вызови rlm_help ДО rlm_execute» снято — оно само порождало
+# ход в каждой нетривиальной сессии. Справка — по надобности: готовый план по теме
+# или сомнение в контракте хелпера; первым вызовом можно сразу работать.
 _SLIM_HELP_BLOCK = """\
 == HELP ==
-This is a slim strategy. For detailed recipes, examples and helper-comparison rules
-you MUST call rlm_help(...) BEFORE running rlm_execute on non-trivial queries.
-  rlm_help(topic='проведение'|'печать'|'права'|'ссылки'|...)  → готовый план для домена
-  rlm_help(category='discovery'|'code'|'xml'|'composite'|'business'|'extension'|'navigation')  → группа хелперов
-  rlm_help(helpers=['name1','name2'])  → детальные рецепты для конкретных хелперов
+Справка по надобности, первым вызовом можно сразу работать:
+  rlm_help(topic='проведение'|'печать'|'права'|'ссылки'|...)  → готовый план по теме
+  rlm_help(helpers=['имя'])  → контракт хелпера до вызова
+  rlm_help(domain='код')  → подписи домена хелперов
   rlm_help(section='workflow'|'disambiguation'|'performance'|'io'|'coverage')  → справочные секции
-  rlm_help()  → меню всех topic/category/section
-NOTE: in-sandbox help('keyword') (the BSL helper) still works inside rlm_execute for
-quick recipe lookup at code-time — that is separate from the rlm_help MCP tool above."""
+  rlm_help()  → меню
+help('keyword') внутри rlm_execute — рецепты кода (это хелпер песочницы, не MCP-тул)."""
 
 _SLIM_WORKFLOW_OVERVIEW = """\
 == WORKFLOW (overview) ==
@@ -1612,23 +1694,66 @@ Get rules, when_a/when_b for any pair → rlm_help(section='disambiguation')
 or rlm_help(helpers=['name_a','name_b'], section='disambiguation') for one pair."""
 
 
-def build_slim_helpers_index(registry: dict) -> str:
-    """One line per category with up to 6 helper names, no signatures or descriptions.
+# Блок доменов хелперов (v1.41.0) — на месте прежнего compact index: подписи
+# выбранных доменов уже в available_functions, имена всех доменов — в описании
+# параметра rlm_start.domains. Потолки: 400 (домены выбраны / только ядро, вместе
+# со строкой нераспознанного) и 150 (весь каталог без неё; строка нераспознанного
+# несёт перечень ключей и в 150 не входит — с ней общий потолок 400).
+_DOMAINS_BLOCK_MAX = 400
+_DOMAINS_BLOCK_HEAD = "\n== ДОМЕНЫ ХЕЛПЕРОВ =="
 
-    Detailed signatures live in `available_functions` of `rlm_start` and full
-    recipes/tags via `rlm_help(category=..., helpers=[...])`.
-    """
-    if not registry:
+
+def _ignored_domains_line(choice: DomainChoice, keys_listed: bool, room: int) -> str:
+    """Строка нераспознанного: фрагменты, их число и допустимые ключи — под потолок
+    блока. Не влезают фрагменты — остаётся одно число (ключи не выбрасываются никогда)."""
+    allowed = "допустимые — выше" if keys_listed else f"ключи: {DOMAIN_KEYS_TEXT}"
+    line = f"Не распознано значений: {choice.ignored_total}; {allowed}."
+    for k in range(len(choice.ignored), 0, -1):
+        hidden = choice.ignored_total - k
+        shown = ", ".join(choice.ignored[:k]) + (f" (+{hidden})" if hidden > 0 else "")
+        candidate = f"Не распознано: {shown}; {allowed}."
+        if len(candidate) <= room:
+            return candidate
+    return line
+
+
+def build_domains_block(choice: DomainChoice | None, catalog_mode: str) -> str:
+    """Три варианта: домены выбраны, только ядро, весь каталог. При
+    ``RLM_CATALOG_MODE=all`` блока нет: каталог выдан сервером, а не выбором агента."""
+    if catalog_mode == "all":
         return ""
-    lines = ["== HELPERS (compact index — call rlm_help for sigs/recipes) =="]
-    for cat_key, cat_label in _CATEGORY_ORDER:
-        names = [name for name, entry in registry.items() if entry.get("cat") == cat_key]
-        if not names:
-            continue
-        head = ", ".join(names[:6])
-        suffix = f", … ({len(names)} total)" if len(names) > 6 else ""
-        lines.append(f"  {cat_label} ({len(names)}): {head}{suffix}")
-    return "\n".join(lines)
+    choice = choice or DomainChoice()
+    lines = [_DOMAINS_BLOCK_HEAD]
+    keys_listed = False
+    if choice.all_catalog:
+        lines.append("Загружен весь каталог: все подписи — в available_functions.")
+    elif choice.keys:
+        lines.append(f"Загружены: {', '.join(choice.keys)} — подписи в available_functions.")
+        lines.append("Еще домен: domains=['…'] у ближайшего rlm_execute — подписи придут в его signatures.")
+        lines.append("Хелпер вне загруженных зови по имени — подпись придет в signatures.")
+    else:
+        lines.append(f"Загружено только ядро. Ключи: {DOMAIN_KEYS_TEXT}.")
+        lines.append("Домен: domains=['код'] у ближайшего rlm_execute — подписи придут в его signatures.")
+        lines.append("Хелпер вне ядра зови по имени — подпись придет в signatures.")
+        keys_listed = True
+    tail: list[str] = []
+    if choice.ignored_total:
+        room = _DOMAINS_BLOCK_MAX - len("\n".join(lines)) - 1
+        tail.append(_ignored_domains_line(choice, keys_listed, room))
+    if choice.keys and not choice.all_catalog:
+        topics = [t for key in choice.keys for t in HELPER_DOMAINS[key]["topics"]]
+        # Тем у шести доменов вместе — шестнадцать: строка режется под общий потолок
+        # блока, а не раздувает его. Остальные темы — в меню rlm_help().
+        room = _DOMAINS_BLOCK_MAX - len("\n".join(lines + tail)) - 1
+        shown: list[str] = []
+        for topic in topics:
+            rest = ", …" if len(shown) + 1 < len(topics) else ""
+            if len("Темы рецептов: " + ", ".join([*shown, topic]) + rest) > room:
+                break
+            shown.append(topic)
+        if shown:
+            lines.append("Темы рецептов: " + ", ".join(shown) + (", …" if len(shown) < len(topics) else ""))
+    return "\n".join(lines + tail)
 
 
 def _build_slim_strategy(
@@ -1641,11 +1766,20 @@ def _build_slim_strategy(
     idx_stats: dict | None = None,
     idx_warnings: list[str] | None = None,
     query: str = "",
+    *,
+    domain_choice: DomainChoice | None = None,
+    catalog_mode: str | None = None,
 ) -> str:
     """Slim strategy — replaces the static workflow/disambiguation/perf walls
     with one-line pointers to the `rlm_help(...)` MCP tool. Token target ~1500-1800.
+
+    v1.41.0: ``domain_choice`` — выбор доменов агентом (``None`` — только ядро, как у
+    внутреннего вызова без выбора), ``catalog_mode`` — режим каталога, прочитанный
+    сервером ОДИН раз на старте (``None`` — читается здесь, для прямых вызовов).
     """
     config = EFFORT_LEVELS.get(effort, EFFORT_LEVELS["medium"])
+    catalog_mode = catalog_mode or get_catalog_mode()
+    choice = domain_choice or DomainChoice()
 
     has_extensions = (
         extension_context is not None
@@ -1657,7 +1791,8 @@ def _build_slim_strategy(
 
     # --- Extension alert (BEFORE everything else if present) ---
     if has_extensions:
-        parts.append(_extension_strategy(extension_context, ext_overrides or {}))
+        # Пустая строка отделяет блок от вступления «You are exploring…».
+        parts.append(_extension_strategy(extension_context, ext_overrides or {}, slim=True) + "\n")
 
     # --- Sandbox preamble + critical block ---
     parts.append(
@@ -1672,20 +1807,29 @@ def _build_slim_strategy(
     parts.append(_SLIM_WORKFLOW_OVERVIEW)
 
     # --- Auto-routed compact recipe (always 'compact', regardless of effort) ---
-    if query:
-        domain = _match_recipe(query)
-        if domain:
-            recipe = _BUSINESS_RECIPES[domain]
-            steps = recipe.get("compact") or []
-            recipe_lines = [f"\n== BUSINESS RECIPE: {domain} =="]
-            for i, step in enumerate(steps, 1):
-                recipe_lines.append(f"  {i}. {step}")
-            recipe_lines.append(f"Full version + code_hint (if any): rlm_help(topic='{domain}', format='full')")
-            parts.append("\n".join(recipe_lines))
+    # v1.41.0: тема — строгим совпадением с начала слова (slim_recipe_topic): та же
+    # функция выбирает у сервера подписи шагов рецепта, поэтому рецепт и подписи
+    # относятся к одной теме. Невыданный домен темы — строка о попутной догрузке.
+    topic = slim_recipe_topic(query)
+    if topic:
+        recipe = _BUSINESS_RECIPES[topic]
+        steps = recipe.get("compact") or []
+        recipe_lines = [f"\n== BUSINESS RECIPE: {topic} =="]
+        for i, step in enumerate(steps, 1):
+            recipe_lines.append(f"  {i}. {step}")
+        recipe_lines.append(f"Full version + code_hint (if any): rlm_help(topic='{topic}', format='full')")
+        topic_domain = domain_of_topic(topic)
+        if catalog_mode == "domains" and not choice.all_catalog and topic_domain not in choice.keys:
+            recipe_lines.append(
+                f"Остальные хелперы домена «{topic_domain}» — добавь domains=['{topic_domain}'] "
+                "к ближайшему rlm_execute."
+            )
+        parts.append("\n".join(recipe_lines))
 
-    # --- Compact helpers index (categories + names, no signatures) ---
-    if registry:
-        parts.append(build_slim_helpers_index(registry))
+    # --- Helper domains (what is loaded and how to add more) ---
+    domains_block = build_domains_block(choice, catalog_mode)
+    if domains_block:
+        parts.append(domains_block)
 
     # --- Full-text search routing (only when git_search is registered) ---
     git_note = _git_search_routing(registry)
@@ -1728,7 +1872,19 @@ def _build_slim_strategy(
             "find_custom_modifications() uses them automatically."
         )
 
-    return "\n".join(parts)
+    return _space_slim_sections("\n".join(parts))
+
+
+# Строка-заголовок секции, перед которой нет пустой строки.
+_SLIM_UNSPACED_HEADER_RE = re.compile(r"(?<=[^\n])\n(?=== )")
+
+
+def _space_slim_sections(text: str) -> str:
+    """Оформление slim-стратегии (v1.41.0): ровно одна пустая строка перед каждым
+    заголовком ``== … ==`` и никакой — в начале. Блоки собираются из констант,
+    общих с full и справкой, и край у них разный; выравнивание — одно место на
+    выходе slim, а не правка каждой константы."""
+    return _SLIM_UNSPACED_HEADER_RE.sub("\n\n", text.lstrip("\n"))
 
 
 def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) -> str:
@@ -1787,47 +1943,10 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
         "get_index_info() на старте (пустая трата execute); число перехватов — "
         "get_overrides()['total']."
     )
-
-    instant_helpers = ["extract_procedures()", "find_exports()"]
-    if calls_count:
-        instant_helpers.append("find_callers_context()")
-        instant_helpers.append("find_call_hierarchy()")
-    instant_helpers.extend(
-        [
-            "find_event_subscriptions()",
-            "find_scheduled_jobs()",
-            "find_functional_options()",
-        ]
-    )
-    role_rights_count = idx_stats.get("role_rights", 0)
-    if role_rights_count:
-        instant_helpers.append("find_roles()")
-    register_movements_count = idx_stats.get("register_movements", 0)
-    if register_movements_count:
-        instant_helpers.extend(["find_register_movements()", "find_register_writers()"])
+    # v1.41.0: строка «INSTANT from index: …» (перечень индексных хелперов) из slim
+    # убрана — она дублирует rlm_help(section='performance'), где та же раскладка
+    # INSTANT/HYBRID/LIVE дана подробно. Встроенный INDEX full-режима не меняется.
     file_paths_count = idx_stats.get("file_paths", 0)
-    if file_paths_count:
-        # find_files() is NOT listed here: it is instant on an index-hit but falls back
-        # to an FS-scan on a zero-hit (v1.26.0) — the conditional behaviour is described
-        # in the tips below, so it must not appear in the unconditional INSTANT list.
-        instant_helpers.extend(["glob_files(indexed)", "tree(indexed)"])
-    if synonyms_count:
-        instant_helpers.append("search_objects()")
-    form_elements_count = idx_stats.get("form_elements", 0)
-    if form_elements_count:
-        instant_helpers.append("parse_form()")
-    bver = int(idx_stats.get("builder_version") or 0)
-    if bver >= 8:
-        instant_helpers.append("search_regions()")
-        instant_helpers.append("search_module_headers()")
-    if oa_count:
-        instant_helpers.append("find_attributes()")
-    if pi_count:
-        instant_helpers.append("find_predefined()")
-    if oa_count and pi_count:
-        instant_helpers.append("get_object_full_structure()")
-    instant_helpers.append("search()")
-    idx_lines.append(f"INSTANT from index: {', '.join(instant_helpers)}.")
 
     if has_fts:
         idx_lines.append(
@@ -1999,9 +2118,15 @@ def _ext_override_detail_budget() -> int:
         return 0
 
 
-def _extension_strategy(ext_context, ext_overrides: dict) -> str:
-    """Build strategy text for extension context."""
-    from rlm_tools_bsl.extension_detector import ConfigRole, _ext_list_cap
+def _extension_strategy(ext_context, ext_overrides: dict, *, slim: bool = False) -> str:
+    """Build strategy text for extension context.
+
+    ``slim`` (v1.41.0): заголовок блока — в общем виде slim-секций ``== … ==``, а при
+    усечённом списке расширений — строка о полном списке через ``detect_extensions()``.
+    Full ни того ни другого не получает — его ответ побайтно прежний, и порог там
+    прежний (20).
+    """
+    from rlm_tools_bsl.extension_detector import ConfigRole
 
     current = ext_context.current
     lines: list[str] = []
@@ -2011,8 +2136,9 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
         # на КАЖДОЕ расширение раздували стратегию выше токен-лимита. Усекаем агент-facing
         # представление до top-N по overrides (полнота — через detect_extensions()).
         # Внутренний ext_context.nearby_extensions и питание песочницы НЕ трогаются.
+        # v1.41.0: порог по режиму (5 в slim, 20 в full; явный RLM_EXT_LIST_CAP — он).
         shown, total, n_shown = summarize_extensions_by_overrides(
-            ext_context.nearby_extensions, ext_overrides, _ext_list_cap()
+            ext_context.nearby_extensions, ext_overrides, ext_list_display_cap()
         )
         truncated = n_shown < total
         budget = _ext_override_detail_budget()
@@ -2022,9 +2148,10 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
         # truncation markers — nearby_extensions_truncated/total/shown + extensions_hint);
         # serializing them a 2nd time here (prose header) and a 3rd (per-extension counters
         # below) cost ~600 tok on EVERY rlm_start. The behavioral block is preserved VERBATIM.
+        header = f"CRITICAL — {total} EXTENSIONS DETECTED"
         lines.append(
-            f"\nCRITICAL — {total} EXTENSIONS DETECTED "
-            "(name/prefix/overrides_count в extension_context.nearby_extensions)\n"
+            (f"\n== {header} ==\n" if slim else f"\n{header} ")
+            + "(name/prefix/overrides_count в extension_context.nearby_extensions)\n"
             "Extensions OVERRIDE methods in this config via annotations:\n"
             "  &Перед (Before), &После (After), &Вместо (Instead), &ИзменениеИКонтроль (ChangeAndValidate)\n"
             "YOU MUST mention overridden methods in your response.\n"
@@ -2080,14 +2207,24 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
             lines.append(
                 "\nFull per-object override detail on demand: get_overrides('ИмяОбъекта') or find_ext_overrides()."
             )
+        if truncated and slim:
+            # Ранжирование по числу перехватов не доказывает, что видимые N расширений
+            # относятся к вопросу: нужное может оказаться ниже. Условие («вопрос о
+            # расширениях или полный разбор») применяет агент — серверу распознавать
+            # тему запроса не нужно.
+            lines.append(
+                f"Показаны {n_shown} из {total} расширений (по числу перехватов). Вопрос о расширениях "
+                "или полный разбор объекта — сначала полный список detect_extensions(), потом вывод о составе."
+            )
 
     elif current.role == ConfigRole.EXTENSION:
         name_label = current.name or "?"
         purpose_label = current.purpose or "unknown"
         prefix_label = current.name_prefix or "—"
+        header = "CRITICAL — THIS IS AN EXTENSION, NOT A MAIN CONFIG"
         lines.append(
-            f"\nCRITICAL — THIS IS AN EXTENSION, NOT A MAIN CONFIG.\n"
-            f"Extension: '{name_label}' (purpose: {purpose_label}, prefix: {prefix_label})\n"
+            (f"\n== {header} ==\n" if slim else f"\n{header}.\n")
+            + f"Extension: '{name_label}' (purpose: {purpose_label}, prefix: {prefix_label})\n"
             "Objects with ObjectBelonging=Adopted are borrowed from the main config.\n"
             "YOUR ANALYSIS IS INCOMPLETE without the main configuration.\n"
             "YOU MUST:\n"

@@ -455,15 +455,23 @@ def test_efficiency_hints_in_execute_response_and_log(caplog):
 
 
 def test_rlm_execute_tool_description_mentions_profile_and_batch():
-    """rlm_execute Field description teaches get_object_profile + batch forms (R3 #2)."""
-    import inspect
+    """Обзор объекта за один вызов и батч-формы доходят до агента (R3 #2).
+
+    v1.41.0: описания MCP-тулов сжаты (только поведение, которого не видно в схеме),
+    поэтому перечень батч-форм переехал из поля `code` в блок BATCHING стратегии —
+    slim инлайнит его в каждый старт. В поле осталось само правило батчинга.
+    """
+    import asyncio
 
     from rlm_tools_bsl import server
+    from rlm_tools_bsl.bsl_strategy_data import STRATEGY_SECTIONS
 
-    src = inspect.getsource(server)
-    assert "get_object_profile(name) (structure+modules" in src
-    assert "read_files([p1,p2])" in src
-    assert "read_procedure(path, ['ProcA','ProcB'])" in src
+    tool = next(t for t in asyncio.run(server.mcp.list_tools()) if t.name == "rlm_execute")
+    assert "одним вызовом" in tool.inputSchema["properties"]["code"]["description"]
+    batching = STRATEGY_SECTIONS["batching"]
+    assert "get_object_profile(name)" in batching
+    assert "read_files([p1,p2,p3])" in batching
+    assert "read_procedure(path, ['Проц1','Проц2'])" in batching
 
 
 def test_invalid_session():

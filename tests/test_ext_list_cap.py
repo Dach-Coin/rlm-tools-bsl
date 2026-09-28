@@ -364,8 +364,9 @@ def test_sandbox_gets_all_extension_paths_above_cap(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("cap_value", ["0", "-1"])
 def test_response_disabled_cap_keeps_full(tmp_path, monkeypatch, cap_value):
-    """env-disable: RLM_EXT_LIST_CAP=0 и =-1, N=30 → полный список во всех трёх
-    представлениях (response без companion-полей, warning/strategy со всеми именами)."""
+    """env-disable: RLM_EXT_LIST_CAP=0 и =-1, N=30 → полный список без усечения
+    (response без companion-полей, strategy без +more). Warning ответа rlm_start с
+    v1.41.0 список не повторяет — он в extension_context."""
     from rlm_tools_bsl.server import _rlm_end, _rlm_start
 
     monkeypatch.setenv("RLM_EXT_LIST_CAP", cap_value)
@@ -379,9 +380,10 @@ def test_response_disabled_cap_keeps_full(tmp_path, monkeypatch, cap_value):
         assert len(ec["nearby_extensions"]) == 30
         assert "nearby_extensions_truncated" not in ec
         assert "extensions_hint" not in ec
-        # Site 1: warning со всеми именами (без короткой сводки).
-        assert any("Расш29" in w for w in resp["warnings"])
-        assert not any("call detect_extensions() for the complete list" in w for w in resp["warnings"])
+        # Site 1 (v1.41.0): warning не дублирует список — одна строка со ссылкой на него.
+        assert resp["warnings"] == [
+            "30 extension(s) detected near main config — see extension_context.nearby_extensions."
+        ]
         # Site 3: strategy — счётчик total (все 30) + указатель на nearby_extensions,
         # без +more и без перечня имён/префиксов (#1, v1.28.0).
         assert "30 EXTENSIONS DETECTED" in resp["strategy"]
@@ -418,8 +420,8 @@ def test_extension_session_response_not_truncated(tmp_path, monkeypatch):
 
 
 def test_small_cf_cfe_unaffected(tmp_path, monkeypatch):
-    """N=1: companion-полей нет, warning полный с именем, заголовок без +more
-    (формальная фиксация «малые конфиги байт-в-байт прежние»)."""
+    """N=1: companion-полей нет, заголовок без +more, имя — в extension_context.
+    Warning ответа rlm_start с v1.41.0 список не повторяет."""
     from test_extension_overrides import _make_main_with_extension
     from rlm_tools_bsl.server import _rlm_end, _rlm_start
 
@@ -433,9 +435,11 @@ def test_small_cf_cfe_unaffected(tmp_path, monkeypatch):
         assert len(ec["nearby_extensions"]) == 1
         assert "nearby_extensions_truncated" not in ec
         assert "extensions_hint" not in ec
-        # warning полный с именем расширения, без короткой сводки.
-        assert any("ТестовоеРасширение" in w for w in resp["warnings"])
-        assert not any("call detect_extensions() for the complete list" in w for w in resp["warnings"])
+        assert ec["nearby_extensions"][0]["name"] == "ТестовоеРасширение"
+        # warning — одна строка со ссылкой на список, без имени и без сводки усечения.
+        assert resp["warnings"] == [
+            "1 extension(s) detected near main config — see extension_context.nearby_extensions."
+        ]
         # strategy без +more.
         assert "more (detect_extensions())" not in resp["strategy"]
     finally:

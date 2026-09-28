@@ -25,9 +25,33 @@ class Session:
     total_out_chars: int = 0
     # v1.29.0 §9.1: сериализация двух rlm_execute ОДНОЙ сессии. Держится только
     # исполняющим путём _rlm_execute; rlm_end/TTL-eviction/shutdown его НИКОГДА
-    # не берут (иначе teardown ждал бы пользовательский timeout до 300с).
+    # не ждут (иначе teardown ждал бы пользовательский timeout до 300с). v1.41.0:
+    # rlm_end после отцепления сессии пробует взять его БЕЗ ожидания — только чтобы
+    # пометить итог журнала in_flight=1, если execute ещё идёт.
     # Никогда не сериализуется в sandbox worker.
     execution_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    # v1.41.0 — состояние выдачи подписей хелперов. Меняют его только _rlm_start (до
+    # публикации сессии) и _rlm_execute (под execution_lock); справка rlm_help
+    # состояния сессии не трогает, поэтому отдельный замок не нужен.
+    #   registry_view — представление реестра сессии: имена из реестра воркера,
+    #     пересечённые с каталогом родителя, записи (тексты подписей) — из каталога;
+    #     пустое в generic-сессии (BSL-хелперов нет);
+    #   registry_generation — поколение воркера, для которого строилось представление;
+    #   catalog_all_at_start — весь каталог выдан на старте (full, RLM_CATALOG_MODE=all,
+    #     выбор «весь каталог»): способ выдачи фиксируется на весь срок сессии;
+    #   helper_domains — выбранные и попутно догруженные домены;
+    #   delivered_helpers — имена, чьи подписи агент уже получил (старт или signatures);
+    #   outside_helpers — вызовы хелперов, чья подпись до вызова не выдавалась;
+    #   outside_unknown_executes — ответы без истории вызовов (hard timeout/авария);
+    #   domains_added — сколько rlm_execute догрузили хотя бы один новый домен.
+    registry_view: dict = field(default_factory=dict, repr=False, compare=False)
+    registry_generation: int = 0
+    catalog_all_at_start: bool = False
+    helper_domains: list = field(default_factory=list)
+    delivered_helpers: set = field(default_factory=set, repr=False, compare=False)
+    outside_helpers: list = field(default_factory=list)
+    outside_unknown_executes: int = 0
+    domains_added: int = 0
 
 
 class SessionManager:

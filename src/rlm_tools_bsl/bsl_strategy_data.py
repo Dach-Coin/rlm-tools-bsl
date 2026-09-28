@@ -15,6 +15,11 @@ from those literals.
 
 from __future__ import annotations
 
+import json
+import re
+from dataclasses import dataclass
+from typing import Iterable
+
 
 STRATEGY_SECTIONS: dict[str, str] = {
     "critical": """\
@@ -404,3 +409,394 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "tags": ["subscriptions", "references", "events"],
     },
 ]
+
+
+# ─────────────────────────────────────────────────────────────────────
+#                    Домены хелперов (v1.41.0)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Агент сам выбирает, какие подписи хелперов ему нужны: rlm_start(domains=[…]).
+# Ядро уходит в каждой сессии; домены собраны «с запасом» — один хелпер может
+# входить в несколько доменов. Единый источник для схемы тула, блока стратегии,
+# документации и тестов. Файловые и LLM-хелперы в данные не входят: они живут вне
+# реестра и в ядре всегда (LLM — если настроен).
+
+HELPER_CORE: tuple[str, ...] = ("find_module", "extract_procedures", "read_procedure", "search_objects", "help")
+
+# Восемь файловых хелперов песочницы (helpers.make_helpers): в реестре BSL-хелперов
+# их нет, но рецепты их называют, и упоминание файлового хелпера — не вызов вслепую.
+FILE_HELPER_NAMES: tuple[str, ...] = (
+    "read_file",
+    "read_files",
+    "grep",
+    "grep_summary",
+    "grep_read",
+    "glob_files",
+    "tree",
+    "find_files",
+)
+
+ALL_CATALOG = "весь каталог"
+_ALL_CATALOG_ALIASES = frozenset({ALL_CATALOG, "all", "*", "все", "всё", "весь"})
+
+# Порядок словаря — порядок строк в таблице описания параметра. Состав — §3.3 плана:
+# правило «рецепт каждой темы исполним подписями ядра и домена этой темы» держат
+# растяжки tests/test_v1_41_0.py.
+HELPER_DOMAINS: dict[str, dict] = {
+    "документ": {
+        "label": "движения, подписки, основания, печать",
+        "helpers": (
+            "get_object_profile",
+            "find_register_movements",
+            "find_register_writers",
+            "analyze_document_flow",
+            "find_based_on_documents",
+            "find_print_forms",
+            "find_event_subscriptions",
+            "find_scheduled_jobs",
+            "find_functional_options",
+            "find_roles",
+            "get_object_full_structure",
+            "get_object_modules",
+            "find_callers_context",
+            "find_definition",
+            "code_metrics",
+            "find_custom_modifications",
+            "get_overrides",
+            "search_methods",
+            "find_by_type",
+            "analyze_subsystem",
+            "safe_grep",
+            "git_search",
+        ),
+        "topics": ("проведение", "себестоимость", "распределение", "печать", "ввод на основании"),
+    },
+    "структура": {
+        "label": "реквизиты, ТЧ, формы, перечисления, макеты",
+        "helpers": (
+            "get_object_profile",
+            "get_object_full_structure",
+            "get_object_modules",
+            "analyze_object",
+            "parse_object_xml",
+            "parse_form",
+            "find_attributes",
+            "find_predefined",
+            "find_enum_values",
+            "find_templates",
+            "find_defined_types",
+            "find_by_type",
+            "find_callers_context",
+            "find_definition",
+            "find_print_forms",
+            "find_register_movements",
+            "get_module_outline",
+            "code_metrics",
+        ),
+        "topics": ("структура объекта", "события формы", "перечисления", "тип реквизита"),
+    },
+    "код": {
+        "label": "кто вызывает метод, поиск по коду",
+        "helpers": (
+            "find_definition",
+            "find_callers",
+            "find_callers_context",
+            "find_call_hierarchy",
+            "find_path",
+            "find_exports",
+            "get_module_outline",
+            "extract_queries",
+            "code_metrics",
+            "search_methods",
+            "safe_grep",
+            "git_search",
+            "count_matches",
+            "find_event_subscriptions",
+            "find_scheduled_jobs",
+            "get_object_modules",
+        ),
+        "topics": ("иерархия вызовов", "достижимость"),
+    },
+    "связи": {
+        "label": "где используется объект, права, интеграция",
+        "helpers": (
+            "find_references_to_object",
+            "find_code_usages",
+            "find_data_path",
+            "find_defined_types",
+            "analyze_subsystem",
+            "find_roles",
+            "find_functional_options",
+            "find_exchange_plan_content",
+            "find_based_on_documents",
+            "find_event_subscriptions",
+            "get_overrides",
+            "git_search",
+            "safe_grep",
+            "find_http_services",
+            "find_web_services",
+            "find_xdto_packages",
+            "get_object_profile",
+            "find_by_type",
+            "find_scheduled_jobs",
+            "search_methods",
+        ),
+        "topics": ("ссылки", "права", "интеграция", "путь данных"),
+    },
+    "расширения": {
+        "label": "перехваты, доработки",
+        "helpers": (
+            "get_overrides",
+            "find_ext_overrides",
+            "detect_extensions",
+            "find_custom_modifications",
+            "get_object_modules",
+            "get_module_outline",
+            "find_definition",
+            "find_callers_context",
+            "search_methods",
+            "find_by_type",
+            "find_attributes",
+            "find_predefined",
+            "parse_object_xml",
+            "search",
+        ),
+        "topics": ("расширения",),
+    },
+    "поиск": {
+        "label": "вхождения, области, шапки, общие модули",
+        "helpers": (
+            "count_matches",
+            "search_regions",
+            "search_module_headers",
+            "search",
+            "search_methods",
+            "git_search",
+            "safe_grep",
+            "find_common_modules",
+            "find_templates",
+            "find_by_type",
+            "code_metrics",
+            "find_http_services",
+            "find_web_services",
+            "find_xdto_packages",
+            "find_exchange_plan_content",
+            "find_scheduled_jobs",
+            "get_index_info",
+        ),
+        "topics": (),
+    },
+}
+
+# Хелпер, который регистрируется не всегда: таблица статична, реестр сессии живой.
+CONDITIONAL_HELPERS: dict[str, str] = {"git_search": "только под git"}
+
+# Закрытый список фрагментов рецептов, имена внутри которых НЕ считаются упоминанием
+# хелпера: это запреты и названия маршрутов, а не вызовы. Исключение снимает имя
+# только внутри своего фрагмента — то же имя в другом месте рецепта остаётся
+# упоминанием. Устаревший фрагмент (ушёл из рецепта) роняет растяжку.
+RECIPE_NON_STEP_FRAGMENTS: dict[str, tuple[str, ...]] = {
+    "себестоимость": ("вместо find_register_movements/analyze_document_flow по отдельности",),
+}
+
+_TOPIC_DOMAIN: dict[str, str] = {topic: key for key, d in HELPER_DOMAINS.items() for topic in d["topics"]}
+
+ALLOWED_DOMAIN_VALUES: tuple[str, ...] = (*HELPER_DOMAINS, ALL_CATALOG)
+DOMAIN_KEYS_TEXT = " | ".join(ALLOWED_DOMAIN_VALUES)
+
+
+def domain_of_topic(topic: str) -> str | None:
+    """Домен, к которому привязана тема рецепта (None — тема неизвестна)."""
+    return _TOPIC_DOMAIN.get(topic)
+
+
+def domain_helper_names(keys: Iterable[str]) -> frozenset[str]:
+    """Объединение хелперов перечисленных доменов (ядро не входит)."""
+    out: set[str] = set()
+    for key in keys:
+        domain = HELPER_DOMAINS.get(key)
+        if domain is not None:
+            out.update(domain["helpers"])
+    return frozenset(out)
+
+
+# ── Нормализатор выбора (один на rlm_start, rlm_execute и rlm_help) ──────────
+
+# Крайние символы, которые снимаются с каждого значения: пробелы, кавычки любого вида
+# и квадратные скобки. Клиенты передают список строкой ('["документ", "код"]') или
+# с лишними кавычками ('"документ"') — без этой чистки такие значения терялись.
+_STRIP_CHARS = " \t\r\n\"'`«»“”„‘’[]"
+# Неизвестные значения не копируются в ответ без лимита: показывается не больше
+# трёх коротких фрагментов, остальное — счётчиком.
+_IGNORED_SHOWN_MAX = 3
+_IGNORED_FRAGMENT_MAX = 16
+_DOMAINS_KEY_MAX = 200
+
+
+def _fragment(value: str) -> str:
+    safe = "".join(ch if ch.isprintable() and ch not in "<>" else "?" for ch in value)
+    return safe if len(safe) <= _IGNORED_FRAGMENT_MAX else safe[:_IGNORED_FRAGMENT_MAX] + "…"
+
+
+@dataclass(frozen=True)
+class DomainChoice:
+    """Нормализованный выбор доменов.
+
+    ``keys`` — распознанные домены в порядке ``HELPER_DOMAINS``; ``all_catalog`` —
+    выбран весь каталог; ``ignored`` — ограниченные фрагменты нераспознанных
+    значений, ``ignored_total`` — их полное число (различных); ``explicit_empty`` —
+    исходное значение было буквальным пустым списком ``[]`` или его JSON-строкой
+    (осознанное «только ядро»), а не пропуском, ``null`` или пустой строкой.
+    """
+
+    keys: tuple[str, ...] = ()
+    all_catalog: bool = False
+    ignored: tuple[str, ...] = ()
+    ignored_total: int = 0
+    explicit_empty: bool = False
+
+    @property
+    def recognized(self) -> bool:
+        return self.all_catalog or bool(self.keys)
+
+    @property
+    def ignored_truncated(self) -> bool:
+        return self.ignored_total > len(self.ignored) or any(v.endswith("…") for v in self.ignored)
+
+    def selected(self) -> list[str]:
+        return [ALL_CATALOG] if self.all_catalog else list(self.keys)
+
+    def ignored_summary(self) -> dict:
+        """Ограниченная сводка нераспознанного: одна форма на ответ, блок и журнал."""
+        out: dict = {"ignored": list(self.ignored)}
+        if self.ignored_truncated:
+            out["ignored_total"] = self.ignored_total
+            out["ignored_truncated"] = True
+        return out
+
+    def response_key(self) -> dict:
+        """Ключ ``domains`` ответа rlm_start: сериализованный — не больше 200 символов."""
+        out = {"selected": self.selected(), **self.ignored_summary()}
+        while len(json.dumps(out, ensure_ascii=False)) > _DOMAINS_KEY_MAX and out["ignored"]:
+            out["ignored"].pop()
+            out["ignored_total"] = self.ignored_total
+            out["ignored_truncated"] = True
+        return out
+
+    def log_value(self) -> str:
+        if self.all_catalog:
+            return ALL_CATALOG
+        return ",".join(self.keys) if self.keys else "core"
+
+    def ignored_log_value(self) -> str:
+        if not self.ignored_total:
+            return "-"
+        shown = ",".join(self.ignored)
+        hidden = self.ignored_total - len(self.ignored)
+        return f"{shown}(+{hidden})" if hidden > 0 else shown
+
+
+def normalize_domains(value) -> DomainChoice:
+    """Список, строка или ``None`` → ``DomainChoice``.
+
+    И строка, и каждый элемент списка режутся по запятым; с каждого значения
+    снимаются крайние пробелы, кавычки и квадратные скобки; регистр не важен.
+    Ключи — шесть доменов и «весь каталог» (к нему приводятся ``all``, ``*``,
+    ``все``, ``всё``, ``весь``). Пустые значения пропускаются молча: пустой выбор и
+    выбор без единого распознанного ключа различает вызывающий. Строка ``"[]"`` —
+    тот же явный пустой список: через MCP её в список превращает сам FastMCP, а
+    прямой вызов обёртки тула не должен понимать то же значение иначе.
+    """
+    if value is None:
+        return DomainChoice()
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        explicit_empty = not items
+    else:
+        items = [value]
+        explicit_empty = isinstance(value, str) and "".join(value.split()) == "[]"
+    keys: set[str] = set()
+    all_catalog = False
+    ignored: list[str] = []
+    seen_ignored: set[str] = set()
+    for item in items:
+        text = item if isinstance(item, str) else str(item)
+        for piece in text.split(","):
+            norm = " ".join(piece.strip(_STRIP_CHARS).lower().split())
+            if not norm:
+                continue
+            if norm in _ALL_CATALOG_ALIASES:
+                all_catalog = True
+            elif norm in HELPER_DOMAINS:
+                keys.add(norm)
+            elif norm not in seen_ignored:
+                seen_ignored.add(norm)
+                frag = _fragment(norm)
+                if len(ignored) < _IGNORED_SHOWN_MAX and frag not in ignored:
+                    ignored.append(frag)
+    return DomainChoice(
+        keys=tuple(k for k in HELPER_DOMAINS if k in keys),
+        all_catalog=all_catalog,
+        ignored=tuple(ignored),
+        ignored_total=len(seen_ignored),
+        explicit_empty=explicit_empty,
+    )
+
+
+# ── Таблица доменов и описание параметра rlm_start.domains ───────────────────
+
+
+def render_domain_table(with_names: bool = True) -> str:
+    """Строка на домен: ``ключ (метка): имена``; без имён — ``ключ (метка)``.
+
+    Два рендера нужны для сравнения на одинаковых заданиях (§3.6 плана): короткие
+    метки против меток с именами. В производстве — вариант с именами.
+    """
+    lines: list[str] = []
+    for key, domain in HELPER_DOMAINS.items():
+        if with_names:
+            names = ", ".join(f"{n}*" if n in CONDITIONAL_HELPERS else n for n in domain["helpers"])
+            lines.append(f"{key} ({domain['label']}): {names}")
+        else:
+            lines.append(f"{key} ({domain['label']})")
+    if with_names:
+        lines.extend(f"* {name} — {note}." for name, note in CONDITIONAL_HELPERS.items())
+    return "\n".join(lines)
+
+
+def domains_param_description(with_names: bool = True) -> str:
+    """Описание параметра ``rlm_start.domains`` — одно на все режимы (≤ 3 000).
+
+    Начинается с перечня ключей: после серверного отказа агент берёт допустимые
+    значения и отсюда, и из ответа.
+    """
+    return "\n".join(
+        [
+            f"Ключи: {DOMAIN_KEYS_TEXT}.",
+            "Для BSL в slim/domains выбор ОБЯЗАТЕЛЕН: подписи придут в available_functions с ядром.",
+            "[] — только ядро (один модуль, одна процедура); 1 домен — узкий вопрос; 2 — стык двух доменов "
+            f"или сомнение между ними; ['{ALL_CATALOG}'] — полный разбор или сквозной сценарий.",
+            "Нужен еще домен — добавь domains=[...] к ближайшему rlm_execute: подписи придут в его ответе.",
+            "Любой хелпер можно звать по имени — подпись придет с первым ответом.",
+            f"Ядро: {', '.join(HELPER_CORE)} и файловые.",
+            render_domain_table(with_names=with_names),
+            "В full, при RLM_CATALOG_MODE=all и без BSL параметр не нужен и не учитывается.",
+        ]
+    )
+
+
+# ── Упоминания хелперов в рецепте темы ───────────────────────────────────────
+
+
+def recipe_mentions(text: str, topic: str, names: Iterable[str]) -> list[str]:
+    """Имена из ``names``, упомянутые в тексте рецепта темы, в порядке ``names``.
+
+    Упоминание — имя целым словом: до и после него нет буквы, цифры или ``_``.
+    Скобка после имени не нужна: рецепты называют хелперы и без неё
+    (``find_register_movements.is_postable``, «live safe_grep-маршрут»). Имена внутри
+    фрагментов ``RECIPE_NON_STEP_FRAGMENTS`` своей темы упоминанием не считаются.
+    Текст и имена приходят аргументами, поэтому модуль остаётся leaf.
+    """
+    for fragment in RECIPE_NON_STEP_FRAGMENTS.get(topic, ()):
+        text = text.replace(fragment, " ")
+    return [name for name in names if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text)]

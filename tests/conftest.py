@@ -94,6 +94,18 @@ def _isolate_ext_display_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_catalog_mode_env(monkeypatch):
+    """Снять ``RLM_CATALOG_MODE`` перед каждым тестом (v1.41.0).
+
+    ``all``, унаследованный из окружения разработчика или CI, молча поменял бы смысл
+    всех slim-тестов: весь каталог вместо ядра и доменов, без блока доменов. Тесты
+    режима ``all`` ставят переменную локальным ``monkeypatch.setenv`` поверх этой
+    autouse-фикстуры — по образцу ``_isolate_ext_display_env``.
+    """
+    monkeypatch.delenv("RLM_CATALOG_MODE", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_real_home(tmp_path_factory, monkeypatch):
     """Default-isolation: every test writes indexes AND file-cache to tmp dirs.
 

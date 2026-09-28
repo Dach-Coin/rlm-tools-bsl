@@ -21,7 +21,7 @@ rlm_projects(action="add", name="My Config", path="/path/to/1c-sources", descrip
 ### 3. Открыть сессию по имени
 
 ```
-rlm_start(project="My Config", query="find all exported procedures")
+rlm_start(project="My Config", query="find all exported procedures", domains=["код"])
 ```
 
 ### Путь проекта: авто-определение корня конфигурации
@@ -67,10 +67,10 @@ rlm_start(project="My Config", query="find all exported procedures")
 
 ```
 # По имени проекта (точное или подстрока)
-rlm_start(project="My Config", query="find module SomeModule")
+rlm_start(project="My Config", query="find module SomeModule", domains=[])
 
 # По пути (как раньше, обратная совместимость)
-rlm_start(path="/path/to/1c-sources", query="find module SomeModule")
+rlm_start(path="/path/to/1c-sources", query="find module SomeModule", domains=[])
 
 # Индексирование по имени проекта
 rlm_index(action="build", project="My Config")  # → {"started": true} (фон)
