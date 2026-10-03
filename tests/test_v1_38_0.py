@@ -336,7 +336,7 @@ def test_set_subscriptions_survive_rebuild_and_reach_the_column(tmp_path, monkey
         assert json.loads(rows["НаборДокументов"]) == ["DocumentObject"]
         assert json.loads(rows["Точная"]) == []
         version = con.execute("SELECT value FROM index_meta WHERE key='builder_version'").fetchone()[0]
-        assert int(version) == BUILDER_VERSION == 16
+        assert int(version) == BUILDER_VERSION
     finally:
         con.close()
 

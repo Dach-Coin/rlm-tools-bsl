@@ -267,7 +267,8 @@ def test_get_object_profile_signature_stays_compact():
 
 def test_helper_snapshot_count_locked():
     """Adding/removing a registered helper is an intentional change — update this number."""
-    assert len(build_helper_metadata_snapshot()) == 56
+    # v1.42.0: +find_unresolved_calls (аудит адресатов вызовов).
+    assert len(build_helper_metadata_snapshot()) == 57
 
 
 @pytest.mark.parametrize("mode", ["slim", "full"])
@@ -696,7 +697,10 @@ def test_missing_index_rlm_start_payload_within_budget(monkeypatch, tmp_path, mo
 # символов из 12727 всего available_functions; запаса под контракты v1.33.0
 # при этом не оставалось (slim+рецепт 49 символов, full payload 244).
 _SIG_CEILINGS = {
-    "find_call_hierarchy": 560,
+    # v1.42.0: 560 -> 571 ровно на измеренную дельту (+11, факт 559 -> 570): ключ `call_kind`
+    # в `callers[]` — без него агент не отличит запуск по имени (`background`) от прямого
+    # вызова и прочтет строку места запуска как строку вызова. Запас остается прежним (1).
+    "find_call_hierarchy": 571,
     "find_path": 540,
     # v1.37.0 (завершение релиза): 520 -> 410 по правилу `ceil10(факт * 1.10)` и
     # ТОЛЬКО ВНИЗ. Задача 0 срезала прозу, факт стал 370, и прежний потолок оставлял

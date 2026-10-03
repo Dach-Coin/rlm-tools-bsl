@@ -6,6 +6,7 @@ The index is stored on disk and supports incremental updates.
 
 from __future__ import annotations
 
+import bisect
 import errno
 import functools
 import hashlib
@@ -30,6 +31,7 @@ from rlm_tools_bsl._git_process import run_git
 from rlm_tools_bsl.bsl_knowledge import (
     BSL_PATTERNS,
     _merge_proc_continuations_with_mask,
+    _split_params,
     mask_comments_and_strings,
 )
 from rlm_tools_bsl.cache import _paths_hash
@@ -38,6 +40,7 @@ from rlm_tools_bsl.bsl_xml_parsers import (
     CATEGORY_TO_REF_HEAD as _CATEGORY_TO_REF_HEAD,
     _CODE_MANAGER_COLLECTIONS,
     _CODE_QUERY_COLLECTIONS,
+    _RU_META_FORMS,
     _RU_REFTYPE_TO_CANONICAL,
     canonicalize_type_ref,
     classify_subscription_row,
@@ -104,7 +107,22 @@ def _row_type_sets(row) -> list[str]:
     return _json_list(raw)
 
 
-BUILDER_VERSION = 16
+BUILDER_VERSION = 17
+
+# Недостачи индекса ПРЕЖНЕГО поколения по сравнению с текущим — одна строка на бамп.
+# rlm_start склеивает тексты всех строк с порогом выше версии индекса. Последняя строка
+# обязана нести порог == BUILDER_VERSION (тест), иначе бамп молча выдаст старый текст.
+OLD_INDEX_GAPS: tuple[tuple[int, str], ...] = (
+    (15, "в нем есть объявления и движения, взятые из комментариев и строковых литералов"),
+    (16, "в нем нет таблиц объявленного состава: find_templates недоступен, find_common_modules идет живым сканом"),
+    (
+        17,
+        "граф вызовов не видит вызовов через коллекцию менеджера (Справочники.X.Метод), запусков по имени "
+        "(ФоновыеЗадания.Выполнить, ДлительныеОперации) и вызовов из кода расширений, основной слой "
+        "find_unresolved_calls недоступен; также нет длинных сигнатур, шапок под лицензией "
+        "и типов параметров команд объектов EDT",
+    ),
+)
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
@@ -220,6 +238,53 @@ _PROC_END_RE = re.compile(BSL_PATTERNS["procedure_end"], re.IGNORECASE)
 # Call-extraction patterns
 _QUALIFIED_CALL_RE = re.compile(r"(\w+)\.(\w+)\s*\(")
 _SIMPLE_CALL_RE = re.compile(r"(\w+)\s*\(")
+
+# v17: коллекция менеджеров → категория-папка модуля менеджера (RU и EN множественное
+# число, casefold). Вторую карту имён не заводить: источник — _RU_META_FORMS.
+_CALL_MANAGER_COLLECTIONS: dict[str, str] = {
+    forms[k].casefold(): forms["en_plural"]
+    for forms in _RU_META_FORMS.values()
+    for k in ("ru_plural", "en_plural")
+    if forms.get(k) and forms.get("en_plural")
+}
+# Коллекция.X.Метод( — голова цепочки обязана быть коллекцией: (?<![\w.]) отсекает
+# соседнюю точку, а точку через пробельные символы (Метаданные. Справочники.X.М()) —
+# _is_chain_member по полной маске тела.
+_MANAGER_CALL_RE = re.compile(
+    r"(?<![\w.])("
+    + "|".join(sorted(map(re.escape, _CALL_MANAGER_COLLECTIONS), key=len, reverse=True))
+    + r")\.(\w+)\.(\w+)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _is_chain_member(code: str, pos: int) -> bool:
+    """Перед идентификатором на ``pos`` стоит точка (пробельные символы пропускаются)."""
+    j = pos - 1
+    while j >= 0 and code[j].isspace():
+        j -= 1
+    return j >= 0 and code[j] == "."
+
+
+def _is_chain_member_in_lines(masked: list[str], idx: int, pos: int) -> bool:
+    """``_is_chain_member`` по списку строк маски без склейки тела в одну строку.
+
+    Идёт назад от ``pos`` строки ``idx``; на начале строки переходит к концу предыдущей
+    (перевод строки — пробельный символ). Маска гасит комментарии пробелами, поэтому
+    точка цепочки находится и через строку-комментарий и пустую строку."""
+    code = masked[idx]
+    j = pos - 1
+    while True:
+        while j >= 0 and code[j].isspace():
+            j -= 1
+        if j >= 0:
+            return code[j] == "."
+        idx -= 1
+        if idx < 0:
+            return False
+        code = masked[idx]
+        j = len(code) - 1
+
 
 # Reverse code-usage extraction (v1.14.0, metadata_code_usages):
 #   _CODE_DOTTED_RE — a dotted identifier pair, applied to *stripped* code
@@ -434,6 +499,292 @@ _BSL_GLOBAL_FUNCS_LOWER: frozenset[str] = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# v17: платформенные методы МЕНЕДЖЕРОВ объектов (белый список аудита адресатов)
+# ---------------------------------------------------------------------------
+# Состав категории — синтакс-помощник платформы 8.3: страница «<Вид>Менеджер.<Имя>» менеджера ЭТОГО
+# вида (русские и английские имена), плюс имена, которые код сверенных конфигураций вызывает у
+# менеджеров категории без определения в модуле менеджера: ПолучитьИмяПредопределенного синтакс-помощник
+# не называет, вызовы встречены у справочников и планов видов характеристик. У видов состав разный:
+# метод менеджера другого вида (СоздатьЭлемент у плана счетов, итоги у регистра расчета) у этого
+# менеджера отсутствует, и его вызов — настоящий method_missing. Ошибка опасна в обе стороны:
+# пропущенное имя дает ложный method_missing, лишнее прячет настоящий; тесты сверяют обе стороны.
+_REF_MANAGER_BASE = (
+    "ПустаяСсылка",
+    "ПолучитьСсылку",
+    "Выбрать",
+    "ВыбратьПоСсылкам",
+    "НайтиПоРеквизиту",
+    "ПолучитьФорму",
+    "ПолучитьФормуСписка",
+    "ПолучитьФормуВыбора",
+    "ПолучитьДанныеВыбора",
+    "EmptyRef",
+    "GetRef",
+    "Select",
+    "SelectByRefs",
+    "FindByAttribute",
+    "GetForm",
+    "GetListForm",
+    "GetChoiceForm",
+    "GetChoiceData",
+)
+# У менеджера плана видов расчета ПолучитьМакет нет — поэтому отдельно от _REF_MANAGER_BASE.
+_TEMPLATE = ("ПолучитьМакет", "GetTemplate")
+_PREDEFINED_DATA = (
+    "ПолучитьИнициализациюПредопределенныхДанных",
+    "УстановитьИнициализациюПредопределенныхДанных",
+    "ПолучитьОбновлениеПредопределенныхДанных",
+    "УстановитьОбновлениеПредопределенныхДанных",
+    "GetPredefinedDataInitialization",
+    "SetPredefinedDataInitialization",
+    "GetPredefinedDataUpdate",
+    "SetPredefinedDataUpdate",
+)
+_CODE_NAME = ("НайтиПоКоду", "НайтиПоНаименованию", "FindByCode", "FindByDescription")
+# Иерархия элементов и групп — только справочник и план видов характеристик.
+_HIERARCHY = (
+    "СоздатьЭлемент",
+    "СоздатьГруппу",
+    "ВыбратьИерархически",
+    "ПолучитьФормуНовогоЭлемента",
+    "ПолучитьФормуНовойГруппы",
+    "ПолучитьФормуВыбораГруппы",
+    "CreateItem",
+    "CreateFolder",
+    "SelectHierarchically",
+    "GetNewItemForm",
+    "GetNewFolderForm",
+    "GetFolderChoiceForm",
+)
+# Итоги регистров накопления и бухгалтерии. Английское имя ПолучитьМаксимальныйПериодРассчитанныхИтогов
+# у этих видов разное (GetMaxTotalsPeriod / GetTotalsPeriod) — оно в строке вида.
+_TOTALS = (
+    "ПересчитатьИтоги",
+    "ПересчитатьТекущиеИтоги",
+    "ПересчитатьИтогиЗаПериод",
+    "УстановитьИспользованиеИтогов",
+    "ПолучитьИспользованиеИтогов",
+    "УстановитьИспользованиеТекущихИтогов",
+    "ПолучитьИспользованиеТекущихИтогов",
+    "ПолучитьМаксимальныйПериодРассчитанныхИтогов",
+    "УстановитьМаксимальныйПериодРассчитанныхИтогов",
+    "ПолучитьМинимальныйПериодРассчитанныхИтогов",
+    "УстановитьМинимальныйПериодРассчитанныхИтогов",
+    "УстановитьМинимальныйИМаксимальныйПериодыРассчитанныхИтогов",
+    "ПолучитьРежимРазделенияИтогов",
+    "УстановитьРежимРазделенияИтогов",
+    "RecalcTotals",
+    "SetTotalsUsing",
+    "GetTotalsUsing",
+    "RecalcTotalsForPeriod",
+    "RecalcPresentTotals",
+    "GetPresentTotalsUsing",
+    "SetPresentTotalsUsing",
+    "SetMaxTotalsPeriod",
+    "GetMinTotalsPeriod",
+    "SetMinTotalsPeriod",
+    "SetMinAndMaxTotalsPeriods",
+    "GetTotalsSplittingMode",
+    "SetTotalsSplittingMode",
+)
+_REGISTER_BASE = (
+    "СоздатьНаборЗаписей",
+    "Выбрать",
+    "ВыбратьПоРегистратору",
+    "ПолучитьФорму",
+    "ПолучитьФормуСписка",
+    "ПолучитьМакет",
+    "СоздатьКлючЗаписи",
+    "CreateRecordSet",
+    "Select",
+    "SelectByRecorder",
+    "GetForm",
+    "GetListForm",
+    "GetTemplate",
+    "CreateRecordKey",
+)
+_AGGREGATES = (
+    "ПолучитьРежимАгрегатов",
+    "УстановитьРежимАгрегатов",
+    "ПолучитьИспользованиеАгрегатов",
+    "УстановитьИспользованиеАгрегатов",
+    "ОбновитьАгрегаты",
+    "ПерестроитьИспользованиеАгрегатов",
+    "ОчиститьАгрегаты",
+    "ПолучитьАгрегаты",
+    "АгрегатыЗаполнены",
+    "ОпределитьОптимальныеАгрегаты",
+    "AggregatesIsFilled",
+    "UpdateAggregates",
+    "DetermineOptimalAggregates",
+    "ClearAggregates",
+    "RebuildAggregatesUsing",
+    "GetAggregates",
+    "GetAggregatesUsing",
+    "SetAggregatesUsing",
+    "GetAggregatesMode",
+    "SetAggregatesMode",
+)
+_FORMS_TEMPLATE = ("ПолучитьФорму", "ПолучитьМакет", "GetForm", "GetTemplate")
+
+
+def _cf(*groups) -> frozenset[str]:
+    return frozenset(n.casefold() for g in groups for n in g)
+
+
+# Платформенные методы МЕНЕДЖЕРА объекта по категории (casefold). Нужны только аудиту
+# find_unresolved_calls: метод, которого нет в модуле менеджера и нет здесь, — кандидат в дефект.
+PLATFORM_MANAGER_METHODS: dict[str, frozenset[str]] = {
+    "Catalogs": _cf(
+        _REF_MANAGER_BASE, _TEMPLATE, _PREDEFINED_DATA, _CODE_NAME, _HIERARCHY, ("ПолучитьИмяПредопределенного",)
+    ),
+    "ChartsOfCharacteristicTypes": _cf(
+        _REF_MANAGER_BASE, _TEMPLATE, _PREDEFINED_DATA, _CODE_NAME, _HIERARCHY, ("ПолучитьИмяПредопределенного",)
+    ),
+    "ChartsOfAccounts": _cf(
+        _REF_MANAGER_BASE,
+        _TEMPLATE,
+        _PREDEFINED_DATA,
+        _CODE_NAME,
+        ("ВыбратьИерархически", "SelectHierarchically", "СоздатьСчет", "CreateAccount"),
+        ("ПолучитьФормуНовогоСчета", "GetNewAccountForm"),
+    ),
+    "ChartsOfCalculationTypes": _cf(
+        _REF_MANAGER_BASE,
+        _PREDEFINED_DATA,
+        _CODE_NAME,
+        ("СоздатьВидРасчета", "CreateCalculationType", "ПолучитьФормуНовогоВидаРасчета", "GetNewCalculationTypeForm"),
+    ),
+    "ExchangePlans": _cf(
+        _REF_MANAGER_BASE,
+        _TEMPLATE,
+        _CODE_NAME,
+        ("СоздатьУзел", "ЭтотУзел", "CreateNode", "ThisNode", "ПолучитьФормуНовогоУзла", "GetNewNodeForm"),
+    ),
+    "Documents": _cf(
+        _REF_MANAGER_BASE,
+        _TEMPLATE,
+        (
+            "СоздатьДокумент",
+            "НайтиПоНомеру",
+            "ПолучитьФормуНовогоДокумента",
+            "CreateDocument",
+            "FindByNumber",
+            "GetNewDocumentForm",
+        ),
+    ),
+    "BusinessProcesses": _cf(
+        _REF_MANAGER_BASE,
+        _TEMPLATE,
+        (
+            "СоздатьБизнесПроцесс",
+            "НайтиПоНомеру",
+            "ПолучитьФормуНовогоБизнесПроцесса",
+            "CreateBusinessProcess",
+            "FindByNumber",
+            "GetNewBusinessProcessForm",
+            "ПолучитьКартуМаршрута",
+            "GetFlowchart",
+            "ПустаяСсылкаНаТочкуМаршрута",
+            "EmptyRoutePointRef",
+        ),
+    ),
+    "Tasks": _cf(
+        _REF_MANAGER_BASE,
+        _TEMPLATE,
+        (
+            "СоздатьЗадачу",
+            "НайтиПоНомеру",
+            "НайтиПоНаименованию",
+            "ПолучитьФормуНовойЗадачи",
+            "CreateTask",
+            "FindByNumber",
+            "FindByDescription",
+            "GetNewTaskForm",
+        ),
+    ),
+    "Enums": _cf(
+        (
+            "ПустаяСсылка",
+            "Индекс",
+            "Количество",
+            "Получить",
+            "ПолучитьМакет",
+            "ПолучитьДанныеВыбора",
+            "ПолучитьФорму",
+            "ПолучитьФормуСписка",
+            "ПолучитьФормуВыбора",
+            "EmptyRef",
+            "IndexOf",
+            "Count",
+            "Get",
+            "GetTemplate",
+            "GetChoiceData",
+            "GetForm",
+            "GetChoiceForm",
+            "GetListForm",
+        )
+    ),
+    "Constants": _cf(
+        (
+            "Получить",
+            "Установить",
+            "СоздатьМенеджерЗначения",
+            "СоздатьКлючЗначения",
+            "Get",
+            "Set",
+            "CreateValueManager",
+            "CreateValueKey",
+        )
+    ),
+    "Reports": _cf(_FORMS_TEMPLATE, ("Создать", "Create")),
+    "DataProcessors": _cf(_FORMS_TEMPLATE, ("Создать", "Create")),
+    "InformationRegisters": _cf(
+        _REGISTER_BASE,
+        (
+            "СоздатьМенеджерЗаписи",
+            "ПустойКлюч",
+            "Получить",
+            "ПолучитьПервое",
+            "ПолучитьПоследнее",
+            "СрезПервых",
+            "СрезПоследних",
+            "ПолучитьФормуРедактированияЗаписи",
+            "ПересчитатьИтоги",
+            "ПолучитьИспользованиеИтогов",
+            "УстановитьИспользованиеИтогов",
+            "CreateRecordManager",
+            "EmptyKey",
+            "Get",
+            "GetFirst",
+            "GetLast",
+            "SliceFirst",
+            "SliceLast",
+            "GetRecordEditingForm",
+            "RecalcTotals",
+            "GetTotalsUsing",
+            "SetTotalsUsing",
+        ),
+    ),
+    "AccumulationRegisters": _cf(
+        _REGISTER_BASE,
+        _TOTALS,
+        ("GetMaxTotalsPeriod",),
+        _AGGREGATES,
+        ("Остатки", "Обороты", "Balance", "Turnovers"),
+    ),
+    "AccountingRegisters": _cf(
+        _REGISTER_BASE,
+        _TOTALS,
+        ("GetTotalsPeriod",),
+        ("Остатки", "Обороты", "ОборотыДтКт", "Balance", "Turnovers", "DrCrTurnovers"),
+    ),
+    "CalculationRegisters": _cf(
+        _REGISTER_BASE, ("ПолучитьБазу", "GetBase", "ПолучитьДанныеГрафика", "GetScheduleData")
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Call-graph resolution helpers (v1.16.0)
@@ -478,6 +829,76 @@ def _build_common_exported(conn: sqlite3.Connection) -> dict[tuple[str, str], st
     return common
 
 
+def _build_manager_modules(conn: sqlite3.Connection) -> dict[tuple[str, str], str | None]:
+    """``(категория, casefold(объект)) -> rel_path`` модуля менеджера; ``None`` — модулей больше одного.
+
+    Второй модуль одного объекта достижим: индекс на каталоге нескольких расширений или
+    вложенная копия конфигурации (``parse_bsl_path`` находит категорию в любом компоненте пути).
+    Общий построитель резолвера ``_bulk_insert`` и пересчёта ``_reresolve_qualified_callers``."""
+    out: dict[tuple[str, str], str | None] = {}
+    for row in conn.execute(
+        "SELECT rel_path, category, object_name FROM modules "
+        "WHERE module_type='ManagerModule' AND object_name IS NOT NULL AND category IS NOT NULL"
+    ):
+        if isinstance(row, sqlite3.Row):
+            rel, cat, obj = row["rel_path"], row["category"], row["object_name"]
+        else:
+            rel, cat, obj = row
+        k = (cat, obj.casefold())
+        out[k] = None if k in out else rel
+    return out
+
+
+def _changed_manager_pairs(results) -> set[tuple[str, str]]:
+    """``(категория, casefold(объект))`` модулей менеджеров из результатов разбора дельты."""
+    return {
+        (r.info.category, r.info.object_name.casefold())
+        for r in results
+        if r.info.module_type == "ManagerModule" and r.info.object_name and r.info.category
+    }
+
+
+def _collect_removed_resolution_targets(
+    conn: sqlite3.Connection,
+    removed_ids: list[int],
+    changed_common_cf: set[str],
+    changed_managers: set[tuple[str, str]],
+) -> None:
+    """Старые имена общих модулей и пары модулей менеджеров из БД ДО удаления.
+
+    Нужны пересчёту ключей неизменённых вызывающих (``update ≡ build``): исчезнувший
+    модуль виден только в прежней строке ``modules``. Чанки — под лимит переменных SQLite."""
+    for chunk in _chunked(removed_ids):
+        ph = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"SELECT category, object_name, module_type FROM modules WHERE id IN ({ph}) "  # noqa: S608
+            "AND object_name IS NOT NULL "
+            "AND ((category='CommonModules' AND module_type='Module') OR module_type='ManagerModule')",
+            chunk,
+        ):
+            cat, name, mtype = (row[0], row[1], row[2]) if not isinstance(row, sqlite3.Row) else tuple(row)
+            if mtype == "ManagerModule":
+                if cat:
+                    changed_managers.add((cat, name.casefold()))
+            else:
+                changed_common_cf.add(name.casefold())
+
+
+def _manager_callee_key(managers: dict[tuple[str, str], str | None], via: str, callee: str) -> str:
+    """Ключ уровня manager. Модуль есть и он один — реальный путь; иначе синтетический с ведущим '/'.
+
+    Зависит только от текста вызова и наличия модуля, не от набора его методов: так ``update``
+    пересчитывает ключ лишь при появлении/исчезновении модуля, а платформенный метод получает
+    инертный ключ (такого метода в модуле нет). Ведущий ``/`` обязателен: на EDT реальный путь
+    модуля — ``Catalogs/X/ManagerModule.bsl``, и синтетический ключ без него совпал бы с реальным,
+    превратив спорное ребро в точное. Синтетический ключ целью ``_resolve_target_key`` не бывает
+    (тот строит ключи только из реальных ``rel_path``): точных строк он не порождает, а из
+    эвристики по имени ребро уходит — ради этого он и заводится."""
+    obj, _, method = callee.partition(".")
+    rel = managers.get((via, obj.casefold()))
+    return _make_callee_key(rel or f"/{via}/{obj}/ManagerModule.bsl", method)
+
+
 def _callee_short_expr(col: str = "callee_name") -> str:
     """SQL expression yielding the bare method name (suffix after the dot).
 
@@ -510,6 +931,40 @@ def _callee_match_clause(proc_name: str, col: str = "callee_name") -> tuple[str,
     if "." in proc_name:
         return (f"{col} = ? COLLATE NOCASE", proc_name)
     return (f"{_callee_short_expr(col)} = ? COLLATE NOCASE", proc_name)
+
+
+# v1.42.0: член цепочки `<…>.Менеджер.М(` — вызов метода МЕНЕДЖЕРА объекта, известного только во
+# время выполнения (диспетчеры подключаемых команд БСП: `СведенияОбОбъекте.Менеджер.ДобавитьКомандыПечати(…)`).
+# Ключа у такой строки нет (адресат статически не определен), но это настоящий вызов, и отсекать его,
+# как прочие члены цепочки, граф не должен: строка — кандидат по имени. В режиме по имени — без подсказки,
+# в точном — только у цели в модуле менеджера (у общего модуля, формы и модуля объекта получателя
+# `.Менеджер` не бывает). Голова сравнивается после casefold: в SQL — `py_casefold` ридера, в живом
+# слое расширений — `_is_manager_member`; правило одно.
+_MANAGER_MEMBER_HEADS_CF: frozenset[str] = frozenset({"менеджер", "manager"})
+
+
+def _is_manager_member(callee_name: str) -> bool:
+    """Голова ``callee_name`` члена цепочки — ``Менеджер``/``Manager`` (без учета регистра)."""
+    return callee_name.partition(".")[0].casefold() in _MANAGER_MEMBER_HEADS_CF
+
+
+def _is_manager_module_key(key: str) -> bool:
+    """Ключ цели ``<rel_path>::метод`` указывает в модуль менеджера. Имя файла — то же правило, что у
+    ``parse_bsl_path`` (``ManagerModule.bsl`` без учета регистра; ``ValueManagerModule.bsl`` — нет)."""
+    return key.rpartition("::")[0].rpartition("/")[2].casefold() == "managermodule.bsl"
+
+
+def _graph_kind_clause(prefix: str, manager_member: bool) -> str:
+    """Фильтр вида ребра графа (v17): прямой вызов и запуск со статическим адресатом, при
+    ``manager_member`` — и член цепочки ``<…>.Менеджер.М(``. Прочие члены цепочки
+    (``Объект.ОМ.Метод()``) и вычисляемые запуски в граф не попадают. ``prefix`` — ``'c.'`` или ``''``.
+    Скобки обязательны: без них OR пропустил бы лишние строки в каждый запрос."""
+    kind, name = f"{prefix}call_kind", f"{prefix}callee_name"
+    member = ""
+    if manager_member:
+        heads = ", ".join(f"'{h}'" for h in sorted(_MANAGER_MEMBER_HEADS_CF))
+        member = f" OR ({kind} = 'member' AND py_casefold(substr({name}, 1, instr({name}, '.') - 1)) IN ({heads}))"
+    return f" AND ({kind} IS NULL OR {kind} = 'background'{member})"
 
 
 # module_hint normalization for IndexReader.get_callers / find_call_hierarchy.
@@ -609,7 +1064,8 @@ CREATE TABLE IF NOT EXISTS modules (
     form_name TEXT,
     is_form INTEGER DEFAULT 0,
     mtime REAL,
-    size INTEGER
+    size INTEGER,
+    launch_marker INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS methods (
@@ -629,15 +1085,23 @@ CREATE TABLE IF NOT EXISTS calls (
     caller_id INTEGER NOT NULL REFERENCES methods(id),
     callee_name TEXT NOT NULL,
     line INTEGER,
-    callee_key TEXT
+    callee_key TEXT,
+    -- v17: категория коллекции менеджера у вызова Коллекция.X.Метод() ('Catalogs',
+    -- 'Documents', ...), иначе NULL. callee_name при этом хранит 'X.Метод' — инвариант
+    -- «не больше одной точки» сохраняется.
+    callee_via TEXT,
+    -- v17: вид ребра. NULL — прямой вызов; 'member' — метод члена цепочки
+    -- (Объект.Товары.Добавить()), получатель не модуль; 'background' — запуск по имени
+    -- со статическим адресатом; 'background_dynamic' — кандидат запуска без доказанного
+    -- статического ребра (callee_name пуст).
+    call_kind TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_mod_object ON modules(object_name);
 CREATE INDEX IF NOT EXISTS idx_mod_category ON modules(category);
 CREATE INDEX IF NOT EXISTS idx_meth_name ON methods(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_meth_module ON methods(module_id);
-CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_name COLLATE NOCASE);
-CREATE INDEX IF NOT EXISTS idx_calls_callee_key ON calls(callee_key);
+-- Индексы calls — в _CALLS_INDEX_SQL (полная сборка строит их после массовой вставки).
 -- idx_calls_caller removed: saves ~56MB on ERP, update uses callee-based cleanup instead
 
 -- Level-2 metadata tables (optional, controlled by --no-metadata flag)
@@ -1009,15 +1473,33 @@ CREATE TABLE IF NOT EXISTS metadata_code_usages (
 CREATE INDEX IF NOT EXISTS idx_mcu_ref ON metadata_code_usages(object_ref_key);
 """
 
+# Вторичные индексы calls. Полная сборка создает их ПОСЛЕ массовой вставки (`_bulk_insert`):
+# поддерживать четыре B-дерева на каждой из миллионов вставок дороже, чем построить их один раз
+# сортировкой. Прочие пути (`update`, пустой репозиторий) получают их вместе со схемой —
+# `_SCHEMA_SQL` по-прежнему полная. Текст операторов не менять: `sqlite_master` хранит его.
+_CALLS_INDEX_SQL = """\
+CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_calls_callee_key ON calls(callee_key);
+-- v17: частичный индекс по запускам (~1-2 тыс. строк). Запрос обязан содержать ТОЧНО терм
+-- call_kind IN ('background', 'background_dynamic'), иначе планировщик индекс не возьмёт.
+CREATE INDEX IF NOT EXISTS idx_calls_by_name ON calls(call_kind)
+    WHERE call_kind IN ('background', 'background_dynamic');
+"""
 # Expression index for the bare method-name suffix (v1.16.0): lets get_callers /
 # find_call_hierarchy match callers by method name via index equality instead of
 # a leading-wildcard ``LIKE '%.name'`` full scan. Appended (not f-string-ified
 # into the big literal above) so the DDL is built from the SINGLE-SOURCE
 # _callee_short_expr — covers BOTH executescript sites (empty-repo + normal build)
 # with no DDL duplication / drift (Codex round-4).
-_SCHEMA_SQL += (
+_CALLS_INDEX_SQL += (
     f"CREATE INDEX IF NOT EXISTS idx_calls_callee_short ON calls({_callee_short_expr('callee_name')} COLLATE NOCASE);\n"
 )
+_SCHEMA_NO_CALLS_INDEX_SQL = _SCHEMA_SQL
+_SCHEMA_SQL = _SCHEMA_NO_CALLS_INDEX_SQL + _CALLS_INDEX_SQL
+# Кеш страниц SQLite полной сборки, КиБ (PRAGMA cache_size=-N).
+_BUILD_CACHE_KIB = 256 * 1024
+# Финальный VACUUM сборки — только при такой доле свободных страниц файла.
+_VACUUM_MIN_FREE_RATIO = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -2816,6 +3298,13 @@ def _scan_module(lines: list[str]):
         yield lineno, "".join(code_parts), strings
 
 
+@functools.lru_cache(maxsize=1 << 16)
+def _canonical_literal_ref(text: str) -> str:
+    """``canonicalize_type_ref`` пути из строкового литерала. Функция чистая, а одни и те же пути
+    повторяются по тысячам модулей: без кеша это треть времени разбора использований."""
+    return canonicalize_type_ref(text)
+
+
 def _extract_code_usages(
     lines: list[str],
 ) -> list[tuple[str, str | None, str, int]]:
@@ -2878,7 +3367,7 @@ def _extract_code_usages(
                 # JavaScript из строковых литералов — `Document.getElementById`,
                 # `Document.body`. Масштаб 71 строка из 457 863 (0.02 %), и
                 # неточный фильтр выбросил бы настоящие ссылки.
-                en_ref = canonicalize_type_ref(f"{g1}.{g2}")
+                en_ref = _canonical_literal_ref(f"{g1}.{g2}")
                 if en_ref:
                     out.append((en_ref, None, "ref_type", lineno))
     return out
@@ -2890,7 +3379,7 @@ def _chunked(seq: list, size: int = 500):
         yield seq[i : i + size]
 
 
-def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
+def _parse_procedures_from_lines(lines: list[str], *, masked: list[str] | None = None) -> list[dict]:
     """Parse procedure/function definitions from a list of lines.
 
     Multi-line signatures (``Процедура X(a, b,\n    c, d)``) are folded into a
@@ -2898,7 +3387,9 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
     ``end_line`` is computed from the ORIGINAL line list — ``КонецПроцедуры``
     always sits alone on its own row.
 
-    Returns list of dicts: {name, type, line, end_line, is_export, params, loc}.
+    Returns list of dicts: {name, type, line, end_line, is_export, params, loc, body_line}.
+    ``body_line`` (v1.42.0) — 1-based первая строка тела после ВСЕЙ (в том числе многострочной)
+    сигнатуры; в индекс не пишется.
     Здесь ``params`` — СЫРАЯ строка сигнатуры (build-time, хранится в TEXT-колонке).
     На helper-границе ``_split_params`` превращает её в list[str] для агента (v1.18.0).
 
@@ -2906,8 +3397,11 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
     по МАСКЕ (комментарии и содержимое строковых литералов погашены), а ``params``
     вырезается из ОРИГИНАЛА по смещениям маски — она посимвольно той же длины,
     поэтому строковый дефолт (``Знач Адрес = "http://x/y"``) сохраняется дословно.
+
+    ``masked`` — готовая ``mask_comments_and_strings(lines)``, если вызывающий ее уже посчитал.
     """
-    masked = mask_comments_and_strings(lines)
+    if masked is None:
+        masked = mask_comments_and_strings(lines)
     merged_lines, merged_masked, line_map = _merge_proc_continuations_with_mask(lines, masked)
     total_merged = len(merged_lines)
     total_orig = len(lines)
@@ -2949,6 +3443,7 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
                 "end_line": total_orig,
                 "params": params,
                 "loc": total_orig - line_number + 1,
+                "body_line": next_start,
             }
             procedures.append(current)
             break
@@ -2961,6 +3456,7 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
             "end_line": end_line,
             "params": params,
             "loc": end_line - line_number + 1,
+            "body_line": next_start,
         }
         procedures.append(current)
 
@@ -2974,11 +3470,1198 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
     return procedures
 
 
+# ---------------------------------------------------------------------------
+# v17: запуск по имени (ФоновыеЗадания.Выполнить и обёртки БСП ДлительныеОперации)
+# ---------------------------------------------------------------------------
+# (получатели, методы, индекс аргумента с именем метода). Из этого ОДНОГО списка
+# строятся регулярки извлечения и множество имён, исключаемых из receiver_unknown.
+# Индексы — по сигнатурам БСП:
+# ВыполнитьВФоне(ИмяПроцедуры, …), ВыполнитьФункцию(ПараметрыВыполнения, ИмяФункции, …),
+# ВыполнитьПроцедуру(ПараметрыВыполнения, ИмяПроцедуры, …), …ВНесколькоПотоков(ИмяМетода, …),
+# устаревшая ЗапуститьВыполнениеВФоне(ИдентификаторФормы, ИмяЭкспортнойПроцедуры, …).
+_BACKGROUND_LAUNCHER_SPECS: tuple[tuple[tuple[str, ...], tuple[str, ...], int], ...] = (
+    (("ФоновыеЗадания", "BackgroundJobs"), ("Выполнить", "Execute"), 0),
+    (
+        ("ДлительныеОперации",),
+        ("ВыполнитьВФоне", "ВыполнитьФункциюВНесколькоПотоков", "ВыполнитьПроцедуруВНесколькоПотоков"),
+        0,
+    ),
+    (("ДлительныеОперации",), ("ВыполнитьФункцию", "ВыполнитьПроцедуру", "ЗапуститьВыполнениеВФоне"), 1),
+)
+_BACKGROUND_LAUNCHER_RECEIVERS_CF: frozenset[str] = frozenset(
+    receiver.casefold() for receivers, _methods, _arg_index in _BACKGROUND_LAUNCHER_SPECS for receiver in receivers
+)
+_BACKGROUND_LAUNCHER_CALLS_CF: frozenset[str] = frozenset(
+    f"{receiver}.{method}".casefold()
+    for receivers, methods, _arg_index in _BACKGROUND_LAUNCHER_SPECS
+    for receiver in receivers
+    for method in methods
+)
+# Маркер: разбор запусков только в файлах, где он есть (~5 % модулей ЕРП). Проверяется КАЖДЫЙ
+# модуль сборки, поэтому это подстрочный поиск по casefold-тексту, а не безрегистровая
+# альтернация регулярки (вчетверо дороже на ЕРП-масштабе). casefold — надмножество совпадений
+# IGNORECASE-регулярок извлечения: префильтр не отбрасывает того, что нашли бы они.
+_LAUNCH_MARKERS_CF: tuple[str, ...] = tuple(sorted(_BACKGROUND_LAUNCHER_RECEIVERS_CF))
+
+
+def _has_launch_marker(text: str) -> bool:
+    """В тексте есть имя получателя обертки запуска (без учета регистра)."""
+    low = text.casefold()
+    return any(marker in low for marker in _LAUNCH_MARKERS_CF)
+
+
+def _find_all(text: str, needle: str):
+    """Позиции всех вхождений ``needle`` в ``text``."""
+    pos = text.find(needle)
+    while pos >= 0:
+        yield pos
+        pos = text.find(needle, pos + 1)
+
+
+_BACKGROUND_LAUNCHERS: tuple[tuple[re.Pattern[str], int], ...] = tuple(
+    (
+        re.compile(
+            r"(?<![\w.])(?P<receiver>"
+            + "|".join(map(re.escape, receivers))
+            + r")\s*\.\s*(?:"
+            + "|".join(map(re.escape, methods))
+            + r")\s*\(",
+            re.IGNORECASE,
+        ),
+        arg_index,
+    )
+    for receivers, methods, arg_index in _BACKGROUND_LAUNCHER_SPECS
+)
+_LITERAL_ARG_RE = re.compile(r'"((?:[^"\n]|"")*)"')
+_IDENT_RE = re.compile(r"\w+")
+
+# Чистые функции платформы: не переписывают переданную переменную и не меняют контекст
+# модуля, поэтому значение адресата запуска не «убивают». Список намеренно короткий —
+# функции, которые стоят в преамбулах запусков БСП; любой другой вызов непрозрачен.
+_PURE_PLATFORM_FUNCS_CF: frozenset[str] = frozenset(
+    n.casefold()
+    for n in (
+        "НСтр",
+        "NStr",
+        "СтрШаблон",
+        "StrTemplate",
+        "Формат",
+        "Format",
+        "Строка",
+        "String",
+        "Число",
+        "Number",
+        "Дата",
+        "Date",
+        "Булево",
+        "Boolean",
+        "ТипЗнч",
+        "TypeOf",
+        "Тип",
+        "Type",
+        "ЗначениеЗаполнено",
+        "ValueIsFilled",
+    )
+)
+# Формально ключевые слова, но исполняют произвольный код — значит, могут менять переменную.
+_CODE_EXEC_KEYWORDS_CF: frozenset[str] = frozenset({"выполнить", "execute", "вычислить", "eval"})
+_NEW_KEYWORDS_CF: frozenset[str] = frozenset({"новый", "new"})
+
+
+def _has_opaque_call(code: str) -> bool:
+    """В тексте (маска без строк и комментариев) есть вызов, способный изменить переменную.
+
+    Непрозрачный — любой вызов метода (``Объект.Метод(``, ``Модуль.Метод(``) и голый вызов
+    процедуры: тела вызываемого MVP не анализирует, параметры в 1С по умолчанию передаются по
+    ссылке, а процедура модуля может менять его контекст. Не вызовы: скобки ключевых слов
+    (``Если (``, ``Не (``), конструктор ``Новый X(`` и чистые функции платформы."""
+    for m in _SIMPLE_CALL_RE.finditer(code):
+        name_cf = m.group(1).casefold()
+        j = m.start() - 1
+        while j >= 0 and code[j].isspace():
+            j -= 1
+        if j >= 0 and code[j] == ".":
+            return True  # метод объекта или модуля
+        if name_cf in _CODE_EXEC_KEYWORDS_CF:
+            return True
+        if name_cf in _BSL_KEYWORDS_LOWER or name_cf in _PURE_PLATFORM_FUNCS_CF:
+            continue
+        k = j
+        while k >= 0 and (code[k].isalnum() or code[k] == "_"):
+            k -= 1
+        if code[k + 1 : j + 1].casefold() in _NEW_KEYWORDS_CF:
+            continue  # конструктор Новый X(…)
+        return True
+    return False
+
+
+def _has_code_exec_call(code: str) -> bool:
+    """Голый ``Выполнить(``/``Вычислить(`` — исполнение кода в контексте самой процедуры.
+
+    Метод с тем же именем (``Запрос.Выполнить()``) код не исполняет. ``code`` — маска."""
+    for m in _SIMPLE_CALL_RE.finditer(code):
+        if m.group(1).casefold() not in _CODE_EXEC_KEYWORDS_CF:
+            continue
+        j = m.start() - 1
+        while j >= 0 and code[j].isspace():
+            j -= 1
+        if j < 0 or code[j] != ".":
+            return True
+    return False
+
+
+def _mentions_name(code: str, name_cf: str) -> bool:
+    """Имя встречается в маске ``code`` целым словом, без учета регистра."""
+    low = code.casefold()
+    for pos in _find_all(low, name_cf):
+        end = pos + len(name_cf)
+        if pos > 0 and (low[pos - 1].isalnum() or low[pos - 1] == "_"):
+            continue
+        if end < len(low) and (low[end].isalnum() or low[end] == "_"):
+            continue
+        return True
+    return False
+
+
+def _call_may_rewrite(code: str, name_cf: str, is_local: Callable[[], bool]) -> bool:
+    """Может ли вызов в маске ``code`` переписать переменную ``name_cf`` — адресат запуска.
+
+    Непрозрачный вызов (``_has_opaque_call``) переписывает любую переменную, локальность которой
+    не доказана: параметр (по ссылке он может быть синонимом переменной модуля), ``Перем``
+    модуля, реквизит формы или объекта. Доказанно локальную переменную процедуры вызов
+    переписывает, только получив ее аргументом (имя встречается в тексте вызова) либо исполнив
+    код в контексте процедуры (``Выполнить``/``Вычислить``). ``is_local`` спрашивается лениво —
+    только при непрозрачном вызове."""
+    if not _has_opaque_call(code):
+        return False
+    if not is_local():
+        return True
+    return _mentions_name(code, name_cf) or _has_code_exec_call(code)
+
+
+def _split_call_args(text: str, pos: int, need: int, limit: int = 2000) -> list[str] | None:
+    """Первые ``need`` аргументов вызова, начиная сразу после '(' на ``pos``.
+
+    ``text`` — маска с СОХРАНЁННЫМ содержимым строк (комментарии погашены): кавычки учитываются
+    (``""`` внутри литерала — экранирование), скобки считаются вне литералов. Разбор кончается, как
+    только ``need`` аргументов закрыты запятой верхнего уровня или парной ')', поэтому длина хвоста
+    списка (длинные параметры после имени метода) роли не играет. ``None`` — нужные аргументы не
+    закрылись в пределах ``limit`` символов (битый текст)."""
+    depth, cur, args, in_str, i, end = 0, [], [], False, pos, min(len(text), pos + limit)
+    while i < end:
+        ch = text[i]
+        if in_str:
+            cur.append(ch)
+            if ch == '"':
+                if i + 1 < end and text[i + 1] == '"':
+                    cur.append('"')
+                    i += 2
+                    continue
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            cur.append(ch)
+        elif ch in "([":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]":
+            if depth == 0:
+                args.append("".join(cur))
+                return args
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(cur))
+            if len(args) >= need:
+                return args
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    return None
+
+
+# Токены управления потоком для анализа достигающих присваиваний: граница оператора ';'
+# и ключевые слова блоков. (?<![\w.]) — не член цепочки (`Объект.Цикл`), (?!\w) — целое слово.
+_FLOW_TOKEN_RE = re.compile(
+    r";|(?<![\w.])(ИначеЕсли|ElsIf|КонецЕсли|EndIf|Если|If|Тогда|Then|Иначе|Else|"
+    r"КонецЦикла|EndDo|Для|For|Пока|While|Цикл|Do|КонецПопытки|EndTry|Попытка|Try|Исключение|Except|"
+    r"Возврат|Return|Прервать|Break|Продолжить|Continue|ВызватьИсключение|Raise|Перейти|Goto)(?!\w)",
+    re.IGNORECASE,
+)
+_FLOW_IF = frozenset({"если", "if"})
+_FLOW_ELSIF = frozenset({"иначеесли", "elsif"})
+_FLOW_ELSE = frozenset({"иначе", "else"})
+_FLOW_ENDIF = frozenset({"конецесли", "endif"})
+_FLOW_THEN = frozenset({"тогда", "then"})
+_FLOW_LOOP = frozenset({"для", "for", "пока", "while"})
+_FLOW_WHILE = frozenset({"пока", "while"})
+_FLOW_DO = frozenset({"цикл", "do"})
+_FLOW_ENDDO = frozenset({"конеццикла", "enddo"})
+_FLOW_TRY = frozenset({"попытка", "try"})
+_FLOW_EXCEPT = frozenset({"исключение", "except"})
+_FLOW_ENDTRY = frozenset({"конецпопытки", "endtry"})
+_FLOW_JUMP = frozenset(
+    {"возврат", "return", "прервать", "break", "продолжить", "continue", "вызватьисключение", "raise"}
+)
+_FLOW_GOTO = frozenset({"перейти", "goto"})
+_ASSIGN_HEAD_RE = re.compile(r"^\s*([^\W\d]\w*)\s*=")
+_UNREACHABLE = object()
+_NO_OPEN_JUMP = object()
+
+
+def _join_reaching(states: list) -> object:
+    """Слияние состояний ветвей: недостижимые не участвуют, неизвестное поглощает всё."""
+    live = [s for s in states if s is not _UNREACHABLE]
+    if not live:
+        return _UNREACHABLE
+    if any(s is None for s in live):
+        return None
+    out: list[str] = []
+    for s in live:
+        for v in s:
+            if v not in out:
+                out.append(v)
+    return tuple(out)
+
+
+def _literal_reaching_assignments(
+    name: str,
+    prior_keep_lines: list[str],
+    *,
+    target_local: Callable[[str], bool] | None = None,
+) -> list[str] | None:
+    """Литералы, ДОСТИГАЮЩИЕ позиции запуска для переменной ``name``; ``None`` — неизвестно.
+
+    ``prior_keep_lines`` — маска тела (комментарии погашены, литералы целы) строго до позиции
+    получателя запуска: завершённые строки и часть текущей. Малая transfer-функция по операторам:
+    начальное состояние неизвестно; безусловное ``Имя = "литерал";`` заменяет множество значений,
+    любое другое присваивание делает его неизвестным; в ``Если`` каждая ветвь считается от
+    входного состояния и сливается на ``КонецЕсли`` (неявная пустая ветвь без ``Иначе``).
+    Завершённый вызов, способный переписать переменную (``_call_may_rewrite``), переводит
+    состояние в неизвестное. ``target_local(casefold-имя)`` — доказательство, что имя —
+    локальная переменная процедуры (тогда ее переписывает только вызов, получивший ее
+    аргументом, или исполнение кода); ``None`` — локальность не доказана. Цикл: внутри тела
+    значение неизвестно (обратная дуга), после ``КонецЦикла`` — входное, если тело переменную не
+    трогало. ``Попытка``: ветвь ``Исключение`` начинается с входного состояния, если тело
+    попытки переменную не трогало. ``Возврат``/``Прервать``/``ВызватьИсключение`` делают остаток
+    ветви недостижимым, но выражение самого ``Возврат``/``ВызватьИсключение`` вычисляется до
+    перехода: запуск в нем достижим, а вызов в выражении завершенного перехода, способный
+    переписать имя, переписывает его и для ``Исключение`` объемлющей ``Попытки``. Условие ``Пока``
+    вычисляется на каждой итерации, а тело цикла лежит после позиции запуска: запуск в условии —
+    неизвестно. ``Перейти`` и метки не поддержаны (``None``). Литералы возвращаются, только если
+    ВСЕ достижимые состояния в позиции запуска известны."""
+    keep_text = "\n".join(prior_keep_lines)
+    full_text = "\n".join(mask_comments_and_strings(prior_keep_lines))
+    if "~" in full_text:
+        return None  # метки ~Метка: — неподдержанная управляющая форма
+    name_cf = name.casefold()
+    local_known: list[bool] = []
+
+    def _is_local() -> bool:
+        if not local_known:
+            local_known.append(target_local is not None and bool(target_local(name_cf)))
+        return local_known[0]
+
+    def _rewrites(code: str) -> bool:
+        return _call_may_rewrite(code, name_cf, _is_local)
+
+    state: object = None
+    frames: list[dict] = []
+    header_kind: str | None = None
+    header_text = ""
+    pos = 0
+
+    def _touch() -> None:
+        for f in frames:
+            if f["kind"] in ("loop", "try"):
+                f["touched"] = True
+
+    def _statement(seg_full: str, seg_keep: str) -> None:
+        nonlocal state
+        if state is _UNREACHABLE or not seg_full.strip():
+            return
+        m = _ASSIGN_HEAD_RE.match(seg_full)
+        if m and m.group(1).casefold() == name_cf:
+            lit = _LITERAL_ARG_RE.fullmatch(seg_keep[m.end() :].strip())
+            state = (lit.group(1).replace('""', '"').strip(),) if lit else None
+            _touch()
+        elif _rewrites(seg_full):
+            state = None
+            _touch()
+
+    def _header(seg_full: str, loop_var_check: bool) -> None:
+        nonlocal state
+        if state is _UNREACHABLE:
+            return
+        if _rewrites(seg_full):
+            state = None
+            _touch()
+        if loop_var_check:
+            words = seg_full.split()
+            if words and words[0].casefold() in ("каждого", "each") and len(words) > 1:
+                words = words[1:]
+            if words and words[0].casefold() == name_cf:
+                state = None  # переменная цикла
+                _touch()
+
+    # Состояние перед ОТКРЫТЫМ переходом: оператор ``Возврат <выражение>`` еще не закрыт к позиции
+    # запуска — значит, запуск в его выражении, а оно вычисляется ДО перехода.
+    jump_from: object = _NO_OPEN_JUMP
+    for m in _FLOW_TOKEN_RE.finditer(full_text):
+        seg_full = full_text[pos : m.start()]
+        seg_keep = keep_text[pos : m.start()]
+        pos = m.end()
+        tok = (m.group(1) or ";").casefold()
+        if jump_from is not _NO_OPEN_JUMP:
+            # Сегмент сразу после перехода — его выражение, вычисленное ДО перехода: вызов, способный
+            # переписать имя, переписывает его и для Исключение объемлющей Попытки.
+            if jump_from is not _UNREACHABLE and _rewrites(seg_full):
+                _touch()
+            jump_from = _NO_OPEN_JUMP
+        if header_kind is not None:
+            header_text += seg_full
+            if header_kind in ("if", "elseif") and tok in _FLOW_THEN:
+                _header(header_text, False)
+                if header_kind == "if":
+                    frames.append({"kind": "if", "entry": state, "branches": [], "has_else": False})
+                else:
+                    frames[-1]["entry"] = state  # условие вычислено на пути, где прежние ложны
+                header_kind, header_text = None, ""
+                continue
+            if header_kind in ("loop", "while") and tok in _FLOW_DO:
+                _header(header_text, True)
+                frames.append({"kind": "loop", "entry": state, "touched": False})
+                if state is not _UNREACHABLE:
+                    state = None  # обратная дуга: значение предыдущей итерации неизвестно
+                header_kind, header_text = None, ""
+                continue
+            return None  # непарный заголовок — неподдержанная форма
+        if tok == ";":
+            _statement(seg_full, seg_keep)
+            continue
+        # Последний оператор перед ключевым словом блока может быть без ';'.
+        _statement(seg_full, seg_keep)
+        if tok in _FLOW_IF:
+            header_kind = "if"
+        elif tok in _FLOW_ELSIF:
+            if not frames or frames[-1]["kind"] != "if":
+                return None
+            frames[-1]["branches"].append(state)
+            state = frames[-1]["entry"]
+            header_kind = "elseif"
+        elif tok in _FLOW_ELSE:
+            if not frames or frames[-1]["kind"] != "if":
+                return None
+            frames[-1]["branches"].append(state)
+            frames[-1]["has_else"] = True
+            state = frames[-1]["entry"]
+        elif tok in _FLOW_ENDIF:
+            if not frames or frames[-1]["kind"] != "if":
+                return None
+            f = frames.pop()
+            branches = f["branches"] + [state]
+            if not f["has_else"]:
+                branches.append(f["entry"])
+            state = _join_reaching(branches)
+        elif tok in _FLOW_LOOP:
+            header_kind = "while" if tok in _FLOW_WHILE else "loop"
+        elif tok in _FLOW_ENDDO:
+            if not frames or frames[-1]["kind"] != "loop":
+                return None
+            f = frames.pop()
+            state = None if f["touched"] else f["entry"]
+        elif tok in _FLOW_TRY:
+            frames.append({"kind": "try", "entry": state, "touched": False, "in_except": False})
+        elif tok in _FLOW_EXCEPT:
+            if not frames or frames[-1]["kind"] != "try":
+                return None
+            f = frames[-1]
+            f["try_end"] = state
+            f["in_except"] = True
+            state = None if f["touched"] else f["entry"]
+        elif tok in _FLOW_ENDTRY:
+            if not frames or frames[-1]["kind"] != "try":
+                return None
+            f = frames.pop()
+            state = _join_reaching([f["try_end"], state]) if f["in_except"] else state
+        elif tok in _FLOW_JUMP:
+            jump_from = state
+            state = _UNREACHABLE
+        elif tok in _FLOW_GOTO:
+            return None
+        else:  # Тогда/Цикл вне заголовка — неподдержанная форма
+            return None
+    tail = full_text[pos:]
+    if jump_from is not _NO_OPEN_JUMP:
+        state = jump_from  # запуск — в выражении Возврат/ВызватьИсключение, переход после него
+    if header_kind is not None:
+        _header(header_text + tail, False)
+        if header_kind == "while":
+            state = None  # условие Пока повторяется: значение с прошлой итерации тела неизвестно
+    elif state is not _UNREACHABLE and _rewrites(tail):
+        # Незавершённый оператор с запуском: его присваивание ещё не выполнено, но вызовы
+        # левее позиции запуска выполняются раньше него.
+        state = None
+    if state is None or state is _UNREACHABLE:
+        return None
+    return list(state)  # type: ignore[arg-type]
+
+
+def _launch_arg_targets(
+    arg: str,
+    prior_keep_lines: list[str],
+    *,
+    target_local: Callable[[str], bool] | None = None,
+) -> list[str] | None:
+    """Статические значения аргумента: литерал либо ДОСТИГАЮЩИЕ вызова присваивания.
+
+    ``prior_keep_lines`` заканчивается в позиции получателя вызова и включает часть его строки.
+    Присваивание после вызова не может доказывать его адресат. ``None`` — есть хотя бы один путь
+    с неизвестным значением."""
+    a = arg.strip()
+    m = _LITERAL_ARG_RE.fullmatch(a)
+    if m:
+        return [m.group(1).replace('""', '"').strip()]
+    if not _IDENT_RE.fullmatch(a):
+        return None
+    return _literal_reaching_assignments(a, prior_keep_lines, target_local=target_local)
+
+
+def _signature_tail(method: dict) -> int:
+    """Строк хвоста многострочной сигнатуры после строки объявления (0 — однострочная)."""
+    body_line = method.get("body_line")
+    return max(0, body_line - method["line"] - 1) if body_line else 0
+
+
+def _blank_signature_tail(body_lines: list[str], tail: int) -> list[str]:
+    """Тело для разбора запусков: хвост сигнатуры заменен пустыми строками (нумерация та же)."""
+    if tail <= 0:
+        return body_lines
+    return [""] * min(tail, len(body_lines)) + body_lines[tail:]
+
+
+def _launch_edge(target: str) -> tuple[str, str | None] | None:
+    """Форма адреса: 'Модуль.Метод' → (callee, None); 'Коллекция.X.Метод' → ('X.Метод', категория)."""
+    parts = target.split(".")
+    if not all(_IDENT_RE.fullmatch(p) for p in parts):
+        return None
+    if len(parts) == 2:
+        return target, None
+    if len(parts) == 3 and parts[0].casefold() in _CALL_MANAGER_COLLECTIONS:
+        return f"{parts[1]}.{parts[2]}", _CALL_MANAGER_COLLECTIONS[parts[0].casefold()]
+    return None
+
+
+def _launch_call_targets(
+    text_keep: str,
+    pos: int,
+    arg_index: int,
+    prior_keep_lines: list[str],
+    *,
+    target_local: Callable[[str], bool] | None = None,
+) -> list[str] | None:
+    """Статические адресаты запуска: общий разбор для экстрактора и повторной классификации аудита.
+
+    Литерал адресата от вычисления прочих аргументов не зависит — достаточно первых
+    ``arg_index + 1`` аргументов, длинный хвост списка не мешает. Адресат через идентификатор
+    требует ПОЛНОСТЬЮ разобранного списка аргументов без вызовов, способных переписать
+    переменную-адресат (``_call_may_rewrite``; ``target_local`` — доказательство локальности
+    имени, см. ``_literal_reaching_assignments``)."""
+    args = _split_call_args(text_keep, pos, arg_index + 1)
+    if not args or len(args) <= arg_index:
+        return None
+    arg = args[arg_index].strip()
+    if _LITERAL_ARG_RE.fullmatch(arg):
+        return _launch_arg_targets(arg, prior_keep_lines)
+    if not _IDENT_RE.fullmatch(arg):
+        return None
+    # need больше возможного числа аргументов: возврат только по закрывающей ')'.
+    all_args = _split_call_args(text_keep, pos, len(text_keep) + 1)
+    if all_args is None:
+        return None
+    others = [a for i, a in enumerate(all_args) if i != arg_index]
+    others_mask = "\n".join(mask_comments_and_strings("\n".join(others).splitlines()))
+    name_cf = arg.casefold()
+    if _call_may_rewrite(others_mask, name_cf, lambda: target_local is not None and bool(target_local(name_cf))):
+        return None  # вычисление прочих аргументов может изменить переменную-адресат
+    return _launch_arg_targets(arg, prior_keep_lines, target_local=target_local)
+
+
+def _launch_receiver_allowed(
+    receiver_heads: frozenset[str],
+    receiver_context: tuple[frozenset[str], bool] | None,
+) -> bool | None:
+    """Общий предикат графа и аудита: ``True`` — есть доказанная незатенённая голова обёртки,
+    ``False`` — все головы затенены, ``None`` — контекст или происхождение ребра не доказаны."""
+    if not receiver_heads or receiver_context is None:
+        return None
+    shadow_names, complete = receiver_context
+    if receiver_heads.issubset(shadow_names):
+        return False
+    return True if complete else None
+
+
+def _extract_launch_edges(
+    body_lines: list[str],
+    body_start: int,
+    *,
+    receiver_context: tuple[frozenset[str], bool] | None = None,
+    receiver_heads: dict[tuple[str, int, str | None, str], set[str]] | None = None,
+    target_local: Callable[[str], bool] | None = None,
+) -> list[tuple[str, int, str | None, str]]:
+    """Рёбра запусков по имени в теле процедуры: ``(callee_name, line, via, kind)``.
+
+    ``kind='background'`` — статический адресат (литерал либо достигающие литеральные
+    присваивания); ``'background_dynamic'`` с пустым ``callee_name`` — вычисляемое имя, литерал
+    неподдержанной формы либо недоказанный контекст получателя обёртки. ``line`` — строка
+    запускающего вызова. Голова обёртки, затенённая именем контекста, исключается до разбора
+    адресата; ``receiver_heads`` (выходной) — все головы обёрток, создавших ребро.
+    ``target_local`` — доказательство локальности переменной-адресата
+    (``_launch_target_locals``); ``None`` — не доказана."""
+    full = mask_comments_and_strings(body_lines)
+    keep = mask_comments_and_strings(body_lines, keep_string_content=True)
+    text_full, text_keep = "\n".join(full), "\n".join(keep)
+    out: list[tuple[str, int, str | None, str]] = []
+    seen: set[tuple[str, int, str | None, str]] = set()
+    for rx, arg_index in _BACKGROUND_LAUNCHERS:
+        for m in rx.finditer(text_full):
+            if _is_chain_member(text_full, m.start()):
+                continue  # Объект. ФоновыеЗадания.Выполнить — метод члена цепочки
+            receiver_cf = m.group("receiver").casefold()
+            allowed = _launch_receiver_allowed(frozenset({receiver_cf}), receiver_context)
+            if allowed is False:
+                continue  # параметр/переменная/реквизит, а не поддерживаемая обёртка
+            line = body_start + 1 + text_full.count("\n", 0, m.start())
+            # Маски сохраняют смещения: включаем операторы текущей строки ДО вызова.
+            # Неполный обязательный контекст получателя не доказывает статического ребра.
+            prior_keep_lines = text_keep[: m.start()].split("\n")
+            targets = (
+                _launch_call_targets(text_keep, m.end(), arg_index, prior_keep_lines, target_local=target_local)
+                if allowed
+                else None
+            )
+            items: list[tuple[str, int, str | None, str]] = []
+            for t in targets or []:
+                edge = _launch_edge(t)
+                if edge is not None:
+                    items.append((edge[0], line, edge[1], "background"))
+            # Имя не вычислено статически ЛИБО хоть один литерал нераспознанной формы: распознанные
+            # рёбра остаются, нераспознанное помечается одной строкой с вычисляемым адресатом.
+            if not targets or len(items) < len(targets):
+                items.append(("", line, None, "background_dynamic"))
+            for it in items:
+                if receiver_heads is not None:
+                    receiver_heads.setdefault(it, set()).add(receiver_cf)
+                if it not in seen:
+                    seen.add(it)
+                    out.append(it)
+    return out
+
+
+# Затенение имени (§2.5.5): лексические имена области видимости процедуры и модуля. Один разбор
+# на сборщик (получатель обёртки запуска) и аудит адресатов (голова прямого вызова). Между именем
+# и «=» — любые пробельные символы: оператор продолжается через перевод строки, а комментарий в
+# маске уже погашен пробелами (`ОМ` ↵ `= Новый Структура;` — присваивание).
+_SCOPE_ASSIGN_RE = re.compile(
+    r"(?:^|[;\n]|(?<![\w.])(?:Тогда|Then|Иначе|Else|Цикл|Do|Попытка|Try|Исключение|Except)(?!\w))[ \t]*"
+    r"([^\W\d]\w*)\s*=",
+    re.IGNORECASE,
+)
+_SCOPE_LOOP_RE = re.compile(r"(?<![\w.])(?:Для|For)\s+(?:(?:Каждого|Each)\s+)?([^\W\d]\w*)(?!\w)", re.IGNORECASE)
+# Объявление читается до ';' через переводы строк: `Перем А,` ↵ `Б;` объявляет и Б.
+_VAR_DECL_RE = re.compile(r"(?:^|[;\n])[ \t]*(?:Перем|Var)\s+([^;]*)", re.IGNORECASE)
+# Предопределённые элементы (контекст модуля менеджера): категории, где они бывают.
+_LAUNCH_PREDEFINED_CATEGORIES: frozenset[str] = frozenset(
+    ["Catalogs", "ChartsOfCharacteristicTypes", "ChartsOfAccounts", "ChartsOfCalculationTypes"]
+)
+
+
+def _var_decl_names(decl: str) -> set[str]:
+    """casefold-имена из хвоста ``Перем А Экспорт, Б``."""
+    out: set[str] = set()
+    for part in decl.split(","):
+        words = part.split()
+        if words:
+            out.add(words[0].casefold())
+    return out
+
+
+def _module_var_names(masked_lines: list[str], procedures: list[dict]) -> frozenset[str]:
+    """``Перем`` модуля ВНЕ процедур (casefold). ``masked_lines`` — маска ВСЕГО модуля.
+
+    Промежуток между процедурами разбирается целиком, а не построчно: объявление может
+    продолжаться на следующих строках до ``;``."""
+    n = len(masked_lines)
+    spans = sorted((max(0, p["line"] - 1), min(n, p.get("end_line") or n)) for p in procedures)
+    names: set[str] = set()
+    pos = 0  # первая строка, не покрытая ни одной из уже пройденных процедур
+    for start, end in [*spans, (n, n)]:
+        if start > pos:
+            for m in _VAR_DECL_RE.finditer("\n" + "\n".join(masked_lines[pos:start])):
+                names |= _var_decl_names(m.group(1))
+        pos = max(pos, end)
+    return frozenset(names)
+
+
+def _launch_module_var_names(masked_lines: list[str], procedures: list[dict]) -> frozenset[str]:
+    """``Перем`` модуля вне процедур — только имена получателей обёрток."""
+    return _module_var_names(masked_lines, procedures) & _BACKGROUND_LAUNCHER_RECEIVERS_CF
+
+
+def _procedure_scope_names(masked_lines: list[str], procedure: dict) -> set[str]:
+    """Лексические имена процедуры (casefold): параметры (общий ``_split_params``), левые части
+    присваиваний (в том числе после ``;`` и ключевых слов блока), переменные циклов, ``Перем``."""
+    n = len(masked_lines)
+    names: set[str] = {p.casefold() for p in _split_params(procedure.get("params") or "")}
+    start = procedure["line"]
+    end = procedure.get("end_line") or n
+    body = "\n".join(masked_lines[start : max(start, min(end - 1, n))])
+    for m in _SCOPE_ASSIGN_RE.finditer(body):
+        names.add(m.group(1).casefold())
+    for m in _SCOPE_LOOP_RE.finditer(body):
+        names.add(m.group(1).casefold())
+    for m in _VAR_DECL_RE.finditer(body):
+        names |= _var_decl_names(m.group(1))
+    return names
+
+
+def _launch_receiver_context(
+    module_lines: list[str],
+    procedure: dict,
+    module_context_names: frozenset[str] | None,
+    *,
+    module_var_names: frozenset[str] | None = None,
+    masked_lines: list[str] | None = None,
+) -> tuple[frozenset[str], bool]:
+    """Имена, затеняющие получателя обёртки в процедуре, и полнота контекста.
+
+    Лексические имена процедуры (``_procedure_scope_names``) и ``Перем`` модуля вне процедур плюс
+    имена контекста модуля (реквизиты формы/объекта, предопределённые) — ``module_context_names``;
+    ``None`` у него — описатель не прочитан: известные лексические имена сохраняются (доказанное
+    затенение всё равно исключит запуск), но контекст объявляется неполным. Хранится только
+    пересечение с именами получателей обёрток."""
+    if masked_lines is None:
+        masked_lines = mask_comments_and_strings(module_lines)
+    names = _procedure_scope_names(masked_lines, procedure)
+    if module_var_names is None:
+        module_var_names = _launch_module_var_names(masked_lines, _parse_procedures_from_lines(module_lines))
+    names |= module_var_names
+    if module_context_names is not None:
+        names |= module_context_names
+    return frozenset(names & _BACKGROUND_LAUNCHER_RECEIVERS_CF), module_context_names is not None
+
+
+def _descriptor_context_names(
+    path: Path,
+    kind: str,
+    receivers_only: bool,
+    only_names: frozenset[str] | None = None,
+) -> frozenset[str] | None:
+    """Имена контекста в описателе (``kind``: form | object | predefined), casefold.
+
+    ``None`` — описатель не прочитан или не разобран: затенение недоказуемо. Валидность XML
+    проверяется всегда. ``receivers_only`` — только имена получателей обёрток; тогда полный разбор
+    идёт, лишь если такое имя в тексте вообще встречается (надмножественный префильтр: имя
+    реквизита буквально содержит эту подстроку). ``only_names`` (casefold) — тот же префильтр для
+    произвольных имен: ответ — пересечение с ними."""
+    import xml.etree.ElementTree as ET
+
+    from rlm_tools_bsl.bsl_xml_parsers import parse_form_xml, parse_metadata_xml, parse_predefined_items
+
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    if receivers_only and not _has_launch_marker(text):
+        return frozenset()
+    if only_names is not None:
+        low = text.casefold()
+        if not any(n in low for n in only_names):
+            return frozenset()
+    names: set[str] = set()
+    if kind == "form":
+        parsed = parse_form_xml(text)
+        if parsed is None:
+            return None
+        names = {str(a.get("name") or "").split(".")[0].casefold() for a in parsed.get("attributes", [])}
+    elif kind == "object":
+        parsed = parse_metadata_xml(text)
+        if parsed is None:
+            return None
+        for key in ("attributes", "tabular_sections", "dimensions", "resources"):
+            names |= {str(a.get("name") or "").casefold() for a in parsed.get(key) or []}
+    else:
+        items = parse_predefined_items(text) or []
+        names = {str(it.get("name") or "").casefold() for it in items}
+    names.discard("")
+    if receivers_only:
+        names &= _BACKGROUND_LAUNCHER_RECEIVERS_CF
+    if only_names is not None:
+        names &= only_names
+    return frozenset(names)
+
+
+def _module_context_names(
+    file_path: Path | str,
+    base_path: str,
+    info: BslFileInfo,
+    *,
+    borrowed_base_path: str | None = None,
+    receivers_only: bool = False,
+    only_names: frozenset[str] | None = None,
+) -> frozenset[str] | None:
+    """Имена контекста модуля, способные затенить голову вызова (§2.5.5), живым разбором описателя.
+
+    Модуль формы — реквизиты формы; модуль объекта и набора записей — реквизиты, табличные части,
+    измерения и ресурсы объекта; модуль менеджера — предопределённые элементы. Модуль без такого
+    контекста (общий, команды, менеджера без предопределённых) — доказанно пустой ``frozenset()``;
+    отказ обязательного чтения или разбора — ``None``. Не зависит от metadata-таблиц индекса:
+    ``--no-metadata`` эту проверку не отключает.
+
+    ``borrowed_base_path`` — корень ОСНОВНОЙ конфигурации для заимствованного модуля расширения:
+    возвращаются только наследуемые имена (описатель расширения повторно не читается) и ``Перем``
+    одноимённого модуля основной конфигурации. Доказанное отсутствие базового объекта/модуля —
+    пустой набор; неоднозначность или отказ обязательного чтения — ``None``.
+
+    ``only_names`` (casefold) — ответ только о названных именах, с тем же надмножественным
+    префильтром по тексту описателя, что у ``receivers_only``: так ``_launch_target_locals``
+    проверяет, не реквизит ли переменная-адресат запуска."""
+    root = Path(borrowed_base_path) if borrowed_base_path else Path(base_path)
+    cat, obj = info.category, info.object_name
+    is_form = bool(info.form_name) or cat == "CommonForms"
+    if (
+        is_form
+        or info.module_type in ("ObjectModule", "RecordSetModule")
+        or (info.module_type == "ManagerModule" and cat in _LAUNCH_PREDEFINED_CATEGORIES)
+    ):
+        if not cat or not obj:
+            return None
+    names: set[str] = set()
+    if is_form:
+        form_dir = root / "CommonForms" / obj if cat == "CommonForms" else root / cat / obj / "Forms" / info.form_name
+        path = next((c for c in (form_dir / "Form.form", form_dir / "Ext" / "Form.xml") if c.is_file()), None)
+        if path is None:
+            if borrowed_base_path and not form_dir.exists():
+                return frozenset()  # формы нет в основной конфигурации — наследовать нечего
+            return None
+        got = _descriptor_context_names(path, "form", receivers_only, only_names)
+    elif info.module_type in ("ObjectModule", "RecordSetModule"):
+        obj_dir = root / cat / obj
+        path = _find_metadata_xml(obj_dir, cat)
+        if path is None:
+            if borrowed_base_path and not obj_dir.exists() and not (root / cat / f"{obj}.xml").exists():
+                return frozenset()
+            return None
+        got = _descriptor_context_names(path, "object", receivers_only, only_names)
+    elif info.module_type == "ManagerModule" and cat in _LAUNCH_PREDEFINED_CATEGORIES:
+        obj_dir = root / cat / obj
+        predefined = obj_dir / "Ext" / "Predefined.xml"
+        if predefined.is_file():
+            got = _descriptor_context_names(predefined, "predefined", receivers_only, only_names)
+        else:
+            mdo = obj_dir / f"{obj}.mdo"
+            if mdo.is_file():
+                got = _descriptor_context_names(mdo, "predefined", receivers_only, only_names)
+            elif _find_metadata_xml(obj_dir, cat) is not None:
+                got = frozenset()  # CF-объект без Predefined.xml: предопределённых нет
+            elif borrowed_base_path and not obj_dir.exists() and not (root / cat / f"{obj}.xml").exists():
+                return frozenset()
+            else:
+                return None
+    else:
+        got = frozenset()
+    if got is None:
+        return None
+    names |= got
+    if borrowed_base_path:
+        module_vars = _borrowed_module_var_names(root, info, receivers_only)
+        if module_vars is None:
+            return None
+        names |= module_vars if only_names is None else module_vars & only_names
+    return frozenset(names)
+
+
+def _launch_module_context_names(
+    file_path: Path | str,
+    base_path: str,
+    info: BslFileInfo,
+    *,
+    borrowed_base_path: str | None = None,
+) -> frozenset[str] | None:
+    """``_module_context_names`` только с именами получателей обёрток (контекст запуска по имени)."""
+    return _module_context_names(file_path, base_path, info, borrowed_base_path=borrowed_base_path, receivers_only=True)
+
+
+def _launch_target_locals(
+    methods: list[dict],
+    file_path: Path | str,
+    base_path: str,
+    info: BslFileInfo,
+    masked: list[str],
+) -> Callable[[dict], Callable[[str], bool]]:
+    """Доказательство «переменная-адресат запуска — локальная переменная процедуры».
+
+    Возвращает фабрику ``procedure -> (casefold-имя -> bool)`` для ``target_local`` разбора
+    запуска. Имя доказанно локально, если оно не параметр процедуры, не ``Перем`` модуля и не
+    имя контекста модуля (реквизит формы или объекта, табличная часть, измерение, ресурс,
+    предопределенный элемент) при прочитанном описателе; непрочитанный описатель — не доказано.
+    Такую переменную промежуточный вызов переписать не может, если не получил ее аргументом
+    (``_call_may_rewrite``). Только для модулей основной конфигурации: у заимствованного модуля
+    расширения контекст наследуется от основной конфигурации, и живой слой расширений этой
+    фабрикой не пользуется. Все чтения ленивые и однократные на модуль: ``Перем`` модуля и
+    описатель — при первом вопросе."""
+    module_vars: frozenset[str] | None = None
+    context_local: dict[str, bool] = {}
+
+    def for_method(method: dict) -> Callable[[str], bool]:
+        params: frozenset[str] | None = None
+
+        def is_local(name_cf: str) -> bool:
+            nonlocal module_vars, params
+            if params is None:
+                params = frozenset(p.casefold() for p in _split_params(method.get("params") or ""))
+            if name_cf in params:
+                return False
+            if module_vars is None:
+                module_vars = _module_var_names(masked, methods)
+            if name_cf in module_vars:
+                return False
+            known = context_local.get(name_cf)
+            if known is None:
+                ctx = _module_context_names(file_path, base_path, info, only_names=frozenset({name_cf}))
+                known = context_local[name_cf] = ctx is not None and name_cf not in ctx
+            return known
+
+        return is_local
+
+    return for_method
+
+
+def _borrowed_module_var_names(root: Path, info: BslFileInfo, receivers_only: bool) -> frozenset[str] | None:
+    """``Перем`` модуля основной конфигурации с тем же тождеством.
+
+    Одноимённый модуль ищется в обеих раскладках (CF ``…/Ext/…`` и EDT); нет ни одного —
+    доказанное отсутствие (пустой набор), найдены оба либо отказ чтения — ``None``."""
+    cat, obj, mtype = info.category, info.object_name, info.module_type
+    if not cat or not obj or not mtype:
+        return frozenset()
+    if info.form_name:
+        base_dir = root / cat / obj / "Forms" / info.form_name
+        candidates = [base_dir / "Ext" / "Form" / "Module.bsl", base_dir / "Module.bsl"]
+    elif cat == "CommonForms":
+        base_dir = root / cat / obj
+        candidates = [base_dir / "Ext" / "Form" / "Module.bsl", base_dir / "Module.bsl"]
+    else:
+        base_dir = root / cat / obj
+        candidates = [base_dir / "Ext" / f"{mtype}.bsl", base_dir / f"{mtype}.bsl"]
+    found = [c for c in candidates if c.is_file()]
+    if not found:
+        return frozenset()
+    if len(found) > 1:
+        return None
+    try:
+        text = found[0].read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+    if receivers_only and not _has_launch_marker(text):
+        return frozenset()
+    lines = text.splitlines()
+    names = _module_var_names(mask_comments_and_strings(lines), _parse_procedures_from_lines(lines))
+    return names & _BACKGROUND_LAUNCHER_RECEIVERS_CF if receivers_only else names
+
+
+def _module_launch_contexts(
+    lines: list[str],
+    methods: list[dict],
+    file_path: Path | str,
+    base_path: str,
+    info: BslFileInfo,
+    *,
+    masked: list[str] | None = None,
+) -> list[tuple[bool, tuple[frozenset[str], bool] | None]]:
+    """По каждой процедуре: есть ли в её теле совпадение обёртки вне строк и комментариев, и
+    контекст получателя (только для таких процедур).
+
+    Контекст модуля (описатель) читается не более одного раза и только при реальном совпадении;
+    модульные ``Перем`` собираются один раз. Общий путь сборки, обеих веток ``update`` и живого
+    прохода по расширениям. ``masked`` — готовая ``mask_comments_and_strings(lines)``."""
+    plan: list[tuple[bool, tuple[frozenset[str], bool] | None]] = [(False, None)] * len(methods)
+    if masked is None:
+        masked = mask_comments_and_strings(lines)
+    whole = "\n".join(masked)
+    low = whole.casefold()
+    hits = sorted(pos for marker in _LAUNCH_MARKERS_CF for pos in _find_all(low, marker))
+    if not hits:
+        return plan  # имя обертки только в комментариях и строках
+    # Строки с именем обертки, по возрастанию. casefold, не изменивший длину, сохраняет смещения
+    # посимвольно; иначе (лигатуры, «ß») — проверка по телу каждой процедуры.
+    hit_lines: list[int] | None = None
+    if len(low) == len(whole):
+        hit_lines, line, prev = [], 0, 0
+        for pos in hits:
+            line += whole.count("\n", prev, pos)
+            prev = pos
+            if not hit_lines or hit_lines[-1] != line:
+                hit_lines.append(line)
+    module_ctx: object = _UNSET
+    module_vars: frozenset[str] | None = None
+    n = len(lines)
+    for i, method in enumerate(methods):
+        start = method["line"]
+        end = method["end_line"] if method["end_line"] else n
+        body_end = min(end - 1, n)
+        if start >= body_end:
+            continue
+        if hit_lines is not None:
+            k = bisect.bisect_left(hit_lines, start)
+            if k == len(hit_lines) or hit_lines[k] >= body_end:
+                continue
+        body = "\n".join(masked[start:body_end])
+        # Подстрочный префильтр дешев; точные регулярки — только у тел-кандидатов.
+        if hit_lines is None and not _has_launch_marker(body):
+            continue
+        if not any(rx.search(body) for rx, _ in _BACKGROUND_LAUNCHERS):
+            continue
+        if module_ctx is _UNSET:
+            module_ctx = _launch_module_context_names(file_path, base_path, info)
+        if module_vars is None:
+            module_vars = _launch_module_var_names(masked, methods)
+        ctx = _launch_receiver_context(
+            lines,
+            method,
+            module_ctx,  # type: ignore[arg-type]
+            module_var_names=module_vars,
+            masked_lines=masked,
+        )
+        plan[i] = (True, ctx)
+    return plan
+
+
+_LAUNCH_DESCRIPTOR_SUFFIXES = (".xml", ".mdo", ".form")
+
+
+def _launch_descriptor_owners(changed_rel_paths) -> tuple[set[str], set[tuple[str, str]]]:
+    """Владельцы изменённых описателей для пересчёта фоновых рёбер (git fast path).
+
+    Возвращает ``(префиксы каталогов форм, пары (категория, объект))``. Путь описателя сводится к
+    владельцу по раскладке: ``<Кат>/<Объект>/Forms/<Ф>/…`` и ``CommonForms/<Ф>/…`` — форма,
+    ``<Кат>/<Объект>.xml`` и прочие файлы под ``<Кат>/<Объект>/`` — объект (его модули объекта,
+    набора записей и менеджера). Надмножество допустимо: лишний модуль лишь перечитывается."""
+    from rlm_tools_bsl.format_detector import METADATA_CATEGORIES
+
+    form_dirs: set[str] = set()
+    objects: set[tuple[str, str]] = set()
+    for p in changed_rel_paths:
+        if not p.lower().endswith(_LAUNCH_DESCRIPTOR_SUFFIXES):
+            continue
+        parts = p.replace("\\", "/").split("/")
+        if len(parts) < 2:
+            continue  # Configuration.xml и пр. — контекст модулей не задают
+        cat = parts[0]
+        if cat == "CommonForms":
+            form_dirs.add(f"CommonForms/{parts[1].rsplit('.', 1)[0] if len(parts) == 2 else parts[1]}/")
+            continue
+        if cat not in METADATA_CATEGORIES:
+            continue
+        if len(parts) == 2:
+            objects.add((cat, parts[1].rsplit(".", 1)[0]))
+            continue
+        if len(parts) >= 4 and parts[2] == "Forms":
+            form_dirs.add(f"{cat}/{parts[1]}/Forms/{parts[3]}/")
+            continue
+        objects.add((cat, parts[1]))
+    return form_dirs, objects
+
+
+def _launch_context_dependent_modules(
+    conn: sqlite3.Connection,
+    owners: tuple[set[str], set[tuple[str, str]]] | None,
+    skip: set[str],
+    *,
+    untracked_forms: bool = False,
+) -> list[str]:
+    """Модули, контекст получателя обёртки которых зависит от описателя.
+
+    Форма (объекта или общая), модуль объекта и набора записей, модуль менеджера категории с
+    предопределёнными — и только с маркером запуска в тексте (``modules.launch_marker``: без
+    имени обертки описатель запуска не создаст; ``NULL`` и база без колонки — неизвестно,
+    модуль берется). ``owners=None`` — все такие модули (дельта описателей не доказана);
+    ``untracked_forms`` — плюс формы EDT (``Form.form`` в снимке ``file_paths`` нет, его
+    изменение полный скан доказать не может); ``skip`` — модули, уже переобработанные
+    BSL-дельтой этого же обновления."""
+    out: list[str] = []
+    form_dirs, objects = owners if owners is not None else (set(), set())
+    try:
+        rows = conn.execute(
+            "SELECT rel_path, category, object_name, module_type, is_form, launch_marker FROM modules"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = [
+            (*r, None)
+            for r in conn.execute("SELECT rel_path, category, object_name, module_type, is_form FROM modules")
+        ]
+    for row in rows:
+        rel, cat, obj, mtype, is_form, marker = row[0], row[1], row[2], row[3], row[4], row[5]
+        if rel in skip or marker == 0:
+            continue
+        form_like = bool(is_form) or cat == "CommonForms"
+        if not (
+            form_like
+            or mtype in ("ObjectModule", "RecordSetModule")
+            or (mtype == "ManagerModule" and cat in _LAUNCH_PREDEFINED_CATEGORIES)
+        ):
+            continue
+        if owners is None:
+            out.append(rel)
+        elif form_like:
+            if any(rel.startswith(d) for d in form_dirs) or (untracked_forms and "/ext/form/" not in rel.casefold()):
+                out.append(rel)
+        elif (cat, obj) in objects:
+            out.append(rel)
+    return out
+
+
+def _descriptor_delta_owners(
+    conn: sqlite3.Connection, fresh_rows: list[tuple]
+) -> tuple[set[str], set[tuple[str, str]]] | None:
+    """Владельцы описателей, изменившихся с прошлого снимка ``file_paths`` (полный скан update).
+
+    Снимок хранит размер и mtime каждого ``.xml``/``.mdo``; описатель, у которого они
+    разошлись, появившийся или исчезнувший — изменен, и его владелец (форма, объект) находится
+    тем же ``_launch_descriptor_owners``, что у git-ветки. ``fresh_rows`` — свежий
+    ``_collect_file_paths``. ``None`` — снимка нет (дельта недоказуема)."""
+    try:
+        old = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT rel_path, size, mtime FROM file_paths")}
+    except sqlite3.OperationalError:
+        return None
+    if not old:
+        return None
+    new = {r[0]: (r[5], r[6]) for r in fresh_rows}
+    changed = [
+        rel
+        for rel in old.keys() | new.keys()
+        if rel.lower().endswith(_LAUNCH_DESCRIPTOR_SUFFIXES) and old.get(rel) != new.get(rel)
+    ]
+    return _launch_descriptor_owners(changed)
+
+
+def _refresh_launch_rows(conn: sqlite3.Connection, base_path: str, rel_paths: list[str]) -> int:
+    """Пересчитать фоновые строки ``calls`` модулей по ТЕКУЩЕМУ контексту получателя обёртки.
+
+    BSL этих модулей не менялся, поменяться мог только описатель (реквизит формы/объекта,
+    предопределённый элемент), а он затеняет либо открывает голову обёртки. Пересчитываются
+    только строки ``call_kind IN ('background','background_dynamic')`` существующих методов: id
+    методов и прямые вызовы сохраняются, ключи новых строк — тем же резолвером, что у сборки.
+    Возвращает число модулей, где фоновые строки изменились."""
+    base = Path(base_path)
+    common: dict | None = None
+    managers: dict | None = None
+    refreshed = 0
+    for rel in rel_paths:
+        row = conn.execute("SELECT id FROM modules WHERE rel_path = ?", (rel,)).fetchone()
+        if row is None:
+            continue
+        mod_id = row[0]
+        fp = base / rel
+        try:
+            with open(fp, encoding="utf-8-sig", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        if not _has_launch_marker(content):
+            continue
+        lines = content.splitlines()
+        masked = mask_comments_and_strings(lines)
+        methods = _parse_procedures_from_lines(lines, masked=masked)
+        info = parse_bsl_path(str(fp), base_path)
+        plan = _module_launch_contexts(lines, methods, fp, base_path, info, masked=masked)
+        target_locals = _launch_target_locals(methods, fp, base_path, info, masked)
+        id_by_line = {r[1]: r[0] for r in conn.execute("SELECT id, line FROM methods WHERE module_id = ?", (mod_id,))}
+        new_rows: list[tuple[int, str, int, str | None, str]] = []
+        n = len(lines)
+        for method, (scan, ctx) in zip(methods, plan):
+            if not scan:
+                continue
+            mid = id_by_line.get(method["line"])
+            if mid is None:
+                continue
+            start = method["line"]
+            body_end = min((method["end_line"] or n) - 1, n)
+            for callee, ln, via, kind in _extract_launch_edges(
+                _blank_signature_tail(lines[start:body_end], _signature_tail(method)),
+                start,
+                receiver_context=ctx,
+                target_local=target_locals(method),
+            ):
+                new_rows.append((mid, callee, ln, via, kind))
+        method_ids = list(id_by_line.values())
+        if not method_ids:
+            continue
+        old_rows: list[tuple] = []
+        for chunk in _chunked(method_ids):
+            ph = ",".join("?" * len(chunk))
+            old_rows.extend(
+                tuple(r)
+                for r in conn.execute(
+                    f"SELECT caller_id, callee_name, line, callee_via, call_kind FROM calls "  # noqa: S608
+                    f"WHERE caller_id IN ({ph}) AND call_kind IN ('background', 'background_dynamic')",
+                    chunk,
+                )
+            )
+
+        def _key(r: tuple) -> tuple:
+            return tuple((v is not None, v) for v in r)
+
+        if sorted(old_rows, key=_key) == sorted(new_rows, key=_key):
+            continue
+        for chunk in _chunked(method_ids):
+            ph = ",".join("?" * len(chunk))
+            conn.execute(
+                f"DELETE FROM calls WHERE caller_id IN ({ph}) "  # noqa: S608
+                "AND call_kind IN ('background', 'background_dynamic')",
+                chunk,
+            )
+        if new_rows:
+            if common is None:
+                common = _build_common_exported(conn)
+                managers = _build_manager_modules(conn)
+            out_rows = []
+            for mid, callee, ln, via, kind in new_rows:
+                if kind == "background_dynamic" or not callee:
+                    key = None
+                elif via:
+                    key = _manager_callee_key(managers, via, callee)  # type: ignore[arg-type]
+                else:
+                    a, _, b = callee.partition(".")
+                    target = common.get((a.casefold(), b.casefold()))
+                    key = _make_callee_key(target, b) if target else None
+                out_rows.append((mid, callee, ln, key, via, kind))
+            conn.executemany(
+                "INSERT INTO calls (caller_id, callee_name, line, callee_key, callee_via, call_kind) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                out_rows,
+            )
+        refreshed += 1
+    return refreshed
+
+
 def _extract_calls_from_body(
     lines: list[str],
     start_line: int,
     end_line: int,
-) -> list[tuple[str, int]]:
+    scan_launches: bool = False,
+    *,
+    launch_receiver_context: tuple[frozenset[str], bool] | None = None,
+    launch_receiver_heads: dict[tuple[str, int, str | None, str], set[str]] | None = None,
+    launch_target_local: Callable[[str], bool] | None = None,
+    signature_tail: int = 0,
+    module_mask: tuple[list[str], list[bool]] | None = None,
+) -> list[tuple[str, int, str | None, str | None]]:
     """Extract call targets from method body lines.
 
     Args:
@@ -2987,9 +4670,26 @@ def _extract_calls_from_body(
         end_line: 1-based end (EndProcedure line, skipped).
 
     Returns:
-        List of (callee_name, line_number_1based).
+        List of ``(callee_name, line_number_1based, via, kind)``. ``callee_name`` has at
+        most ONE dot (``A.B`` или голое ``B``). v17: ``via`` — категория коллекции у
+        ``Коллекция.X.Метод(`` (тогда ``callee_name`` = ``X.Метод``), ``kind='member'`` —
+        метод члена цепочки ``Выражение.Член.Метод(`` (получатель — значение, а не модуль).
+
+    ``scan_launches`` (файл содержит маркер запуска) — после построчного прохода добавляются
+    рёбра запусков по имени (``_extract_launch_edges``) с ``line`` запускающего вызова.
+    ``launch_receiver_context`` — имена, затеняющие получателя обёртки, и полнота контекста;
+    ``None`` при включённом разборе — контекст НЕ доказан (только ``background_dynamic``).
+    ``launch_receiver_heads`` — выходной словарь «ребро запуска → головы обёрток».
+    ``launch_target_local`` — доказательство локальности переменной-адресата запуска
+    (``_launch_target_locals``); ``None`` — не доказана, любой непрозрачный вызов гасит адресат.
+    ``signature_tail`` — число строк хвоста многострочной сигнатуры после строки объявления
+    (``_signature_tail``): для разбора запусков они гасятся, иначе склеились бы с первым
+    оператором тела.
+    ``module_mask`` — ``(маска модуля, line_states)`` от ``mask_comments_and_strings`` по ВСЕМ
+    строкам файла: если тело начинается вне литерала, его маска — готовый срез (тот же результат,
+    что пересчет по срезу строк); иначе — пересчет, как без нее.
     """
-    calls: list[tuple[str, int]] = []
+    calls: list[tuple[str, int, str | None, str | None]] = []
 
     # Body line range (0-based indices): skip the definition line and the
     # EndProcedure/EndFunction line.
@@ -2998,36 +4698,57 @@ def _extract_calls_from_body(
     if body_start >= body_end:
         return calls
 
-    # Use the multi-line-aware scanner instead of a per-line strip: ``code`` has
-    # string literals (incl. multi-line query texts opened with a continuation
-    # ``|``) and comments already removed across line boundaries. This stops
-    # query-language functions like ЕСТЬNULL(/ВЫРАЗИТЬ(/СУММА( inside multi-line
-    # string literals from leaking in as false call edges (a per-line strip
-    # cannot see that a continuation line is still inside a string).
+    # Маска тела ТОЙ ЖЕ ДЛИНЫ: комментарии и содержимое строковых литералов (в том числе
+    # многострочных текстов запросов с продолжением ``|``) погашены пробелами. Поэтому
+    # функции языка запросов внутри литерала (ЕСТЬNULL(/ВЫРАЗИТЬ(/СУММА() ложными рёбрами
+    # не становятся, а смещения совпадений применимы к соседним строкам: проверка «перед
+    # головой стоит точка цепочки» идёт назад через перевод строки и погашенный комментарий
+    # (``Объект.`` ↵ ``ОМ.Метод()``), чего построчно вырезанный код дать не мог.
     #
-    # Line numbering: _scan_module yields 1-based ``lineno`` relative to the
-    # slice ``lines[body_start:body_end]``; the absolute 1-based line number of
-    # the original file is ``body_start + lineno``.
-    for lineno, code, _strings in _scan_module(lines[body_start:body_end]):
-        if not code.strip():
+    # Line numbering: ``idx`` is 0-based in the slice ``lines[body_start:body_end]``;
+    # the absolute 1-based line number of the original file is ``body_start + idx + 1``.
+    if module_mask is not None and not module_mask[1][body_start]:
+        full = module_mask[0][body_start:body_end]
+    else:
+        full = mask_comments_and_strings(lines[body_start:body_end])
+    for idx, code in enumerate(full):
+        # Все три регулярки вызова требуют «(» в той же строке: строка без нее ребер не дает.
+        if "(" not in code:
             continue
 
-        line_number = body_start + lineno  # 1-based absolute
+        line_number = body_start + idx + 1  # 1-based absolute
 
-        seen_on_line: set[str] = set()
+        # Дедуп на строке — по (callee_name, via, kind) у квалифицированных и по имени у
+        # голых: прямой вызов и член цепочки одного имени — РАЗНЫЕ рёбра. Квалифицированные
+        # имена содержат точку, поэтому с голыми не пересекаются.
+        seen_q: set[tuple[str, str | None, str | None]] = set()
+        seen_bare: set[str] = set()
+
+        # Коллекция.X.Метод( — позиция X → категория. Дешёвый префильтр: у такого
+        # вызова в строке не меньше двух точек.
+        mgr_at: dict[int, str] = {}
+        if code.count(".") >= 2:
+            for mm in _MANAGER_CALL_RE.finditer(code):
+                if _is_chain_member_in_lines(full, idx, mm.start(1)):
+                    continue  # Метаданные. Справочники.X.Метод — член цепочки, не менеджер
+                mgr_at[mm.start(2)] = _CALL_MANAGER_COLLECTIONS[mm.group(1).casefold()]
 
         # Qualified calls first: Module.Method(
-        for qm in _QUALIFIED_CALL_RE.finditer(code):
-            module_part = qm.group(1)
-            method_part = qm.group(2)
-            if module_part.lower() in _BSL_KEYWORDS_LOWER:
-                continue
-            if method_part.lower() in _BSL_KEYWORDS_LOWER:
-                continue
-            callee = f"{module_part}.{method_part}"
-            if callee not in seen_on_line:
-                seen_on_line.add(callee)
-                calls.append((callee, line_number))
+        if "." in code:
+            for qm in _QUALIFIED_CALL_RE.finditer(code):
+                module_part = qm.group(1)
+                method_part = qm.group(2)
+                if module_part.lower() in _BSL_KEYWORDS_LOWER:
+                    continue
+                if method_part.lower() in _BSL_KEYWORDS_LOWER:
+                    continue
+                callee = f"{module_part}.{method_part}"
+                via = mgr_at.get(qm.start())
+                kind = "member" if via is None and _is_chain_member_in_lines(full, idx, qm.start()) else None
+                item = (callee, via, kind)
+                if item not in seen_q:
+                    seen_q.add(item)
+                    calls.append((callee, line_number, via, kind))
 
         # Simple calls: FunctionName(
         for sm in _SIMPLE_CALL_RE.finditer(code):
@@ -3039,16 +4760,24 @@ def _extract_calls_from_body(
             # ONLY here, never to the qualified Module.Method branch above.
             if func_name.casefold() in _BSL_GLOBAL_FUNCS_LOWER:
                 continue
-            # Skip if already captured as part of a qualified call on this line
-            # (the simple regex also matches the method part of Module.Method)
-            if func_name not in seen_on_line:
+            if func_name not in seen_bare:
                 # Check this isn't the method part of a qualified call
                 start_pos = sm.start()
                 if start_pos > 0 and code[start_pos - 1] == ".":
                     continue
-                seen_on_line.add(func_name)
-                calls.append((func_name, line_number))
+                seen_bare.add(func_name)
+                calls.append((func_name, line_number, None, None))
 
+    if scan_launches:
+        calls.extend(
+            _extract_launch_edges(
+                _blank_signature_tail(lines[body_start:body_end], signature_tail),
+                body_start,
+                receiver_context=launch_receiver_context,
+                receiver_heads=launch_receiver_heads,
+                target_local=launch_target_local,
+            )
+        )
     return calls
 
 
@@ -4164,23 +5893,10 @@ def _collect_metadata_tables(
                 # but only if ChartsOfCharacteristicTypes was processed via the attributes loop.
                 # We don't double-emit characteristic_type refs here to avoid duplicates.
 
-    # CommonCommands and per-object commands → command_parameter_type
-    if _ref_allowed("CommonCommands") or any(
-        c in (_active_ref_cats if _active_ref_cats is not None else _METADATA_REFERENCES_TRIGGER_CATEGORIES)
-        for c in (
-            "Catalogs",
-            "Documents",
-            "InformationRegisters",
-            "AccumulationRegisters",
-            "AccountingRegisters",
-            "ChartsOfCharacteristicTypes",
-            "ChartsOfAccounts",
-            "ChartsOfCalculationTypes",
-            "BusinessProcesses",
-            "Tasks",
-            "ExchangePlans",
-        )
-    ):
+    # CommonCommands and per-object commands → command_parameter_type. v17: внешний gate —
+    # единый перечень владельцев _CMD_HOST_CATS (прежний список не знал Reports/DataProcessors, и
+    # выборочный сбор {DataProcessors} этот блок пропускал целиком).
+    if _ref_allowed("CommonCommands") or any(_ref_allowed(cat) for cat in _CMD_HOST_CATS):
         # CommonCommands
         common_cmd_dir = base / "CommonCommands"
         if common_cmd_dir.is_dir() and _ref_allowed("CommonCommands"):
@@ -4218,8 +5934,8 @@ def _collect_metadata_tables(
                                 )
                             )
 
-        # Per-object commands: Catalogs/X/Commands/*.xml or Catalogs/X/Commands/Y/Y.command
-        # _CMD_HOST_CATS module-level — переиспользуется pointwise (_emit_object_command_refs)
+        # Per-object commands: owner .mdo (EDT) + Catalogs/X/Commands/*.xml | Y/Y.command (CF).
+        # Общий построитель с точечным обновлением (_emit_object_command_refs): одно правило.
         for category in _CMD_HOST_CATS:
             if not _ref_allowed(category):
                 continue
@@ -4227,45 +5943,8 @@ def _collect_metadata_tables(
             if not cat_dir.is_dir():
                 continue
             for obj_dir in sorted(cat_dir.iterdir()):
-                if not obj_dir.is_dir():
-                    continue
-                obj_name = obj_dir.name
-                cmd_dir = obj_dir / "Commands"
-                if not cmd_dir.is_dir():
-                    continue
-                for entry in sorted(cmd_dir.iterdir()):
-                    cmd_files: list[Path] = []
-                    if entry.is_file() and entry.suffix.lower() == ".xml":
-                        cmd_files.append(entry)
-                    elif entry.is_dir():
-                        for cand in (entry / f"{entry.name}.command", entry / f"{entry.name}.mdo"):
-                            if cand.is_file():
-                                cmd_files.append(cand)
-                                break
-                    for cfp in cmd_files:
-                        text = _read(cfp)
-                        if not text:
-                            continue
-                        parsed_cmds = parse_command_parameter_type(text)
-                        if not parsed_cmds:
-                            continue
-                        rel = cfp.relative_to(base).as_posix()
-                        type_prefix = _CATEGORY_TO_TYPE_PREFIX.get(category, category)
-                        for ref_dict in parsed_cmds:
-                            canon = ref_dict.get("ref_object", "")
-                            cmd_name = ref_dict.get("command_name", "") or entry.stem
-                            if canon:
-                                result["metadata_references"].append(
-                                    (
-                                        obj_name,
-                                        category,
-                                        canon,
-                                        "command_parameter_type",
-                                        f"{type_prefix}.{obj_name}.Command.{cmd_name}.CommandParameterType",
-                                        rel,
-                                        None,
-                                    )
-                                )
+                if obj_dir.is_dir():
+                    result["metadata_references"].extend(_object_command_ref_rows(base, category, obj_dir))
 
     return result
 
@@ -5307,20 +6986,42 @@ def _emit_predefined_refs(
         )
 
 
-def _emit_object_command_refs(
-    conn: sqlite3.Connection,
-    base_path: str,
-    category: str,
-    object_name: str,
-) -> None:
-    """Refs из per-object команд: Category/<obj>/Commands/* — ref_kind='command_parameter_type'."""
-    from rlm_tools_bsl.bsl_xml_parsers import parse_command_parameter_type
+def _object_command_ref_rows(base: Path, category: str, obj_dir: Path) -> list[tuple]:
+    """Строки ``command_parameter_type`` команд ОБЪЕКТА — общие для сборки и точечного обновления.
 
-    cmd_dir = Path(base_path) / category / object_name / "Commands"
-    if not cmd_dir.is_dir():
-        return
+    v17: сначала описатель владельца ``<Имя>/<Имя>.mdo`` (EDT: команда объекта описана в нем, в
+    ``Commands/<Имя>/`` лежит только модуль) — НЕЗАВИСИМО от наличия каталога ``Commands/``: команда
+    может быть объявлена без выгруженного модуля. Затем прежний обход ``Commands/*`` для CF-дескрипторов
+    (``*.xml``) и ``<Имя>/<Имя>.command|.mdo``; команда, уже описанная владельцем, второй строкой не
+    дублируется."""
+    from rlm_tools_bsl.bsl_xml_parsers import parse_command_parameter_type, parse_object_commands_parameter_types
+
+    obj_name = obj_dir.name
     type_prefix = _CATEGORY_TO_TYPE_PREFIX.get(category, category)
     rows: list[tuple] = []
+    owner_cmds: set[str] = set()
+    owner_mdo = obj_dir / f"{obj_name}.mdo"
+    if owner_mdo.is_file():
+        text = _read_text(owner_mdo)
+        if text:
+            rel = owner_mdo.relative_to(base).as_posix()
+            for ref_dict in parse_object_commands_parameter_types(text):
+                cmd_name = ref_dict["command_name"]
+                owner_cmds.add(cmd_name.casefold())
+                rows.append(
+                    (
+                        obj_name,
+                        category,
+                        ref_dict["ref_object"],
+                        "command_parameter_type",
+                        f"{type_prefix}.{obj_name}.Command.{cmd_name}.CommandParameterType",
+                        rel,
+                        None,
+                    )
+                )
+    cmd_dir = obj_dir / "Commands"
+    if not cmd_dir.is_dir():
+        return rows
     for entry in sorted(cmd_dir.iterdir()):
         cmd_files: list[Path] = []
         if entry.is_file() and entry.suffix.lower() == ".xml":
@@ -5337,23 +7038,37 @@ def _emit_object_command_refs(
             parsed_cmds = parse_command_parameter_type(text)
             if not parsed_cmds:
                 continue
-            rel = cfp.relative_to(Path(base_path)).as_posix()
+            rel = cfp.relative_to(base).as_posix()
             for ref_dict in parsed_cmds:
                 canon = ref_dict.get("ref_object", "")
                 cmd_name = ref_dict.get("command_name", "") or entry.stem
-                if not canon:
+                if not canon or cmd_name.casefold() in owner_cmds:
                     continue
                 rows.append(
                     (
-                        object_name,
+                        obj_name,
                         category,
                         canon,
                         "command_parameter_type",
-                        f"{type_prefix}.{object_name}.Command.{cmd_name}.CommandParameterType",
+                        f"{type_prefix}.{obj_name}.Command.{cmd_name}.CommandParameterType",
                         rel,
                         None,
                     )
                 )
+    return rows
+
+
+def _emit_object_command_refs(
+    conn: sqlite3.Connection,
+    base_path: str,
+    category: str,
+    object_name: str,
+) -> None:
+    """Refs команд объекта (owner .mdo + ``Commands/*``) — ref_kind='command_parameter_type'."""
+    obj_dir = Path(base_path) / category / object_name
+    if not obj_dir.is_dir():
+        return
+    rows = _object_command_ref_rows(Path(base_path), category, obj_dir)
     if rows:
         conn.executemany(
             "INSERT INTO metadata_references "
@@ -6317,6 +8032,9 @@ def _parse_regions(lines: list[str]) -> list[dict]:
     regions: list[dict] = []
     stack: list[dict] = []
     for lineno, raw in enumerate(lines, 1):
+        # Обе директивы начинаются с «#»: строку без него регулярками не проверяем.
+        if "#" not in raw:
+            continue
         stripped = raw.strip()
         # Skip comment lines (// #Область is a commented-out directive)
         if stripped.startswith("//"):
@@ -6341,49 +8059,57 @@ def _parse_regions(lines: list[str]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Module header comment extractor
 # ---------------------------------------------------------------------------
-_HEADER_STOP_WORDS = frozenset(
-    (
-        "процедура",
-        "функция",
-        "procedure",
-        "function",
-        "#область",
-        "#region",
-        "перем",
-        "var",
-    )
-)
+_HEADER_LICENSE_MARK = "Copyright"
+# Маркер доработки или условной сборки: `//++ НЕ УТ`, `// +++ <команда>; <автор>; <дата>`, `//-- ...`.
+# Строка блока уже без `//` и одного пробела; больший отступ — подпункт списка, а не маркер.
+_HEADER_MARKER_RE = re.compile(r"\+\+|--")
 
 
-def _extract_header_comment(lines: list[str], max_chars: int = 500) -> str:
-    """Extract leading // comment block from BSL module."""
-    collected: list[str] = []
-    found_comment = False
-    for raw in lines:
-        stripped = raw.strip()
-        if not stripped:
-            if found_comment:
-                break  # empty line after comment block ends it
-            continue  # skip leading empty lines
-        lower = stripped.lower()
-        if any(lower.startswith(sw) for sw in _HEADER_STOP_WORDS):
-            break
-        if stripped.startswith("//"):
-            found_comment = True
-            # Strip // prefix and optional space
-            text = stripped[2:]
-            if text.startswith(" "):
-                text = text[1:]
-            collected.append(text)
-        else:
-            break
-    result = "\n".join(collected)
-    # Skip BSP copyright blocks — noise, present in ~60-70% of modules
-    if "Copyright" in result:
-        return ""
-    if len(result) > max_chars:
-        result = result[:max_chars]
-    return result
+def _extract_header_comment(lines: list[str], max_chars: int = 500) -> str | None:
+    """Шапка модуля: первый блок //-комментариев, который НЕ является лицензией.
+
+    ``None`` — в начале модуля комментария нет; ``""`` — есть только блок лицензии (Copyright):
+    факт шапки хранится, текст лицензии — нет (шум в 60-70 % модулей). Блок-лицензия
+    пропускается, и берется СЛЕДУЮЩИЙ блок. Строки-маркеры ``++``/``--`` в НАЧАЛЕ блока —
+    служебные, не шапка: срезаются вместе с пустыми строками между ними, а блок из одних
+    маркеров пропускается, как лицензия. Строки ``#Если``/``#If`` между блоками поиск не
+    обрывают; ``#Область``/``#Region``, объявления, ``Перем`` и любой код — обрывают.
+    """
+    had_license = False
+    i, n = 0, len(lines)
+    while i < n:
+        s = lines[i].strip()
+        if not s:
+            i += 1
+            continue
+        low = s.lower()
+        if s.startswith("//"):
+            block: list[str] = []
+            while i < n and lines[i].strip().startswith("//"):
+                t = lines[i].strip()[2:]
+                block.append(t[1:] if t.startswith(" ") else t)
+                i += 1
+            text = "\n".join(block)
+            if _HEADER_LICENSE_MARK in text:
+                had_license = True
+                continue
+            k, marker = 0, False
+            while k < len(block):
+                if _HEADER_MARKER_RE.match(block[k]):
+                    marker = True
+                elif block[k].strip():
+                    break
+                k += 1
+            if marker:
+                if k == len(block):
+                    continue  # блок из одних маркеров — не шапка, как и лицензия
+                text = "\n".join(block[k:])
+            return text[:max_chars]
+        if low.startswith("#если") or low.startswith("#if"):
+            i += 1
+            continue
+        break  # #Область, объявление, Перем, &Директива, любой код — шапки дальше нет
+    return "" if had_license else None
 
 
 class FileResult(NamedTuple):
@@ -6393,12 +8119,16 @@ class FileResult(NamedTuple):
     mtime: float
     size: int
     methods: list[dict]
-    raw_calls: list[tuple[int, str, int]]
+    # (method_idx, callee_name, line, via, kind) — v17: via/kind см. _extract_calls_from_body
+    raw_calls: list[tuple[int, str, int, str | None, str | None]]
     movements: list[tuple[str, str, str]]  # (register_name, source, rel_path)
     regions: list[dict] = []
-    header_comment: str = ""
+    # None — шапки нет; '' — только лицензия (v17); иначе текст шапки.
+    header_comment: str | None = None
     # (object_ref, member_path, usage_kind, line) — reverse code-usages (v1.14.0)
     code_usages: tuple[tuple[str, str | None, str, int], ...] = ()
+    # v17: имя получателя обёртки запуска в тексте (``_has_launch_marker``); None — граф выключен.
+    launch_marker: bool | None = None
 
 
 _MOVEMENTS_INSERT_SQL = (
@@ -6549,15 +8279,37 @@ def _process_single_file(
         return None
 
     lines = content.splitlines()
-    methods = _parse_procedures_from_lines(lines)
+    line_states: list[bool] = []
+    masked = mask_comments_and_strings(lines, line_states=line_states)
+    methods = _parse_procedures_from_lines(lines, masked=masked)
 
-    raw_calls: list[tuple[int, str, int]] = []
+    raw_calls: list[tuple[int, str, int, str | None, str | None]] = []
+    launch_marker: bool | None = None
     if build_calls:
+        # v17: разбор запусков по имени — только в файлах с маркером (~5 % модулей ЕРП); контекст
+        # получателя обёртки — только у процедур с реальным совпадением вне строк/комментариев.
+        launch_marker = _has_launch_marker(content)
+        launch_plan = (
+            _module_launch_contexts(lines, methods, file_path, base_path, info, masked=masked)
+            if launch_marker
+            else None
+        )
+        target_locals = _launch_target_locals(methods, file_path, base_path, info, masked) if launch_plan else None
         for method_idx, method in enumerate(methods):
             start = method["line"]
             end = method["end_line"] if method["end_line"] else len(lines)
-            for callee_name, call_line in _extract_calls_from_body(lines, start, end):
-                raw_calls.append((method_idx, callee_name, call_line))
+            scan, ctx = launch_plan[method_idx] if launch_plan else (False, None)
+            for callee_name, call_line, via, kind in _extract_calls_from_body(
+                lines,
+                start,
+                end,
+                scan,
+                launch_receiver_context=ctx,
+                launch_target_local=target_locals(method) if scan and target_locals else None,
+                signature_tail=_signature_tail(method),
+                module_mask=(masked, line_states),
+            ):
+                raw_calls.append((method_idx, callee_name, call_line, via, kind))
 
     # In-band: extract register movements from Document modules (no extra I/O)
     rel_path = info.relative_path
@@ -6582,27 +8334,23 @@ def _process_single_file(
         regions,
         header_comment,
         code_usages,
+        launch_marker,
     )
 
 
 # ---------------------------------------------------------------------------
-# Regex-based role rights parsing (4x faster than ElementTree)
+# Role rights rows (XML разбирает bsl_xml_parsers.parse_rights_for_index)
 # ---------------------------------------------------------------------------
 # Both CF (Rights.xml) and EDT (.rights) use the same XML format:
 #   <object>
 #     <name>Category.ObjectName</name>
 #     <right><name>Read</name><value>true</value></right>
 #   </object>
-def _parse_role_rights_for_index(
-    content: str,
-    role_name: str,
-    file_path: str,
-) -> list[tuple[str, str, str, str]]:
-    """Parse role rights using ElementTree. Returns list of (role_name, object_name, right_name, file)."""
-    from rlm_tools_bsl.bsl_xml_parsers import parse_rights_xml
-
+def _role_rights_rows(granted: list[dict], role_name: str, file_path: str) -> list[tuple[str, str, str, str]]:
+    """Строки role_rights ``(role_name, object_name, right_name, file)`` из выданных прав
+    (форма ``parse_rights_xml``)."""
     results: list[tuple[str, str, str, str]] = []
-    for entry in parse_rights_xml(content):
+    for entry in granted:
         full_name = entry["object"]
         for right in entry["rights"]:
             results.append((role_name, full_name, right, file_path))
@@ -6675,8 +8423,9 @@ def _insert_role_flags(conn: sqlite3.Connection, data: "_RoleData") -> None:
 
 
 def _collect_role_data(base_path: str) -> _RoleData:
-    """Права, флаг ``setForNewObjects`` и исключения — за один проход по файлам прав."""
-    from rlm_tools_bsl.bsl_xml_parsers import parse_rights_meta
+    """Права, флаг ``setForNewObjects`` и исключения — за один проход по файлам прав и один разбор
+    каждого файла (``parse_rights_for_index``)."""
+    from rlm_tools_bsl.bsl_xml_parsers import parse_rights_for_index
 
     base = Path(base_path)
 
@@ -6700,18 +8449,17 @@ def _collect_role_data(base_path: str) -> _RoleData:
         except (OSError, UnicodeDecodeError):
             return _RoleData([], [], [])
         rel = f.relative_to(base).as_posix()
-        rights = _parse_role_rights_for_index(content, role_name, rel)
-        meta = parse_rights_meta(content)
-        flagged = bool(meta.get("set_for_new_objects"))
-        flags = [(role_name, 1 if flagged else 0, rel)]
-        exclusions: list[tuple[str, str, str, str]] = []
         # Исключения хранятся ТОЛЬКО у флагованных ролей: у обычной роли запись с
         # false означает просто «право не выдано», и таких на боевой конфигурации
         # сотни тысяч — таблица выросла бы на порядок без единого потребителя.
-        if flagged:
-            for entry in meta.get("exclusions") or []:
-                for right in entry.get("rights") or []:
-                    exclusions.append((role_name, entry["object"], right, rel))
+        # Поэтому парсер и считает их только у флагованной роли.
+        granted, flagged, denied = parse_rights_for_index(content)
+        rights = _role_rights_rows(granted, role_name, rel)
+        flags = [(role_name, 1 if flagged else 0, rel)]
+        exclusions: list[tuple[str, str, str, str]] = []
+        for entry in denied:
+            for right in entry.get("rights") or []:
+                exclusions.append((role_name, entry["object"], right, rel))
         return _RoleData(rights, flags, exclusions)
 
     all_rights: list[tuple[str, str, str, str]] = []
@@ -7363,6 +9111,108 @@ _FORM_ELEMENTS_INSERT = (
 
 
 # ---------------------------------------------------------------------------
+# Прогрев описателей полной сборки (холодный кеш файлов)
+# ---------------------------------------------------------------------------
+# Первое открытие файла после загрузки ОС или обновления антивирусных сигнатур (проверка при
+# доступе) стоит ~12 мс, повторное ~0,1 мс; пул потоков открывает холодные файлы вдесятеро быстрее
+# (замер на 8 тыс. XML документов ERP: 11,9 мс подряд против 1,2 мс в 16 потоков). Сборщик
+# метаданных открывает описатели по одному, и на ERP это десятки тысяч открытий. Прогрев читает
+# описатели пулом ВО ВРЕМЯ разбора BSL (тот упирается в GIL, а чтение его отпускает), и к фазе
+# метаданных файлы теплые. Только чтение и отбрасывание: на состав индекса прогрев не влияет.
+_PREFETCH_WORKERS = 16
+_PREFETCH_SUFFIXES = (".xml", ".mdo", ".form", ".rights")
+# Содержимое макетов CF (Templates/<Имя>/Ext/Template.xml) сборка не читает, а по объему это
+# большая часть XML выгрузки ERP (4,3 из 5,4 ГБ).
+_PREFETCH_SKIP_NAMES = frozenset({"template.xml"})
+
+
+def _prefetch_descriptor_paths(base: Path, stop: threading.Event | None = None):
+    """Описатели под ``base`` для прогрева: ``.xml``/``.mdo``/``.form``/``.rights``, кроме содержимого
+    макетов. Только ОБЫЧНЫЕ файлы (в том числе по ссылке на обычный файл): FIFO, устройство или
+    сокет с тем же расширением открывать нельзя — ``open()`` на FIFO без писателя блокируется
+    навсегда, и сборка не вернулась бы. В скрытые каталоги (``.git``, ``.settings``) и ссылки на
+    каталоги обход не заходит. ``stop`` проверяется на каждом каталоге."""
+    stack = [os.fspath(base)]
+    while stack:
+        if stop is not None and stop.is_set():
+            return
+        try:
+            with os.scandir(stack.pop()) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        subdirs: list[str] = []
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if not entry.name.startswith("."):
+                        subdirs.append(entry.path)
+                    continue
+                low = entry.name.lower()
+                if low.endswith(_PREFETCH_SUFFIXES) and low not in _PREFETCH_SKIP_NAMES and entry.is_file():
+                    yield entry.path
+            except OSError:
+                continue
+        stack.extend(reversed(subdirs))
+
+
+def _warm_file(path: str, stop: threading.Event | None = None) -> None:
+    """Прочитать файл порциями и отбросить; ``stop`` проверяется между порциями."""
+    try:
+        with open(path, "rb") as f:
+            while f.read(1 << 20):
+                if stop is not None and stop.is_set():
+                    return
+    except OSError:
+        pass
+
+
+class _DescriptorPrefetch:
+    """Фоновый прогрев описателей на время сборки. ``close()`` снимает невыполненное и дожидается
+    потоков: после возврата сборки ни один файл прогревом не открыт. Сбой прогрева сборку не
+    касается — это только оптимизация."""
+
+    def __init__(self, base_path: str) -> None:
+        self._stop = threading.Event()
+        self._slots = threading.BoundedSemaphore(_PREFETCH_WORKERS * 4)
+        self._pool = ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS, thread_name_prefix="rlm-prefetch")
+        self._walker = threading.Thread(
+            target=self._walk, args=(Path(base_path),), name="rlm-prefetch-walk", daemon=True
+        )
+        self._walker.start()
+
+    def _walk(self, base: Path) -> None:
+        try:
+            for path in _prefetch_descriptor_paths(base, self._stop):
+                # Очередь ограничена: обход не обгоняет чтение на десятки тысяч заданий.
+                while not self._slots.acquire(timeout=0.5):
+                    if self._stop.is_set():
+                        return
+                if self._stop.is_set():
+                    self._slots.release()
+                    return
+                try:
+                    self._pool.submit(self._warm, path)
+                except RuntimeError:  # пул уже закрыт
+                    self._slots.release()
+                    return
+        except Exception:
+            logger.debug("descriptor prefetch walk failed", exc_info=True)
+
+    def _warm(self, path: str) -> None:
+        try:
+            if not self._stop.is_set():
+                _warm_file(path, self._stop)
+        finally:
+            self._slots.release()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._walker.join()
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+
+# ---------------------------------------------------------------------------
 # IndexBuilder
 # ---------------------------------------------------------------------------
 class IndexBuilder:
@@ -7486,7 +9336,9 @@ class IndexBuilder:
             if type_ == "index":
                 conn.execute(f'DROP INDEX IF EXISTS "{name}"')
 
-    def _begin_inplace_rebuild(self, conn: sqlite3.Connection, opts: dict[str, bool]) -> None:
+    def _begin_inplace_rebuild(
+        self, conn: sqlite3.Connection, opts: dict[str, bool], *, defer_calls_indexes: bool = False
+    ) -> None:
         """In-place rebuild prologue (no unlink/rename → safe under an open RO reader on
         Windows). Order matters — covers the whole dangerous window:
           (a) ensure ``index_meta`` exists; (b) ``build_in_progress=1`` + intended build
@@ -7495,7 +9347,10 @@ class IndexBuilder:
               ``index_meta`` (FTS5-safe); (d) ``executescript(_SCHEMA_SQL)`` recreates
               empty tables; (e) DELETE stale meta keys (built_at/bsl_count/paths_hash/
               version/config_*) PRESERVING the marker + build options → strict-check can't
-              mistake a mid-fail for FRESH."""
+              mistake a mid-fail for FRESH.
+
+        ``defer_calls_indexes`` — схема без индексов ``calls`` (``_CALLS_INDEX_SQL``): их создает
+        вызывающий после массовой вставки, под тем же маркером ``build_in_progress``."""
         conn.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
         for key, flag in (
@@ -7510,7 +9365,7 @@ class IndexBuilder:
             )
         conn.commit()
         self._drop_all_objects_except_meta(conn)
-        conn.executescript(_SCHEMA_SQL)
+        conn.executescript(_SCHEMA_NO_CALLS_INDEX_SQL if defer_calls_indexes else _SCHEMA_SQL)
         placeholders = ",".join("?" * len(self._MARKER_PRESERVE_KEYS))
         conn.execute(
             f"DELETE FROM index_meta WHERE key NOT IN ({placeholders})",  # noqa: S608 — fixed-tuple
@@ -7532,17 +9387,36 @@ class IndexBuilder:
         already succeeds today; the commit is defensive against a future caller leaving a
         transaction open, NOT a fix for a current failure.) ANALYZE/VACUUM affect only
         size/planner, never data validity; ``except sqlite3.Error`` only (must not mask
-        KeyboardInterrupt/MemoryError). Marker cleared AFTER VACUUM = single success gate."""
+        KeyboardInterrupt/MemoryError). Marker cleared AFTER VACUUM = single success gate.
+
+        VACUUM — только когда свободных страниц не меньше ``_VACUUM_MIN_FREE_RATIO`` файла: он
+        переписывает весь файл (ERP — 2 ГБ), а после пересборки на месте страницы прежнего
+        содержимого заняты новым (замер ДО3: 0 свободных из 70 тыс. и в свежей сборке, и поверх
+        старой). Сборка с меньшим составом (меньше модулей, без графа) освобождает место — тогда
+        VACUUM идет, как прежде."""
         try:
             conn.commit()
         except sqlite3.Error as exc:
             logger.warning("finalize: pre-VACUUM commit failed (best-effort): %s", exc)
         for stmt in ("ANALYZE", "VACUUM"):
+            if stmt == "VACUUM" and not self._vacuum_worthwhile(conn):
+                continue
             try:
                 conn.execute(stmt)
             except sqlite3.Error as exc:
                 logger.warning("%s failed (best-effort): %s", stmt, exc)
         self._finish_inplace_rebuild(conn)
+
+    @staticmethod
+    def _vacuum_worthwhile(conn: sqlite3.Connection) -> bool:
+        """VACUUM освободит заметное место: доля свободных страниц не меньше порога; не удалось
+        узнать — да (прежнее поведение)."""
+        try:
+            pages = conn.execute("PRAGMA page_count").fetchone()[0]
+            free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        except sqlite3.Error:
+            return True
+        return pages > 0 and free >= pages * _VACUUM_MIN_FREE_RATIO
 
     def build(
         self,
@@ -7631,9 +9505,14 @@ class IndexBuilder:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path))
         try:
-            return self._build_into_conn(
-                conn, base_path, db_path, build_calls, build_metadata, build_fts, build_synonyms
-            )
+            # Описатели прогреваются в фоне, пока идет разбор BSL (см. _DescriptorPrefetch).
+            prefetch = _DescriptorPrefetch(base_path)
+            try:
+                return self._build_into_conn(
+                    conn, base_path, db_path, build_calls, build_metadata, build_fts, build_synonyms
+                )
+            finally:
+                prefetch.close()
         finally:
             conn.close()
 
@@ -7658,6 +9537,9 @@ class IndexBuilder:
         }
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # Кеш страниц на время сборки (соединение закрывает вызывающий): со штатными ~2 МБ вставка
+        # миллионов строк вызовов упирается в промахи по B-деревьям (ДО3: 9,9 с → 3,4 с).
+        conn.execute(f"PRAGMA cache_size=-{_BUILD_CACHE_KIB}")
 
         logger.info("Building method index for %s -> %s", base_path, db_path)
         t0 = time.time()
@@ -7748,9 +9630,10 @@ class IndexBuilder:
 
         # Write to SQLite — in-place: set the build_in_progress marker + clear the schema
         # before populating (conn is opened AND closed by the caller — M1 try/finally).
-        self._begin_inplace_rebuild(conn, opts)
+        self._begin_inplace_rebuild(conn, opts, defer_calls_indexes=True)
 
         self._bulk_insert(conn, results, build_calls)
+        conn.executescript(_CALLS_INDEX_SQL)
         self._refresh_call_resolution_stats(conn)
 
         # Level-1 metadata: Configuration XML
@@ -8038,9 +9921,15 @@ class IndexBuilder:
         # event_subscriptions.source_type_sets, role_flags, common_module_props,
         # constants, templates и declared_register_records остались бы пустыми, и
         # `index info` отрапортовал бы успех.
+        #
+        # v17 — две колонки `calls` (callee_via, call_kind) и новые рёбра/ключи графа
+        # (уровень manager, члены цепочки, запуски по имени); плюс содержимое `methods`
+        # (сигнатуры длиннее 20 строк), `module_headers` (шапка под лицензией) и
+        # `metadata_references` (типы параметров команд объектов EDT), которое инкрементом
+        # не перечитывается: нетронутые модули и XML дельта полного скана не видит.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 16:
+        if old_version < 17:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -8264,6 +10153,10 @@ class IndexBuilder:
                 for r in results
                 if r.info.category == "CommonModules" and r.info.module_type == "Module" and r.info.object_name
             }
+            # v17: то же для уровня manager — пары (категория, casefold(объект)) модулей
+            # менеджеров дельты. Оба перехода неоднозначности (появился второй модуль /
+            # исчез) покрываются этим же множеством.
+            changed_managers: set[tuple[str, str]] = _changed_manager_pairs(results)
 
             with conn:
                 # Delete old data for removed + changed
@@ -8275,16 +10168,7 @@ class IndexBuilder:
                     # needed when calls are built; chunk to stay under the SQLite
                     # variable limit (like the metadata_code_usages delete below).
                     if build_calls and removed_ids:
-                        for chunk in _chunked(removed_ids):
-                            ph = ",".join("?" * len(chunk))
-                            for row in conn.execute(
-                                f"SELECT object_name FROM modules WHERE id IN ({ph}) "  # noqa: S608
-                                "AND category='CommonModules' AND module_type='Module' "
-                                "AND object_name IS NOT NULL",
-                                chunk,
-                            ):
-                                old_name = row[0] if not isinstance(row, sqlite3.Row) else row["object_name"]
-                                changed_common_cf.add(old_name.casefold())
+                        _collect_removed_resolution_targets(conn, removed_ids, changed_common_cf, changed_managers)
                     for chunk in _chunked(removed_ids):
                         placeholders = ",".join("?" * len(chunk))
                         try:
@@ -8329,9 +10213,9 @@ class IndexBuilder:
                 self._ensure_callee_key_column(conn)
                 self._bulk_insert(conn, results, build_calls)
                 # Re-resolve qualified callee_key on unchanged callers of common
-                # modules touched by this delta (keeps update ≡ build).
+                # modules / manager modules touched by this delta (keeps update ≡ build).
                 if build_calls:
-                    self._reresolve_qualified_callers(conn, changed_common_cf)
+                    self._reresolve_qualified_callers(conn, changed_common_cf, changed_managers)
                 self._refresh_call_resolution_stats(conn)
 
                 # Update FTS for newly inserted methods
@@ -8389,6 +10273,22 @@ class IndexBuilder:
                     "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                     ("built_at", str(time.time())),
                 )
+
+        # v17: фоновые рёбра зависят и от ОПИСАТЕЛЕЙ (реквизит формы/объекта, предопределённый
+        # элемент затеняют голову обёртки или делают переменную-адресат нелокальной) — при
+        # неизменном BSL. Дельта описателей — по снимку file_paths (размер и mtime каждого
+        # .xml/.mdo, он еще прежний: пересобирается ниже из тех же свежих строк); у `.form` EDT
+        # снимка нет, такие формы перепроверяются всегда. В обоих случаях — только модули с
+        # маркером запуска. Гейт — build-опция графа, а не has_metadata: контекст читается живьём.
+        fresh_file_paths: list[tuple] | None = None
+        if build_calls:
+            fresh_file_paths = _collect_file_paths(base_path)
+            with conn:
+                self._ensure_callee_key_column(conn)
+                owners = _descriptor_delta_owners(conn, fresh_file_paths)
+                launch_mods = _launch_context_dependent_modules(conn, owners, set(to_add), untracked_forms=True)
+                if _refresh_launch_rows(conn, base_path, launch_mods):
+                    self._refresh_call_resolution_stats(conn)
 
         # Refresh Level-1 metadata (config version may have changed)
         config_meta = _parse_configuration_meta(base_path)
@@ -8573,7 +10473,7 @@ class IndexBuilder:
                     pass
 
         # Refresh file_paths (full rebuild — cheap for 30-50K files)
-        file_paths_rows = _collect_file_paths(base_path)
+        file_paths_rows = fresh_file_paths if fresh_file_paths is not None else _collect_file_paths(base_path)
         # Ensure table exists (schema upgrade v4→v5)
         conn.executescript(
             "CREATE TABLE IF NOT EXISTS file_paths ("
@@ -8788,6 +10688,8 @@ class IndexBuilder:
                 for r in results
                 if r.info.category == "CommonModules" and r.info.module_type == "Module" and r.info.object_name
             }
+            # v17: пары (категория, casefold(объект)) модулей менеджеров дельты — уровень manager.
+            changed_managers: set[tuple[str, str]] = _changed_manager_pairs(results)
 
             with conn:
                 if to_remove:
@@ -8798,16 +10700,7 @@ class IndexBuilder:
                     # needed when calls are built; chunk to stay under the SQLite
                     # variable limit (like the metadata_code_usages delete below).
                     if build_calls and removed_ids:
-                        for chunk in _chunked(removed_ids):
-                            ph = ",".join("?" * len(chunk))
-                            for row in conn.execute(
-                                f"SELECT object_name FROM modules WHERE id IN ({ph}) "  # noqa: S608
-                                "AND category='CommonModules' AND module_type='Module' "
-                                "AND object_name IS NOT NULL",
-                                chunk,
-                            ):
-                                old_name = row[0] if not isinstance(row, sqlite3.Row) else row["object_name"]
-                                changed_common_cf.add(old_name.casefold())
+                        _collect_removed_resolution_targets(conn, removed_ids, changed_common_cf, changed_managers)
                     for chunk in _chunked(removed_ids):
                         placeholders = ",".join("?" * len(chunk))
                         try:
@@ -8850,9 +10743,9 @@ class IndexBuilder:
                 self._ensure_callee_key_column(conn)
                 self._bulk_insert(conn, results, build_calls)
                 # Re-resolve qualified callee_key on unchanged callers of common
-                # modules touched by this delta (keeps update ≡ build).
+                # modules / manager modules touched by this delta (keeps update ≡ build).
                 if build_calls:
-                    self._reresolve_qualified_callers(conn, changed_common_cf)
+                    self._reresolve_qualified_callers(conn, changed_common_cf, changed_managers)
                 self._refresh_call_resolution_stats(conn)
 
                 if has_fts and results:
@@ -8892,6 +10785,18 @@ class IndexBuilder:
                     new_movements, _dropped = _movement_rows_for_insert(results, known_registers)
                     if new_movements:
                         conn.executemany(_MOVEMENTS_INSERT_SQL, new_movements)
+
+        # v17: фоновые рёбра модулей, чей ОПИСАТЕЛЬ (форма, объект, предопределённые) изменился
+        # при неизменном BSL: владелец находится по пути изменённого описателя (в том числе
+        # `.form`, которого нет в наборе метаданных-триггеров). Гейт — build-опция графа.
+        if build_calls:
+            owners = _launch_descriptor_owners(git_changed)
+            if owners[0] or owners[1]:
+                with conn:
+                    self._ensure_callee_key_column(conn)
+                    launch_mods = _launch_context_dependent_modules(conn, owners, set(to_add))
+                    if _refresh_launch_rows(conn, base_path, launch_mods):
+                        self._refresh_call_resolution_stats(conn)
 
         # --- Update bsl_count, paths_hash, built_at ---
         stored_count_row = conn.execute("SELECT value FROM index_meta WHERE key = 'bsl_count'").fetchone()
@@ -9210,6 +11115,10 @@ class IndexBuilder:
         it), so the column exists on every real v14 DB. This guard mirrors the
         defensive ``CREATE TABLE IF NOT EXISTS`` pattern used elsewhere and keeps
         the incremental INSERT from failing should a malformed DB slip through.
+
+        v17: та же защита для ``callee_via`` / ``call_kind`` и частичного индекса
+        ``idx_calls_by_name`` — одноимённая, но неполная база не должна ронять
+        инкрементальный INSERT шестью колонками; и для ``modules.launch_marker``.
         """
         try:
             cols = conn.execute("PRAGMA table_info(calls)").fetchall()
@@ -9217,6 +11126,18 @@ class IndexBuilder:
             if "callee_key" not in names:
                 conn.execute("ALTER TABLE calls ADD COLUMN callee_key TEXT")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_callee_key ON calls(callee_key)")
+            if "callee_via" not in names:
+                conn.execute("ALTER TABLE calls ADD COLUMN callee_via TEXT")
+            if "call_kind" not in names:
+                conn.execute("ALTER TABLE calls ADD COLUMN call_kind TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_calls_by_name ON calls(call_kind) "
+                "WHERE call_kind IN ('background', 'background_dynamic')"
+            )
+            mod_cols = conn.execute("PRAGMA table_info(modules)").fetchall()
+            mod_names = {(c[1] if not isinstance(c, sqlite3.Row) else c["name"]) for c in mod_cols}
+            if mod_cols and "launch_marker" not in mod_names:
+                conn.execute("ALTER TABLE modules ADD COLUMN launch_marker INTEGER")
         except sqlite3.OperationalError:
             pass
 
@@ -9282,7 +11203,11 @@ class IndexBuilder:
         )
 
     @staticmethod
-    def _reresolve_qualified_callers(conn: sqlite3.Connection, changed_common_cf: set[str] | None) -> int:
+    def _reresolve_qualified_callers(
+        conn: sqlite3.Connection,
+        changed_common_cf: set[str] | None,
+        changed_managers: set[tuple[str, str]] | None = None,
+    ) -> int:
         """Re-resolve ``callee_key`` of qualified ``A.B`` edges against current DB.
 
         The incremental update only re-resolves edges of REPROCESSED modules, so a
@@ -9294,27 +11219,50 @@ class IndexBuilder:
         ``changed_common_cf`` — casefolded names of common modules touched by the
         delta; only edges ``A.B`` with ``A`` in this set are recomputed. ``None`` =
         GLOBAL mode (every qualified edge), for the one-time legacy migration. An
-        empty set is a no-op (returns 0). Returns the number of updated edges.
+        empty set is a no-op for this tier. Returns the number of updated edges.
+
+        v17 — второй уровень, ``manager``: строки ``callee_via IS NOT NULL``, чья пара
+        ``(callee_via, casefold(X))`` входит в ``changed_managers`` (модуль менеджера появился,
+        исчез, перечитан; ``None`` — все). Уровень общих модулей пересчитывает только строки
+        ``callee_via IS NULL AND (call_kind IS NULL OR call_kind='background')``: иначе он
+        обнулил бы ключи менеджеров и «разрешил» бы члены цепочки.
 
         A correctness-first single scan (not ``LIKE 'A.%'``): the resolver matches
         module names via ``casefold()``, but LIKE/NOCASE does not fold Cyrillic, so an
         indexed prefix would miss differently-cased callers and break ``update ≡ build``.
         """
-        if changed_common_cf is not None and not changed_common_cf:
+        common_off = changed_common_cf is not None and not changed_common_cf
+        mgr_off = changed_managers is not None and not changed_managers
+        if common_off and mgr_off:
             return 0
-        common = _build_common_exported(conn)
         updates: list[tuple[str | None, int]] = []
-        # Positional access (row[i]) — works for both sqlite3.Row and tuple
-        # factories, and ``rowid`` is not always addressable by name.
-        for row in conn.execute("SELECT rowid, callee_name, callee_key FROM calls WHERE instr(callee_name,'.')>0"):
-            rowid, callee_name, stored = row[0], row[1], row[2]
-            a, _, b = callee_name.partition(".")
-            if changed_common_cf is not None and a.casefold() not in changed_common_cf:
-                continue
-            rel = common.get((a.casefold(), b.casefold()))
-            new_key = _make_callee_key(rel, b) if rel else None
-            if new_key != stored:
-                updates.append((new_key, rowid))
+        if not common_off:
+            common = _build_common_exported(conn)
+            # Positional access (row[i]) — works for both sqlite3.Row and tuple
+            # factories, and ``rowid`` is not always addressable by name.
+            for row in conn.execute(
+                "SELECT rowid, callee_name, callee_key FROM calls WHERE instr(callee_name,'.')>0 "
+                "AND callee_via IS NULL AND (call_kind IS NULL OR call_kind='background')"
+            ):
+                rowid, callee_name, stored = row[0], row[1], row[2]
+                a, _, b = callee_name.partition(".")
+                if changed_common_cf is not None and a.casefold() not in changed_common_cf:
+                    continue
+                rel = common.get((a.casefold(), b.casefold()))
+                new_key = _make_callee_key(rel, b) if rel else None
+                if new_key != stored:
+                    updates.append((new_key, rowid))
+        if not mgr_off:
+            managers = _build_manager_modules(conn)
+            for row in conn.execute(
+                "SELECT rowid, callee_name, callee_key, callee_via FROM calls WHERE callee_via IS NOT NULL"
+            ):
+                rowid, name, stored, via = row[0], row[1], row[2], row[3]
+                if changed_managers is not None and (via, name.partition(".")[0].casefold()) not in changed_managers:
+                    continue
+                new_key = _manager_callee_key(managers, via, name)
+                if new_key != stored:
+                    updates.append((new_key, rowid))
         if updates:
             conn.executemany("UPDATE calls SET callee_key=? WHERE rowid=?", updates)
         return len(updates)
@@ -9417,35 +11365,29 @@ class IndexBuilder:
                     1 if r.info.is_form_module else 0,
                     r.mtime,
                     r.size,
+                    None if r.launch_marker is None else int(r.launch_marker),
                 )
             )
 
         conn.executemany(
             "INSERT OR REPLACE INTO modules "
-            "(rel_path, category, object_name, module_type, form_name, is_form, mtime, size) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(rel_path, category, object_name, module_type, form_name, is_form, mtime, size, launch_marker) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             module_rows,
         )
 
-        # Build rel_path -> module_id map
+        # rel_path -> module_id (sqlite3 without row_factory returns tuples (id, rel_path))
         path_to_id: dict[str, int] = {}
         for row in conn.execute("SELECT id, rel_path FROM modules"):
-            path_to_id[row[0] if isinstance(row, tuple) else row["rel_path"]] = (
-                row[1] if isinstance(row, tuple) else row["id"]
-            )
-        # Fix: sqlite3 without row_factory returns tuples (id, rel_path)
-        path_to_id_fixed: dict[str, int] = {}
-        for row in conn.execute("SELECT id, rel_path FROM modules"):
             if isinstance(row, sqlite3.Row):
-                path_to_id_fixed[row["rel_path"]] = row["id"]
+                path_to_id[row["rel_path"]] = row["id"]
             else:
-                path_to_id_fixed[row[1]] = row[0]
-        path_to_id = path_to_id_fixed
+                path_to_id[row[1]] = row[0]
 
-        # Insert methods and collect method IDs for calls
+        # Insert methods; calls map method_idx -> method_id below
         method_rows: list[tuple] = []
-        # We need to track method insertions to map method_idx -> method_id for calls
-        call_pending: list[tuple[str, int, str, int]] = []  # (rel_path, method_idx, callee, line)
+        # Копия миллионов вызовов не нужна: строки calls собираются из r.raw_calls ниже.
+        has_calls = False
 
         for r in results:
             mod_id = path_to_id.get(r.info.relative_path)
@@ -9464,9 +11406,8 @@ class IndexBuilder:
                         method.get("loc"),
                     )
                 )
-            if build_calls:
-                for method_idx, callee_name, call_line in r.raw_calls:
-                    call_pending.append((r.info.relative_path, method_idx, callee_name, call_line))
+            if build_calls and r.raw_calls:
+                has_calls = True
 
         conn.executemany(
             "INSERT OR REPLACE INTO methods "
@@ -9476,7 +11417,7 @@ class IndexBuilder:
         )
 
         # Insert calls — need to resolve method_idx to method_id
-        if build_calls and call_pending:
+        if has_calls:
             # Module ids of the CURRENT batch (the only callers we resolve here).
             # NOTE: path_to_id spans the WHOLE DB, so take ids from ``results``.
             batch_ids = [path_to_id[r.info.relative_path] for r in results if r.info.relative_path in path_to_id]
@@ -9506,13 +11447,16 @@ class IndexBuilder:
                     mid, modid = row[0], row[1]
                 methods_by_module.setdefault(modid, []).append(mid)
 
-            # Resolution lookups. Two provably-safe tiers only:
+            # Resolution lookups. Provably-safe tiers only:
             #   local           — bare ``B()`` → a method of the caller's own module
             #                      (caller ∈ batch, so batch-local lookup suffices)
             #   common_exported — ``A.B()`` → an exported method of common module A
             #                      (target may be in an UNCHANGED module → whole-DB)
-            # Object/manager qualified calls (Справочники.X.Метод / Объект.Метод)
-            # are intentionally NOT resolved (ambiguous variable/manager method).
+            #   manager (v17)   — ``Коллекция.X.Метод()`` (via задан) → модуль менеджера X:
+            #                      реальный путь либо синтетический ``/<Кат>/<X>/ManagerModule.bsl``
+            #                      (модуля нет или их несколько) — см. _manager_callee_key.
+            # Variable/value calls (``Объект.Метод``) are intentionally NOT resolved;
+            # ``member`` (``Выражение.Член.Метод``) is never resolved.
             # Value ``None`` marks an ambiguous key (multiple candidates) → NULL.
             local_lookup: dict[tuple[int, str], str | None] = {}
             if narrow:
@@ -9537,8 +11481,17 @@ class IndexBuilder:
                 local_lookup[lk] = None if lk in local_lookup else rel_path
 
             common_exported = _build_common_exported(conn)
+            # Модули менеджеров — после вставки modules: модули текущего батча уже в таблице.
+            managers = _build_manager_modules(conn)
 
-            def _resolve_callee_key(caller_module_id: int, callee: str) -> str | None:
+            def _resolve_callee_key(
+                caller_module_id: int, callee: str, via: str | None, kind: str | None
+            ) -> str | None:
+                if kind in ("member", "background_dynamic"):
+                    return None
+                if via:
+                    # Коллекция.X.Метод — уровень manager ПЕРВЫМ.
+                    return _manager_callee_key(managers, via, callee)
                 if "." in callee:
                     # Qualified A.B — only common-exported is safe to resolve.
                     a, _, b = callee.partition(".")
@@ -9548,24 +11501,25 @@ class IndexBuilder:
                 rel = local_lookup.get((caller_module_id, callee.casefold()))
                 return _make_callee_key(rel, callee) if rel else None
 
-            call_rows: list[tuple] = []
-            for r in results:
-                mod_id = path_to_id.get(r.info.relative_path)
-                if mod_id is None:
-                    continue
-                method_ids = methods_by_module.get(mod_id, [])
+            def _call_rows():
+                # Генератор, а не список: миллионы строк не держатся в памяти второй раз.
+                for r in results:
+                    mod_id = path_to_id.get(r.info.relative_path)
+                    if mod_id is None:
+                        continue
+                    method_ids = methods_by_module.get(mod_id, [])
 
-                for method_idx, callee_name, call_line in r.raw_calls:
-                    if method_idx < len(method_ids):
-                        caller_method_id = method_ids[method_idx]
-                        callee_key = _resolve_callee_key(mod_id, callee_name)
-                        call_rows.append((caller_method_id, callee_name, call_line, callee_key))
+                    for method_idx, callee_name, call_line, via, kind in r.raw_calls:
+                        if method_idx < len(method_ids):
+                            caller_method_id = method_ids[method_idx]
+                            callee_key = _resolve_callee_key(mod_id, callee_name, via, kind)
+                            yield (caller_method_id, callee_name, call_line, callee_key, via, kind)
 
-            if call_rows:
-                conn.executemany(
-                    "INSERT INTO calls (caller_id, callee_name, line, callee_key) VALUES (?, ?, ?, ?)",
-                    call_rows,
-                )
+            conn.executemany(
+                "INSERT INTO calls (caller_id, callee_name, line, callee_key, callee_via, call_kind) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                _call_rows(),
+            )
 
         # Insert regions and module_headers
         region_rows: list[tuple] = []
@@ -9576,7 +11530,7 @@ class IndexBuilder:
                 continue
             for reg in r.regions:
                 region_rows.append((mod_id, reg["name"], reg["line"], reg["end_line"]))
-            if r.header_comment:
+            if r.header_comment is not None:
                 header_rows.append((mod_id, r.header_comment))
 
         if region_rows:
@@ -9891,6 +11845,8 @@ class IndexReader:
         # resolution). Returning None makes the comparison NULL (row excluded),
         # which is the correct semantics.
         self._conn.create_function("py_lower", 1, lambda s: s.lower() if s is not None else None)
+        # v17: casefold-префикс пути вызывающего у аудита адресатов — тот же предикат, что у хелпера.
+        self._conn.create_function("py_casefold", 1, lambda s: s.casefold() if s is not None else None)
         # Capability check (Phase B): a v13 DB opened read-only BEFORE a
         # background rebuild has no calls.callee_key column. Probe once and gate
         # the exact (resolved) call-graph mode on it — otherwise get_callers must
@@ -9906,13 +11862,33 @@ class IndexReader:
         # SELECT-ов, хотя база уже v16, — осознанный размен против чтения
         # index_meta в каждом горячем маршруте; граница названа в HELPERS.md.
         self._builder_version = self._probe_builder_version()
+        # v17: те же однократные пробы для колонок вида ребра и build-опции графа.
+        # has_calls читается из index_meta, а не из непустоты calls: пустой, но
+        # включённый граф допустим (в корректной конфигурации вызовов может не быть).
+        self._has_call_kind = self._probe_calls_column("call_kind")
+        self._has_callee_via = self._probe_calls_column("callee_via")
+        self._has_calls_built = self._probe_calls_built()
         # Кеш раскрытия определяемых типов (см. _defined_type_members).
         self._defined_type_cache: dict[str, list[str] | None] = {}
+        # v17: (снимок поколения, число запусков без статического ребра) — см.
+        # count_unresolved_launches; живёт ровно одно стабильное поколение.
+        self._unresolved_launches: tuple | None = None
 
     def _probe_callee_key(self) -> bool:
+        return self._probe_calls_column("callee_key")
+
+    def _probe_calls_column(self, column: str) -> bool:
         try:
             cols = self._conn.execute("PRAGMA table_info(calls)").fetchall()
-            return any(c["name"] == "callee_key" for c in cols)
+            return any(c["name"] == column for c in cols)
+        except sqlite3.Error:
+            return False
+
+    def _probe_calls_built(self) -> bool:
+        """build-опция графа: только точное ``'1'`` означает включённый граф."""
+        try:
+            row = self._conn.execute("SELECT value FROM index_meta WHERE key = 'has_calls'").fetchone()
+            return bool(row) and row["value"] == "1"
         except sqlite3.Error:
             return False
 
@@ -9936,6 +11912,366 @@ class IndexReader:
     def has_declared_composition(self) -> bool:
         """v16-таблицы и колонки объявленного состава доступны."""
         return self._builder_version >= 16
+
+    @_transient_safe(lambda: None)
+    def count_unresolved_launches(self) -> int | None:
+        """Число запусков по имени без статического адресата; ``None`` — канал недоступен/транзиентен.
+
+        Сырые строки ``background_dynamic``: вычисляемые имена, литералы неподдержанной формы и
+        недоказанный контекст получателя обёртки — это кандидаты без доказанного ребра, а не
+        число причин ``dynamic_name`` аудита. Считается ОДИН раз на стабильное поколение
+        (``data_version``/``built_at``/``base_path``); запрос идёт по частичному индексу
+        ``idx_calls_by_name`` — терм ``IN`` совпадает с его ``WHERE`` дословно, иначе планировщик
+        индекс не возьмёт. Транзиентный ноль (идёт сборка) не кешируется."""
+        if not self.has_call_audit:
+            return None
+
+        def _stamp(cap: dict | None) -> tuple | None:
+            if cap is None or cap.get("build_in_progress") not in (None, "0"):
+                return None
+            if cap.get("has_calls", self._has_calls_built) is not True:
+                return None
+            return tuple(cap.get(k) for k in ("data_version", "built_at", "base_path"))
+
+        before = _stamp(self.get_build_capabilities())  # вне self._lock: он не реентерабельный
+        if before is None:
+            return None
+        with self._lock:
+            cached = self._unresolved_launches
+            if cached is not None and cached[0] == before:
+                total = cached[1]
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM calls WHERE call_kind IN ('background', 'background_dynamic') "
+                    "AND call_kind = 'background_dynamic'"
+                ).fetchone()
+                total = int(row[0]) if row else 0
+        if _stamp(self.get_build_capabilities()) != before:
+            return None
+        with self._lock:
+            self._unresolved_launches = (before, total)
+        return total
+
+    @_transient_safe(lambda: None)
+    def is_launch_target(self, target_key: str) -> bool | None:
+        """Может ли цель ``<rel_path>::метод`` быть адресатом запуска по имени (v1.42.0).
+
+        Только экспортный метод модуля, который адресует запуск: общего (``"Модуль.Метод"``),
+        менеджера (``"Справочники.X.Метод"``) и модуля объекта обработки или отчета — литерал БСП
+        ``"Обработка.X.МодульОбъекта.Метод"`` (граф его не разрешает: он среди запусков без
+        статического адресата). Обработчик события формы или объекта, неэкспортный метод — ``False``:
+        число запусков без адресата к их нулю вызывающих отношения не имеет. ``None`` — модуль не
+        найден или сбой чтения."""
+        rel, sep, method_cf = target_key.rpartition("::")
+        if not sep:
+            return None
+        with self._lock:
+            mod = self._conn.execute(
+                "SELECT id, category, module_type FROM modules WHERE rel_path = ?", (rel,)
+            ).fetchone()
+            if mod is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT name, is_export FROM methods WHERE module_id = ?", (mod["id"],)
+            ).fetchall()
+        cat, mtype = mod["category"], mod["module_type"]
+        if not (
+            (cat == "CommonModules" and mtype == "Module")
+            or mtype == "ManagerModule"
+            or (cat in ("DataProcessors", "Reports") and mtype == "ObjectModule")
+        ):
+            return False
+        return any(bool(r["is_export"]) for r in rows if str(r["name"]).casefold() == method_cf)
+
+    # --- v17: аудит адресатов (find_unresolved_calls) --------------------------------
+    # Методы, читающие строки `calls`, гейтятся `has_call_audit`; каталог адресатов и контекст
+    # затенения — НЕТ: они нужны живому аудиту расширений и на v16, и при --no-calls.
+
+    @_transient_safe(lambda: None)
+    def get_call_audit_catalog(self) -> dict | None:
+        """Слой 'main' для классификатора: общие модули, модули менеджеров, объекты.
+
+        ``objects`` — из ``file_paths`` по тем же поддерживаемым раскладкам, что у
+        ``_find_metadata_xml``/``_iter_metadata_xml_files``: CF ``<Кат>/<Имя>.xml`` (глубина 2),
+        CF ``<Кат>/<Имя>/Ext/<Hint>.xml`` (глубина 4, кроме ``Predefined.xml``), EDT
+        ``<Кат>/<Имя>/<Имя>.mdo`` (глубина 3); плюс пары (категория, объект) из ``modules``.
+        Пустой ``file_paths`` — ``objects=None`` (существование объекта без модулей недоказуемо),
+        но известные модули сохраняются. ``None`` вместо всего результата — сбой чтения."""
+        allowed = set(_CALL_MANAGER_COLLECTIONS.values())
+        with self._lock:
+            mod_rows = self._conn.execute(
+                "SELECT mod.rel_path, mod.category, mod.object_name, mod.module_type, me.name, me.is_export "
+                "FROM modules mod LEFT JOIN methods me ON me.module_id = mod.id "
+                "WHERE mod.object_name IS NOT NULL AND ((mod.category = 'CommonModules' AND mod.module_type = 'Module') "
+                "OR mod.module_type = 'ManagerModule')"
+            ).fetchall()
+            fp_rows = self._conn.execute(
+                "SELECT rel_path, depth FROM file_paths WHERE depth IN (2, 3, 4) AND extension IN ('.xml', '.mdo')"
+            ).fetchall()
+            fp_any = self._conn.execute("SELECT 1 FROM file_paths LIMIT 1").fetchone()
+            obj_rows = self._conn.execute(
+                "SELECT DISTINCT category, object_name FROM modules WHERE object_name IS NOT NULL AND category IS NOT NULL"
+            ).fetchall()
+        common: dict[str, dict] = {}
+        managers: dict[tuple[str, str], dict] = {}
+        for r in mod_rows:
+            rel, cat, obj, mtype, mname, exp = r[0], r[1], r[2], r[3], r[4], r[5]
+            if mtype == "ManagerModule":
+                if not cat:
+                    continue
+                entry = managers.setdefault((cat, obj.casefold()), {"paths": [], "methods": {}})
+            else:
+                entry = common.setdefault(obj.casefold(), {"paths": [], "methods": {}})
+            if rel not in entry["paths"]:
+                entry["paths"].append(rel)
+            if mname is not None:
+                m_cf = mname.casefold()
+                entry["methods"][m_cf] = entry["methods"].get(m_cf, False) or bool(exp)
+        objects: set[tuple[str, str]] | None = None
+        if fp_any is not None:
+            objects = set()
+            for r in fp_rows:
+                parts = str(r[0]).split("/")
+                if not parts or parts[0] not in allowed:
+                    continue
+                depth = r[1]
+                if depth == 2 and parts[1].lower().endswith(".xml"):
+                    objects.add((parts[0], parts[1][:-4].casefold()))
+                elif depth == 3 and parts[2].casefold() == f"{parts[1]}.mdo".casefold():
+                    objects.add((parts[0], parts[1].casefold()))
+                elif (
+                    depth == 4
+                    and parts[2] == "Ext"
+                    and parts[3].lower().endswith(".xml")
+                    and parts[3].lower() != "predefined.xml"
+                ):
+                    objects.add((parts[0], parts[1].casefold()))
+            for r in obj_rows:
+                if r[0] in allowed:
+                    objects.add((r[0], str(r[1]).casefold()))
+        return {"common_modules": common, "manager_modules": managers, "objects": objects}
+
+    def _path_clause(self, path: str) -> tuple[str, list]:
+        """Фильтр файла ВЫЗЫВАЮЩЕГО: casefold-префикс (тот же предикат, что у хелпера)."""
+        if not path:
+            return "", []
+        prefix = path.casefold()
+        return " AND substr(py_casefold(mod.rel_path), 1, ?) = ?", [len(prefix), prefix]
+
+    @_transient_safe(lambda: None)
+    def scan_unresolved_calls(
+        self,
+        module_names_cf: set[str],
+        collect_unknown: bool = False,
+        ambiguous_module_names_cf: set[str] | None = None,
+        path: str = "",
+    ) -> dict | None:
+        """ОДИН проход по ``calls`` без via: кандидаты + непроверенные головы.
+
+        Кандидат — прямой квалифицированный вызов (``call_kind IS NULL``), голова которого
+        (casefold) — имя общего модуля, и ``callee_key IS NULL`` ЛИБО голова в
+        ``ambiguous_module_names_cf``. ``unknown_receivers`` — прямой ``A.B`` с головой ВНЕ этих
+        имён, кроме самих запускателей (они учтены как запуски): удалённый модуль либо метод
+        значения — тип не доказан. ``unqualified`` — голые вызовы; ``value_methods`` — члены
+        цепочки. Счётчик неизвестных считается всегда, список — только при ``collect_unknown``."""
+        if not self.has_call_audit:
+            return None
+        ambiguous = ambiguous_module_names_cf or set()
+        clause, params = self._path_clause(path)
+        if clause:
+            sql = (
+                "SELECT c.caller_id, c.callee_name, c.line, c.call_kind, c.callee_key FROM calls c "
+                "JOIN methods m ON m.id = c.caller_id JOIN modules mod ON mod.id = m.module_id "
+                "WHERE c.callee_via IS NULL AND (c.call_kind IS NULL OR c.call_kind = 'member')" + clause
+            )
+        else:
+            sql = (
+                "SELECT caller_id, callee_name, line, call_kind, callee_key FROM calls "
+                "WHERE callee_via IS NULL AND (call_kind IS NULL OR call_kind = 'member')"
+            )
+        candidates: list[dict] = []
+        unknown: list[dict] = []
+        unknown_count = unqualified = value_methods = 0
+        with self._lock:
+            for caller_id, name, line, kind, key in self._conn.execute(sql, params):
+                if kind == "member":
+                    value_methods += 1
+                    continue
+                head, dot, _rest = name.partition(".")
+                if not dot:
+                    if name:
+                        unqualified += 1
+                    continue
+                head_cf = head.casefold()
+                if head_cf in module_names_cf:
+                    if key is None or head_cf in ambiguous:
+                        candidates.append(
+                            {"caller_id": caller_id, "callee_name": name, "line": line, "callee_key": key}
+                        )
+                    continue
+                if name.casefold() in _BACKGROUND_LAUNCHER_CALLS_CF:
+                    continue
+                unknown_count += 1
+                if collect_unknown:
+                    unknown.append({"caller_id": caller_id, "callee_name": name, "line": line})
+        return {
+            "candidates": candidates,
+            "unknown_receivers": unknown,
+            "unknown_receiver_count": unknown_count,
+            "unqualified": unqualified,
+            "value_methods": value_methods,
+        }
+
+    @_transient_safe(lambda: None)
+    def get_manager_calls(self) -> list[dict] | None:
+        """Прямые вызовы через коллекцию менеджера. Запуски с ``callee_via`` читает
+        ``get_launch_calls``: иначе одно фоновое ребро попало бы в оба потока."""
+        if not self.has_call_audit:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT caller_id, callee_name, line, callee_via FROM calls "
+                "WHERE callee_via IS NOT NULL AND call_kind IS NULL"
+            ).fetchall()
+        return [{"caller_id": r[0], "callee_name": r[1], "line": r[2], "via": r[3]} for r in rows]
+
+    @_transient_safe(lambda: None)
+    def get_launch_calls(self) -> list[dict] | None:
+        """Запуски по имени (терм частичного индекса — дословно)."""
+        if not self.has_call_audit:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT caller_id, callee_name, line, callee_key, callee_via, call_kind FROM calls "
+                "WHERE call_kind IN ('background', 'background_dynamic')"
+            ).fetchall()
+        return [
+            {"caller_id": r[0], "callee_name": r[1], "line": r[2], "callee_key": r[3], "via": r[4], "kind": r[5]}
+            for r in rows
+        ]
+
+    @_transient_safe(lambda: None)
+    def get_callers_info(self, caller_ids: list[int]) -> dict[int, dict] | None:
+        """Процедура и модуль вызывающего по id метода (чанками по 500)."""
+        out: dict[int, dict] = {}
+        ids = sorted(set(caller_ids))
+        with self._lock:
+            for chunk in _chunked(ids):
+                ph = ",".join("?" * len(chunk))
+                for r in self._conn.execute(
+                    "SELECT m.id, m.name, m.line, m.end_line, m.params, mod.rel_path, mod.category, "  # noqa: S608
+                    "mod.object_name, mod.module_type, mod.form_name FROM methods m "
+                    f"JOIN modules mod ON mod.id = m.module_id WHERE m.id IN ({ph})",
+                    chunk,
+                ):
+                    out[r[0]] = {
+                        "name": r[1],
+                        "line": r[2],
+                        "end_line": r[3],
+                        "params": r[4],
+                        "rel_path": r[5],
+                        "category": r[6],
+                        "object_name": r[7],
+                        "module_type": r[8],
+                        "form_name": r[9],
+                    }
+        return out
+
+    @_transient_safe(lambda: None)
+    def get_module_context_names(self, rel_path: str) -> set[str] | None:
+        """Имена контекста модуля (casefold) из индексных таблиц — нижняя оценка для затенения.
+
+        Реквизиты формы (``form_elements`` той же категории, объекта и формы, верхний уровень имени;
+        у общей формы — (CommonForms, X, X)), реквизиты и ТЧ объекта (``object_attributes``) для модуля объекта
+        и набора записей, предопределённые (``predefined_items``) для модуля менеджера. ``None`` —
+        таблицы нет или сбой чтения: при ``--no-metadata`` граф может быть включён, а пустые
+        таблицы отсутствия затенения НЕ доказывают — вызывающий сверяет живой описатель."""
+        with self._lock:
+            mod = self._conn.execute(
+                "SELECT category, object_name, module_type, form_name FROM modules WHERE rel_path = ?",
+                (rel_path,),
+            ).fetchone()
+            if mod is None:
+                return None
+            cat, obj, mtype, form = mod[0], mod[1], mod[2], mod[3]
+            names: set[str] = set()
+            if form or cat == "CommonForms":
+                form_name = form or obj
+                # Категория обязательна: формы Справочники.Х.Форма и Документы.Х.Форма — разные.
+                for r in self._conn.execute(
+                    "SELECT element_name FROM form_elements WHERE kind = 'attribute' "
+                    "AND category = ? AND object_name = ? AND form_name = ?",
+                    (cat, obj, form_name),
+                ):
+                    if r[0]:
+                        names.add(str(r[0]).split(".")[0].casefold())
+            elif mtype in ("ObjectModule", "RecordSetModule"):
+                for r in self._conn.execute(
+                    "SELECT attr_name, ts_name FROM object_attributes WHERE object_name = ? AND category = ?",
+                    (obj, cat),
+                ):
+                    if r[1]:
+                        names.add(str(r[1]).casefold())
+                    elif r[0]:
+                        names.add(str(r[0]).casefold())
+            elif mtype == "ManagerModule":
+                for r in self._conn.execute(
+                    "SELECT item_name FROM predefined_items WHERE object_name = ? AND category = ?",
+                    (obj, cat),
+                ):
+                    if r[0]:
+                        names.add(str(r[0]).casefold())
+        return names
+
+    @_transient_safe(lambda: None)
+    def get_call_counts(self, path: str = "") -> dict | None:
+        """Агрегаты одним SQL: ``module_resolved`` — квалифицированные с ключом без via и вида;
+        ``manager_calls`` — прямые через коллекцию; ``launches`` — ``background``; ``dynamic`` —
+        ``background_dynamic``. Счётчики менеджера и запусков не пересекаются. Пустая ``calls``
+        даёт целочисленные нули; ``None`` — только недоступность канала. ``path`` ограничивает
+        файл ВЫЗЫВАЮЩЕГО тем же casefold-префиксом, что у хелпера."""
+        if not self.has_call_audit:
+            return None
+        clause, params = self._path_clause(path)
+        select = (
+            "SELECT COALESCE(SUM(CASE WHEN c.callee_key IS NOT NULL AND c.callee_via IS NULL "
+            "AND c.call_kind IS NULL AND instr(c.callee_name, '.') > 0 THEN 1 ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN c.callee_via IS NOT NULL AND c.call_kind IS NULL THEN 1 ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN c.call_kind = 'background' THEN 1 ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN c.call_kind = 'background_dynamic' THEN 1 ELSE 0 END), 0) FROM calls c"
+        )
+        if clause:
+            select += (
+                " JOIN methods m ON m.id = c.caller_id JOIN modules mod ON mod.id = m.module_id WHERE 1=1" + clause
+            )
+        with self._lock:
+            row = self._conn.execute(select, params).fetchone()
+        return {
+            "module_resolved": int(row[0]),
+            "manager_calls": int(row[1]),
+            "launches": int(row[2]),
+            "dynamic": int(row[3]),
+        }
+
+    @property
+    def has_call_audit(self) -> bool:
+        """Граф v17 доказуемо полон для аудита адресатов: схема v17 И граф включён сборкой.
+
+        Все слагаемые — однократные пробы при открытии ридера: после перехода v16 → v17
+        или включения графа у ранее открытого ``--no-calls`` ридера нужен новый ридер.
+        """
+        return self._builder_version >= 17 and self._has_call_kind and self._has_callee_via and self._has_calls_built
+
+    @_transient_safe(lambda: None)
+    def probe_call_rows(self) -> bool | None:
+        """Есть ли строки в ``calls``: трехзначная O(1)-проба (v17, Д8).
+
+        В отличие от ``has_calls`` различает доказанную пустоту (``False``) и транзиентный
+        отказ чтения (``None``): по пустому включенному графу ноль вызывающих авторитетен, по
+        отказу — нет."""
+        with self._lock:
+            row = self._conn.execute("SELECT 1 FROM calls LIMIT 1").fetchone()
+        return row is not None
 
     @property
     def has_calls(self) -> bool:
@@ -10281,6 +12617,8 @@ class IndexReader:
         module_hint: str = "",
         offset: int = 0,
         limit: int = 50,
+        *,
+        name_only: bool = False,
     ) -> dict | None:
         """Find callers of a procedure/function using the call graph index.
 
@@ -10301,6 +12639,18 @@ class IndexReader:
         absent (v13 DB read before rebuild) exact mode is off
         (``exact_available=False``) and the legacy name-based query runs.
 
+        Only the MAIN configuration's edges: modules of nearby extensions are not in the
+        index. ``find_callers_context`` merges their live call layer (v1.42.0, Д8) AFTER
+        these rows, built from ``get_call_resolution_maps`` so the keys match byte-for-byte.
+
+        ``name_only`` (v1.42.0) — поиск по имени без точного режима. Его включает хелпер графа,
+        когда цель без подсказки неоднозначна ВНЕ индекса: имя уникально в основной конфигурации,
+        но одноименная процедура объявлена в соседнем расширении.
+
+        v17: члены цепочки (``call_kind='member'``) и вычисляемые запуски в выдачу не попадают, кроме
+        ``<…>.Менеджер.М(`` — кандидата по имени (``edge_exact=False``, ``call_kind='call'``): в режиме
+        по имени без ``module_hint``, в точном — только у цели в модуле менеджера (``_graph_kind_clause``).
+
         Returns None if the calls table has no data.
         """
         with self._lock:
@@ -10320,26 +12670,46 @@ class IndexReader:
             # idx_calls_callee_short, dotted input hits idx_calls_callee. Shared
             # verbatim by every match site below so the planner uses the index.
             match_sql, match_param = _callee_match_clause(proc_name, "c.callee_name")
+            # v17: вид ребра. На v16-базе колонки нет — не читаем её вовсе, все строки 'call'.
+            kind_col = ", c.call_kind AS call_kind" if self._has_call_kind else ""
+
+            # v17: допустимые строки графа — прямой вызов и запуск со статическим адресатом (плюс
+            # член цепочки `<…>.Менеджер.М(` — см. _graph_kind_clause). Одного callee_key IS NULL
+            # недостаточно: эвристика по имени выбирает ВСЕ ключи NULL и снова приписала бы
+            # `Объект.ОМ.Метод()` (член цепочки) общему модулю `ОМ`.
+            def _kind_ok(prefix: str, manager_member: bool) -> str:
+                return _graph_kind_clause(prefix, manager_member) if self._has_call_kind else ""
+
+            def _call_kind(r) -> str:
+                return "background" if self._has_call_kind and r["call_kind"] == "background" else "call"
 
             # --- Exact (resolved) mode ---------------------------------------
-            exact_key = self._resolve_target_key(proc_name, module_hint)
+            exact_key = None if name_only else self._resolve_target_key(proc_name, module_hint)
             if exact_key is not None:
+                kind_ok = _kind_ok("c.", _is_manager_module_key(exact_key))
                 base_select = (
                     "SELECT c.line AS call_line, c.callee_name, c.callee_key AS edge_callee_key, "
                     "m.name AS caller_name, "
                     "m.is_export AS caller_is_export, mod.rel_path, mod.object_name, "
-                    "mod.category, mod.module_type "
+                    f"mod.category, mod.module_type{kind_col} "
                     "FROM calls c JOIN methods m ON m.id = c.caller_id "
                     "JOIN modules mod ON mod.id = m.module_id "
                 )
-                where = f"WHERE (c.callee_key = ? OR (c.callee_key IS NULL AND {match_sql}))"
+                # Унарный «+» у `callee_key IS NULL` (здесь и в подсчете ниже) запрещает брать по этому
+                # терму индекс, значения он не меняет. SQLite без stat4 оценивает IS NULL средним stat1 и
+                # не знает, что строк без ключа — половина таблицы: на статистике индексов ERP планировщик
+                # иначе выбирал idx_calls_callee_key и перебирал все строки без ключа (~1 с на запрос)
+                # вместо единиц строк по idx_calls_callee_short.
+                where = f"WHERE (c.callee_key = ? OR (+c.callee_key IS NULL AND {match_sql})){kind_ok}"
 
+                # По callee_key членов цепочки и вычисляемых запусков нет по инварианту
+                # резолвера (их ключ всегда NULL), поэтому точный счёт фильтра не требует.
                 exact_cnt_row = self._conn.execute(
                     "SELECT COUNT(*) AS cnt FROM calls WHERE callee_key = ?", (exact_key,)
                 ).fetchone()
                 exact_rows = exact_cnt_row["cnt"] if exact_cnt_row else 0
                 fb_cnt_row = self._conn.execute(
-                    f"SELECT COUNT(*) AS cnt FROM calls c WHERE c.callee_key IS NULL AND {match_sql}",
+                    f"SELECT COUNT(*) AS cnt FROM calls c WHERE +c.callee_key IS NULL AND {match_sql}{kind_ok}",
                     (match_param,),
                 ).fetchone()
                 fallback_rows = fb_cnt_row["cnt"] if fb_cnt_row else 0
@@ -10361,6 +12731,7 @@ class IndexReader:
                         # kept by name recall (callee_key IS NULL). _meta aggregates
                         # cannot carry this per-row, so find_path reads it here.
                         "edge_exact": bool(r["edge_callee_key"] is not None and r["edge_callee_key"] == exact_key),
+                        "call_kind": _call_kind(r),
                     }
                     for r in rows
                 ]
@@ -10382,6 +12753,12 @@ class IndexReader:
             # --- Fallback (name-based) mode — legacy behavior ----------------
             # Match callers by method name via the shared indexed clause; for a
             # bare proc_name this also covers qualified "Module.proc_name" edges.
+            # Член цепочки `<…>.Менеджер.М(` здесь — кандидат только без подсказки. С подсказкой цель не
+            # разрешилась (объект неоднозначен или не найден), и получатель `Менеджер` к ней не относится;
+            # фильтр `hint.%` ниже такую строку не отсек бы при подсказке `Менеджер`/`Manager`, а слой
+            # расширений с неразрешенной подсказкой не подмешивается вовсе — ответы обязаны совпадать.
+            kind_ok = _kind_ok("c.", not module_hint)
+            kind_ok_bare = _kind_ok("", not module_hint)
             query = f"""
                 SELECT
                     c.line AS call_line,
@@ -10391,11 +12768,11 @@ class IndexReader:
                     mod.rel_path,
                     mod.object_name,
                     mod.category,
-                    mod.module_type
+                    mod.module_type{kind_col}
                 FROM calls c
                 JOIN methods m ON m.id = c.caller_id
                 JOIN modules mod ON mod.id = m.module_id
-                WHERE ({match_sql})
+                WHERE ({match_sql}){kind_ok}
             """
             params_list: list = [match_param]
 
@@ -10425,7 +12802,7 @@ class IndexReader:
                 # Fast path: COUNT on calls table only. Unaliased column → matches
                 # idx_calls_callee_short (bare) / idx_calls_callee (dotted).
                 count_sql, count_param = _callee_match_clause(proc_name, "callee_name")
-                count_query = f"SELECT COUNT(*) AS cnt FROM calls WHERE ({count_sql})"
+                count_query = f"SELECT COUNT(*) AS cnt FROM calls WHERE ({count_sql}){kind_ok_bare}"
                 count_row = self._conn.execute(count_query, [count_param]).fetchone()
             else:
                 # Exact path: COUNT via JOIN (precise, with module filter)
@@ -10462,6 +12839,7 @@ class IndexReader:
                     "module_type": r["module_type"],
                     # Name-based fallback: no edge resolved to a stable key.
                     "edge_exact": False,
+                    "call_kind": _call_kind(r),
                 }
                 for r in rows
             ]
@@ -10482,6 +12860,26 @@ class IndexReader:
                     "fallback_rows": total_callers,
                 },
             }
+
+    @_transient_safe(lambda: None)
+    def get_call_resolution_maps(self) -> dict | None:
+        """Карты разрешения ребер для живого слоя вызовов расширений (v17, Д8).
+
+        ``common_exported`` и ``managers`` — те же построители, что у резолвера ``_bulk_insert``
+        (``_build_common_exported``/``_build_manager_modules``): ключ ребра расширения совпадает с
+        ключом индекса побайтно. ``modules_by_identity`` — ``(категория, casefold(объект),
+        тип_модуля, casefold(форма))`` → ``rel_path``; повтор тождества (две физические копии)
+        дает ``None``, а не произвольный последний путь. ``None`` целиком — граф недоступен."""
+        if not self.has_call_audit:
+            return None
+        with self._lock:
+            common = _build_common_exported(self._conn)
+            managers = _build_manager_modules(self._conn)
+            by_identity: dict[tuple[str, str, str, str], str | None] = {}
+            for r in self._conn.execute("SELECT rel_path, category, object_name, module_type, form_name FROM modules"):
+                key = (r[1] or "", (r[2] or "").casefold(), r[3] or "", (r[4] or "").casefold())
+                by_identity[key] = None if key in by_identity else r[0]
+        return {"common_exported": common, "managers": managers, "modules_by_identity": by_identity}
 
     @_transient_safe(lambda: None)
     def resolve_target_identity(self, proc_name: str, module_hint: str = "") -> str | None:
@@ -11061,7 +13459,7 @@ class IndexReader:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT key, value FROM index_meta WHERE key IN "
-                "('has_synonyms','has_metadata','bsl_count','base_path','built_at','build_in_progress')"
+                "('has_synonyms','has_metadata','has_calls','bsl_count','base_path','built_at','build_in_progress')"
             ).fetchall()
             meta = {r["key"]: r["value"] for r in rows}
             modules_row = self._conn.execute("SELECT COUNT(*) AS n FROM modules").fetchone()
@@ -11077,7 +13475,10 @@ class IndexReader:
 
         has_synonyms = _flag("has_synonyms", True)
         has_metadata = _flag("has_metadata", False)
-        if has_synonyms is None or has_metadata is None:
+        # v17: build-опция графа. Legacy-индекс без ключа — прежний дефолт True, чтобы не
+        # менять ответы других хелперов; для v17 сам гейт аудита — однократная проба ридера.
+        has_calls = _flag("has_calls", True)
+        if has_synonyms is None or has_metadata is None or has_calls is None:
             return None
 
         raw_bsl = meta.get("bsl_count")
@@ -11100,6 +13501,7 @@ class IndexReader:
         return {
             "has_synonyms": has_synonyms,
             "has_metadata": has_metadata,
+            "has_calls": has_calls,
             "bsl_count": bsl_count,
             "modules_count": int(modules_row["n"]) if modules_row is not None else 0,
             "base_path": base,
@@ -11720,6 +14122,7 @@ class IndexReader:
                         "m.category, mh.header_comment "
                         "FROM module_headers mh "
                         "JOIN modules m ON m.id = mh.module_id "
+                        "ORDER BY (mh.header_comment = ''), m.rel_path "
                         "LIMIT ?",
                         (limit,),
                     ).fetchall()
@@ -11730,6 +14133,7 @@ class IndexReader:
                         "FROM module_headers mh "
                         "JOIN modules m ON m.id = mh.module_id "
                         "WHERE py_lower(mh.header_comment) LIKE py_lower(?) ESCAPE '\\' "
+                        "ORDER BY (mh.header_comment = ''), m.rel_path "
                         "LIMIT ?",
                         (_like_contains(query.strip()), limit),
                     ).fetchall()
@@ -11817,6 +14221,23 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    def _module_headers_counts(self, query: str) -> tuple[int, int]:
+        """``(всего, с непустым текстом)`` шапок по ``query``. **INTERNAL, LOCKLESS** — вызывающий
+        держит ``self._lock``. JOIN modules mirrors search_module_headers exactly (drops orphaned
+        header rows so the count matches len(search_module_headers(q, huge)))."""
+        select = (
+            "SELECT COUNT(*), COALESCE(SUM(mh.header_comment <> ''), 0) "
+            "FROM module_headers mh JOIN modules m ON m.id = mh.module_id"
+        )
+        if not query or not query.strip():
+            row = self._conn.execute(select).fetchone()
+        else:
+            row = self._conn.execute(
+                select + " WHERE py_lower(mh.header_comment) LIKE py_lower(?) ESCAPE '\\'",
+                (_like_contains(query.strip()),),
+            ).fetchone()
+        return (int(row[0]), int(row[1])) if row is not None else (0, 0)
+
     @_transient_safe(lambda: None)
     def count_module_headers(self, query: str = "") -> int | None:
         """COUNT of module headers matching ``query`` (same WHERE as search_module_headers).
@@ -11826,19 +14247,20 @@ class IndexReader:
         """
         with self._lock:
             try:
-                # JOIN modules mirrors search_module_headers exactly (drops orphaned
-                # header rows so the count matches len(search_module_headers(q, huge))).
-                if not query or not query.strip():
-                    row = self._conn.execute(
-                        "SELECT COUNT(*) FROM module_headers mh JOIN modules m ON m.id = mh.module_id"
-                    ).fetchone()
-                else:
-                    row = self._conn.execute(
-                        "SELECT COUNT(*) FROM module_headers mh JOIN modules m ON m.id = mh.module_id "
-                        "WHERE py_lower(mh.header_comment) LIKE py_lower(?) ESCAPE '\\'",
-                        (_like_contains(query.strip()),),
-                    ).fetchone()
-                return int(row[0]) if row is not None else 0
+                return self._module_headers_counts(query)[0]
+            except sqlite3.OperationalError:
+                return None
+
+    @_transient_safe(lambda: None)
+    def count_module_headers_with_text(self, query: str = "") -> tuple[int, int] | None:
+        """``(всего, с текстом)`` — ``count_module_headers`` плюс число строк с НЕПУСТОЙ шапкой (v17).
+
+        С v17 модуль, у которого в начале только лицензия, хранит строку с пустым текстом: на пустом
+        запросе она входит во «всего», но не в «с текстом» (на непустом запросе пустая шапка не
+        совпадает, и числа равны). ``None`` — таблицы нет."""
+        with self._lock:
+            try:
+                return self._module_headers_counts(query)
             except sqlite3.OperationalError:
                 return None
 

@@ -263,12 +263,20 @@ class TestPhaseBResolver:
         assert com == _make_callee_key(OBSHIY_PATH, "ВнутренняяЛогика")
         assert nak != com
 
-    def test_object_manager_qualified_is_null(self, built):
+    def test_manager_call_keyed_variable_call_null(self, built):
         db_path, _ = built
-        # Справочники.Контрагенты.НайтиПоКоду → regex keeps last pair
-        # "Контрагенты.НайтиПоКоду"; Контрагент.ПолучитьОбъект → variable method.
-        # Both are intentionally NOT resolved.
-        assert _edge_key(db_path, NAKLADNAYA_PATH, "Контрагенты.НайтиПоКоду") is None
+        # v17: Справочники.Контрагенты.НайтиПоКоду → "Контрагенты.НайтиПоКоду" с
+        # callee_via='Catalogs' и ключом уровня manager. Модуля менеджера у Контрагенты в
+        # фикстуре нет, поэтому ключ синтетический (ведущий '/'), точной цели он не даёт.
+        # Контрагент.ПолучитьОбъект — метод переменной: по-прежнему НЕ резолвится.
+        assert _edge_key(db_path, NAKLADNAYA_PATH, "Контрагенты.НайтиПоКоду") == (
+            "/Catalogs/Контрагенты/ManagerModule.bsl::найтипокоду"
+        )
+        with _conn(db_path) as c:
+            via = c.execute("SELECT callee_via FROM calls WHERE callee_name = 'Контрагенты.НайтиПоКоду'").fetchone()[
+                "callee_via"
+            ]
+        assert via == "Catalogs"
         assert _edge_key(db_path, NAKLADNAYA_PATH, "Контрагент.ПолучитьОбъект") is None
 
     def test_platform_global_noise_filtered_out(self, built):

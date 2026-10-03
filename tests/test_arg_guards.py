@@ -288,10 +288,15 @@ def test_safe_grep_result_cap_none_untouched(guarded_bsl, caplog):
 
 def test_count_only_payload_unchanged(guarded_bsl):
     """Гард пишет предупреждение в лог, а не в payload: четырёхключевой dict
-    закреплён byte-for-byte и в docstring, и в тестах."""
-    for name in ("search_regions", "search_module_headers"):
+    закреплён byte-for-byte и в docstring, и в тестах. v1.42.0: у шапок модулей пятый ключ
+    `with_text` (строки с текстом шапки) — часть контракта ответа, а не след гарда."""
+    expected = {
+        "search_regions": {"total", "source", "truncated", "scope"},
+        "search_module_headers": {"total", "with_text", "source", "truncated", "scope"},
+    }
+    for name, keys in expected.items():
         res = guarded_bsl[name]("Служебные", None, count_only=True)
-        assert set(res) == {"total", "source", "truncated", "scope"}
+        assert set(res) == keys, name
 
 
 # ── 9-10. мусорные типы и list-перегрузка ────────────────────────────

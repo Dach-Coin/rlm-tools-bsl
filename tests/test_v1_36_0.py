@@ -1119,7 +1119,15 @@ def test_reader_fixtures_smoke(request, fixture_name):
 #            find_print_forms +55 (presentation|None, presentation_source, delegate,
 #            _meta.delegates), get_module_outline +16, get_object_modules +16
 #            (loc=Σ строк методов) -> факт 12 260 при пороге 12 393. Порог НЕ двигается.
-_SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557
+#   v1.42.0: find_callers_context/find_call_hierarchy/find_path +11 каждая (call_kind) —
+#            внутри запаса: прежние хелперы 12 293 при прежнем пороге 12 393.
+#            Новый хелпер find_unresolved_calls +255 — порог поднят РОВНО на его подпись
+#            (как три новых хелпера v1.38.0), чтобы гард держал прежние подписи на уровне
+#            12 393 -> факт 12 548 при пороге 12 648.
+#            После приемки: find_unresolved_calls +32 (expression/kind/target_owner в issues),
+#            search_module_headers +11 (with_text) — внутри запаса, порог НЕ двигается:
+#            факт 12 591 при пороге 12 648 (прежние хелперы 12 304 при 12 393).
+_SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557 + 255
 
 
 def test_sig_budget_headroom_freed_for_release():
@@ -1175,6 +1183,30 @@ def test_trimmed_sigs_did_not_lose_a_single_key_name():
             "exact_rows",
             "fallback_rows",
         ],
+        # v1.42.0: все ключи строки issues (expression/kind/target_owner в подпись дописаны после e2e).
+        "find_unresolved_calls": [
+            "layer",
+            "reasons",
+            "path",
+            "limit",
+            "offset",
+            "issues",
+            "file",
+            "line",
+            "caller",
+            "owner",
+            "expression",
+            "target",
+            "kind",
+            "reason",
+            "target_owner",
+            "total",
+            "has_more",
+            "by_reason",
+            "not_checked",
+            "partial",
+        ],
+        "search_module_headers": ["query", "limit", "count_only", "total", "with_text", "source", "truncated", "scope"],
         # v1.37.0 (Задача 0) — надзор РАСШИРЕН на каждую фактически порезанную
         # подпись. Перечень выше покрывал лишь подписи, которые резал v1.36.0;
         # без этих строк резка вместе с именем ключа прошла бы зелёной.

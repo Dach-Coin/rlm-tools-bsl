@@ -2507,6 +2507,35 @@ def parse_command_parameter_type(xml_content: str) -> list[dict]:
     return results
 
 
+def parse_object_commands_parameter_types(mdo_text: str) -> list[dict]:
+    """EDT: типы параметров команд ОБЪЕКТА из .mdo владельца — ``[{command_name, ref_object}]``.
+
+    В EDT команда объекта описана внутри описателя владельца (``<commands>`` →
+    ``<commandParameterType>`` → ``<types>``); в каталоге ``Commands/<Имя>/`` лежит только модуль.
+    Корень — любой объект mdclass. Локальные имена тегов допускают XML-префикс и атрибуты:
+    точный поиск открывающего тега отрезал бы валидный ``<mdclass:commandParameterType>``."""
+    if not mdo_text or "commandParameterType" not in mdo_text:
+        return []
+    try:
+        root = ET.fromstring(mdo_text)
+    except ET.ParseError:
+        return []
+    out: list[dict] = []
+    for ch in root:
+        if (ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag) != "commands":
+            continue
+        name = _xml_direct_text(ch, "name")
+        for sub in ch:
+            if (sub.tag.split("}")[-1] if "}" in sub.tag else sub.tag) != "commandParameterType":
+                continue
+            for t in sub:
+                if (t.tag.split("}")[-1] if "}" in t.tag else t.tag) == "types" and t.text:
+                    canon = canonicalize_type_ref(t.text.strip())
+                    if canon:
+                        out.append({"command_name": name, "ref_object": canon})
+    return out
+
+
 _NS_RIGHTS_VERSIONS = [
     "http://v8.1c.ru/8.2/roles",
     "http://v8.1c.ru/8.3/roles",
@@ -2522,7 +2551,11 @@ def parse_rights_xml(xml_content: str, object_filter: str = "") -> list[dict]:
         root = ET.fromstring(xml_content)
     except ET.ParseError:
         return []
+    return _rights_granted_from_root(root, object_filter)
 
+
+def _rights_granted_from_root(root, object_filter: str = "") -> list[dict]:
+    """Тело ``parse_rights_xml`` над уже разобранным корнем."""
     # Detect namespace from root tag
     root_ns = ""
     if "}" in root.tag:
@@ -2791,16 +2824,43 @@ def parse_rights_meta(xml_content: str) -> dict:
         root = ET.fromstring(xml_content)
     except ET.ParseError:
         return out
+    out["set_for_new_objects"] = _rights_set_for_new_objects(root)
+    out["exclusions"] = _rights_exclusions_from_root(root)
+    return out
 
-    root_ns = root.tag.split("}")[0].lstrip("{") if "}" in root.tag else ""
-    ns_candidates = [{"r": root_ns}] if root_ns else []
-    ns_candidates.extend({"r": uri} for uri in _NS_RIGHTS_VERSIONS)
 
+def parse_rights_for_index(xml_content: str) -> tuple[list[dict], bool, list[dict]]:
+    """Файл прав для сборщика индекса — ОДИН разбор XML вместо двух.
+
+    Возвращает ``(выданные права, setForNewObjects, исключения)``: первое — ровно
+    ``parse_rights_xml(xml_content)``, второе и третье — поля ``parse_rights_meta``. Исключения
+    считаются только у роли с флагом: сборщик хранит их только у нее, а обход всех запретов
+    обычной роли на ERP дороже самого разбора файла. Битый XML — ``([], False, [])``.
+    """
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return [], False, []
+    granted = _rights_granted_from_root(root)
+    flagged = _rights_set_for_new_objects(root)
+    return granted, flagged, (_rights_exclusions_from_root(root) if flagged else [])
+
+
+def _rights_set_for_new_objects(root) -> bool:
+    """Флаг уровня роли ``setForNewObjects`` (часть ``parse_rights_meta``)."""
     for ch in root:
         local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
         if local == "setForNewObjects":
-            out["set_for_new_objects"] = bool(ch.text and ch.text.strip().lower() == "true")
-            break
+            return bool(ch.text and ch.text.strip().lower() == "true")
+    return False
+
+
+def _rights_exclusions_from_root(root) -> list[dict]:
+    """Исключения роли — права со значением false (часть ``parse_rights_meta``)."""
+    exclusions: list[dict] = []
+    root_ns = root.tag.split("}")[0].lstrip("{") if "}" in root.tag else ""
+    ns_candidates = [{"r": root_ns}] if root_ns else []
+    ns_candidates.extend({"r": uri} for uri in _NS_RIGHTS_VERSIONS)
 
     for ns in ns_candidates:
         obj_elements = root.findall("r:object", ns)
@@ -2819,10 +2879,10 @@ def parse_rights_meta(xml_content: str) -> dict:
                 if right_value_el.text and right_value_el.text.strip().lower() == "false":
                     denied.append(right_name_el.text.strip())
             if denied:
-                out["exclusions"].append({"object": name_el.text.strip(), "rights": denied})
+                exclusions.append({"object": name_el.text.strip(), "rights": denied})
         break
 
-    return out
+    return exclusions
 
 
 # ---------------------------------------------------------------------------

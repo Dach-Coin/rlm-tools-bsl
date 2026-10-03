@@ -503,6 +503,7 @@ HELPER_DOMAINS: dict[str, dict] = {
             "find_callers_context",
             "find_call_hierarchy",
             "find_path",
+            "find_unresolved_calls",
             "find_exports",
             "get_module_outline",
             "extract_queries",
@@ -547,6 +548,7 @@ HELPER_DOMAINS: dict[str, dict] = {
         "label": "перехваты, доработки",
         "helpers": (
             "get_overrides",
+            "find_unresolved_calls",
             "find_ext_overrides",
             "detect_extensions",
             "find_custom_modifications",

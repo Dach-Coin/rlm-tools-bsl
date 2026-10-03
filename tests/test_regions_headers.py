@@ -179,7 +179,8 @@ class TestExtractHeaderComment:
             "Процедура Тест()",
             "КонецПроцедуры",
         ]
-        assert _extract_header_comment(lines) == ""
+        # v1.42.0: None — шапки нет; "" — только лицензия.
+        assert _extract_header_comment(lines) is None
 
     def test_header_stopped_by_procedure(self):
         lines = [
@@ -208,7 +209,7 @@ class TestExtractHeaderComment:
         assert result == "Заголовок"
 
     def test_empty_file(self):
-        assert _extract_header_comment([]) == ""
+        assert _extract_header_comment([]) is None
 
     def test_comment_without_space(self):
         lines = ["//Без пробела"]
@@ -654,6 +655,8 @@ class TestCountOnly:
             res = bsl["search_module_headers"]("себестоимости", count_only=True)
             assert res == {
                 "total": reader.count_module_headers("себестоимости"),
+                # v1.42.0: строки с текстом шапки; на непустом запросе пустая шапка не совпадает
+                "with_text": reader.count_module_headers("себестоимости"),
                 "source": "index",
                 "truncated": False,
                 "scope": "main_index",
@@ -686,7 +689,7 @@ class TestCountOnly:
         res = bsl["search_regions"]("x", count_only=True)
         assert res == {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
         res_h = bsl["search_module_headers"]("x", count_only=True)
-        assert res_h == {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
+        assert res_h == {"total": 0, "with_text": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
 
 
 class TestRegionsStrategy:

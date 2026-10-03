@@ -110,7 +110,10 @@ def _split_params(raw: str) -> list[str]:
 
     ``params`` исторически хранится/возвращается строкой (``"Знач А, Б = 5"``),
     и агент, ожидавший список, получал ``AttributeError`` при итерации. Эта
-    функция — единый разборщик, применяемый на helper-границе (не в build-time).
+    функция — единый разборщик имён параметров: на helper-границе и (v1.42.0) в
+    build-time проверке затенения получателя обёртки запуска по имени
+    (``bsl_index._launch_receiver_context``) и локальности переменной-адресата запуска
+    (``bsl_index._launch_target_locals``) — одно правило для сборщика и живого разбора.
 
     Возвращает только имена параметров: отбрасывает по-значению-префикс
     ``Знач``/``Val`` (регистронезависимо — ключевые слова 1С) и хвост
@@ -200,6 +203,7 @@ def mask_comments_and_strings(
     lines: list[str],
     *,
     keep_string_content: bool = False,
+    line_states: list[bool] | None = None,
 ) -> list[str]:
     """Маска той же длины: текст комментариев (и, по умолчанию, содержимое строковых
     литералов) заменяется пробелами.
@@ -217,10 +221,17 @@ def mask_comments_and_strings(
 
     Кавычки-ограничители сохраняются всегда: без них ``_count_unquoted_parens`` перестал
     бы видеть границы литерала.
+
+    ``line_states`` (выходной) — по строке: начинается ли она ВНУТРИ литерала. Машина состояний
+    идет строго слева направо без заглядывания вперед, поэтому срез маски модуля с строки,
+    начавшейся вне литерала, совпадает с маской этого среза: так сборщик берет маску тела
+    процедуры готовой, а не считает ее заново.
     """
     out: list[str] = []
     in_string = False
     for raw in lines:
+        if line_states is not None:
+            line_states.append(in_string)
         n = len(raw)
         # 1С допускает КОММЕНТАРИЙ между строками-продолжениями многострочного
         # литерала. Такая строка — комментарий, а НЕ содержимое литерала, и её
@@ -288,7 +299,9 @@ def mask_comments_and_strings(
     return out
 
 
-_MULTILINE_HARD_CAP_LINES = 20
+# Строчный потолок — страховка; от разбега на битом файле защищают символьный потолок и стоп
+# на следующем объявлении (v1.42.0: 20 → 100 — типовые сигнатуры на 24+ строки).
+_MULTILINE_HARD_CAP_LINES = 100
 _MULTILINE_HARD_CAP_CHARS = 2000
 
 
@@ -322,8 +335,9 @@ def _merge_proc_continuations_with_mask(
     Решение о склейке принимается ПО МАСКЕ, поэтому закомментированное объявление с
     несбалансированной скобкой больше не проглатывает соседей.
 
-    Hard caps: 20 строк / 2000 символов на сигнатуру — защита от разбега на битых
-    файлах с несбалансированной `(`.
+    Hard caps: 100 строк / 2000 символов на сигнатуру и стоп на следующем объявлении
+    процедуры — защита от разбега на битых файлах с несбалансированной `(` (v1.42.0:
+    строчный потолок поднят с 20, соседнее объявление склейкой не поглощается).
     """
     merged_lines: list[str] = []
     merged_masked: list[str] = []
@@ -334,7 +348,8 @@ def _merge_proc_continuations_with_mask(
     while i < total:
         line = lines[i]
         mline = masked[i]
-        if _PROC_DEF_PREFIX_RE.match(mline):
+        # Префикс объявления требует «(» в той же строке: без нее регулярку не зовем.
+        if "(" in mline and _PROC_DEF_PREFIX_RE.match(mline):
             open_count, close_count = _count_unquoted_parens(mline)
             balance = open_count - close_count
             if balance > 0:
@@ -343,6 +358,11 @@ def _merge_proc_continuations_with_mask(
                 start_original = i + 1
                 last_index = i
                 for j in range(i + 1, min(i + _MULTILINE_HARD_CAP_LINES, total)):
+                    # Следующее объявление процедуры в сигнатуру входить не может: на битом файле
+                    # с несбалансированной '(' склейка остановится ДО него, и соседняя процедура
+                    # не будет поглощена при любом потолке.
+                    if "(" in masked[j] and _PROC_DEF_PREFIX_RE.match(masked[j]):
+                        break
                     combined = combined + " " + lines[j]
                     combined_mask = combined_mask + " " + masked[j]
                     o, c = _count_unquoted_parens(masked[j])

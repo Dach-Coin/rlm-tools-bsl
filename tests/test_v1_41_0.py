@@ -97,9 +97,10 @@ class TestDomainDataStretch:
 
     def test_domain_sizes_match_the_plan(self):
         """Размеры §3.3 плана (с git_search): документ 22, структура 18, код 16,
-        связи 20, расширения 14, поиск 17."""
+        связи 20, расширения 14, поиск 17; + find_unresolved_calls в v1.42.0 (код 17,
+        расширения 15)."""
         sizes = {key: len(d["helpers"]) for key, d in HELPER_DOMAINS.items()}
-        assert sizes == {"документ": 22, "структура": 18, "код": 16, "связи": 20, "расширения": 14, "поиск": 17}
+        assert sizes == {"документ": 22, "структура": 18, "код": 17, "связи": 20, "расширения": 15, "поиск": 17}
         for key, d in HELPER_DOMAINS.items():
             assert len(set(d["helpers"])) == len(d["helpers"]), f"дубль в домене {key}"
 

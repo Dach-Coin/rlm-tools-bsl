@@ -87,6 +87,7 @@ from rlm_tools_bsl.bsl_strategy_data import (
 )
 from rlm_tools_bsl.bsl_index import (
     BUILDER_VERSION,
+    OLD_INDEX_GAPS,
     IndexReader,
     IndexStatus,
     check_index_usable,
@@ -1094,12 +1095,14 @@ def _rlm_start(
                         # Check index builder version
                         idx_version = int(idx_stats.get("builder_version") or 0)
                         if idx_version < BUILDER_VERSION:
+                            # Недостачи — только тех поколений, что старше индекса: у v16
+                            # недостача v15 уже закрыта, и её текст был бы ложен.
+                            gaps = [text for version, text in OLD_INDEX_GAPS if idx_version < version]
+                            reason = "; ".join(gaps) or "часть его данных собрана прежней версией сборщика"
                             msg = (
-                                f"Индекс собран сборщиком v{idx_version}, текущий v{BUILDER_VERSION}. "
-                                "Он продолжает работать, но содержит объявления и движения, взятые "
-                                "из комментариев и строковых литералов. Следующий 'rlm-bsl-index "
-                                f'index update "{resolved}"\' пересоберет индекс полностью — '
-                                "это разовая длительная операция."
+                                f"Индекс собран сборщиком v{idx_version}, текущий v{BUILDER_VERSION}: {reason}. "
+                                "Он продолжает работать; следующий 'rlm-bsl-index index update "
+                                f'"{resolved}"\' пересоберет индекс полностью — это разовая длительная операция.'
                             )
                             idx_warnings.append(msg)
                             logger.warning("rlm_start: session=%s %s", session_id, msg)
