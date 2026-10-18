@@ -558,7 +558,8 @@ _FP_SPEC = {
     },
 }
 
-# Маршрут файлов: три вызова цели в модуле А и один в модуле Б; страница FS-маршрута — 1 файл.
+# Маршрут файлов: три вызова цели в модуле А и один в модуле Б; страница FS-маршрута — 1 файл, первым идёт А
+# (порядок кандидатов задаёт _sorted_glob).
 _FR_SPEC = {
     "CommonModules/А/Ext/Module.bsl": (
         "Процедура ВызовА() Экспорт\n\tМ.ОбщаяЦель();\n\tМ.ОбщаяЦель();\n\tМ.ОбщаяЦель();\nКонецПроцедуры\n"
@@ -571,6 +572,12 @@ _FR_SPEC = {
 }
 
 _HINT_CALL_RE = __import__("re").compile(r"find_callers_context\([^)]*\)")
+
+
+def _sorted_glob(glob_fn):
+    """glob_files с порядком по пути: без индекса кандидаты идут в порядке обхода ФС, а он у каждой ФС свой
+    (NTFS — по алфавиту, ext4 — по хешу имени с затравкой ФС)."""
+    return lambda pattern: sorted(glob_fn(pattern))
 
 
 @pytest.fixture
@@ -645,7 +652,9 @@ class TestFindPathTruncation:
         # совет из hint исполняется и находит строку за страницей
         root = _cf_doc_tree(tmp_path / "cf", _FR_SPEC)
         reader = _reader_for(root, monkeypatch) if route == "rows" else None
-        bsl = _bsl_for(root, reader)
+        # первая страница маршрута файлов — модуль А (три строки при одном файле) на любой ФС: иначе первым мог
+        # оказаться Б, и совет вёл бы к А — верно, но мимо ассерта (так было на ext4 раннера CI)
+        bsl = _bsl_for(root, reader, glob_wrap=_sorted_glob if route == "files" else None)
         res = bsl["find_path"]("НеСвязан", "ОбщаяЦель", max_depth=1, to_hint=_FP_TARGET)
         assert res["found"] is False and res["_meta"]["budget_exceeded"] is True
         node = res["_meta"]["truncated_nodes"][0]
