@@ -1949,8 +1949,44 @@ def _git_head_sha(base_path: str) -> str | None:
         return None
 
 
+def _git_commit_exists(base_path: str, sha: str) -> bool | None:
+    """Check that *sha* resolves to a commit object of the repository.
+
+    Existence is all the git fast path needs from the stored commit: the
+    committed diff (``git diff <sha> HEAD``) compares two trees and does not
+    require *sha* to be an ancestor of HEAD. A commit rewritten by rebase /
+    amend / force-push stays in the object store while the reflog keeps it
+    (``gc.reflogExpireUnreachable``, 30 days by default).
+
+    Returns ``True`` — the commit exists; ``False`` — git confirmed there is no
+    such commit (``rev-parse -q --verify`` exit code 1: the object was pruned,
+    the index was copied from another clone, a shallow history does not contain
+    it); ``None`` — the check itself failed (git not found, timeout, ``OSError``,
+    any other exit code, e.g. a corrupt object). The decision is made on the exit
+    code only, so it does not depend on the language of git messages.
+    """
+    cmd = _git_base_cmd(base_path)
+    if cmd is None:
+        return None
+    try:
+        r = run_git([*cmd, "rev-parse", "-q", "--verify", f"{sha}^{{commit}}"], timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode == 0:
+        return True
+    if r.returncode == 1:
+        return False
+    return None
+
+
 def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDirtyResult | None:
     """Collect all files changed since *since_commit* (committed+staged+unstaged+untracked).
+
+    *since_commit* must exist as a commit object (see :func:`_git_commit_exists`)
+    but does **not** have to be an ancestor of HEAD: the committed diff below is a
+    tree-to-tree comparison, valid for any two commits. A commit rewritten by
+    rebase / amend or left on another (unmerged) branch still yields exactly the
+    files whose content differs from HEAD.
 
     Returns a :class:`_GitDirtyResult` with paths relative to *base_path*
     (prefix stripped). Returns ``None`` on a **critical** git error (caller must
@@ -1959,15 +1995,8 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
     incomplete and the caller must force a full scan (and persist the
     ``git_dirty_unreliable`` flag) rather than silently dropping the changes.
     """
-    # Verify since_commit is an ancestor of HEAD
     cmd = _git_base_cmd(base_path)
     if cmd is None:
-        return None
-    try:
-        r = run_git([*cmd, "merge-base", "--is-ancestor", since_commit, "HEAD"], timeout=60)
-        if r.returncode != 0:
-            return None
-    except (subprocess.TimeoutExpired, OSError):
         return None
 
     base_args = [*cmd, "-c", "core.quotePath=false"]
@@ -10063,9 +10092,17 @@ class IndexBuilder:
                 if repo_info:
                     git_root, prefix = repo_info
                     git_head = _git_head_sha(base_path)
-                    git_result = _git_changed_files(base_path, stored_commit, prefix)
+                    # The stored commit only has to EXIST — ancestry is not required
+                    # (tree diff, see _git_changed_files). A rebased / amended /
+                    # force-pushed stored commit therefore keeps the fast path. Only a
+                    # commit git confirms as absent is "stored commit missing"; a failed
+                    # check (None: timeout, corrupt object, ...) stays "git error".
+                    stored_commit_exists = _git_commit_exists(base_path, stored_commit)
+                    git_result = _git_changed_files(base_path, stored_commit, prefix) if stored_commit_exists else None
 
-                    if git_result is None or git_head is None:
+                    if stored_commit_exists is False:
+                        fallback_reason = "stored commit missing"
+                    elif git_result is None or git_head is None:
                         fallback_reason = "git error" if git_result is None else "head sha error"
                     elif git_result.unreliable_reason is not None:
                         # Best-effort detection timed out — the change set is

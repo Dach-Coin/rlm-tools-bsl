@@ -12,6 +12,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,7 @@ from rlm_tools_bsl.bsl_index import (
     _collect_object_synonyms,
     _git_available,
     _git_changed_files,
+    _git_commit_exists,
     _git_current_dirty,
     _git_dirty_timeout,
     _git_head_sha,
@@ -95,16 +98,17 @@ def _read_meta(db_path: Path, key: str) -> str | None:
 def _install_worktree_timeout(monkeypatch) -> None:
     """Force best-effort work-tree git commands to time out.
 
-    Critical commands (rev-parse, merge-base, committed diff) pass through so
-    the fast path is still *attempted* — only the staged/unstaged/untracked
-    work-tree probes (which carry ``--ignore-cr-at-eol`` or ``ls-files
-    --others``) raise ``TimeoutExpired``, marking detection unreliable.
+    Critical commands (rev-parse, including the stored-commit check, and the
+    committed diff) pass through so the fast path is still *attempted* — only
+    the staged/unstaged/untracked work-tree probes (which carry
+    ``--ignore-cr-at-eol`` or ``ls-files --others``) raise ``TimeoutExpired``,
+    marking detection unreliable.
     """
     # Патчим именно связанное имя ``bsl_index.run_git``, а не ``subprocess.run``:
     # на Windows реальный runner вообще не ходит через ``subprocess.run`` (у него
     # свой CreateProcessW-путь), а seam ``_git_process._run_posix`` захвачен на
     # импорте. Делегат сохраняется ДО подмены, поэтому критические команды
-    # (rev-parse / merge-base / committed diff) выполняются по-настоящему.
+    # (rev-parse / committed diff) выполняются по-настоящему.
     real_run_git = bsl_index_mod.run_git
 
     def fake_run_git(args, *, timeout):
@@ -115,6 +119,108 @@ def _install_worktree_timeout(monkeypatch) -> None:
         return real_run_git(args, timeout=timeout)
 
     monkeypatch.setattr(bsl_index_mod, "run_git", fake_run_git)
+
+
+def _corrupt_loose_object(root: Path, sha: str) -> None:
+    """Damage the loose object *sha* (as after a storage failure): present, but unreadable."""
+    obj = root / ".git" / "objects" / sha[:2] / sha[2:]
+    assert obj.is_file()  # fresh repo without gc: commits are loose objects
+    obj.chmod(0o644)  # git writes objects read-only (on Windows — the read-only attribute)
+    obj.write_bytes(b"corrupt object")
+
+
+# Index content by natural keys — no surrogate ids, no file dates/sizes. Used to
+# check that an incremental update equals a full build of the same tree.
+_INDEX_CONTENT_SQL = {
+    "modules": "SELECT rel_path, category, object_name, module_type, form_name, is_form, launch_marker FROM modules",
+    "methods": (
+        "SELECT mo.rel_path, me.name, me.type, me.is_export, me.params, me.line, me.end_line, me.loc "
+        "FROM methods me JOIN modules mo ON mo.id = me.module_id"
+    ),
+    "calls": (
+        "SELECT mo.rel_path, me.name, c.callee_name, c.line, c.callee_key, c.callee_via, c.call_kind "
+        "FROM calls c JOIN methods me ON me.id = c.caller_id JOIN modules mo ON mo.id = me.module_id"
+    ),
+    "regions": "SELECT mo.rel_path, r.name, r.line, r.end_line FROM regions r JOIN modules mo ON mo.id = r.module_id",
+    "methods_fts": (
+        "SELECT mo.rel_path, me.name, f.name, f.object_name FROM methods_fts f "
+        "JOIN methods me ON me.id = f.rowid JOIN modules mo ON mo.id = me.module_id"
+    ),
+    "object_synonyms": "SELECT object_name, category, synonym, file FROM object_synonyms",
+    "object_attributes": (
+        "SELECT object_name, category, attr_name, attr_synonym, attr_type, attr_kind, ts_name, source_file "
+        "FROM object_attributes"
+    ),
+    "common_module_props": "SELECT module_name, global_, server, server_call, privileged, file FROM common_module_props",
+    "metadata_references": (
+        "SELECT source_object, source_category, ref_object, ref_kind, used_in, path, line FROM metadata_references"
+    ),
+    "file_paths": "SELECT rel_path, extension, dir_path, filename, depth FROM file_paths",
+}
+
+
+def _index_content(db_path: Path) -> dict:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        content: dict = {table: Counter(conn.execute(sql).fetchall()) for table, sql in _INDEX_CONTENT_SQL.items()}
+    finally:
+        conn.close()
+    for key in ("bsl_count", "paths_hash", "git_head_commit"):
+        content[key] = _read_meta(db_path, key)
+    return content
+
+
+def _fresh_build_content(base: Path, tmp_path: Path, monkeypatch) -> dict:
+    """Full build of the same tree into a separate RLM_INDEX_DIR — the reference for update."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx_fresh"))
+    return _index_content(IndexBuilder().build(str(base)))
+
+
+_MD_NS = 'xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20"'
+
+
+def _md_synonym(text: str) -> str:
+    return f"<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>{text}</v8:content></v8:item></Synonym>"
+
+
+def _md_uuid(key: str) -> uuid.UUID:
+    """Deterministic uuid: rewriting an unchanged object must not change its XML."""
+    return uuid.uuid5(uuid.NAMESPACE_URL, key)
+
+
+def _common_module_xml(name: str) -> str:
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n<MetaDataObject {_MD_NS}>\n'
+        f'<CommonModule uuid="{_md_uuid("CommonModule." + name)}"><Properties><Name>{name}</Name>'
+        f"{_md_synonym(name)}<Global>false</Global><Server>true</Server><ServerCall>false</ServerCall>"
+        "<Privileged>false</Privileged></Properties></CommonModule>\n</MetaDataObject>\n"
+    )
+
+
+def _catalog_xml(name: str, synonym: str) -> str:
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n<MetaDataObject {_MD_NS}>\n'
+        f'<Catalog uuid="{_md_uuid("Catalog." + name)}"><Properties><Name>{name}</Name>{_md_synonym(synonym)}'
+        f'</Properties><ChildObjects><Attribute uuid="{_md_uuid("Catalog." + name + ".Артикул")}"><Properties>'
+        f"<Name>Артикул</Name>{_md_synonym('Артикул')}<Type><v8:Type>xs:string</v8:Type></Type></Properties>"
+        "</Attribute></ChildObjects></Catalog>\n</MetaDataObject>\n"
+    )
+
+
+def _configuration_xml(common_modules: list[str], catalogs: list[str]) -> str:
+    children = "".join(f"<CommonModule>{m}</CommonModule>" for m in common_modules)
+    children += "".join(f"<Catalog>{c}</Catalog>" for c in catalogs)
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n<MetaDataObject {_MD_NS}>\n'
+        f'<Configuration uuid="{_md_uuid("Configuration")}"><Properties><Name>Тест</Name>'
+        f"<Version>1.0.0.1</Version></Properties><ChildObjects>{children}</ChildObjects></Configuration>\n"
+        "</MetaDataObject>\n"
+    )
+
+
+def _write_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +274,72 @@ def git_bsl_project_with_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv("RLM_INDEX_DIR", str(base / ".index"))
     builder = IndexBuilder()
     builder.build(str(base), build_calls=True, build_metadata=True, build_synonyms=True)
+    return base
+
+
+@pytest.fixture
+def git_cf_branches(tmp_path, monkeypatch):
+    """CF tree with two diverged branches; the index is built on the tip of ``feature``.
+
+    master:  common modules ``Общий`` and ``Второй``, catalogs ``Товары`` and ``Услуги``.
+    feature: new export function in ``Общий``, new common module ``Новый``,
+             new catalog ``Склады``, synonym of ``Товары`` changed.
+    Then master moves on: new function in ``Второй``, synonym of ``Услуги`` changed.
+    Every catalog has an object directory (``Ext/ObjectModule.bsl``), as in a real export.
+    """
+    root = tmp_path / "repo"
+    base = root / "src"
+
+    def common_module(name: str, body: str) -> None:
+        _write_file(base / "CommonModules" / f"{name}.xml", _common_module_xml(name))
+        _write_file(base / "CommonModules" / name / "Ext" / "Module.bsl", body)
+
+    def catalog(name: str, synonym: str) -> None:
+        _write_file(base / "Catalogs" / f"{name}.xml", _catalog_xml(name, synonym))
+        _write_file(
+            base / "Catalogs" / name / "Ext" / "ObjectModule.bsl", "Процедура ПередЗаписью(Отказ)\nКонецПроцедуры\n"
+        )
+
+    common_module("Общий", "Процедура Проц() Экспорт\nКонецПроцедуры\n")
+    common_module("Второй", "Процедура Вторая() Экспорт\n    Общий.Проц();\nКонецПроцедуры\n")
+    catalog("Товары", "Товары")
+    catalog("Услуги", "Услуги")
+    _write_file(base / "Configuration.xml", _configuration_xml(["Общий", "Второй"], ["Товары", "Услуги"]))
+    _git(root, "init", "-q", "-b", "master")
+    _git(root, "config", "user.name", "Test")
+    _git(root, "config", "user.email", "test@test.com")
+    _git(root, "config", "core.autocrlf", "false")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "base")
+
+    _git(root, "checkout", "-q", "-b", "feature")
+    common_module(
+        "Общий",
+        "Процедура Проц() Экспорт\nКонецПроцедуры\n\nФункция ФункцияВетки() Экспорт\n    Возврат 1;\nКонецФункции\n",
+    )
+    common_module("Новый", "Функция Новая() Экспорт\n    Общий.Проц();\n    Возврат 2;\nКонецФункции\n")
+    catalog("Товары", "Товары (ветка)")
+    catalog("Склады", "Склады")
+    _write_file(
+        base / "Configuration.xml",
+        _configuration_xml(["Общий", "Второй", "Новый"], ["Товары", "Услуги", "Склады"]),
+    )
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "feature")
+
+    _git(root, "checkout", "-q", "master")
+    common_module(
+        "Второй",
+        "Процедура Вторая() Экспорт\n    Общий.Проц();\nКонецПроцедуры\n\n"
+        "Функция ФункцияМастера() Экспорт\n    Возврат 3;\nКонецФункции\n",
+    )
+    catalog("Услуги", "Услуги (master)")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "master moved on")
+
+    _git(root, "checkout", "-q", "feature")
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    IndexBuilder().build(str(base))
     return base
 
 
@@ -231,6 +403,38 @@ class TestGitHeadSha:
         assert sha is not None
         assert len(sha) == 40
         assert all(c in "0123456789abcdef" for c in sha)
+
+
+class TestGitCommitExists:
+    def test_head_exists(self, git_bsl_project):
+        sha = _git_head_sha(str(git_bsl_project))
+        assert _git_commit_exists(str(git_bsl_project), sha) is True
+
+    def test_unknown_sha(self, git_bsl_project):
+        assert _git_commit_exists(str(git_bsl_project), "0" * 40) is False
+
+    def test_rewritten_commit_still_exists(self, git_bsl_project):
+        """Переписанный amend/rebase коммит остаётся объектом репозитория (его держит reflog)."""
+        root = git_bsl_project.parent
+        old_sha = _git_head_sha(str(git_bsl_project))
+        _git(root, "commit", "--amend", "-m", "rewritten")
+        assert _git_head_sha(str(git_bsl_project)) != old_sha
+        assert _git(root, "merge-base", "--is-ancestor", old_sha, "HEAD", check=False).returncode != 0
+        assert _git_commit_exists(str(git_bsl_project), old_sha) is True
+
+    def test_corrupt_object_is_check_failure(self, git_bsl_project):
+        """Повреждённый объект — отказ проверки (None), а не «коммита нет» (False)."""
+        root = git_bsl_project.parent
+        old_sha = _git_head_sha(str(git_bsl_project))
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        _git(root, "commit", "-q", "-am", "next")
+        _corrupt_loose_object(root, old_sha)
+        assert _git_commit_exists(str(git_bsl_project), old_sha) is None
+
+    def test_no_git(self, tmp_path):
+        """Не git-репозиторий: проверить нельзя — None, а не «коммита нет»."""
+        assert _git_commit_exists(str(tmp_path), "0" * 40) is None
 
 
 class TestGitChangedFiles:
@@ -309,6 +513,43 @@ class TestGitChangedFiles:
         _, prefix = info
         result = _git_changed_files(str(git_bsl_project), "0" * 40, prefix)
         assert result is None
+
+    def test_since_commit_rewritten_by_amend(self, git_bsl_project):
+        """Сохранённый коммит переписан (rebase/amend): не предок HEAD, но дельта считается."""
+        root = git_bsl_project.parent
+        old_sha = _git_head_sha(str(git_bsl_project))
+
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        _git(root, "add", ".")
+        _git(root, "commit", "--amend", "--no-edit")
+        assert _git(root, "merge-base", "--is-ancestor", old_sha, "HEAD", check=False).returncode != 0
+
+        info = _git_repo_info(str(git_bsl_project))
+        _, prefix = info
+        changed = _git_changed_files(str(git_bsl_project), old_sha, prefix)
+        assert changed is not None
+        assert changed.unreliable_reason is None
+        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed.paths
+
+    def test_since_commit_on_unmerged_branch(self, git_bsl_project):
+        """Сохранённый коммит лежит на другой, несмерженной ветке: tree-diff видит разницу с HEAD."""
+        root = git_bsl_project.parent
+        _git(root, "checkout", "-q", "-b", "feature")
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        _git(root, "add", ".")
+        _git(root, "commit", "-m", "feature change")
+        feature_sha = _git_head_sha(str(git_bsl_project))
+        _git(root, "checkout", "-q", "-")
+        assert _git(root, "merge-base", "--is-ancestor", feature_sha, "HEAD", check=False).returncode != 0
+
+        info = _git_repo_info(str(git_bsl_project))
+        _, prefix = info
+        changed = _git_changed_files(str(git_bsl_project), feature_sha, prefix)
+        assert changed is not None
+        assert changed.unreliable_reason is None
+        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed.paths
 
     def test_prefix_filter(self, git_bsl_project):
         root = git_bsl_project.parent
@@ -500,6 +741,74 @@ class TestUpdateGitFastPath:
         result = IndexBuilder().update(str(git_bsl_project))
         new_count = int(_read_meta(db_path, "bsl_count"))
         assert new_count == old_count + result["added"] - result["removed"]
+
+    def test_rewritten_head_keeps_fast_path(self, git_bsl_project):
+        """Индекс собран на коммите, который потом переписан (rebase/amend) — fast path сохраняется."""
+        root = git_bsl_project.parent
+        db_path = get_index_db_path(str(git_bsl_project))
+        stored_before = _read_meta(db_path, "git_head_commit")
+
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        _git(root, "add", ".")
+        _git(root, "commit", "--amend", "--no-edit")
+        assert _git(root, "merge-base", "--is-ancestor", stored_before, "HEAD", check=False).returncode != 0
+
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is True
+        assert result["git_fallback_reason"] is None
+        assert result["changed"] == 1
+        assert _read_meta(db_path, "git_head_commit") == _git_head_sha(str(git_bsl_project))
+
+
+class TestUpdateStoredCommitNotAncestor:
+    """Сохранённый коммит не предок HEAD: быстрый путь сохраняется, индекс равен полной сборке."""
+
+    def test_rebase_onto_moved_master(self, git_cf_branches, tmp_path, monkeypatch):
+        base = git_cf_branches
+        root = base.parent
+        db_path = get_index_db_path(str(base))
+        stored = _read_meta(db_path, "git_head_commit")
+
+        _git(root, "rebase", "-q", "master")
+        assert _git(root, "merge-base", "--is-ancestor", stored, "HEAD", check=False).returncode != 0
+
+        result = IndexBuilder().update(str(base))
+        assert result["git_fast_path"] is True
+        assert result["git_fallback_reason"] is None
+        # Only what came from master: module «Второй» (plus the XML of «Услуги»).
+        assert (result["added"], result["changed"], result["removed"]) == (0, 1, 0)
+
+        content = _index_content(db_path)
+        methods = {row[1] for row in content["methods"]}
+        assert {"ФункцияВетки", "Новая", "ФункцияМастера"} <= methods
+        assert content == _fresh_build_content(base, tmp_path, monkeypatch)
+
+    def test_checkout_branch_without_stored_commit(self, git_cf_branches, tmp_path, monkeypatch):
+        base = git_cf_branches
+        root = base.parent
+        db_path = get_index_db_path(str(base))
+        stored = _read_meta(db_path, "git_head_commit")
+        before = _index_content(db_path)
+        assert any(row[0] == "Новый" for row in before["common_module_props"])
+        assert any(row[0] == "Склады" for row in before["object_attributes"])
+
+        _git(root, "checkout", "-q", "master")
+        assert _git(root, "merge-base", "--is-ancestor", stored, "HEAD", check=False).returncode != 0
+
+        result = IndexBuilder().update(str(base))
+        assert result["git_fast_path"] is True
+        assert result["git_fallback_reason"] is None
+        # «Общий» and «Второй» changed; module «Новый» and the object module of «Склады» are gone.
+        assert (result["added"], result["changed"], result["removed"]) == (0, 2, 2)
+
+        content = _index_content(db_path)
+        assert not any(row[0].startswith("CommonModules/Новый/") for row in content["modules"])
+        assert not any(row[0] == "Новый" for row in content["common_module_props"])
+        assert not any(row[0] in ("Новый", "Склады") for row in content["object_synonyms"])
+        assert not any(row[0] == "Склады" for row in content["object_attributes"])
+        assert content["bsl_count"] == "4"
+        assert content == _fresh_build_content(base, tmp_path, monkeypatch)
 
 
 class TestUpdateFallback:
@@ -794,6 +1103,52 @@ class TestFallbackReasonInDelta:
         result = IndexBuilder().update(str(git_bsl_project))
         assert result["git_fast_path"] is True
         assert result["git_fallback_reason"] is None
+
+    def test_stored_commit_missing_reason(self, git_bsl_project):
+        """Объекта сохранённого коммита нет в репозитории → полный скан с точной причиной, не `git error`."""
+        db_path = get_index_db_path(str(git_bsl_project))
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE index_meta SET value = ? WHERE key = 'git_head_commit'", ("0" * 40,))
+        conn.commit()
+        conn.close()
+
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is False
+        assert result["git_fallback_reason"] == "stored commit missing"
+
+        # Текущий HEAD сохранён — следующий update снова идёт быстрым путём.
+        assert _read_meta(db_path, "git_head_commit") == _git_head_sha(str(git_bsl_project))
+        result2 = IndexBuilder().update(str(git_bsl_project))
+        assert result2["git_fast_path"] is True
+
+    def test_corrupt_stored_commit_is_git_error(self, git_bsl_project):
+        """Объект сохранённого коммита есть, но не читается → `git error`, а не `stored commit missing`."""
+        root = git_bsl_project.parent
+        db_path = get_index_db_path(str(git_bsl_project))
+        stored = _read_meta(db_path, "git_head_commit")
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        _git(root, "commit", "-q", "-am", "next")
+        _corrupt_loose_object(root, stored)
+
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is False
+        assert result["git_fallback_reason"] == "git error"
+        assert result["changed"] == 1  # the full scan still picks up the edit
+
+    def test_stored_commit_check_timeout_is_git_error(self, git_bsl_project, monkeypatch):
+        """Проверка сохранённого коммита не уложилась в таймаут → `git error`."""
+        real_run_git = bsl_index_mod.run_git
+
+        def fake_run_git(args, *, timeout):
+            if any(str(a).endswith("^{commit}") for a in args):
+                raise subprocess.TimeoutExpired(cmd=list(args), timeout=timeout)
+            return real_run_git(args, timeout=timeout)
+
+        monkeypatch.setattr(bsl_index_mod, "run_git", fake_run_git)
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is False
+        assert result["git_fallback_reason"] == "git error"
 
 
 class TestCollectMetadataTablesKwargs:
