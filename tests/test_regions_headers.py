@@ -831,14 +831,14 @@ class TestSearchRegionsGroupBy:
             reader.close()
 
     def test_unknown_group_by_warns_instead_of_lying(self, skewed):
-        """Тот же контракт, что у kinds= — пусто, но ГРОМКО."""
+        """Тот же контракт, что у kinds= — громко. v1.46.0: прежде здесь стояли пустые `groups` с
+        `_meta.arg_warning` — теперь неизвестное значение — отказ с перечнем допустимых (Д4, П1)."""
         db_path, project = skewed
         bsl, reader = self._bsl(db_path, project)
         try:
-            res = bsl["search_regions"]("", group_by="имя")
-            assert res["groups"] == []
-            warn = (res.get("_meta") or {}).get("arg_warning") or ""
-            assert "group_by" in warn and "name" in warn and "category" in warn
+            with pytest.raises(ValueError, match="^search_regions: group_by — ") as exc:
+                bsl["search_regions"]("", group_by="имя")
+            assert "name" in str(exc.value) and "category" in str(exc.value)
         finally:
             reader.close()
 

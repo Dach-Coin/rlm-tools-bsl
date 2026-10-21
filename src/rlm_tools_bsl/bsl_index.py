@@ -1542,6 +1542,18 @@ _CATEGORY_RU: dict[str, str] = {
     "DefinedTypes": "Определяемый тип",
 }
 
+
+def strip_category_prefix(category: str | None, stored: str) -> str:
+    """Синоним объекта без префикса вида (v1.46.0, Д9): ``object_synonyms.synonym`` хранит
+    ``«<Категория>: <синоним>»`` (ради поиска по виду), а наружу синоним идёт как в описателе. Снимается
+    ровно ``f"{_CATEGORY_RU.get(category, category)}: "`` в начале — не «до первого двоеточия»: ``': '`` бывает
+    и внутри самого синонима. Нет такого префикса — строка как есть."""
+    if not stored:
+        return stored
+    prefix = f"{_CATEGORY_RU.get(category or '', category or '')}: "
+    return stored[len(prefix) :] if stored.startswith(prefix) else stored
+
+
 # Map: top-level category folder -> 1C metadata type singular prefix (used in `used_in`)
 _CATEGORY_TO_TYPE_PREFIX: dict[str, str] = {
     "Documents": "Document",
@@ -3185,6 +3197,27 @@ def _check_content_sample(db_path: Path, base_path: str) -> IndexStatus | None:
     return IndexStatus.STALE_CONTENT if content_sample_check(db_path, base_path)[0] == "mismatch" else None
 
 
+def categories_changed_since(config_root: str, built_at: float, *, tolerance: float = 2.0) -> list[str]:
+    """v1.46.0 (Д16, П3 — вариант V1): категории индекса (``_CATEGORY_RU`` — 33, в том числе подписки,
+    функциональные опции, регламентные задания и определяемые типы, которых нет в ``METADATA_CATEGORIES``), чей
+    каталог ``<config_root>/<категория>`` изменён позже ``built_at + tolerance`` — в нём добавлен или удалён объект
+    либо перезаписан описатель (git checkout/pull пересоздаёт файлы: время каталога растёт и без изменения состава).
+
+    Только ``stat`` каталогов по известным именам, без листинга (на боевых — доли миллисекунды на старт). Вложенную
+    подсистему и модуль или форму, добавленные в СУЩЕСТВУЮЩИЙ объект, проверка не видит: меняется время каталога
+    объекта, а не категории. Нет каталога или ошибка ``stat`` — пропуск. Отсортировано."""
+    root = Path(config_root)
+    changed: list[str] = []
+    for category in _CATEGORY_RU:
+        try:
+            mtime = os.stat(root / category).st_mtime
+        except OSError:
+            continue
+        if mtime > built_at + tolerance:
+            changed.append(category)
+    return sorted(changed)
+
+
 def check_index_usable(
     db_path: str | Path,
     base_path: str,
@@ -3199,7 +3232,8 @@ def check_index_usable(
 
     Structural drift (files added/removed) is NOT checked here — use
     check_index_strict() or compare format_info.bsl_file_count with
-    index_meta bsl_count separately.
+    index_meta bsl_count separately. v1.46.0: rlm_start отдельно сверяет состав категорий —
+    ``categories_changed_since`` (``stat`` каталогов 33 категорий против ``built_at``).
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -10356,10 +10390,6 @@ class IndexBuilder:
                     "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                     ("paths_hash", new_paths_hash),
                 )
-                conn.execute(
-                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                    ("built_at", str(time.time())),
-                )
 
         # v17: фоновые рёбра зависят и от ОПИСАТЕЛЕЙ (реквизит формы/объекта, предопределённый
         # элемент затеняют голову обёртки или делают переменную-адресат нелокальной) — при
@@ -10653,6 +10683,14 @@ class IndexBuilder:
         conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
             ("version", str(BUILDER_VERSION)),
+        )
+        # v1.46.0: `built_at` — момент сверки индекса с исходниками. Полный скан сверил всё и без `.bsl`-дельты
+        # (правка только описателей: роль, подписка) — `built_at` пишется всегда, как у git-быстрого пути и сборки.
+        # Прежде — только при изменённых `.bsl`, и предупреждение старта о составе категорий
+        # (`categories_changed_since`) после такого `update` повторялось, а возраст индекса не сбрасывался.
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+            ("built_at", str(time.time())),
         )
 
         # Save git_head_commit on fallback so NEXT update can use git fast path.
@@ -13476,7 +13514,8 @@ class IndexReader:
         """Get enum definition from the index.
 
         Args:
-            enum_name: Enum name (or fragment, case-insensitive).
+            enum_name: Enum name (or fragment, case-insensitive). v1.46.0 (Д19): строка с ТОЧНЫМ именем — первой,
+                иначе прежний выбор — первая, чьё имя содержит запрос.
 
         Returns:
             Dict with name, synonym, values, file — or None if table missing / not found.
@@ -13491,6 +13530,10 @@ class IndexReader:
                 return None
 
             name_lower = enum_name.lower()
+            # v1.46.0 (Д19, П9): точное имя (нормализация `lower()`, как у UDF `py_lower`) — ПЕРВЫМ проходом; затем
+            # прежний перебор «первая строка, чьё имя СОДЕРЖИТ запрос» (порядок таблицы). Прежде на точном имени
+            # отвечало чужое перечисление, если его строка шла раньше (`СтавкиНДС` → `СпособыЗаполненияСтавкиНДС`).
+            rows = sorted(rows, key=lambda r: r["name"].lower() != name_lower)
             for r in rows:
                 if name_lower in r["name"].lower():
                     values = []
@@ -13648,12 +13691,17 @@ class IndexReader:
     def get_all_modules(self) -> list[dict] | None:
         """Return all modules from the index for fast _index_state init.
 
+        v1.46.0 (Д5): в порядке пути (``ORDER BY rel_path``; BINARY-сравнение SQLite — порядок кодовых точек).
+        Прежде порядок был порядком вставки — завершения потоков сборки и истории ``update`` (точечное
+        обновление вставляет строки изменённых модулей в конец), — а он становится порядком каталога сессии:
+        проход ``find_by_type``/``find_module`` без имени, «первый точный модуль» омонима.
+
         Returns:
             list of dicts {rel_path, category, object_name, module_type, form_name}.
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT rel_path, category, object_name, module_type, form_name FROM modules"
+                "SELECT rel_path, category, object_name, module_type, form_name FROM modules ORDER BY rel_path"
             ).fetchall()
             return [
                 {
@@ -15088,10 +15136,8 @@ class IndexReader:
         # read-time bugfix незаметно становится новым глобальным synonym-search.
         # Одного его мало: строка появляется ТОЛЬКО при НЕПУСТОМ <Synonym>, то
         # есть на подсистеме без синонима второй источник молчит.
-        synonym_prefix = f"{_CATEGORY_RU['Subsystems']}: "
         for r in synonym_rows:
-            stored = r["synonym"] or ""
-            raw = stored[len(synonym_prefix) :] if stored.startswith(synonym_prefix) else stored
+            raw = strip_category_prefix("Subsystems", r["synonym"] or "")
             obj = r["object_name"] or ""
             key = (obj, r["file"] or "")
             synonym_hit = raw.lower() == q and _legacy_synonym_candidate(key[1])

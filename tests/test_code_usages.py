@@ -36,6 +36,12 @@ _CF_CONFIG_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <Configuration><Properties><Name>ТестКонфиг</Name></Properties></Configuration>
 </MetaDataObject>
 """
+# v1.46.0: описатель документа, к которому обращается код фикстур (объект есть на диске).
+_DOC_DESCRIPTOR_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+  <Document><Properties><Name>ПриобретениеТоваровУслуг</Name></Properties></Document>
+</MetaDataObject>
+"""
 
 # A module exercising all three usage kinds + the source-aware negatives.
 _USAGE_MODULE = """\
@@ -215,6 +221,9 @@ def cf_index(tmp_path, monkeypatch):
     base = tmp_path / "cf"
     _write(base / "Configuration.xml", _CF_CONFIG_XML)
     _write(base / "CommonModules" / "ТестМодуль" / "Ext" / "Module.bsl", _USAGE_MODULE)
+    # v1.46.0: прежде документа в дереве не было — только обращения к нему в коде; ссылку на объект, которого нет,
+    # шлюз существования (Д3) отвергает. Смысл тестов — обращения в коде, а не существование.
+    _write(base / "Documents" / "ПриобретениеТоваровУслуг.xml", _DOC_DESCRIPTOR_XML)
     builder = IndexBuilder()
     db_path = builder.build(
         str(base),
@@ -382,6 +391,8 @@ class TestHelper:
         # idx_reader=None → reader path skipped → partial=True live fallback.
         base = tmp_path / "nolive"
         _write(base / "Configuration.xml", _CF_CONFIG_XML)
+        # v1.46.0: прежде документа в дереве не было (см. `cf_index`).
+        _write(base / "Documents" / "ПриобретениеТоваровУслуг.xml", _DOC_DESCRIPTOR_XML)
         helpers = _make_helpers(base, None)
         res = helpers["find_code_usages"]("Документ.ПриобретениеТоваровУслуг")
         assert res["partial"] is True

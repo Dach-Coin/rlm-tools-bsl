@@ -285,8 +285,8 @@ def test_e2e_main_with_extension_pointer_no_counts(tmp_path, monkeypatch):
     sid = resp["session_id"]
     try:
         s = resp["strategy"]
-        assert "EXTENSIONS DETECTED" in s
-        assert "1 EXTENSIONS DETECTED" in s  # total (1 расширение) в заголовке
+        # v1.46.0 (Д11): прежде здесь стояло «1 EXTENSIONS DETECTED» — число в заголовке теперь согласовано.
+        assert "1 EXTENSION DETECTED" in s  # total (1 расширение) в заголовке
         assert "nearby_extensions" in s  # указатель на структурный источник
         assert re.search(r": \d+ overrides", s) is None  # НЕТ построчных счётчиков
         # Без поимённого дампа по умолчанию. ВАЖНО: сами имена методов

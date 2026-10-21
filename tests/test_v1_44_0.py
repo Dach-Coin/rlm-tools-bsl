@@ -1957,7 +1957,9 @@ _NON_REFERENCE_ANSWERS = [
     ("find_functional_options", "Подсистема.Продажи", lambda r: r["object"], "Подсистема.Продажи"),
     # сегмент из пробелов — не имя объекта (до правки — вхождения всех документов, все подписки на документы)
     ("find_code_usages", "Documents/ /", lambda r: (r["object"], r["total"]), ("Documents/ /", 0)),
-    ("find_event_subscriptions", "Documents/ /", lambda r: sorted(x["name"] for x in r), ["ВсеДокументы"]),
+    # v1.46.0: прежде здесь стояло ["ВсеДокументы"] — строка подписки на набор документов (`scope='set'`): сегмент из
+    # пробелов — не-ссылка, которой не соответствует ни один объект, и подписки на наборы к ней не раскрываются (Д3).
+    ("find_event_subscriptions", "Documents/ /", lambda r: sorted(x["name"] for x in r), []),
     (
         "get_object_full_structure",
         "Documents/ /Оплата",

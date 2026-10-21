@@ -275,6 +275,7 @@ class Sandbox:
         extension_name_by_root: dict[str, str] | None = None,
         scan_lease=None,
         index_start_status: dict | None = None,
+        main_config_root: str = "",
     ):
         # Топология корней (v1.34.0) проверяется ДО построения namespace и до
         # любого обращения к ридеру/ФС, но ТОЛЬКО на активном BSL-пути:
@@ -300,6 +301,8 @@ class Sandbox:
         self._current_config_role = current_config_role
         self._current_config_name = current_config_name or ""
         self._current_config_root = current_config_root or ""
+        # v1.46.0 (П11): корень основной рядом с расширением — только имена описателей для проверки существования.
+        self._main_config_root = main_config_root or ""
         self._extension_name_by_root = dict(extension_name_by_root or {})
         self._idx_reader = idx_reader
         self._idx_zero_callers_authoritative = idx_zero_callers_authoritative
@@ -415,6 +418,7 @@ class Sandbox:
                 current_config_role=self._current_config_role,
                 current_config_name=self._current_config_name,
                 current_config_root=self._current_config_root,
+                main_config_root=self._main_config_root,
                 extension_name_by_root=self._extension_name_by_root,
                 scan_lease=self._scan_lease,
             )

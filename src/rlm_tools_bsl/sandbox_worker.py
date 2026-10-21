@@ -775,6 +775,8 @@ def _build_session(
         current_config_role=payload.get("current_config_role"),
         current_config_name=payload.get("current_config_name") or "",
         current_config_root=payload.get("current_config_root") or "",
+        # v1.46.0 (П11): нет ключа у старого payload — "" (проверки существования по основной нет).
+        main_config_root=payload.get("main_config_root") or "",
         extension_name_by_root=dict(payload.get("extension_name_by_root") or {}),
         # v1.40.0: аренда СВОЕГО слота общего бюджета обхода.
         scan_lease=scan_lease,

@@ -2980,8 +2980,10 @@ class TestAuditContract:
         assert full["total"] == len(full["issues"]) == 8
 
     def test_unknown_reason_and_layer(self, audit_helpers):
-        res = audit_helpers["find_unresolved_calls"](reasons=["нет_такой"])
-        assert res["issues"] == [] and "method_missing" in res["_meta"]["arg_warning"]
+        # v1.46.0: прежде здесь стояли пустые `issues` с `_meta.arg_warning` — теперь неизвестная причина — отказ
+        # (Д4, П1), как и неизвестный слой.
+        with pytest.raises(ValueError, match="^find_unresolved_calls: reasons — .*method_missing"):
+            audit_helpers["find_unresolved_calls"](reasons=["нет_такой"])
         with pytest.raises(ValueError, match="layer"):
             audit_helpers["find_unresolved_calls"](layer="нет_такого")
 

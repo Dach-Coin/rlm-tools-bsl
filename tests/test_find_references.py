@@ -469,6 +469,17 @@ def _write(path: str | Path, content: str) -> None:
     p.write_text(content, encoding="utf-8")
 
 
+def _write_referenced_catalog(base: Path, name: str) -> None:
+    """v1.46.0: справочник, на который ссылаются объекты фикстуры, — описателем на диске (без ссылок: состав ссылок
+    фикстуры прежний). Прежде его в дереве не было — только ссылки на него, а ссылку на объект, которого нет, шлюз
+    существования (Д3) отвергает. Смысл живых тестов — разбор ссылок, а не существование."""
+    _write(
+        base / "Catalogs" / f"{name}.xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+        f"<Catalog><Properties><Name>{name}</Name></Properties></Catalog></MetaDataObject>\n",
+    )
+
+
 _CF_CONFIG_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
   <Configuration>
@@ -654,12 +665,12 @@ class TestFindReferencesToObject:
             assert r["kind"] == "attribute_type"
 
     def test_not_found_returns_empty(self, refs_cf_fixture):
+        # v1.46.0: прежде здесь стоял пустой ответ (`total=0`) — ссылка на несуществующий объект теперь
+        # отказ шлюза существования с маршрутом search_objects (Д3).
         reader, base, _ = refs_cf_fixture
         helpers = _stub_helpers(base, reader)
-        result = helpers["find_references_to_object"]("Catalog.НеСуществует")
-        assert result["total"] == 0
-        assert result["references"] == []
-        assert result["by_kind"] == {}
+        with pytest.raises(ValueError, match="^find_references_to_object: объекта Catalog.НеСуществует нет"):
+            helpers["find_references_to_object"]("Catalog.НеСуществует")
 
     def test_defined_type_lookup_via_helper(self, refs_cf_fixture):
         reader, base, _ = refs_cf_fixture
@@ -699,6 +710,7 @@ class TestLiveFallback:
         _write(base / "Configuration.xml", _CF_CONFIG_XML)
         # Standard CF layout: top-level Subsystems/CRM.xml
         _write(base / "Subsystems" / "CRM.xml", _CF_SUBSYSTEM_XML)
+        _write_referenced_catalog(base, "Контрагенты")  # v1.46.0: прежде объекта в дереве не было
 
         helpers = self._build_live_helpers(base)
         result = helpers["find_references_to_object"]("Справочник.Контрагенты")
@@ -716,6 +728,7 @@ class TestLiveFallback:
             base / "Catalogs" / "Контрагенты" / "Ext" / "Catalog.xml",
             _CF_CATALOG_XML,
         )
+        _write_referenced_catalog(base, "Организации")  # v1.46.0: прежде объекта в дереве не было
 
         helpers = self._build_live_helpers(base)
         result = helpers["find_references_to_object"]("Catalog.Организации")
@@ -886,6 +899,7 @@ class TestAttributeLineFilled:
             base / "Catalogs" / "Контрагенты" / "Ext" / "Catalog.xml",
             _CF_CATALOG_XML,
         )
+        _write_referenced_catalog(base, "Банки")  # v1.46.0: прежде объекта в дереве не было
         from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
 
         helpers = make_bsl_helpers(
@@ -954,6 +968,7 @@ class TestLiveCommandParameterType:
         base = tmp_path / "cf_cc"
         _write(base / "Configuration.xml", _CF_CONFIG_XML)
         _write(base / "CommonCommands" / "СоздатьЗаказ.xml", _CF_COMMON_COMMAND_XML)
+        _write_referenced_catalog(base, "Контрагенты")  # v1.46.0: прежде объекта в дереве не было
 
         helpers = self._build_helpers(base)
         result = helpers["find_references_to_object"]("Catalog.Контрагенты")
@@ -977,6 +992,7 @@ class TestLiveCommandParameterType:
             base / "Catalogs" / "Заказы" / "Commands" / "СоздатьКлиента.xml",
             _CF_COMMON_COMMAND_XML.replace("СоздатьЗаказ", "СоздатьКлиента"),
         )
+        _write_referenced_catalog(base, "Контрагенты")  # v1.46.0: прежде объекта в дереве не было
 
         helpers = self._build_helpers(base)
         result = helpers["find_references_to_object"]("Catalog.Контрагенты")
@@ -992,6 +1008,7 @@ class TestLiveCommandParameterType:
         base = tmp_path / "cf_filter_cmd"
         _write(base / "Configuration.xml", _CF_CONFIG_XML)
         _write(base / "CommonCommands" / "СоздатьЗаказ.xml", _CF_COMMON_COMMAND_XML)
+        _write_referenced_catalog(base, "Контрагенты")  # v1.46.0: прежде объекта в дереве не было
 
         helpers = self._build_helpers(base)
         result = helpers["find_references_to_object"]("Catalog.Контрагенты", kinds=["attribute_type"])
@@ -1007,6 +1024,7 @@ class TestLiveSiblingExtDedup:
         monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
         base = tmp_path / "cf_dedup"
         _write(base / "Configuration.xml", _CF_CONFIG_XML)
+        _write_referenced_catalog(base, "Организации")  # v1.46.0: прежде объекта в дереве не было
         # Both layouts at once for the SAME object
         _write(
             base / "Catalogs" / "Контрагенты" / "Ext" / "Catalog.xml",
@@ -1034,6 +1052,7 @@ class TestLiveSiblingExtDedup:
         monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
         base = tmp_path / "cf_dedup_attr"
         _write(base / "Configuration.xml", _CF_CONFIG_XML)
+        _write_referenced_catalog(base, "Банки")  # v1.46.0: прежде объекта в дереве не было
         _write(
             base / "Catalogs" / "Контрагенты" / "Ext" / "Catalog.xml",
             _CF_CATALOG_XML,

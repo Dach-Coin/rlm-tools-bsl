@@ -90,6 +90,7 @@ from rlm_tools_bsl.bsl_index import (
     OLD_INDEX_GAPS,
     IndexReader,
     IndexStatus,
+    categories_changed_since,
     check_index_usable,
     content_sample_check,
     describe_index_root,
@@ -574,6 +575,7 @@ def _create_session_backend(
     current_config_root: str = "",
     extension_name_by_root: dict[str, str] | None = None,
     index_start_status: dict | None = None,
+    main_config_root: str = "",
 ):
     """Фабрика backend по режиму (§5.2): выбор делается один раз при rlm_start,
     дальше server не ветвится по типу backend.
@@ -585,7 +587,9 @@ def _create_session_backend(
 
     Роль/имя/current-root/карта имён расширений (v1.34.0) уже вычислены сервером
     через ``detect_extension_context`` и едут JSON-safe примитивами — внутри
-    сессии detector не повторяется."""
+    сессии detector не повторяется. Тем же путём (v1.46.0, П11) едет
+    ``main_config_root`` — корень основной рядом с расширением в сессии на
+    расширении: по нему хелперы судят о существовании объектов основной."""
     # Защитная проверка топологии корней ДО создания backend: на активном
     # BSL-пути пересекающиеся base/ext дали бы двойной учёт одного дерева.
     # В generic-режиме валидация не выполняется — provenance там не используется.
@@ -615,6 +619,7 @@ def _create_session_backend(
             current_config_name=current_config_name,
             current_config_root=current_config_root,
             extension_name_by_root=dict(extension_name_by_root or {}),
+            main_config_root=main_config_root,
         )
 
         def _startup_unregister(candidate) -> None:
@@ -651,6 +656,7 @@ def _create_session_backend(
         current_config_name=current_config_name,
         current_config_root=current_config_root,
         extension_name_by_root=dict(extension_name_by_root or {}),
+        main_config_root=main_config_root,
         # v1.40.0: ОДНА аренда общего бюджета обхода на все inline-сессии процесса.
         # Сессии она не принадлежит, поэтому закрытию backend-а освобождать нечего.
         scan_lease=get_scan_ledger().inline_lease(),
@@ -1126,6 +1132,23 @@ def _rlm_start(
                             idx_warnings.append(
                                 "Index content may be outdated — run 'rlm-bsl-index index update' to refresh"
                             )
+                        # v1.46.0 (Д16, П3 — V1): каталоги категорий, изменённые после сборки, — `stat` против
+                        # `built_at`. Время каталога растёт, когда объект добавлен или удалён, но и когда описатель
+                        # перезаписан (git checkout/pull пересоздаёт файлы), поэтому текст — «мог измениться», без
+                        # утверждения о новых объектах (ревью 1.46.0). Статус `ok` полноты не доказывал:
+                        # у молодого индекса выборка не делается, а структурный дрейф не проверялся вовсе.
+                        # `index_status` не меняется; `update` переписывает `built_at` — ложного повтора нет.
+                        drift_built_at = idx_stats.get("built_at")
+                        drift = categories_changed_since(resolved, float(drift_built_at)) if drift_built_at else []
+                        if drift:
+                            idx_warnings.append(
+                                f"После сборки индекса мог измениться состав категорий: {', '.join(drift)} (каталог "
+                                "категории изменен: объект добавлен, удален или его описатель перезаписан — так делают "
+                                "и git checkout/pull) — индекс может отставать; вложенную подсистему и модуль, "
+                                "добавленный в существующий объект, эта проверка не видит. Обновить индекс: "
+                                f'rlm-bsl-index index update "{resolved}"'
+                            )
+                            logger.warning("rlm_start: session=%s category_drift=%s", session_id, ",".join(drift))
                         # Check index builder version
                         idx_version = int(idx_stats.get("builder_version") or 0)
                         if idx_version < BUILDER_VERSION:
@@ -1266,6 +1289,13 @@ def _rlm_start(
         )
         ext_paths_for_sandbox = [e.path for e in _nearby_for_bsl]
         ext_name_by_root = {e.path: e.name for e in _nearby_for_bsl if e.path and e.name}
+        # v1.46.0 (П11): корень основной рядом с расширением — в сессию на расширении (только для проверки
+        # существования объектов основной; повторный детект внутри сессии запрещён).
+        _main_root_for_bsl = (
+            ext_context.nearby_main.path
+            if ext_context.current.role == ConfigRole.EXTENSION and ext_context.nearby_main is not None
+            else ""
+        )
         backend, parent_owns_reader = _create_session_backend(
             sandbox_mode=sandbox_mode,
             resolved=resolved,
@@ -1284,6 +1314,7 @@ def _rlm_start(
             current_config_name=ext_context.current.name or "",
             current_config_root=_current_root_for_bsl,
             extension_name_by_root=ext_name_by_root,
+            main_config_root=_main_root_for_bsl or "",
         )
         _drain_startup_log_records(session_id, backend)
         if not parent_owns_reader:

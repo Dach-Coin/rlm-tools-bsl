@@ -708,8 +708,15 @@ def _dp_catalog(name: str, attr_types: list[str]) -> str:
 
 def _dp_tree(root: Path) -> Path:
     spec = dict(_DP_SPEC)
-    # А → (Б, В); Б → Г: две исходящие ссылки у А, цепочка через Б
-    for name, refs in (("А", ["CatalogRef.Б", "CatalogRef.В"]), ("Б", ["CatalogRef.Г"]), ("В", []), ("Г", [])):
+    # А → (Б, В); Б → Г: две исходящие ссылки у А, цепочка через Б. v1.46.0: `Изолированный` — существующий
+    # объект без ссылок (конец промаха): конец-ссылка на несуществующий объект — отказ шлюза, а не обход.
+    for name, refs in (
+        ("А", ["CatalogRef.Б", "CatalogRef.В"]),
+        ("Б", ["CatalogRef.Г"]),
+        ("В", []),
+        ("Г", []),
+        ("Изолированный", []),
+    ):
         spec[f"Catalogs/{name}.xml"] = _dp_catalog(name, refs)
         spec[f"Catalogs/{name}/Ext/Catalog.xml"] = _dp_catalog(name, refs)
     return _cf_doc_tree(root, spec)
@@ -726,11 +733,13 @@ class TestDataPathTruncation:
         other = "Catalog.В" if first == "Catalog.Б" else "Catalog.Б"
         res = bsl["find_data_path"]("Справочник.А", other.replace("Catalog.", "Справочник."), max_depth=1)
         assert res["found"] is True and res["path"][0]["to"] == other  # ссылка за страницей узла
-        res2 = bsl["find_data_path"]("Справочник.А", "Справочник.Нет", max_depth=1)
-        assert res2["found"] is False and res2["_meta"]["budget_exceeded"] is True and "hint" in res2
-        assert res2["_meta"]["truncated_nodes"] == [{"object": "Catalog.А", "refs_returned": 1}]
-        assert res2["_meta"]["truncated_nodes_total"] == 1
-        assert "find_references_to_object('Справочник.Нет')" in res2["hint"]
+        # v1.46.0: прежде здесь стоял конец `Справочник.Нет` — несуществующий объект теперь отвергает шлюз.
+        # v1.46.0 (Д6): прежде здесь стоял неокончательный промах (`budget_exceeded=True`, `hint`, `truncated_nodes`)
+        # — у узла последнего уровня (`max_depth=1`) дети не раскрывались бы вовсе, и после точечной проверки
+        # прямой ссылки промах окончателен.
+        res2 = bsl["find_data_path"]("Справочник.А", "Справочник.Изолированный", max_depth=1)
+        assert res2["found"] is False and res2["_meta"]["budget_exceeded"] is False and "hint" not in res2
+        assert "truncated_nodes" not in res2["_meta"]
 
     @pytest.mark.parametrize("exit_kind", ["node_budget", "no_index", "refs_table_lost"])
     def test_find_data_path_every_inconclusive_exit_has_hint(self, tmp_path, monkeypatch, exit_kind):
@@ -745,14 +754,16 @@ class TestDataPathTruncation:
         else:
             monkeypatch.setattr(IndexReader, "find_metadata_refs_from", lambda self, *a, **k: None)
         bsl = _bsl_for(root, reader)
-        res = bsl["find_data_path"]("Справочник.А", "Справочник.Нет", max_depth=3)
+        # v1.46.0: прежде здесь стоял конец `Справочник.Нет` — несуществующий объект теперь отвергает шлюз.
+        res = bsl["find_data_path"]("Справочник.А", "Справочник.Изолированный", max_depth=3)
         assert res["found"] is False and "hint" in res
         assert res["_meta"]["budget_exceeded"] is True or res["partial"] is True
 
     def test_find_data_path_conclusive_miss_has_no_hint(self, tmp_path, monkeypatch):
         root = _dp_tree(tmp_path / "cf")
         bsl = _bsl_for(root, _reader_for(root, monkeypatch))
-        res = bsl["find_data_path"]("Справочник.А", "Справочник.Нет", max_depth=3)
+        # v1.46.0: прежде здесь стоял конец `Справочник.Нет` — несуществующий объект теперь отвергает шлюз.
+        res = bsl["find_data_path"]("Справочник.А", "Справочник.Изолированный", max_depth=3)
         assert res["found"] is False and res["_meta"]["budget_exceeded"] is False and res["partial"] is False
         assert "hint" not in res and "truncated_nodes" not in res["_meta"]
 
@@ -1094,8 +1105,10 @@ class TestDocumentFlowHomonym:
         # ссылка 'Документ.X' — категория документа задана явно: при одноимённом регистре без документа
         # метаданные и подписки регистра больше не выдаются за документ (ревью вехи 4, буква плана Задачи 6)
         _root, bsl = amort
-        res = bsl["analyze_document_flow"]("Документ.ТолькоРегистр")
-        assert res["metadata"].get("object_type") != "AccumulationRegister"
+        # v1.46.0: прежде здесь стоял ответ с пустыми метаданными (не регистра). Документа `ТолькоРегистр` нет, и
+        # ссылку на несуществующий объект шлюз существования (Д3) отвергает — регистр за документ по-прежнему не выдаётся.
+        with pytest.raises(ValueError, match="^analyze_document_flow: объекта Document.ТолькоРегистр нет"):
+            bsl["analyze_document_flow"]("Документ.ТолькоРегистр")
 
     def test_flow_hybrid_input_keeps_previous_parsing(self, amort):
         # 'Документ.Catalogs/X' — не ссылка: прежний разбор (производное имя `Catalogs/X`)
@@ -1934,6 +1947,9 @@ class TestPostingHintSize:
 
     def test_posting_hint_keeps_per_delegate_facts(self, tmp_path, monkeypatch):
         """Ловушка однофамильца — факт ДЕЛЕГАТА, а не пояснение вида: она остаётся у каждого."""
+        # v1.46.0: окружающий git отсечён — временный каталог внутри рабочего дерева git уводил подсказку на маршрут
+        # `safe_grep`, и проверка маршрута `find_definition` падала без отношения к коду.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
         handler = (
             "Процедура ОбработкаПроведения(Отказ, Режим)\n"
             + "".join(

@@ -490,11 +490,14 @@ def test_list_overload_isolation_preserved(guarded_bsl):
 
 
 def test_unknown_profile_section_yields_arg_warning(guarded_bsl):
-    """Опечатка в имени секции обязана быть заметной, а не давать пустой профиль."""
-    res = guarded_bsl["get_object_profile"]("Документ.ТестовыйДокумент", sections=["predefined_items"])
-    warn = (res.get("_meta") or {}).get("arg_warning") or ""
-    assert "predefined_items" in warn
-    assert "structure" in warn, "варнинг обязан перечислить принятые имена"
+    """Опечатка в имени секции обязана быть заметной, а не давать пустой профиль.
+
+    v1.46.0: прежде здесь стояло `_meta.arg_warning` с пустым `sections` — теперь неизвестное имя секции —
+    отказ `ValueError` с перечнем допустимых (Д4, П1)."""
+    with pytest.raises(ValueError, match="^get_object_profile: sections — ") as exc:
+        guarded_bsl["get_object_profile"]("Документ.ТестовыйДокумент", sections=["predefined_items"])
+    assert "predefined_items" in str(exc.value)
+    assert "structure" in str(exc.value), "отказ обязан перечислить принятые имена"
 
 
 def test_flow_and_code_usages_are_accepted_as_section_names(guarded_bsl):
@@ -519,21 +522,21 @@ def test_known_section_produces_no_warning(guarded_bsl):
 
 
 def test_unknown_ref_kind_yields_arg_warning(guarded_bsl):
-    res = guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["Subsystem"])
-    warn = (res.get("_meta") or {}).get("arg_warning") or ""
-    assert "Subsystem" in warn, "варнинг обязан назвать отвергнутый вид"
-    assert "subsystem_content" in warn, "варнинг обязан перечислить допустимые виды"
-    assert res["total"] == 0
+    # v1.46.0: прежде здесь стоял `total=0` с `_meta.arg_warning` — теперь неизвестный вид — отказ (Д4, П1).
+    with pytest.raises(ValueError, match="^find_references_to_object: kinds — ") as exc:
+        guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["Subsystem"])
+    assert "Subsystem" in str(exc.value), "отказ обязан назвать отвергнутый вид"
+    assert "subsystem_content" in str(exc.value), "отказ обязан перечислить допустимые виды"
 
 
 def test_mixed_ref_kinds_keep_filtering_by_valid_ones(guarded_bsl):
-    """Валидный вид продолжает фильтровать как прежде — гард только информирует."""
-    mixed = guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["Subsystem", "attribute_type"])
+    """v1.46.0: прежде здесь стояло «частично неизвестный список фильтрует по известным» (неизвестный вид молча
+    выпадал, и «ссылок этого вида нет» читалось как факт) — теперь такой список — отказ (Д4, П1); валидный вид
+    фильтрует как прежде."""
+    with pytest.raises(ValueError, match="^find_references_to_object: kinds — неизвестные значения \\['Subsystem'\\]"):
+        guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["Subsystem", "attribute_type"])
     only_valid = guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["attribute_type"])
     assert only_valid["total"] > 0, "фикстура обязана давать ссылку, иначе сравнение вакуумно (0 == 0)"
-    assert mixed["total"] == only_valid["total"]
-    assert mixed["by_kind"] == only_valid["by_kind"]
-    assert "Subsystem" in ((mixed.get("_meta") or {}).get("arg_warning") or "")
 
 
 def test_known_ref_kind_produces_no_meta_noise(guarded_bsl):

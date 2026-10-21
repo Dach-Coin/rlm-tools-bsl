@@ -463,6 +463,15 @@ def test_find_predefined_refetches_a_page_eaten_by_the_homonym(tmp_path):
     try:
         empty_root = tmp_path / "root"
         empty_root.mkdir()
+        # v1.46.0: описатель ПВХ на диске — прежде объекта в дереве не было (только строки индекса), а ссылку на
+        # объект, которого нет, шлюз существования (Д3) отвергает. Строки ответа по-прежнему из индекса.
+        (empty_root / "ChartsOfCharacteristicTypes").mkdir()
+        (empty_root / "ChartsOfCharacteristicTypes" / "Бета.xml").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+            "<ChartOfCharacteristicTypes><Properties><Name>Бета</Name></Properties></ChartOfCharacteristicTypes>"
+            "</MetaDataObject>\n",
+            encoding="utf-8",
+        )
         bsl = _bsl_for(empty_root, reader)
         got = bsl["find_predefined"](object_name="ПланВидовХарактеристик.Бета", limit=5)
         assert [(r["category"], r["item_name"]) for r in got] == [("ChartsOfCharacteristicTypes", "П2")]

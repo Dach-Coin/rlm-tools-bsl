@@ -1380,7 +1380,10 @@ class TestMetadataRouteCandidacy:
 
     def test_healthy_config_reports_no_failures(self, tmp_path):
         root = self._healthy_cf(tmp_path)
-        meta = _make_bsl(root)["find_references_to_object"]("Document.Цель")["_meta"]
+        # v1.46.0: прежде здесь стояло `Document.Цель` — такого объекта в дереве нет, а ссылку на объект, которого
+        # нет, шлюз существования (Д3) отвергает. Смысл теста — перепись кандидатов, а не объект: спрашивается
+        # существующий `Док` (его описатель кандидатом и так учтён — счёт прежний).
+        meta = _make_bsl(root)["find_references_to_object"]("Document.Док")["_meta"]
         assert meta["failed_files"] == 0, meta
         assert meta["candidates_total"] == 1, meta
         assert meta["scanned_files"] == 1, meta
@@ -1390,7 +1393,8 @@ class TestMetadataRouteCandidacy:
         классифицируется, поэтому остаётся кандидатом и доказанным отказом."""
         root = self._healthy_cf(tmp_path)
         _write(root / "Documents" / "Битый" / "Ext" / "Document.xml", "<MetaDataObject><Document")
-        meta = _make_bsl(root)["find_references_to_object"]("Document.Цель")["_meta"]
+        # v1.46.0: прежде здесь стояло `Document.Цель` (см. `test_healthy_config_reports_no_failures`).
+        meta = _make_bsl(root)["find_references_to_object"]("Document.Док")["_meta"]
         assert meta["candidates_total"] == 2, meta
         assert meta["failed_files"] == 1, meta
 
@@ -1402,10 +1406,11 @@ class TestMetadataRouteCandidacy:
             root / "ExchangePlans" / "П" / "Ext" / "Content.xml",
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<ExchangePlanContent xmlns="http://v8.1c.ru/8.3/xcf/extrnprops">\n'
-            "  <Item><Metadata>Document.Цель</Metadata><AutoRecord>Allow</AutoRecord></Item>\n"
+            "  <Item><Metadata>Document.Док</Metadata><AutoRecord>Allow</AutoRecord></Item>\n"
             "</ExchangePlanContent>\n",
         )
-        res = _make_bsl(root)["find_references_to_object"]("Document.Цель")
+        # v1.46.0: прежде состав и вопрос называли `Document.Цель` (см. `test_healthy_config_reports_no_failures`).
+        res = _make_bsl(root)["find_references_to_object"]("Document.Док")
         meta = res["_meta"]
         assert meta["failed_files"] == 0, meta
         # Ссылка ПРИ ЭТОМ найдена — сужение переписи не сузило recall.
@@ -1417,7 +1422,9 @@ def test_default_kinds_still_names_unsupported_kinds(cf):
     прятал ограничение именно в том вызове, которым хелпер и вызывают: пустой
     ответ по `role_rights` читался бы как доказанное «ссылок нет»."""
     bsl = _make_bsl(cf)
-    default = bsl["find_references_to_object"]("Document.Цель")["_meta"]["unsupported_kinds"]
+    # v1.46.0: прежде здесь стояло `Document.Цель` — такого объекта в дереве нет (шлюз существования, Д3, отвергает
+    # ссылку на него); перечень видов от объекта не зависит, спрашивается существующий `ТестДок`.
+    default = bsl["find_references_to_object"]("Document.ТестДок")["_meta"]["unsupported_kinds"]
     assert set(default) == {
         "choice_parameter_link",
         "event_subscription_source",
@@ -1427,7 +1434,7 @@ def test_default_kinds_still_names_unsupported_kinds(cf):
         "role_rights",
     }, default
     # Явный запрос по-прежнему сужается до запрошенного.
-    narrow = bsl["find_references_to_object"]("Document.Цель", kinds=["role_rights", "owner"])
+    narrow = bsl["find_references_to_object"]("Document.ТестДок", kinds=["role_rights", "owner"])
     assert narrow["_meta"]["unsupported_kinds"] == ["role_rights"]
 
 
@@ -2659,6 +2666,10 @@ class TestIndexIdentityIsProven:
         гейт, который у него уже был.
         """
         a, b = two_configs
+        # v1.46.0: справочник `ВладелецБ` есть и в базе A (без ссылок на него): прежде его в A не было, а ссылку на
+        # объект, которого нет, шлюз существования (Д3) отвергает. Проверка прежняя — строки чужого индекса (ссылка
+        # на `ВладелецБ`) не используются, ответ идёт живым обходом базы A.
+        _write(a / "Catalogs" / "ВладелецБ" / "Ext" / "Catalog.xml", self._CAT_XML.format(name="ВладелецБ"))
         bsl = _make_bsl(a, idx_reader=self._legacy(kind, b))
         assert [r["object_name"] for r in bsl["search_objects"]("", limit=100)] == []
         cnt = bsl["search_objects"]("", count_only=True)

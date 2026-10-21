@@ -2396,7 +2396,10 @@ def test_object_modules_registered_sig_exact():
 
     sig = build_helper_metadata_snapshot()["get_object_modules"]["sig"]
     # v1.40.0: 467 -> 483 — `loc=Σ строк методов` (+16), осознанное расширение контракта.
-    assert len(sig) == 483
+    # v1.46.0 (П4): 483 -> 506 — подпись называет единицы: `overrides:{count=методов,` и верхний
+    # `_meta:{index_used=все из индекса,` (+23): `index_used=False` рядом с `modules_index=8` читался как
+    # «индекс не использован», а `count` — как число строк перехватов.
+    assert len(sig) == 506
     assert "orphan_methods?" in sig
     assert "# ДЕШЕВЫЙ КОД-СКЕЛЕТ объекта за 1 вызов" not in sig
 

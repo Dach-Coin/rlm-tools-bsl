@@ -484,7 +484,7 @@ index-домена (синонимы, ссылки метаданных) пол�
 СВЕЖЕСТЬ — МАТРИЦА, не иерархия: index_status=missing/incomplete → собери индекс;
 stale_content → index update; stale_age → календарь (выборка — в warnings: совпала/не проводится —
 граф вызовов авторитетен), сверь критичное живьём;
-ok полноты НЕ доказывает (структурный дрейф не проверяется никогда);
+ok полноты НЕ доказывает (дрейф виден лишь по каталогам категорий);
 index_coverage=disabled → домен не строился, пересобери с нужной опцией;
 unavailable|wider_than_current → строки годны, полнота не доказана; partial=True →
 неполон ИМЕННО этот ответ (см. _meta.reasons). index_status — снимок СЕССИИ, а
@@ -1006,7 +1006,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "ПЛАТФОРМЕННЫЕ обработчики модуля объекта (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф ВЫЗОВОВ не попадает → callers=0 это НОРМА, а не мертвый код, и module_hint этого не лечит. НО по имени хелпер обработчики НЕ исключает: если BSL-код где-то ЯВНО зовет ОбработкаПроведения(...), такое ребро в индексе ЕСТЬ и хелпер его ПОКАЖЕТ — не игнорируй его. Просто ЧЕМ пишутся движения, так не найти: трассируй ДЕЛЕГАТА из тела обработчика → рецепт «проведение». include_triggers ребра «зовет платформа» не добавит (такого edge_type нет), но CFE-перехват самого обработчика ПОКАЖЕТ. Неэкспортную зовут только из своего модуля",
             "module_hint=rel_path привязывает КОРЕНЬ к ОДНОМУ модулю → exact; 'Документ.X'/голое имя — лишь при уникальном в объекте имени",
             "Формы hint: rel_path (ТОЧНАЯ) | 'Документ.X' | голое имя — две последние задают лишь ОБЪЕКТ: exact только если имя в нём уникально",
-            "Доверие: _meta.root_exact (включился ли exact на корне), _meta.exact_rows/fallback_rows, node['meta'].target_exact, node['target_key']=rel_path::метод",
+            "Доверие: _meta.root_exact (включился ли exact на корне), _meta.exact_rows/fallback_rows (у узла — node['meta']; target_exact — лишь цель), node['target_key']=rel_path::метод",
             "Дерево по узлам: tree['tree'][i] = {name, target_hint, target_key, meta, callers}",
             "tree['truncated_targets'] — список узлов с >200 callers (популярные имена); добор — с node['target_hint'], не ''",
             "tree['visited'] — общее число уникальных узлов в обходе",
@@ -1019,11 +1019,10 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "# NB: корень — метод, который РЕАЛЬНО зовут из BSL: у платформенного callers=0.\n"
             "hint = [m['path'] for m in find_module('РеализацияТоваровУслуг') if m['module_type'] == 'ObjectModule'][0]\n"
             "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint=hint, depth=2)  # rel_path — ТОЧНАЯ форма\n"
-            "m = tree.get('_meta', {})\n"
-            "print(f\"root_exact={m.get('root_exact')} exact_rows={m.get('exact_rows')} fallback_rows={m.get('fallback_rows')}\")\n"
-            "for node in tree.get('tree', []):\n"
-            "    mark = 'EXACT' if node['meta']['target_exact'] else 'name'\n"
-            "    print(f\"{node['name']} [{mark}] ({len(node.get('callers', []))} callers)\")\n"
+            "for node in tree.get('tree', []):  # метка — по РЕБРАМ узла, первый — корень\n"
+            "    x = node['meta']\n"
+            "    mark = 'смешанно' if x['exact_rows'] and x['fallback_rows'] else 'точно' if x['exact_rows'] else 'по имени'\n"
+            "    print(f\"{node['name']} [ребра: {mark}; цель: {x['target_exact']}] ({len(node.get('callers', []))} callers)\")\n"
             "    for caller in node.get('callers', [])[:5]:\n"
             "        print(f\"  ← {caller['caller_name']} ({caller['object_name']} {caller['module_path']}:{caller['line']})\")"
         ),
@@ -1095,7 +1094,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "каждый элемент path = РЕБРО {from, to, kind, used_in, path, line}",
             "kinds=[...] → ограничить виды ссылок (attribute_type, owner, based_on, subsystem_content, ...)",
             "partial=True → нет таблицы metadata_references (старый индекс) — нужен ребилд",
-            "_meta.budget_exceeded=True → node_budget (~400) ИЛИ узел с ≥1000 ссылок (_meta.truncated_nodes; прямая ссылка на to проверена); маршрут — res['hint']",
+            "_meta.budget_exceeded=True → node_budget (~400) ИЛИ узел не последнего уровня с ≥1000 ссылок (_meta.truncated_nodes; прямая ссылка на to проверена); маршрут — res['hint']",
             "ALT: find_references_to_object('Справочник.X') → все ВХОДЯЩИЕ ссылки на объект (обратное направление, 1 уровень)",
         ],
     },
@@ -2169,7 +2168,8 @@ def _extension_strategy(ext_context, ext_overrides: dict, *, slim: bool = False)
         # truncation markers — nearby_extensions_truncated/total/shown + extensions_hint);
         # serializing them a 2nd time here (prose header) and a 3rd (per-extension counters
         # below) cost ~600 tok on EVERY rlm_start. The behavioral block is preserved VERBATIM.
-        header = f"CRITICAL — {total} EXTENSIONS DETECTED"
+        # v1.46.0 (Д11): число согласовано — «1 EXTENSION DETECTED» (прежде «1 EXTENSIONS»).
+        header = f"CRITICAL — {total} {'EXTENSION' if total == 1 else 'EXTENSIONS'} DETECTED"
         lines.append(
             (f"\n== {header} ==\n" if slim else f"\n{header} ")
             + "(name/prefix/overrides_count в extension_context.nearby_extensions)\n"

@@ -262,11 +262,13 @@ def test_find_event_subscriptions_event_filter(bsl_env):
 
 
 def test_find_event_subscriptions_event_filter_russian(bsl_env):
-    """event_filter with Russian event name."""
+    """event_filter with Russian event name.
+
+    v1.46.0: прежде здесь стоял тихий пустой список — русское имя обработчика с событием из XML (английским)
+    не совпадает никогда; теперь это отказ с перечнем английских имен событий (Д4, П1)."""
     _make_event_subs_fixture(str(bsl_env.path))
-    # No Russian event name in fixture — empty result, but doesn't crash.
-    result = bsl_env.bsl["find_event_subscriptions"]("", event_filter=["ПередЗаписью"])
-    assert isinstance(result, list)
+    with pytest.raises(ValueError, match="^find_event_subscriptions: event_filter — .*английское имя события"):
+        bsl_env.bsl["find_event_subscriptions"]("", event_filter=["ПередЗаписью"])
 
 
 def test_find_event_subscriptions_filter_falls_back_when_index_empty(bsl_env):

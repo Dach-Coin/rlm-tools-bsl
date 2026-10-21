@@ -2096,6 +2096,25 @@ def _make_based_on_index_fixture(tmpdir, *, with_zadacha=False):
     return bsl, reader, db_path
 
 
+_DESCRIPTOR_TAGS = {"Catalogs": "Catalog", "Documents": "Document"}
+
+
+def _write_descriptor(tmpdir, category, name):
+    """Описатель объекта выгрузки Конфигуратора (``<category>/<name>.xml``): объект есть на диске.
+
+    v1.46.0: прежде объекты части тестов существовали только ссылками на них (засеянные строки
+    ``metadata_references``, состав функциональных опций, источники подписок), а ссылку на объект,
+    которого нет, шлюз существования (Д3) отвергает ``ValueError``. Смысл этих тестов — не существование."""
+    tag = _DESCRIPTOR_TAGS[category]
+    os.makedirs(os.path.join(tmpdir, category), exist_ok=True)
+    with open(os.path.join(tmpdir, category, f"{name}.xml"), "w", encoding="utf-8") as f:
+        f.write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><{tag}><Properties>'
+            f"<Name>{name}</Name></Properties></{tag}></MetaDataObject>"
+        )
+
+
 def _seed_based_on(db_path, rows):
     """rows: list of (source_object, source_category, ref_object) — декларативные
     <BasedOn>: source может создаваться НА ОСНОВАНИИ ref_object."""
@@ -2197,6 +2216,8 @@ def _make_homonym_based_on_fixture(tmpdir):
         )
     with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
         f.write("<Configuration/>")
+    # v1.46.0: прежде справочника-омонима в дереве не было — только ссылки на него в засеянных строках.
+    _write_descriptor(tmpdir, "Catalogs", "Контрагент")
     helpers, resolve_safe = make_helpers(tmpdir)
     format_info = detect_format(tmpdir)
     from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
@@ -2653,6 +2674,9 @@ def test_find_event_subscriptions_typed_input_is_category_aware(with_index):
     live-фолбэке. Тест только с индексом оставил бы вторую непроверенной, и конфигурация
     без индекса ответила бы иначе."""
     with tempfile.TemporaryDirectory() as tmpdir:
+        # v1.46.0: прежде омонимов в дереве не было — только источники подписок (см. `_write_descriptor`).
+        _write_descriptor(tmpdir, "Documents", "Дубль")
+        _write_descriptor(tmpdir, "Catalogs", "Дубль")
         bsl, reader = _make_subs_env(
             tmpdir,
             [
@@ -8150,6 +8174,8 @@ def test_find_event_subscriptions_bare_name_tolerates_padding():
     _strip_meta_prefix(object_name) БЕЗ strip: ' Реализация ' не матчился ни точно, ни
     подстрокой. Обе ветки обязаны вести себя одинаково."""
     with tempfile.TemporaryDirectory() as tmpdir:
+        # v1.46.0: прежде документа в дереве не было — только источник подписки (см. `_write_descriptor`).
+        _write_descriptor(tmpdir, "Documents", "РеализацияТоваровУслуг")
         bsl, _ = _make_subs_env(
             tmpdir,
             [
@@ -8429,6 +8455,8 @@ def test_event_subscription_dotless_typed_prefix_is_the_empty_overview(with_inde
 
 def test_typed_non_document_based_on_without_metadata_index_is_partial():
     with tempfile.TemporaryDirectory() as tmpdir:
+        # v1.46.0: прежде справочника `Контрагент` в дереве не было (см. `_write_descriptor`).
+        _write_descriptor(tmpdir, "Catalogs", "Контрагент")
         bsl, _ = _make_full_fixture(tmpdir)
         result = bsl["find_based_on_documents"]("Справочник.Контрагент")
         assert result["partial"] is True
@@ -8439,6 +8467,8 @@ def test_typed_non_document_based_on_without_metadata_index_is_partial():
 @pytest.mark.parametrize("failure", ["missing", "error"])
 def test_typed_non_document_based_on_old_or_failed_reader_is_partial(monkeypatch, failure):
     with tempfile.TemporaryDirectory() as tmpdir:
+        # v1.46.0: прежде справочника `Контрагент` в дереве не было (см. `_write_descriptor`).
+        _write_descriptor(tmpdir, "Catalogs", "Контрагент")
         bsl, reader, _db_path = _make_based_on_index_fixture(tmpdir)
         try:
             if failure == "missing":
@@ -8696,6 +8726,8 @@ def test_fo_exact_typed_matches_object_and_members_not_homonyms(tmp_path):
     _write_fo(tmpdir, "ФО_Длиннее", ["Document.ЗаказПоставщикуДопы"])
     _write_fo(tmpdir, "ФО_Чужой", ["Document.ПриобретениеТоваров.TabularSection.Товары.Attribute.ЗаказПоставщику"])
     _write_fo(tmpdir, "ФО_Справочник", ["Catalog.ЗаказПоставщику"])
+    # v1.46.0: прежде документа в дереве не было — только состав ФО (см. `_write_descriptor`).
+    _write_descriptor(tmpdir, "Documents", "ЗаказПоставщику")
     bsl = _fo_bsl(tmpdir)
 
     typed = bsl["find_functional_options"]("Документ.ЗаказПоставщику", include_code=False)
@@ -8712,6 +8744,9 @@ def test_fo_typed_keeps_category_without_index(tmp_path):
     tmpdir = str(tmp_path)
     _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
     _write_fo(tmpdir, "ФО_Спр", ["Catalog.Заказ"])
+    # v1.46.0: прежде объектов в дереве не было — только состав ФО (см. `_write_descriptor`).
+    _write_descriptor(tmpdir, "Documents", "Заказ")
+    _write_descriptor(tmpdir, "Catalogs", "Заказ")
     bsl = _fo_bsl(tmpdir)  # idx_reader=None → live-ветка
 
     assert _fo_names(bsl["find_functional_options"]("Document.Заказ", include_code=False)) == ["ФО_Док"]
@@ -8727,6 +8762,8 @@ def test_fo_legacy_display_name_is_case_sensitive_as_before(tmp_path):
     давая ноль. На не-ссылке (член объекта) имя по-прежнему регистрозависимо."""
     tmpdir = str(tmp_path)
     _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
+    # v1.46.0: прежде документа в дереве не было — только состав ФО (см. `_write_descriptor`).
+    _write_descriptor(tmpdir, "Documents", "Заказ")
     bsl = _fo_bsl(tmpdir)
     assert bsl["find_functional_options"]("Document.Заказ", include_code=False)["object"] == "Заказ"
     assert bsl["find_functional_options"]("document.Заказ", include_code=False)["object"] == "Заказ"
@@ -8772,6 +8809,8 @@ def test_fo_reader_none_falls_back_to_live(tmp_path):
     отработать, иначе живая конфигурация молча отвечает пустотой."""
     tmpdir = str(tmp_path)
     _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
+    # v1.46.0: прежде документа в дереве не было — только состав ФО (см. `_write_descriptor`).
+    _write_descriptor(tmpdir, "Documents", "Заказ")
     reader = _FakeFoReader(exact_result=None, all_result=None)
     bsl = _fo_bsl(tmpdir, idx_reader=reader)
 
@@ -8784,6 +8823,8 @@ def test_fo_reader_empty_list_is_final_answer(tmp_path):
     """[] = таблица есть, совпадений нет → ОКОНЧАТЕЛЬНЫЙ ответ, live звать нельзя."""
     tmpdir = str(tmp_path)
     _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
+    # v1.46.0: прежде документа в дереве не было — только состав ФО (см. `_write_descriptor`).
+    _write_descriptor(tmpdir, "Documents", "Заказ")
     reader = _FakeFoReader(exact_result=[], all_result=[])
     bsl = _fo_bsl(tmpdir, idx_reader=reader)
 
@@ -8814,13 +8855,18 @@ def test_fo_cf_and_edt_deep_member_ref_are_equivalent(tmp_path):
 
     results = []
     for d in (cf_dir, edt_dir):
+        # v1.46.0: прежде документа-владельца в дереве не было — только состав ФО (см. `_write_descriptor`).
+        _write_descriptor(str(d), "Documents", "ПриобретениеТоваровУслуг")
         bsl = _fo_bsl(str(d))
         owner = bsl["find_functional_options"]("Документ.ПриобретениеТоваровУслуг", include_code=False)
         foreign_bare = bsl["find_functional_options"]("ЗаказПоставщику", include_code=False)
-        foreign_typed = bsl["find_functional_options"]("Документ.ЗаказПоставщику", include_code=False)
-        results.append((_fo_names(owner), _fo_names(foreign_bare), _fo_names(foreign_typed)))
+        # v1.46.0: прежде здесь стояло `foreign_typed == []`; документа `ЗаказПоставщику` нет (это имя реквизита), и
+        # ссылку на несуществующий объект шлюз существования (Д3) отвергает — в обоих форматах одинаково.
+        with pytest.raises(ValueError, match="^find_functional_options: объекта Document.ЗаказПоставщику нет"):
+            bsl["find_functional_options"]("Документ.ЗаказПоставщику", include_code=False)
+        results.append((_fo_names(owner), _fo_names(foreign_bare)))
 
-    assert results[0] == (["ФО_Глубокий"], [], [])
+    assert results[0] == (["ФО_Глубокий"], [])
     assert results[0] == results[1]
 
 
@@ -9687,11 +9733,10 @@ def test_kinds_requested_and_applied_are_always_present():
             assert one["kinds_requested"] == ["attribute_type"]
             assert one["kinds_applied"] == ["attribute_type"]
 
-            mixed = bsl["find_references_to_object"]("Документ.ТестДок", kinds=["attribute_type", "нетТакогоВида"])[
-                "_meta"
-            ]
-            assert mixed["kinds_requested"] == ["attribute_type", "нетТакогоВида"]
-            assert mixed["kinds_applied"] == ["attribute_type"], mixed
+            # v1.46.0: прежде здесь стоял частично неизвестный список, молча сужавшийся до известных видов
+            # (`kinds_applied=['attribute_type']`) — теперь он отказ (Д4, П1).
+            with pytest.raises(ValueError, match="^find_references_to_object: kinds — "):
+                bsl["find_references_to_object"]("Документ.ТестДок", kinds=["attribute_type", "нетТакогоВида"])
         finally:
             reader.close()
 
