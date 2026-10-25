@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import threading
 import types
@@ -312,8 +313,10 @@ def cf_edt_empty_subsystem(tmp_path, monkeypatch):
 
     Обязательна (поправка V2): предикат кандидатов по `dir_path='Subsystems'` на
     этой раскладке даёт НОЛЬ, а CF-фикстура регресс не ловит. Пустой синоним тоже
-    не случаен: строка в `object_synonyms` появляется ТОЛЬКО при непустом
-    `<Synonym>`, то есть второй источник кандидатов здесь молчит.
+    не случаен: строка в `object_synonyms` появлялась ТОЛЬКО при непустом
+    `<Synonym>`, то есть второй источник кандидатов здесь молчал. v1.47.0: у объекта
+    без синонима строка с пустым синонимом есть — тест снимает её сам, чтобы
+    проверить предикат `file_paths` в одиночку.
     """
     monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
     root = tmp_path / "edt"
@@ -1132,7 +1135,11 @@ def test_reader_fixtures_smoke(request, fixture_name):
 #            (declared_total/declared_truncated названы полностью: суффиксная форма
 #            читалась как declared_registers_total) −8 («стр.1» про _meta.delegates
 #            переехало в рецепт) — порог НЕ двигается: факт 12 625 при пороге 12 648.
-_SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557 + 255
+#   v1.47.0: find_register_writers +13 (issue #42, решение владельца): ключ declared_documents
+#            +19, донор «:false» у runtime_filtered −6 (значение названо в рецепте) — порог поднят
+#            РОВНО на прибавку сверх запаса (+9, как +23 у get_object_modules в v1.46.0): факт 12 657
+#            при пороге 12 657.
+_SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557 + 255 + 9
 
 
 def test_sig_budget_headroom_freed_for_release():
@@ -1456,7 +1463,17 @@ def test_lookup_edt_empty_without_synonym_comes_from_file_paths(cf_edt_empty_sub
             "SELECT COUNT(*) FROM object_synonyms WHERE category='Subsystems' AND object_name=?",
             ("ЕДТПустая",),
         ).fetchone()[0]
-    assert (n_content, n_synonyms) == (0, 0), "фикстура обязана оставить только file_paths"
+    # v1.47.0: прежде здесь стояло `(0, 0)` — строки синонима у подсистемы без `<Synonym>` не было. Теперь
+    # она есть (пустой синоним), и кандидата дают оба источника — одним путём. Предикат `file_paths`
+    # проверяется в одиночку: строка синонима снимается.
+    assert (n_content, n_synonyms) == (0, 1), "фикстура: строк состава нет, строка синонима — пустая"
+    assert reader.get_subsystem_lookup("ЕДТПустая")["direct_candidates"] == ["Subsystems/ЕДТПустая/ЕДТПустая.mdo"]
+    conn = sqlite3.connect(reader._db_path)
+    try:
+        conn.execute("DELETE FROM object_synonyms WHERE category='Subsystems' AND object_name=?", ("ЕДТПустая",))
+        conn.commit()
+    finally:
+        conn.close()
     found = reader.get_subsystem_lookup("ЕДТПустая")
     assert found["direct"] == []
     assert found["direct_candidates"] == ["Subsystems/ЕДТПустая/ЕДТПустая.mdo"]

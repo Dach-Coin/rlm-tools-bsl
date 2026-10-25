@@ -1675,7 +1675,9 @@ def test_parse_mdo_scheduled_job():
     assert result["name"] == "ext_ОтправкаПодтверждения"
     assert result["synonym"] == "Отправка подтверждения поставки"
     assert result["method_name"] == "CommonModule.ext_РегламентныеЗадания.ОтправкаПодтверждения"
-    assert result["use"] is True  # EDT default
+    # v1.47.0: прежде здесь стояло `True` — EDT опускает значение по умолчанию `false`,
+    # и у фикстуры без узла `<use>` задание выключено
+    assert result["use"] is False
     assert result["predefined"] is True
     assert result["restart_on_failure"]["count"] == 3
 

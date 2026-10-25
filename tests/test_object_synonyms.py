@@ -246,9 +246,11 @@ class TestCollector:
         assert "КурсыВалют" in names
 
     def test_collector_cf_skips_empty_synonym(self, cf_project):
+        # v1.47.0: прежде здесь стояло «строки нет» — объект без синонима теперь строка с пустым
+        # синонимом «<Категория>: » (поиск по виду и по техническому имени находит объект)
         results = _collect_object_synonyms(str(cf_project))
-        names = {r[0] for r in results}
-        assert "ПустойМодуль" not in names
+        by_name = {r[0]: r for r in results}
+        assert by_name["ПустойМодуль"][1:3] == ("CommonModules", "Общий модуль: ")
 
     def test_collector_cf_category_prefix(self, cf_project):
         results = _collect_object_synonyms(str(cf_project))
@@ -416,7 +418,8 @@ class TestBuildSynonyms:
         conn = sqlite3.connect(str(db_path))
         count = conn.execute("SELECT COUNT(*) FROM object_synonyms").fetchone()[0]
         conn.close()
-        assert count == 3  # АвансовыйОтчет, РасчетСебестоимости, КурсыВалют
+        # v1.47.0: прежде здесь стояло 3 — объект без синонима (ПустойМодуль) теперь строка с пустым синонимом
+        assert count == 4  # АвансовыйОтчет, РасчетСебестоимости, КурсыВалют, ПустойМодуль
 
     def test_build_has_synonyms_meta(self, built_cf_index):
         db_path, _ = built_cf_index
@@ -510,7 +513,8 @@ class TestSearchObjects:
         reader = IndexReader(db_path)
         results = reader.search_objects("")
         reader.close()
-        assert len(results) == 3  # all objects
+        # v1.47.0: прежде здесь стояло 3 — объект без синонима (ПустойМодуль) теперь строка с пустым синонимом
+        assert len(results) == 4  # all objects
 
     def test_search_no_match(self, built_cf_index):
         db_path, _ = built_cf_index
@@ -573,7 +577,8 @@ class TestStatistics:
         stats = reader.get_statistics()
         reader.close()
         assert "object_synonyms" in stats
-        assert stats["object_synonyms"] == 3
+        # v1.47.0: прежде здесь стояло 3 — объект без синонима (ПустойМодуль) теперь строка с пустым синонимом
+        assert stats["object_synonyms"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -762,7 +767,8 @@ class TestIncrementalUpdate:
         conn = sqlite3.connect(str(db_path))
         count = conn.execute("SELECT COUNT(*) FROM object_synonyms").fetchone()[0]
         conn.close()
-        assert count == 3  # synonyms built
+        # v1.47.0: прежде здесь стояло 3 — объект без синонима (ПустойМодуль) теперь строка с пустым синонимом
+        assert count == 4  # synonyms built
 
     def test_update_respects_no_synonyms(self, cf_project, monkeypatch):
         """Build with --no-synonyms → update should NOT build synonyms."""

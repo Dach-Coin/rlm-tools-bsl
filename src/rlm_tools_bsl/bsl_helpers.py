@@ -38,8 +38,10 @@ from rlm_tools_bsl.bsl_index import (
     _BSL_GLOBAL_FUNCS_LOWER,
     _CALL_MANAGER_COLLECTIONS,
     _CATEGORY_RU,
+    _ERP_MECHANISM_RE,
     _MANAGER_CALL_RE,
     _REGISTER_CATALOG_DIRS,
+    _REGISTER_REF_HEADS,
     _extract_calls_from_body,
     _blank_signature_tail,
     _extract_header_comment,
@@ -67,7 +69,12 @@ from rlm_tools_bsl.bsl_index import (
     _make_callee_key,
     _manager_callee_key,
     _MOVEMENT_METHOD_NOISE,
+    _PF_ID_LITERAL_RE,
+    _REGISTER_BY_NAME_CALL_RE,  # noqa: F401 — реэкспорт прежнего адреса (v1.47.0: переехал в bsl_index)
+    _REGISTER_BY_NAME_DELEGATES,  # noqa: F401 — реэкспорт прежнего адреса (v1.47.0: переехал в bsl_index)
+    _pf_call_args,
     _ref_anchor_index,
+    _register_by_name_refs,
     _scan_module,
     strip_category_prefix,
 )
@@ -175,10 +182,39 @@ _SUBSCRIPTION_EVENTS: tuple[str, ...] = (
     "BeforeExecute",
     "OnExecute",
 )
-# `object_attributes.attr_kind`: колонка табличной части — `ts_attribute` (не `column`).
-_ATTR_KINDS: tuple[str, ...] = ("attribute", "dimension", "resource", "ts_attribute")
+# `object_attributes.attr_kind`: колонка табличной части — `ts_attribute` (не `column`); v1.47.0 — реквизит
+# адресации задачи `addressing_attribute`.
+_ATTR_KINDS: tuple[str, ...] = ("attribute", "dimension", "resource", "ts_attribute", "addressing_attribute")
 # `metadata_code_usages.kind`.
-_CODE_USAGE_KINDS: tuple[str, ...] = ("manager", "ref_type", "query")
+_CODE_USAGE_KINDS: tuple[str, ...] = ("manager", "ref_type", "query", "metadata", "form")
+# v1.47.0 (Д14): делегат механизмов модуля менеджера — `<ОбщийМодуль>.<Процедура>(МеханизмыДокумента…)`, список
+# механизмов — первый аргумент (`ДокЛокализация.ЗарегистрироватьУчетныеМеханизмы(МеханизмыДокумента)`).
+_MECHANISM_DELEGATE_CALL_RE = re.compile(
+    r"(?<![\w.])(\w+)\s*\.\s*(\w+)\s*\(\s*МеханизмыДокумента(?![\w.])", re.IGNORECASE
+)
+# Источники `register_movements`, которые `find_register_movements` отдаёт в `code_registers` и профиль считает в
+# `summary.code_registers`: запись набора из кода модуля объекта и менеджера; v1.47.0 — и таблица движений БГУ.
+_CODE_MOVEMENT_SOURCES: tuple[str, ...] = ("code", "manager_code", "movement_table")
+# v1.47.0: виды обращений в коде, которых индекс прежнего поколения (`builder_version < 18`) не производит.
+_CODE_KINDS_SINCE_V18: tuple[str, ...] = ("form", "metadata")
+_CODE_KINDS_V18_HINT = (
+    "Индекс собран прежней версией сборщика: обращений вида {kinds} в нем нет — выполните "
+    "'rlm-bsl-index index update' (разовая полная пересборка) и откройте новую сессию."
+)
+# v1.47.0: виды ссылок, которых индекс прежнего поколения (`builder_version < 18`) не производит. На таком индексе
+# `find_references_to_object` называет запрошенные из них в `_meta.kinds_unavailable`: пустой ответ по ним — не
+# «ссылок нет», а «индекс собран до появления вида».
+_REF_KINDS_SINCE_V18: frozenset[str] = frozenset(
+    {
+        "document_journal_content",
+        "filter_criterion_type",
+        "filter_criterion_content",
+        "linked_object",
+        "form_attribute_type",
+        "form_main_table",
+        "form_query",
+    }
+)
 
 
 def _closed_values(helper: str, param: str, values, allowed, *, fold=str.casefold) -> list[str]:
@@ -1122,9 +1158,7 @@ _PF_EXPR_END_RE = re.compile(
     r"|КонецФункции|EndIf|ElsIf|Else|EndDo|Except|EndTry|EndProcedure|EndFunction)(?!\w))",
     re.IGNORECASE,
 )
-# Идентификатор — непустой литерал целиком, а не \w+: БСП допускает список
-# «Акт,Счет», и прежний \w+ терял такую команду целиком.
-_PF_ID_LITERAL_RE = re.compile(r'"((?:[^"]|"")+)"')
+# `_PF_ID_LITERAL_RE` и `_pf_call_args` — в bsl_index (v1.47.0, импорт выше).
 
 
 def _pf_unquote(value: str) -> str:
@@ -1152,44 +1186,6 @@ def _pf_presentation(text: str, pos: int, code: str | None = None) -> tuple[str 
     if m and _PF_EXPR_END_RE.match(code, m.end()):
         return _pf_unquote(m.group(1)), "literal"
     return None, "computed"
-
-
-def _pf_call_args(text: str, start: int) -> list[str]:
-    """Аргументы вызова от позиции сразу после `(` — балансом скобок и кавычек
-    (`""` внутри строки 1С — экранированная кавычка). Регулярка `[^,]+` рвётся на
-    `НСтр("…, …")`, поэтому аргументы разбираются посимвольно."""
-    args: list[str] = []
-    cur: list[str] = []
-    depth, i, in_str = 0, start, False
-    while i < len(text):
-        ch = text[i]
-        if in_str:
-            cur.append(ch)
-            if ch == '"':
-                if text[i + 1 : i + 2] == '"':
-                    cur.append('"')
-                    i += 1
-                else:
-                    in_str = False
-        elif ch == '"':
-            in_str = True
-            cur.append(ch)
-        elif ch == "(":
-            depth += 1
-            cur.append(ch)
-        elif ch == ")":
-            if depth == 0:
-                args.append("".join(cur))
-                return args
-            depth -= 1
-            cur.append(ch)
-        elif ch == "," and depth == 0:
-            args.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-        i += 1
-    return args  # незакрытый вызов: что успели разобрать
 
 
 def _parse_print_commands(body: str, path: str) -> tuple[list[dict], list[str]]:
@@ -1308,49 +1304,8 @@ def _pf_list_delegate_calls(body: str) -> tuple[str, list[dict]]:
     return coll, calls
 
 
-# Делегаты, которые пишут набор движений по ИМЕНИ регистра из аргумента (v1.43.0):
-# (модуль, метод) в нижнем регистре → индекс аргумента (с нуля) с именем регистра.
-# Таблица, а не общее правило «процедура пишет Движения[<параметр>]»: среди таких процедур
-# есть очистка (УдалитьДвиженияДокумента — Движения[Имя].Очистить()), и общее правило дало
-# бы ложные движения. Каждая запись — с замером:
-#   БГУ: ПроведениеСервер.ОтразитьДвиженияПоРегистру(ДополнительныеСвойства, Движения, Отказ, ИмяТаблицы)
-#        — тело: Движения[ИмяТаблицы].Записывать = Истина; …Загрузить(…); 184 вызова в 60 модулях
-#        объектов документов. В ERP (ПроведениеДокументов.ОтразитьДвижения) из модулей объектов
-#        документов не вызывается — записи нет.
-_REGISTER_BY_NAME_DELEGATES: dict[tuple[str, str], int] = {
-    ("проведениесервер", "отразитьдвиженияпорегистру"): 3,
-}
-_REGISTER_BY_NAME_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\.\s*(\w+)\s*\(", re.IGNORECASE)
-
-
-def _register_by_name_refs(body: str) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
-    """``(литеральные (имя, строка), вычисляемые (выражение, строка))`` вызовов делегатов
-    ``_REGISTER_BY_NAME_DELEGATES``. Две маски одной длины (приём ``_parse_print_commands``):
-    вызов ищется по коду без комментариев и строк, аргументы читаются с содержимым строк —
-    имя регистра лежит в литерале. Аргумент может быть перенесён и отделён комментарием."""
-    literal: list[tuple[str, int]] = []
-    dynamic: list[tuple[str, int]] = []
-    # Дешёвый префильтр по сырому тексту: маска всего модуля стоит десятки миллисекунд, а
-    # функцию зовут на каждом find_register_movements — у 99 % документов делегата нет.
-    low = body.casefold()
-    if not any(method in low for _module, method in _REGISTER_BY_NAME_DELEGATES):
-        return literal, dynamic
-    lines = body.splitlines()
-    code = "\n".join(mask_comments_and_strings(lines))
-    text = "\n".join(mask_comments_and_strings(lines, keep_string_content=True))
-    for m in _REGISTER_BY_NAME_CALL_RE.finditer(code):
-        pos = _REGISTER_BY_NAME_DELEGATES.get((m.group(1).casefold(), m.group(2).casefold()))
-        if pos is None:
-            continue
-        line_no = code.count("\n", 0, m.start()) + 1
-        args = _pf_call_args(text, m.end())
-        arg = args[pos].strip() if len(args) > pos else ""
-        lit = _PF_ID_LITERAL_RE.fullmatch(arg)
-        if lit and re.fullmatch(r"\w+", lit.group(1)):
-            literal.append((lit.group(1), line_no))
-        else:
-            dynamic.append((arg[:80] or f"{m.group(1)}.{m.group(2)}", line_no))
-    return literal, dynamic
+# Делегаты «регистр по имени» (`_REGISTER_BY_NAME_DELEGATES`, `_REGISTER_BY_NAME_CALL_RE`,
+# `_register_by_name_refs`) — в bsl_index (v1.47.0: ими пользуется и сборщик), импорт выше.
 
 
 # ---------------------------------------------------------------------------
@@ -3756,6 +3711,13 @@ def make_bsl_helpers(
                         "ext_line": ov.get("ext_line"),
                         # v1.45.0 (Д12): исполнимый путь файла расширения (`../cfe/…`), как у get_overrides.
                         "extension_file": _override_extension_file(ov),
+                        # v1.47.0: перехват из формы расширения (callType) — элемент и событие; у строк из
+                        # аннотаций ключей нет (прежний ответ побайтно).
+                        **(
+                            {"form_item": ov.get("form_item"), "form_event": ov.get("form_event")}
+                            if ov.get("form_event") is not None
+                            else {}
+                        ),
                     }
                     for ov in method_overrides
                 ]
@@ -3784,8 +3746,11 @@ def make_bsl_helpers(
         Returns: list of dicts {name, type, line, end_line, is_export, params, overridden_by?}.
         ``params`` — список имён параметров (list[str], v1.18.0; напр. "Знач А, Б=5" → ["А", "Б"]).
         ``overridden_by?`` — list[{annotation, extension_name, extension_method, extension_root,
-        ext_module_path, ext_line, extension_file}]; ``ext_line`` — строка аннотации, объявление метода ниже;
-        ``extension_file`` (v1.45.0) — исполнимый путь файла расширения (``../cfe/…``)."""
+        ext_module_path, ext_line, extension_file, form_item?, form_event?}]; ``ext_line`` — строка аннотации,
+        объявление метода ниже; ``extension_file`` (v1.45.0) — исполнимый путь файла расширения (``../cfe/…``);
+        ``form_item``/``form_event`` (v1.47.0) — только у перехвата из формы расширения (``callType``), тогда
+        ``ext_line`` — строка объявления метода расширения (``None`` — обработчика, названного формой, в модуле
+        нет либо модуль не прочитан)."""
 
         _orig_arg = path
         path, _arg_meta = _resolve_module_arg(path)
@@ -5125,6 +5090,12 @@ def make_bsl_helpers(
             ext_line = ov.get("ext_line")
 
             header = f'\n// === Перехвачен &{annotation} в расширении "{ext_name}" ==='
+            if ov.get("form_event") is not None:
+                # v1.47.0: перехват из формы расширения — аннотации в коде нет, его задаёт callType события
+                # или действия команды формы.
+                item = ov.get("form_item") or ""
+                where = f"событие {ov.get('form_event')}" + (f" элемента {item}" if item else " формы")
+                header = f'\n// === Перехвачен {annotation} (callType формы: {where}) в расширении "{ext_name}" ==='
             # v1.45.0 (Д12): ссылка на файл — исполнимый `extension_file` (`../cfe/…`, его принимают
             # read_procedure/extract_procedures); корень вне сессии — прежняя форма «имя расширения/путь».
             ext_file = _override_extension_file(ov)
@@ -5134,11 +5105,17 @@ def make_bsl_helpers(
 
             # Try to read extension method body
             ext_body = None
-            if ext_root and ext_mod:
+            # v1.47.0: секция без тела говорит почему — модуль прочитан (или его нет), а метода в нём нет
+            # («missing»), модуль не прочитан («unread») или имени метода нет («no_name»). Прежде секция молча
+            # кончалась ссылкой на файл: у перехвата из формы обработчик, названный в XML формы, в модуле бывает
+            # не объявлен.
+            body_state = "unread" if ext_method else "no_name"
+            if ext_root and ext_mod and ext_method:
                 candidate = Path(ext_root, ext_mod).resolve()
                 if any(candidate.is_relative_to(root) for root in trusted_roots):
                     try:
                         ext_content = candidate.read_text(encoding="utf-8-sig", errors="replace")
+                        body_state = "missing"
                         ext_lines = ext_content.splitlines()
                         # Поиск метода по имени в файле расширения.
                         # v1.33.0: построчного поиска НЕДОСТАТОЧНО — полный `procedure_def`
@@ -5163,6 +5140,8 @@ def make_bsl_helpers(
                                 if proc_end_re.search(ext_masked[j]):
                                     ext_body = "\n".join(ext_lines[start_idx : j + 1])
                                     break
+                    except FileNotFoundError:
+                        body_state = "missing"  # модуля нет — процедуры в нём нет тем более
                     except OSError:
                         pass
 
@@ -5174,6 +5153,20 @@ def make_bsl_helpers(
 
                     ext_body = number_lines(ext_body, start=start_idx + 1)
                 parts.append(ext_body)
+            elif body_state == "missing" and ov.get("form_event") is not None:
+                parts.append(
+                    f"// Обработчик {ext_method} в модуле формы расширения не найден: форма расширения ссылается "
+                    "на процедуру, которой в модуле нет"
+                )
+            elif body_state == "missing":
+                parts.append(
+                    f"// Метод {ext_method} в модуле расширения не найден: модуль изменился после сборки индекса — "
+                    "обнови индекс"
+                )
+            elif body_state == "no_name":
+                parts.append("// Тело не прочитано: имя метода расширения неизвестно")
+            else:
+                parts.append("// Тело не прочитано: модуль расширения недоступен из этой сессии")
 
         return "\n".join(parts)
 
@@ -5254,7 +5247,11 @@ def make_bsl_helpers(
         называет расхождение версий основной конфигурации и расширения. Без индекса перехваты берутся живым обходом
         расширений (раньше — только из индекса). Перехваты сверяются с модулем по
         идентичности пути модуля в расширении: индексная привязка к модулю одноимённого
-        объекта другой категории или другой формы не выдаётся за перехват этого модуля."""
+        объекта другой категории или другой формы не выдаётся за перехват этого модуля.
+
+        **v1.47.0.** Секция перехвата без тела говорит почему: обработчика, названного формой расширения, в
+        модуле нет; метода аннотации в модуле уже нет (модуль изменился после сборки индекса); модуль не
+        прочитан. Заголовок перехвата из формы — ``Перехвачен <Перед|После|Вместо> (callType формы: …)``."""
         return _single_or_map(
             proc_name,
             lambda name: _read_procedure_one(path, name, include_overrides, numbered),
@@ -9060,7 +9057,8 @@ def make_bsl_helpers(
           parse_object_xml('Documents/Name')                    — auto-resolves
 
         Returns: dict with keys like name, synonym, attributes, tabular_sections,
-        dimensions, resources (depends on metadata type)."""
+        dimensions, resources (depends on metadata type); у задачи — ``addressing_attributes``
+        (реквизиты адресации, v1.47.0)."""
         resolved = _resolve_object_xml(path)
         content = _ext_read_file(resolved)
         parsed = parse_metadata_xml(content)
@@ -9074,7 +9072,8 @@ def make_bsl_helpers(
         # (name <-> attr_name). Оборачиваем ТОЛЬКО вложенные записи, не сам
         # верхний dict (его internal-консьюмеры проверяют isinstance(..., dict)).
         if isinstance(parsed, dict):
-            for _section in ("attributes", "dimensions", "resources"):
+            # v1.47.0: и реквизиты адресации задачи — та же обёртка, что у `attributes`.
+            for _section in ("attributes", "dimensions", "resources", "addressing_attributes"):
                 if isinstance(parsed.get(_section), list):
                     parsed[_section] = [_AttrRecord(a) if isinstance(a, dict) else a for a in parsed[_section]]
             for _ts in parsed.get("tabular_sections", []) or []:
@@ -10002,6 +10001,11 @@ def make_bsl_helpers(
                 so_rows = idx_reader.search_objects(name, limit=20)
             except Exception:
                 so_rows = None
+            # v1.47.0: строка объекта БЕЗ синонима (хранится «<Категория>: ») — для поиска, а не «объект с
+            # синонимом»: каскад и его запасной ход (Pass 3) видят прежний набор строк, и выбор на омониме
+            # (перечисление без синонима и документ с модулями) прежний.
+            if so_rows:
+                so_rows = [s for s in so_rows if strip_category_prefix(s.get("category"), s.get("synonym") or "")]
             for s in so_rows or []:
                 if (s.get("object_name") or "").lower() == name_lower and (
                     pc is None or (s.get("category") or "").lower() == pc
@@ -10761,10 +10765,15 @@ def make_bsl_helpers(
         Returns dict:
           {object_name, category, synonym, posting,
            attributes, tabular_sections:[{name, synonym, columns}],
-           dimensions, resources, predefined_items,
+           dimensions, resources, addressing_attributes?, predefined_items,
            enum_values_for_typed_refs:{Enum.X:[...]},
-           forms:[str],
+           forms:[str], templates:[dict], value_type,
            _meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}
+
+        ``addressing_attributes`` (v1.47.0) — ``[{name, synonym, type}]``, реквизиты адресации; ключ ТОЛЬКО у
+        задачи (у прочих категорий его нет), ``type`` — нормализованным списком на обоих маршрутах. v1.47.0:
+        обработки, отчёты, бизнес-процессы, задачи, планы обмена, счетов, видов расчёта и регистры расчёта — из
+        индекса (``index_used=True``, ``type`` реквизита — нормализованный список), как шесть прежних категорий.
         """
         # v1.40.0: префикс типа — КАТЕГОРИЯ, и она строгая. Раньше префикс срезался и
         # выбрасывался: на точном омониме `РегистрНакопления.X` отвечал ДОКУМЕНТОМ `X`
@@ -10806,6 +10815,8 @@ def make_bsl_helpers(
             "tabular_sections": [],
             "dimensions": [],
             "resources": [],
+            # v1.47.0: реквизиты адресации — ключ только у задачи; у прочих категорий ответ прежний.
+            **({"addressing_attributes": []} if (category or "").lower() == "tasks" else {}),
             "predefined_items": [],
             "enum_values_for_typed_refs": {},
             "forms": [],
@@ -10917,6 +10928,23 @@ def make_bsl_helpers(
                     )
                 if result["resources"]:
                     result["resources"] = [_AttrRecord(r) for r in result["resources"]]
+                    structural_filled_from_live = True
+            # v1.47.0: реквизиты адресации задачи. Ключ новый, поэтому тип — нормализованным списком, как на
+            # индексном маршруте (у прочих секций живьём на CF — прежняя сырая строка).
+            if "addressing_attributes" in result and not result["addressing_attributes"]:
+                from rlm_tools_bsl.bsl_xml_parsers import normalize_type_string as _nts
+
+                for addr in meta.get("addressing_attributes", []) or []:
+                    result["addressing_attributes"].append(
+                        _AttrRecord(
+                            {
+                                "name": addr.get("name", ""),
+                                "synonym": addr.get("synonym", "") or "",
+                                "type": json.loads(_nts(addr.get("type", "") or "")),
+                            }
+                        )
+                    )
+                if result["addressing_attributes"]:
                     structural_filled_from_live = True
 
             # --- Tabular sections: либо полное заполнение, либо обогащение synonym ---
@@ -11049,6 +11077,8 @@ def make_bsl_helpers(
                 elif kind == "ts_attribute":
                     ts_name = row.get("ts_name") or ""
                     ts_groups.setdefault(ts_name, []).append(attr_dict)
+                elif kind == "addressing_attribute" and "addressing_attributes" in result:
+                    result["addressing_attributes"].append(attr_dict)
 
             for ts_name, columns in ts_groups.items():
                 result["tabular_sections"].append(
@@ -11161,6 +11191,7 @@ def make_bsl_helpers(
                 result["attributes"]
                 or result["dimensions"]
                 or result["resources"]
+                or result.get("addressing_attributes")
                 or result["tabular_sections"]
                 or result["predefined_items"]
             )
@@ -11387,7 +11418,9 @@ def make_bsl_helpers(
             if idx_reader is not None:
                 try:
                     ov_map = _index_overrides_for_path(rel) or {}
-                    ov_methods = sorted(ov_map.keys())
+                    # v1.47.0: число перехваченных МЕТОДОВ — неразрешённая цель перехвата из формы (`''`) не
+                    # метод; её строка остаётся в get_overrides.
+                    ov_methods = sorted(k for k in ov_map.keys() if k)
                 except Exception:
                     ov_methods = []
             totals = outline.get("totals") or {}
@@ -11499,7 +11532,9 @@ def make_bsl_helpers(
             МЕТОДОВ, а не строк перехватов (``get_overrides(объект)['total']`` считает строки); верхний
             ``_meta.index_used=True`` — ВСЕ модули из индекса, ``False`` — хотя бы один разобран живьём или не
             прочитан (разбивка — ``modules_index``/``modules_live``/``modules_skipped``), а не «индекс не
-            использован». Подпись называет обе единицы.
+            использован». Подпись называет обе единицы. v1.47.0: перехват из формы расширения с неразрешённой
+            целью (``target_method=''``) — не метод: в ``overrides.methods``/``count`` и ``totals.overrides`` его нет,
+            а строка — в ``get_overrides``.
 
             ``orphan_methods`` присутствует в строке модуля ТОГДА И ТОЛЬКО ТОГДА,
             когда ``include_methods=True``; форма элемента — та же, что у
@@ -12173,6 +12208,15 @@ def make_bsl_helpers(
                 else set()
             )
             rows = _merge_movement_rows(rows, live_alias_movements)
+            # v1.47.0 (Д14): механизмы делегатов модуля менеджера — те же, что у find_register_movements, и в items,
+            # и в summary.erp_mechanisms (строка на механизм, файл — модуль делегата).
+            _delegate_names, mechanism_delegates = _delegate_mechanisms(object_name)
+            delegate_rows = [
+                {"register_name": name, "source": "erp_mechanism", "file": d["module"]}
+                for d in mechanism_delegates
+                for name in d["mechanisms"]
+            ]
+            rows = _merge_movement_rows(rows, delegate_rows)
             rows, suppressed_main, replacement_meta = _apply_cfe_posting_replacement(
                 rows, cfe_interceptors, suppressible_main_rows
             )
@@ -12190,6 +12234,7 @@ def make_bsl_helpers(
             by_source: dict[str, list[str]] = {
                 "code": [],
                 "manager_code": [],
+                "movement_table": [],
                 "erp_mechanism": [],
                 "manager_table": [],
                 "adapted": [],
@@ -12197,7 +12242,8 @@ def make_bsl_helpers(
             for src, n in ordered:
                 by_source.setdefault(src, []).append(n)
             summary = {
-                "code_registers": len(by_source["code"]) + len(by_source["manager_code"]),
+                # v1.47.0: и movement_table — таблица движений БГУ (тот же перечень, что у find_register_movements).
+                "code_registers": sum(len(by_source[src]) for src in _CODE_MOVEMENT_SOURCES),
                 "erp_mechanisms": len(by_source["erp_mechanism"]),
                 "manager_tables": len(by_source["manager_table"]),
                 "adapted_registers": len(by_source["adapted"]),
@@ -12216,7 +12262,7 @@ def make_bsl_helpers(
                 "returned": len(items),
                 "has_more": total > len(page),
                 "_meta": {
-                    "source": "mixed" if main_alias_movements or cfe_modules_scanned else "index",
+                    "source": "mixed" if main_alias_movements or cfe_modules_scanned or delegate_rows else "index",
                     **({"extension_modules_scanned": len(cfe_modules_scanned)} if cfe_modules_scanned else {}),
                     **(
                         {
@@ -13554,6 +13600,63 @@ def make_bsl_helpers(
                 rows.append({"register_name": register_name, "source": "code", "file": path})
         return rows, scanned, unreadable, posting_interceptors
 
+    def _delegate_mechanisms(document_name: str) -> tuple[list[str], list[dict]]:
+        """Механизмы ERP, которые добавляет делегат модуля менеджера документа (v1.47.0, Д14) — раскрытие на чтении.
+
+        ``(механизмы в порядке первой встречи, провенанс [{module, procedure, mechanisms}])``: модуль менеджера
+        документа основной конфигурации (каталог модулей сессии) → вызовы ``<ОбщийМодуль>.<Процедура>(
+        МеханизмыДокумента…)`` по коду без комментариев и строк (``МеханизмыДокумента`` — первый аргумент) → тело
+        процедуры общего модуля (`read_procedure`) → литералы ``МеханизмыДокумента.Добавить("…")`` (`_ERP_MECHANISM_RE`
+        сборщика, по маске с содержимым строк). Голова не общий модуль — пропуск; вложенные делегаты не
+        раскрываются (один уровень — других на корпусе нет). Провенанс — только делегаты с механизмами. Индекс не
+        нужен: ответ одинаков на индексе любого поколения и без него."""
+        mechanisms: list[str] = []
+        provenance: list[dict] = []
+        for mod in _exact_modules("Documents", document_name, "ManagerModule"):
+            path = mod["path"]
+            if _owner_root_for(path) is not None:
+                continue  # модуль расширения: механизмы документа — из модуля основной конфигурации, как прежде
+            try:
+                body = _ext_read_file(path)
+            except Exception:
+                continue
+            if "механизмыдокумента" not in body.casefold():
+                continue
+            code = "\n".join(mask_comments_and_strings(body.splitlines()))
+            for m in _MECHANISM_DELEGATE_CALL_RE.finditer(code):
+                head, procedure = m.group(1), m.group(2)
+                module = _pf_delegate_module([head], path, procedure)
+                if not module or any(
+                    p["module"] == module and p["procedure"].casefold() == procedure.casefold() for p in provenance
+                ):
+                    continue
+                sub = read_procedure(module, procedure)
+                if not sub:
+                    continue
+                text = "\n".join(mask_comments_and_strings(sub.splitlines(), keep_string_content=True))
+                found: list[str] = []
+                for mm in _ERP_MECHANISM_RE.finditer(text):
+                    if mm.group(1) not in found:
+                        found.append(mm.group(1))
+                if not found:
+                    continue
+                provenance.append({"module": module, "procedure": procedure, "mechanisms": found})
+                for name in found:
+                    if name not in mechanisms:
+                        mechanisms.append(name)
+        return mechanisms, provenance
+
+    def _add_delegate_mechanisms(result: dict, document_name: str) -> None:
+        """`find_register_movements`: механизмы делегатов — после механизмов модуля менеджера, без повторов;
+        провенанс — ``_meta.mechanism_delegates`` (ключ только при непустом)."""
+        extra, provenance = _delegate_mechanisms(document_name)
+        if not provenance:
+            return
+        for name in extra:
+            if name not in result["erp_mechanisms"]:
+                result["erp_mechanisms"].append(name)
+        result.setdefault("_meta", {})["mechanism_delegates"] = provenance
+
     def _merge_movement_rows(base_rows: list[dict], extra_rows: list[dict]) -> list[dict]:
         """Add movement rows without changing the existing reader row semantics/order."""
 
@@ -13607,7 +13710,13 @@ def make_bsl_helpers(
         вызова, в том числе модуль расширения); вычисляемое имя и литерал вне каталога — строки
         ``unresolved`` (``dynamic_name`` / ``unknown_register``; канал доступен только на индексе
         v16+). ``declared_by_kind`` — ПОЛНЫЙ объявленный состав по видам регистров; при усечённой
-        странице ``declared_registers`` маршрут к полному списку — ``_meta.declared_route``."""
+        странице ``declared_registers`` маршрут к полному списку — ``_meta.declared_route``.
+
+        **v1.47.0.** ``code_registers`` — ещё и ``source='movement_table'`` (таблица движений БГУ, названная
+        именем регистра в модуле менеджера; индекс v18). ``erp_mechanisms`` — механизмы модуля менеджера,
+        затем механизмы его делегатов ``<ОбщийМодуль>.<Процедура>(МеханизмыДокумента…)``, которых там нет
+        (раскрытие на чтении, на индексе любого поколения и без него); ``_meta.mechanism_delegates`` —
+        провенанс ``[{module, procedure, mechanisms}]``, ключ только при непустом."""
         # `_meta` здесь условный (ставится setdefault и может отсутствовать), поэтому
         # предупреждение уходит в лог, а не в ответ.
         posting_calls_offset, _w = _coerce_bound(
@@ -13649,10 +13758,12 @@ def make_bsl_helpers(
                     # Строки source='unresolved' в этот список НЕ попадают: у них
                     # пустое имя регистра, и в общем списке они молча завысили бы
                     # число движений. Их канал — отдельный ключ `unresolved`.
+                    # v1.47.0: и movement_table — таблица движений БГУ, названная именем регистра в
+                    # модуле менеджера (имя сверено с каталогом регистров при сборке).
                     "code_registers": [
                         {"name": m["register_name"], "source": m["source"], "file": m["file"]}
                         for m in idx_movements
-                        if m["source"] in ("code", "manager_code")
+                        if m["source"] in _CODE_MOVEMENT_SOURCES
                     ],
                     # v1.45.0: ObjectModule документа, чьи движения учтены в ответе, — тот же смысл,
                     # что и без индекса: основной конфигурации первым (её строки — из снимка),
@@ -13684,6 +13795,7 @@ def make_bsl_helpers(
                     # основной конфигурации и расширений: канал объявлен доступным, и потерянная
                     # строка расширения дала бы ложное «всё разрешилось».
                     idx_movements = _merge_movement_rows(idx_movements, _live_by_name_unresolved(document_name))
+                _add_delegate_mechanisms(result, document_name)  # v1.47.0 (Д14): раскрытие на чтении
                 _attach_declared_and_unresolved(result, document_name, idx_movements, rows_from_index=True)
                 _maybe_add_postability_hint(result, document_name)
                 _maybe_add_posting_handler_hint(result, document_name, posting_calls_offset)
@@ -13849,6 +13961,7 @@ def make_bsl_helpers(
         result["erp_mechanisms"] = erp_mechanisms
         result["manager_tables"] = manager_tables
         result["adapted_registers"] = adapted_registers
+        _add_delegate_mechanisms(result, document_name)  # v1.47.0 (Д14): тот же раскрыватель, что на индексе
         if extension_modules_unreadable:
             result["partial"] = True
             result.setdefault("_meta", {}).update(
@@ -14999,10 +15112,11 @@ def make_bsl_helpers(
             parts.append(
                 f"ЗАПИСЬ РЕГИСТРОВ ПРЯМО В ОБРАБОТЧИКЕ (набор/менеджер записи: после создания виден "
                 f"Записать() по нему): {regs} -> регистры УЖЕ НАЗВАНЫ, {closing}"
-                "ВНИМАНИЕ: find_register_writers их НЕ НАЙДЕТ (набор записей в ObjectModule "
+                "ВНИМАНИЕ: в writers find_register_writers их НЕ НАЙДЕТ (набор записей в ObjectModule "
                 "индекс не разбирает; из МОДУЛЯ МЕНЕДЖЕРА такую запись он знает — source "
-                f"'manager_code') — статические reverse-кандидаты ищи через "
-                f"{_register_search_route()}, затем проверяй живой вызывающий путь. "
+                "'manager_code'; документы, объявившие регистр в движениях, — в его declared_documents) — "
+                f"статические reverse-кандидаты в коде ищи через {_register_search_route()}, затем проверяй "
+                "живой вызывающий путь. "
             )
 
         if paged_record_sets_created:
@@ -15650,13 +15764,118 @@ def make_bsl_helpers(
         meta["delegates_total"] = total
         meta["delegates_truncated"] = truncated
 
+    def _declared_documents_for(register_name: str) -> tuple[list[str], str, list[str]]:
+        """Документы, объявившие регистр в движениях (``RegisterRecords``): ``(имена, источник, нечитаемые)``.
+
+        v1.47.0 (issue #42): обратный ход ``_declared_registers_for`` с теми же маршрутами. Индекс v16+ — первым; на
+        v15, без индекса и при недоступном канале (``None`` ридера) — описатели документов текущего корня тем же
+        перечислителем и разборщиком, что у сборщика (``_iter_category_descriptors``, ``parse_metadata_xml``), поэтому
+        ответы с индексом и без совпадают. Имя сравнивается, как у ``writers`` своего маршрута: на индексе —
+        ``COLLATE NOCASE``, живьём — без учёта регистра. Нечитаемый описатель живого обхода — в третьем элементе
+        (путь от корня сессии), а не тихий пропуск."""
+
+        def ordered(names) -> list[str]:
+            return sorted(set(names), key=lambda n: (n.casefold(), n))
+
+        if idx_reader is not None and getattr(idx_reader, "has_declared_composition", False):
+            try:
+                rows = idx_reader.get_declaring_documents(register_name)
+            except Exception:
+                rows = None
+            if rows is not None:
+                return ordered(rows), "index", []
+        from rlm_tools_bsl.bsl_index import _iter_category_descriptors
+
+        root = Path(_current_root_path())
+        target = register_name.casefold()
+        mention = re.compile(re.escape(register_name), re.IGNORECASE)
+        names: list[str] = []
+        unreadable: list[str] = []
+        for name, descriptor in _iter_category_descriptors(root, "Documents"):
+            try:
+                content = descriptor.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                try:
+                    unreadable.append(Path(os.path.relpath(descriptor.resolve(), _base_path_resolved)).as_posix())
+                except (OSError, ValueError):
+                    unreadable.append(descriptor.as_posix())
+                continue
+            if not mention.search(content):
+                continue  # имени регистра в описателе нет вовсе — разбирать нечего
+            try:
+                parsed = parse_metadata_xml(content)
+            except Exception:
+                parsed = None  # как у сборщика: описатель, который не разобрался, строк не даёт
+            for ref in (parsed or {}).get("register_records") or []:
+                head, _, reg_name = ref.partition(".")
+                if head in _REGISTER_REF_HEADS and reg_name.casefold() == target:
+                    names.append(name)
+                    break
+        return ordered(names), "live", unreadable
+
+    def _declared_writers_hint(
+        register_name: str, writers: list[dict], declared: list[str], source: str, unreadable: list[str]
+    ) -> str:
+        """Вторая часть подсказки ``find_register_writers`` (v1.47.0, issue #42): что значит ``declared_documents`` рядом
+        с ``writers``. Пустой список на индексе, когда на диске регистр записан иначе (кириллица в другом регистре
+        букв), — не «никто не объявил»: имя там сравнивается с учётом регистра, как у ``writers``, и подсказка называет
+        написание с диска."""
+        partial = (
+            f" Описателей документов не прочитано: {len(unreadable)} (_meta.declared_unreadable) — список может быть неполон."
+            if unreadable
+            else ""
+        )
+        if declared:
+            total = len(declared)
+            if not writers:
+                return (
+                    f" Записи в коде не найдено, но регистр объявлен в движениях (RegisterRecords) у документов: {total} — "
+                    "declared_documents: пишут, вероятно, общие механизмы проведения, которых статический разбор не видит. "
+                    f"Разбор документа — find_register_movements({declared[0]!r}).{partial}"
+                )
+            written = {str(w.get("document") or "").casefold() for w in writers}
+            confirmed = sum(1 for name in declared if name.casefold() in written)
+            return (
+                f" Регистр объявлен в движениях (RegisterRecords) у документов: {total} — declared_documents; из них в коде "
+                f"запись найдена у {confirmed}, у остальных она идет через общие механизмы проведения или статически не "
+                f"видна.{partial}"
+            )
+        if source == "index" and not writers:
+            # Только при пустых ОБОИХ списках: `writers` и `declared_documents` сравнивают имя одинаково, и если
+            # писатель совпал (латиница — `COLLATE NOCASE`), то и объявивших на этом написании нет на самом деле.
+            roots = [Path(_current_root_path())]
+            for cat in _REGISTER_CATALOG_DIRS:
+                hit = _descriptor_hit(register_name, cat, roots)
+                if hit is None or hit[1] == register_name:
+                    continue
+                # Только если написание с диска даёт строки: латиницу `COLLATE NOCASE` складывает и сам, и при
+                # пустом ответе на «правильное» написание совет повторить был бы ложным.
+                if idx_reader.get_declaring_documents(hit[1]) or idx_reader.get_register_writers(hit[1]):
+                    return (
+                        " writers и declared_documents пусты: на индексе имя кириллицей сравнивается с учетом регистра "
+                        f"букв, а на диске регистр записан как {hit[1]!r} — повтори find_register_writers({hit[1]!r})."
+                    )
+        if unreadable:
+            return (
+                " Документов, объявивших регистр в движениях (RegisterRecords), не найдено, но описателей документов не "
+                f"прочитано: {len(unreadable)} (_meta.declared_unreadable) — список может быть неполон."
+            )
+        if writers:
+            return (
+                " Ни один документ не объявил регистр в движениях (RegisterRecords): строки writers — запись не от имени "
+                "регистратора (набор или менеджер записи) либо код вне проведения."
+            )
+        return (
+            " Ни один документ не объявил регистр в движениях (RegisterRecords): документы-регистраторы его не пишут."
+        )
+
     def find_register_writers(register_name: str) -> dict:
         """Find static document references to a specific register.
 
         Отдаёт ВСЕ известные индексу источники записи, а не только прямые
         ``Движения.RegisterName`` из ObjectModule: `code`, `manager_code` (набор
-        записей из модуля менеджера, v1.33.0), `erp_mechanism`, `manager_table`,
-        `adapted`. CFE replacement reachability and Posting=Deny are intentionally
+        записей из модуля менеджера, v1.33.0), `movement_table` (таблица движений БГУ, v1.47.0),
+        `erp_mechanism`, `manager_table`, `adapted`. CFE replacement reachability and Posting=Deny are intentionally
         not applied.
         ``find_register_movements(document)`` applies those filters, but main code
         rows there still come from the index snapshot.
@@ -15665,9 +15884,19 @@ def make_bsl_helpers(
             register_name: Register name to search for.
 
         Returns: dict with register, writers, total_documents_scanned, total_writers,
-                 runtime_filtered=False, and an interpretation hint. v1.46.0 (Д7): на индексе строка —
+                 declared_documents, runtime_filtered=False, an interpretation hint and
+                 ``_meta`` {declared_source, declared_unreadable?}. v1.46.0 (Д7): на индексе строка —
                  пара (документ, источник, файл) без повторов, ``total_writers`` — их число,
                  ``total_documents_scanned=None`` (файлы не читались); без индекса — прежний ответ.
+
+        v1.47.0 (issue #42): ``declared_documents`` — имена документов, объявивших регистр в движениях
+        (``RegisterRecords``), в порядке имени, полный список: регистраторы, в том числе те, чья
+        запись идёт через общие механизмы проведения и в ``writers`` не видна (типовые конфигурации бухгалтерского
+        учёта пишут так почти всё). ``writers``/``total_writers`` — по-прежнему только запись, найденная в коде.
+        ``_meta.declared_source`` — ``index`` (таблица объявленного состава, индекс v16+) или ``live`` (описатели
+        документов: без индекса, на индексе до v16 и при недоступном канале); ``_meta.declared_unreadable`` — пути
+        нечитаемых описателей живого обхода (ключ есть только при непустом списке). Имя сравнивается, как у
+        ``writers`` своего маршрута; ``hint`` говорит, как читать список рядом с ``writers``.
 
         v1.44.0: префикс типа в любом регистре и путь (``AccumulationRegisters/X``,
         ``РегистрыНакопления/X``) — тот же регистр; объект не-регистра — ``ValueError`` с маршрутом."""
@@ -15678,6 +15907,7 @@ def make_bsl_helpers(
             "снимком индекса; после изменения main-кода проверь живой файл кандидата."
         )
 
+        result: dict | None = None
         # Fast path: SQLite index
         if idx_reader is not None:
             idx_writers = idx_reader.get_register_writers(register_name)
@@ -15686,22 +15916,40 @@ def make_bsl_helpers(
                 # приходила столько раз, сколько упоминаний в модуле, а `total_writers` считал вхождения. Теперь —
                 # пары без повторов в порядке первого появления (улика в ответ не входит, теряться нечему);
                 # `total_documents_scanned=None`: на индексе файлы не читались (прежде константа 0).
-                writers: list[dict] = []
+                index_writers: list[dict] = []
                 seen_pairs: set[tuple] = set()
                 for w in idx_writers:
                     key = (w["document_name"], w["source"], w["file"])
                     if key not in seen_pairs:
                         seen_pairs.add(key)
-                        writers.append({"document": w["document_name"], "source": w["source"], "file": w["file"]})
-                return {
+                        index_writers.append({"document": w["document_name"], "source": w["source"], "file": w["file"]})
+                result = {
                     "register": register_name,
-                    "writers": writers,
+                    "writers": index_writers,
                     "total_documents_scanned": None,
-                    "total_writers": len(writers),
-                    "runtime_filtered": False,
-                    "hint": runtime_hint,
+                    "total_writers": len(index_writers),
                 }
+        if result is None:
+            result = _live_register_writers(register_name)
 
+        # v1.47.0 (issue #42): объявленный состав — отдельным ключом, а не строками `writers`: те остаются записью,
+        # найденной в коде (типовые конфигурации пишут движения общими механизмами проведения — там `writers`
+        # пуст, а регистраторов десятки).
+        declared, declared_source, unreadable = _declared_documents_for(register_name)
+        result["declared_documents"] = declared
+        result["runtime_filtered"] = False
+        result["hint"] = runtime_hint + _declared_writers_hint(
+            register_name, result["writers"], declared, declared_source, unreadable
+        )
+        result["_meta"] = {"declared_source": declared_source}
+        if unreadable:
+            result["_meta"]["declared_unreadable"] = unreadable
+        return result
+
+    def _live_register_writers(register_name: str) -> dict:
+        """Живой путь ``find_register_writers`` (без индекса или при пустой таблице движений): прямые
+        ``Движения.<Регистр>`` в модулях объектов документов — ``{register, writers, total_documents_scanned,
+        total_writers}``."""
         _ensure_index()
         # Collect all document ObjectModule files
         doc_modules = [
@@ -15740,8 +15988,6 @@ def make_bsl_helpers(
             "writers": writers,
             "total_documents_scanned": len(doc_modules),
             "total_writers": len(writers),
-            "runtime_filtered": False,
-            "hint": runtime_hint,
         }
 
     def analyze_document_flow(document_name: str) -> dict:
@@ -17625,6 +17871,20 @@ def make_bsl_helpers(
                                 "source_file": resolved,
                             }
                         )
+                # v1.47.0: реквизиты адресации задачи расширения — как у строк индекса основной конфигурации.
+                for addr in parsed.get("addressing_attributes", []):
+                    rows.append(
+                        {
+                            "object_name": obj_name,
+                            "category": cat,
+                            "attr_name": addr.get("name", ""),
+                            "attr_synonym": addr.get("synonym", ""),
+                            "attr_type": _make_type(addr.get("type", "")),
+                            "attr_kind": "addressing_attribute",
+                            "ts_name": None,
+                            "source_file": resolved,
+                        }
+                    )
 
                 if rows:
                     _ext_attrs_cache[key] = [_AttrRecord(r) for r in rows]
@@ -17883,6 +18143,26 @@ def make_bsl_helpers(
                         "source_file": resolved,
                     }
                 )
+        # v1.47.0: реквизиты адресации задачи — тот же вид, что у строк индекса (`addressing_attribute`).
+        for addr in parsed.get("addressing_attributes", []):
+            if name and (
+                name.lower() not in addr.get("name", "").lower() and name.lower() not in addr.get("synonym", "").lower()
+            ):
+                continue
+            if kind and kind != "addressing_attribute":
+                continue
+            results.append(
+                {
+                    "object_name": obj_short,
+                    "category": cat,
+                    "attr_name": addr.get("name", ""),
+                    "attr_synonym": addr.get("synonym", ""),
+                    "attr_type": _make_type(addr.get("type", "")),
+                    "attr_kind": "addressing_attribute",
+                    "ts_name": None,
+                    "source_file": resolved,
+                }
+            )
         return results
 
     def _refuse_object_name_as_element_name(
@@ -17948,7 +18228,12 @@ def make_bsl_helpers(
         ``0.5`` — это законная пустая страница (0), ``None`` — дефолт 500.
 
         ``kind`` — ``attribute`` | ``dimension`` | ``resource`` | ``ts_attribute`` (колонка табличной
-        части; регистр не важен); v1.46.0: иное значение — ``ValueError`` (прежде тихий ноль)."""
+        части) | ``addressing_attribute`` (реквизит адресации задачи, v1.47.0; регистр не важен); v1.46.0: иное
+        значение — ``ValueError`` (прежде тихий ноль).
+
+        v1.47.0: в индексе — реквизиты и обработок, отчётов, бизнес-процессов, задач, планов обмена, счетов, видов
+        расчёта и регистров расчёта (прежде только шести категорий): поиск по ``name`` находит и их, а ответ по
+        ``object_name`` идёт из индекса (тип — нормализованным списком, как у прочих категорий)."""
         limit, _w = _coerce_bound(limit, 500, "limit", _FIND_ATTRIBUTES_SIG)
         _warn_bound(_w)
         # v1.46.0 (Д4, П1): неизвестный вид — отказ (прежде тихий ноль; колонка табличной части — `ts_attribute`,
@@ -20681,14 +20966,20 @@ def make_bsl_helpers(
         Возвращает: {extension_path, object_filter, overrides (первые 200), total, truncated, partial,
         _meta?: {scan_diagnostics}, hint?}. ``hint`` (v1.46.0) — только при ``total=0`` по имени, которому не
         соответствует ни один объект: маршрут ``search_objects``; ссылка с префиксом на несуществующий объект —
-        ``ValueError`` (шлюз существования)."""
+        ``ValueError`` (шлюз существования). v1.47.0: строки — и перехваты из форм расширения (``callType``), с
+        ключами ``form_item``/``form_event`` (у строк из аннотаций — ``None``), как у ``get_overrides``: события и
+        команды своих элементов формы (имени нет в ``<BaseForm>``) строк не дают, ``line``/``ext_line`` — ``None``,
+        если обработчика, названного формой, в модуле нет или модуль не прочитан (тогда ``partial=True``). Форма
+        расширения (``Ext/Form.xml``) — кандидат обхода наравне с модулем: входит в ``scan_diagnostics``
+        (``candidate_files``/``files_scanned``), а нечитаемая форма делает ответ неполным (``partial=True``,
+        ``unreadable_files``)."""
         from rlm_tools_bsl.extension_detector import find_extension_overrides as _feo
 
         # v1.43.0: `Справочник.X`/`Catalogs/X` — объект в категории (раньше молчаливый ноль).
         # v1.44.0: путь модуля или описателя — тот же объект (`_object_arg`).
         want_cat, bare = _object_arg(object_name, _split_object_arg)  # не-ссылка — прежним `_split_object_arg`
         diagnostics: dict = {}
-        overrides = _feo(extension_path, bare or None, diagnostics=diagnostics)
+        overrides = _feo(extension_path, bare or None, diagnostics=diagnostics, main_root=_live_override_main_root())
         # v1.41.0: несуществующий корень — названный отказ, а не total=0 с partial=True:
         # туда по памяти кладут имя объекта или `../`-путь из extension_file, и тихий ноль
         # читался как «перехватов нет». Нечитаемые файлы существующего корня — прежний partial.
@@ -20760,7 +21051,22 @@ def make_bsl_helpers(
         "module_type",
         "source_path",
     )
-    _OVERRIDE_OPT_KEYS = ("ext_line", "line", "target_method_line", "source_module_id")
+    # v1.47.0: `form_item`/`form_event` — у перехватов из форм расширения (callType); у строк из аннотаций и у
+    # индекса прежнего поколения (колонок нет, ридер читает `SELECT *`) — None.
+    _OVERRIDE_OPT_KEYS = ("ext_line", "line", "target_method_line", "source_module_id", "form_item", "form_event")
+
+    def _live_override_main_root() -> str | None:
+        """Корень основной конфигурации для цели перехвата из формы расширения (v1.47.0, живой сканер): в сессии
+        на основной конфигурации — её корень, на расширении — основная рядом (если найдена), иначе ``None``."""
+        if _current_root_role() != "extension":
+            return _current_root_path()
+        try:
+            from rlm_tools_bsl.extension_detector import detect_extension_context as _det
+
+            nearby_main = getattr(_det(base_path), "nearby_main", None)
+        except Exception:
+            return None
+        return nearby_main.path if nearby_main is not None else None
 
     def _override_extension_file(out: dict) -> str:
         """`../`-путь от корня СЕССИИ до физического файла расширения.
@@ -21192,7 +21498,19 @@ def make_bsl_helpers(
         файла расширения, исполнимый как есть:
         ``read_procedure(row['extension_file'], row['extension_method'])``. Пустым он
         бывает ровно в одном случае — корень расширения из текущей сессии недостижим;
-        сам ключ есть всегда."""
+        сам ключ есть всегда.
+        **v1.47.0:** и перехваты из форм расширения выгрузки Конфигуратора (``callType`` события формы,
+        элемента или действия команды): ``annotation`` — ``Перед``/``После``/``Вместо``, ``form_item`` — элемент
+        (``''`` — сама форма, у команды — её имя), ``form_event`` — событие (у команды — ``'Action'``),
+        ``target_method`` — обработчик той же пары в форме основной конфигурации либо ``''`` (у пары в основной
+        форме обработчика нет или имя события выгружено идентификатором — строка остаётся); события и команды
+        СВОИХ элементов формы расширения (имени нет в ``<BaseForm>``) — не перехваты, строк нет. ``ext_line`` —
+        строка объявления метода расширения; ``None`` — обработчика, названного формой, в модуле нет либо модуль
+        не прочитан (при живом обходе тогда ``partial=True``; строка индекса — как записана при сборке, при
+        ``partial=False``); секция ``read_procedure(..., include_overrides=True)`` называет причину. У строк из
+        аннотаций и на индексе
+        прежнего поколения ``form_item``/``form_event`` — ``None``; ключи есть всегда. Живой обход читает и формы
+        расширения: нечитаемая форма — неполный обход (``partial=True``, корень в ``_meta.failed_extension_roots``)."""
         # Гарды limit/offset — через `_coerce_bound` (конвенция v1.30.0):
         # предупреждение уходит в лог, ключи ответа не засоряются.
         limit, _wl = _coerce_bound(limit, _OVERRIDES_CAP, "limit", "get_overrides(..., limit=200, offset=0)")
@@ -21250,11 +21568,20 @@ def make_bsl_helpers(
         failed_extension_roots: list[dict] = []
         successful_scans = 0
 
+        # v1.47.0: цель перехвата из формы расширения — по форме основной конфигурации (сессия на основной — её
+        # корень, на расширении — основная рядом).
+        nearby_main = getattr(ctx, "nearby_main", None)
+        live_main_root = (
+            (nearby_main.path if nearby_main is not None else None)
+            if ctx.current.role == ConfigRole.EXTENSION
+            else _current_root_path()
+        )
+
         def _scan_live_extension(extension_path: str, extension_name: str) -> list[dict]:
             nonlocal successful_scans
             diagnostics: dict = {}
             try:
-                rows = _feo(extension_path, bare or None, diagnostics=diagnostics)
+                rows = _feo(extension_path, bare or None, diagnostics=diagnostics, main_root=live_main_root)
             except Exception as exc:
                 failed_extension_roots.append(
                     {
@@ -21404,27 +21731,28 @@ def make_bsl_helpers(
             canonical = text
         return canonical, [canonical]
 
-    # Priority for sorting + truncation
-    _REF_KIND_PRIORITY: dict[str, int] = {
-        "attribute_type": 0,
-        "subsystem_content": 1,
-        "exchange_plan_content": 2,
-        "functional_option_content": 3,
-        "event_subscription_source": 4,
-        "role_rights": 5,
-        "defined_type_content": 6,
-        "characteristic_type": 7,
-        "owner": 8,
-        "based_on": 9,
-        "choice_parameter_link": 10,
-        "link_by_type": 11,
-        "main_form": 12,
-        "list_form": 13,
-        "default_object_form": 14,
-        "default_list_form": 15,
-        "command_parameter_type": 16,
-        "predefined_characteristic_type": 17,
-    }
+    def _ref_target_outside_graph(canonical: str) -> str | None:
+        """Голова цели ``Голова.Имя``, которую ``canonicalize_type_ref`` не канонизирует (v1.47.0, Д19): ссылок на
+        объекты такого вида граф ссылок не хранит ни из одного источника (критерий отбора, хранилище настроек, веб- и
+        HTTP-сервис, внешний источник данных, общий макет, параметр сеанса...) либо префикс не распознан. Каноническая
+        цель и голое имя — ``None``."""
+        from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref as _ctr
+
+        head, dot, name = (canonical or "").partition(".")
+        if not dot or not head or not name or _ctr(canonical):
+            return None
+        return head
+
+    def _outside_graph_route(canonical: str) -> str:
+        """Маршрут ответа о цели вне графа ссылок (v1.47.0, Д19): сырые таблицы состава подсистем и прав ролей."""
+        name = canonical.split(".")[1]
+        return f"состав подсистем — analyze_subsystem({name!r}), права ролей — find_roles({name!r})"
+
+    # Priority for sorting + truncation. v1.47.0: одна карта на ридер и хелперы — прежняя ручная копия здесь
+    # расходилась бы с SQL-сортировкой ридера при каждом новом виде.
+    from rlm_tools_bsl.bsl_index import IndexReader as _IndexReader
+
+    _REF_KIND_PRIORITY: dict[str, int] = dict(_IndexReader._REF_KIND_SQL_PRIORITY)
 
     # Capability-карта LIVE-walker'а: какие виды ссылок он ФАКТИЧЕСКИ способен
     # испустить. Ключ включает parser-route И известную walker-у категорию, а не
@@ -21433,7 +21761,11 @@ def make_bsl_helpers(
     # охват такого запроса НЕ доказывает. Объединение значений равно всем реально
     # испускаемым видам и сейчас НЕ включает `role_rights` (Rights.xml live-walker не
     # посещает), `functional_option_content`, `event_subscription_source`,
-    # `choice_parameter_link`, `link_by_type`, `predefined_characteristic_type`.
+    # `choice_parameter_link`, `link_by_type`, `predefined_characteristic_type`,
+    # а с v1.47.0 — и виды форм `form_attribute_type`, `form_main_table`, `form_query`
+    # (формы живой обход не разбирает: они только в индексе, живьём — `unsupported_kinds`).
+    # v1.47.0: журналы, критерии отбора и связующие свойства разбирает тот же `parse_metadata_xml` —
+    # их четыре вида живой обход даёт сразу (критерии он обходит: категория в `_CATEGORY_TYPE`).
     _LIVE_METADATA_XML_KINDS = frozenset(
         {
             "attribute_type",
@@ -21444,6 +21776,10 @@ def make_bsl_helpers(
             "default_list_form",
             "main_form",
             "list_form",
+            "document_journal_content",
+            "filter_criterion_type",
+            "filter_criterion_content",
+            "linked_object",
         }
     )
     _LIVE_REFERENCE_KINDS_BY_ROUTE: dict[tuple[str, str | None], frozenset[str]] = {
@@ -21561,8 +21897,23 @@ def make_bsl_helpers(
         Returns:
             {object, references, total, truncated, partial, by_kind, hint?,
              _meta:{source, index_coverage, extensions_included, kinds_requested,
-                    kinds_applied, unsupported_kinds, expanded_on_read, resolved_ref?}}
+                    kinds_applied, kinds_unavailable, unsupported_kinds, expanded_on_read, resolved_ref?,
+                    target_not_indexed?}}
             (+ code_* keys when include_code=True).
+
+        Виды (закрытый набор ``kinds``): ``attribute_type``, ``subsystem_content``, ``exchange_plan_content``,
+        ``functional_option_content``, ``event_subscription_source``, ``role_rights``, ``defined_type_content``,
+        ``characteristic_type``, ``owner``, ``based_on``, ``default_object_form``, ``default_list_form``,
+        ``command_parameter_type``, ``predefined_characteristic_type``; v1.47.0 — ``document_journal_content``
+        (журнал регистрирует документ), ``filter_criterion_type`` и ``filter_criterion_content`` (тип и состав
+        критерия отбора), ``linked_object`` (связующее свойство: план счетов регистра бухгалтерии, виды субконто
+        плана счетов, план видов расчета и график регистра расчета, базовые виды расчета, задача бизнес-процесса),
+        ``form_attribute_type``, ``form_main_table``, ``form_query`` (ссылки форм: типы реквизитов, колонок и
+        параметров формы, основная таблица и текст запроса динамического списка; только индекс, живьем —
+        ``unsupported_kinds``). ``main_form``, ``list_form``, ``choice_parameter_link``, ``link_by_type`` — объявлены,
+        сборщиком не производятся (вызов с ними не ломается; строк этих видов нет). ``kinds_unavailable`` (v1.47.0) —
+        виды запроса, которых индекс прежнего поколения (до v18) не производит: пустой ответ по ним — «нужна
+        пересборка», а не «ссылок нет»; на v18 и живьем — ``[]``.
 
         ``kinds_requested`` / ``kinds_applied`` (v1.37.0) say what was ASKED and what
         actually ran after the route was chosen — a kind can be dropped by the ROUTE,
@@ -21574,6 +21925,11 @@ def make_bsl_helpers(
         они слиты с объявленными, ``{}`` — раскрытия не было. Голое имя (v1.45.0): объект одной
         категории — ответ по его ссылке и ``resolved_ref``; нескольких — ``ValueError``;
         объекта нет — прежний ответ и верхний ``hint``.
+
+        ``target_not_indexed`` (v1.47.0) — цель вида, ссылок на объекты которого граф не хранит (критерий отбора,
+        хранилище настроек, веб- и HTTP-сервис, внешний источник данных, общий макет, параметр сеанса...) либо с
+        нераспознанным префиксом: строк, кроме ролей с флагом, нет, и верхний ``hint`` ведет к
+        ``analyze_subsystem``/``find_roles``. Ключ есть только у такой цели.
         """
         # Без гарда битый limit роняет индексный запрос, голый `except Exception`
         # ниже его глушит, и управление уходит в live-скан ВСЕЙ конфигурации —
@@ -21589,8 +21945,19 @@ def make_bsl_helpers(
         kinds_echo = kinds
         if kinds:
             kinds = _closed_values("find_references_to_object", "kinds", kinds, _REF_KIND_PRIORITY)
+        # v1.47.0 (Д19): голова цели вне графа ссылок — задаётся после разбора цели (ниже).
+        outside_head: str | None = None
 
         def _finish(res: dict) -> dict:
+            if outside_head is not None:
+                # v1.47.0 (Д19): ссылок на объекты такого вида граф не хранит — без признака ответ (роли с флагом
+                # «для новых объектов») читался бы как полный. Строки, `total` и `partial` прежние.
+                res["_meta"]["target_not_indexed"] = True
+                res["hint"] = (
+                    f"граф ссылок не хранит ссылок на объекты вида {outside_head} (вид вне графа либо префикс не "
+                    f"распознан): строк, кроме ролей с флагом «для новых объектов», нет; "
+                    f"{_outside_graph_route(res['object'])}"
+                )
             if include_code:
                 code = find_code_usages(object_ref, limit=limit)
                 res["code_usages"] = code["usages"]
@@ -21636,6 +22003,8 @@ def make_bsl_helpers(
                     else []
                 ),
                 "kinds_applied": [],
+                # v1.47.0: виды запроса, которых индекс прежнего поколения не производит; всегда есть, пусто — [].
+                "kinds_unavailable": [],
                 # v1.45.0 (Д23): сколько строк каждого вида раскрыто НА ЧТЕНИИ (подписки на набор типов,
                 # роли по флагу) — в `by_kind`/`total` они слиты с объявленными; всегда есть, пусто — {}.
                 "expanded_on_read": {},
@@ -21653,6 +22022,7 @@ def make_bsl_helpers(
             canonical, _ = _normalize_object_ref(object_ref)
             result["object"] = canonical
             result["_meta"]["resolved_ref"] = resolved
+        outside_head = _ref_target_outside_graph(canonical)
 
         if idx_reader is not None:
             cap_pre = _read_build_capabilities()
@@ -21731,6 +22101,13 @@ def make_bsl_helpers(
                 result["_meta"]["kinds_applied"] = sorted(
                     k for k in (effective_kinds or _REF_KIND_PRIORITY) if k in _REF_KIND_PRIORITY
                 )
+                # v1.47.0 (Д6, Д7): индекс до v18 новых видов не производит — их пустота не «ссылок нет». Ридер без
+                # пробы поколения (тестовый двойник) поколения не называет — ключ пуст.
+                index_generation = getattr(idx_reader, "builder_version", None)
+                if isinstance(index_generation, int) and index_generation < 18:
+                    result["_meta"]["kinds_unavailable"] = sorted(
+                        k for k in result["_meta"]["kinds_applied"] if k in _REF_KINDS_SINCE_V18
+                    )
                 # v15 не хранит результатов read/parse/traversal census optional
                 # домена, поэтому строки/total сохраняются как НИЖНЯЯ оценка, live
                 # recall не добавляется, но покрытие честно неполное — это ось
@@ -21849,7 +22226,9 @@ def make_bsl_helpers(
 
             ``error``+``hint`` — структурный ответ без обхода: конец без распознанного префикса либо (v1.46.0)
             конец-ссылка на объект, которого в его категории нет ни в основной конфигурации, ни в соседних
-            расширениях (маршрут ``search_objects``). ``hint`` без ``error`` — неокончательный промах.
+            расширениях (маршрут ``search_objects``), либо (v1.47.0) конец вида, которого граф ссылок не связывает:
+            цель — критерий отбора или хранилище настроек, любой конец — веб- или HTTP-сервис, внешний источник
+            данных (маршрут ``analyze_subsystem``/``find_roles``). ``hint`` без ``error`` — неокончательный промах.
             v1.46.0 (Д6): узел последнего уровня (``depth + 1 == max_depth``) с полной страницей ссылок
             усечённым не считается — его дети не раскрывались бы и так, прямая ссылка проверена точечно.
 
@@ -21896,6 +22275,33 @@ def make_bsl_helpers(
             "budget_exceeded": False,
             "kinds": kinds,
         }
+
+        # v1.47.0 (Д19): конец вида, которого граф ссылок не связывает, — структурный ответ без обхода. Цель-критерий и
+        # цель-хранилище настроек (их префиксы карта знает) давали тихое «не найдено» после обхода, а веб- и HTTP-сервис
+        # и внешний источник данных — отказ «укажите префикс», хотя префикс дан. Источник-критерий и источник-хранилище
+        # обходятся, как прежде: исходящие ссылки у них в графе есть. Голова, которой хелперы не знают, — отказ ниже.
+        for side, canon in (("to", to_canon), ("from", from_canon)):
+            head = _ref_target_outside_graph(canon)
+            if head is None:
+                continue
+            in_prefix_map = head in prefix_to_category
+            if (side == "to" and in_prefix_map) or (not in_prefix_map and head.casefold() in _NONREF_KIND_CATEGORIES):
+                error = (
+                    f"конец {canon}: ссылок на объекты вида {head} в графе ссылок нет — путь к нему не строится"
+                    if side == "to"
+                    else f"конец {canon}: объекты вида {head} в графе ссылок не участвуют — путь не строится"
+                )
+                return {
+                    "found": False,
+                    "from": from_canon,
+                    "to": to_canon,
+                    "path": None,
+                    "depth": 0,
+                    "partial": False,
+                    "error": error,
+                    "hint": _outside_graph_route(canon),
+                    "_meta": base_meta,
+                }
 
         # Contract guard: both endpoints must carry a recognized prefix.
         if _prefix_category(from_canon) is None or _prefix_category(to_canon) is None:
@@ -22095,10 +22501,16 @@ def make_bsl_helpers(
         references). Backed by the metadata_code_usages index table (builder v13+).
 
         Captures (light regex layer, source-aware):
-          - 'manager'  — collection access `Документы.X` / `Documents.X`;
+          - 'manager'  — collection access `Документы.X` / `Documents.X`; v1.47.0: 'member' —
+                         the identifier after `X.` (method, property, enum value) or None;
+                         a call `ПланыОбмена.ГлавныйУзел()` (parenthesis right after X) is not an object;
           - 'ref_type' — type in a string literal `"ДокументСсылка.X"` / `"DocumentRef.X"`;
           - 'query'    — metadata path in a query literal `Документ.X` and
-                         `Документ.X.Товары` ('member' = tabular section name).
+                         `Документ.X.Товары` ('member' = the 3rd path segment);
+          - 'metadata' (v1.47.0) — `Метаданные.Документы.X[.Член]` in code ('member' = next segment);
+                         a call `Метаданные.Документы.Найти(Имя)` is not an object either;
+          - 'form'     (v1.47.0) — form path in a literal `"Документ.X.Форма.Ф"` ('member' = form name),
+                         `"Обработка.X.Форма"` ('Форма'), standard forms `"Справочник.X.ФормаВыбора"`.
         Does NOT capture attribute access via local variables (`Док.Товары.Количество`).
 
         Scope (v1.34.0 — уточнено, поведение не менялось): охват зависит от
@@ -22116,7 +22528,7 @@ def make_bsl_helpers(
                 accepted in either RU or EN form, case-insensitively; the object
                 NAME part is also matched case-insensitively (incl. Cyrillic) via
                 the stored object_ref_key.
-            kind: optional filter — 'manager' | 'ref_type' | 'query'. Применяется
+            kind: optional filter — 'manager' | 'ref_type' | 'query' | 'metadata' | 'form'. Применяется
                 ТОЛЬКО на индексном маршруте: живой фолбэк вид обращения не
                 определяет и метит строки 'unknown', поэтому там фильтр
                 неприменим — факт публикуется в `_meta.kind_filter_applied`.
@@ -22125,8 +22537,10 @@ def make_bsl_helpers(
 
         Returns:
             {object, usages: [{path, object_name, category, module_type, line, kind, member}],
-             by_kind, total, truncated, partial, _meta: {scope, extensions_included}}.
-            partial=True only when the index lacks the table (rebuild required).
+             by_kind, total, truncated, partial, hint?, _meta: {scope, extensions_included, kinds_unavailable}}.
+            partial=True only when the index lacks the table (rebuild required) — or (v1.47.0) when the
+            requested kind is in ``_meta.kinds_unavailable``: the index (before v18) does not produce
+            'form'/'metadata' rows; ``hint`` then names the update route. On v18 and live — ``[]``.
         """
         # Тот же заглушающий `except Exception` ниже, что и у
         # find_references_to_object: битый limit роняет индексный запрос, ошибка
@@ -22153,6 +22567,8 @@ def make_bsl_helpers(
                 "scope": "main_config",
                 "source": "unavailable",
                 "extensions_included": False,
+                # v1.47.0: виды, которых индекс прежнего поколения не производит; всегда есть, пусто — [].
+                "kinds_unavailable": [],
                 **({"arg_warning": _w} if _w else {}),
             },
         }
@@ -22222,6 +22638,15 @@ def make_bsl_helpers(
                 if index_proof == "incomplete":
                     result["partial"] = True
                     result["_meta"]["index_proof"] = index_proof
+                # v1.47.0 (Д9, Д10): индекс до v18 видов `form`/`metadata` не производит — пустота по ним не
+                # «обращений нет». Запрошен такой вид — ответ ещё и неполон, с маршрутом обновления индекса.
+                index_generation = getattr(idx_reader, "builder_version", None)
+                if isinstance(index_generation, int) and index_generation < 18:
+                    unavailable = [k for k in _CODE_KINDS_SINCE_V18 if kind is None or k == kind]
+                    result["_meta"]["kinds_unavailable"] = unavailable
+                    if kind is not None and unavailable:
+                        result["partial"] = True
+                        result["hint"] = _CODE_KINDS_V18_HINT.format(kinds=", ".join(repr(k) for k in unavailable))
                 return result
 
         # Fallback: таблицы нет (pre-v13 индекс) ЛИБО поколение индекса не доказано
@@ -22435,12 +22860,14 @@ def make_bsl_helpers(
             except ValueError:
                 return str(path_obj)
 
+        from rlm_tools_bsl.bsl_index import _CMD_HOST_CATS
         from rlm_tools_bsl.bsl_xml_parsers import (
             canonicalize_type_ref as _ctr,
             parse_command_parameter_type as _pcpt,
             parse_defined_type as _pdt,
             parse_exchange_plan_content as _pep,
             parse_metadata_xml as _pmx,
+            parse_object_commands_parameter_types as _pocpt,
             parse_pvh_characteristics as _ppc,
         )
 
@@ -22469,6 +22896,7 @@ def make_bsl_helpers(
             "DataProcessors": "DataProcessor",
             "Constants": "Constant",
             "DocumentJournals": "DocumentJournal",
+            "FilterCriteria": "FilterCriterion",
         }
 
         scan_categories = list(_CATEGORY_TYPE.keys())
@@ -22484,11 +22912,17 @@ def make_bsl_helpers(
         # of source file path (in production both files have identical content).
         emitted_keys: set[tuple[str, str]] = set()
 
-        def _emit_from_xml(xml_path: Path, category: str, fallback_name: str) -> None:
+        def _emit_from_xml(xml_path: Path, category: str, fallback_name: str, *, owner_commands: bool = False) -> None:
+            """``owner_commands`` (v1.47.0) — описатель владельца команд (`_CMD_HOST_CATS`): команды объекта
+            описаны в нём (CF ``<ChildObjects><Command>``, EDT ``<commands>``), как у индекса
+            (`_object_command_ref_rows`). Файл — кандидат и маршрута `command_parameter_type`; учитывается один
+            раз, текст разбирается без второго чтения."""
             if xml_path in seen_files:
                 return
             seen_files.add(xml_path)
-            relevant = _route_relevant("metadata_xml", category)
+            relevant = _route_relevant("metadata_xml", category) or (
+                owner_commands and _route_relevant("command_parameter_type")
+            )
             try:
                 content = xml_path.read_text(encoding="utf-8-sig", errors="replace")
             except OSError:
@@ -22549,6 +22983,18 @@ def make_bsl_helpers(
                     anchor = _ref_anchor_index(content_lines)
                 line = anchor.line_for(ref)
                 results.append({"used_in": used_in, "path": rel, "line": line, "kind": kind})
+            if not owner_commands or (kinds_set is not None and "command_parameter_type" not in kinds_set):
+                return
+            # Строка владельца — раньше обхода `Commands/*`: повтор оттуда отсекает ключ `(used_in, kind)`.
+            for ref in _pocpt(content):
+                if ref.get("ref_object", "").lower() != canonical_lower:
+                    continue
+                used_in = f"{type_prefix}.{fallback_name}.Command.{ref['command_name']}.CommandParameterType"
+                key = (used_in, "command_parameter_type")
+                if key in emitted_keys:
+                    continue
+                emitted_keys.add(key)
+                results.append({"used_in": used_in, "path": rel, "line": None, "kind": "command_parameter_type"})
 
         def _emit_command_param_refs(
             xml_path: Path,
@@ -22654,7 +23100,7 @@ def make_bsl_helpers(
                                     xml_path = fp
                                     break
                 if xml_path is not None:
-                    _emit_from_xml(xml_path, category, obj_name)
+                    _emit_from_xml(xml_path, category, obj_name, owner_commands=category in _CMD_HOST_CATS)
                     covered_stems.add(obj_name)
 
                 # Object-nested commands: <Cat>/<Obj>/Commands/<Cmd>.xml or
@@ -23428,7 +23874,9 @@ def make_bsl_helpers(
         "          print(body)\n"
         "  # Если расширения перехватили метод — читать с перехватами:\n"
         "  full = read_procedure(path, 'ProcName', include_overrides=True)\n"
-        "  # full = оригинал + '=== Перехвачен &Аннотация в расширении X ===' + тело перехвата\n"
+        "  # full = оригинал + секции '=== Перехвачен &Аннотация в расширении X ===' (у перехвата из\n"
+        "  #   формы — 'Перехвачен После (callType формы: событие E …)') + тело метода расширения;\n"
+        "  #   секция без тела — строка-пометка, почему тела нет (обработчика в модуле нет и т.п.)\n"
         "  # Метода в базовом модуле нет, а перехват есть (событие платформы без обработчика):\n"
         "  #   full = строка-пометка '// Метод X в базовом модуле не объявлен...' + секции перехватов.\n"
         "  #   У общего модуля событий платформы нет: там это расхождение версий основной и расширения.\n"
@@ -23463,7 +23911,7 @@ def make_bsl_helpers(
         "              print('  ... more callers, increase offset')\n"
         "  # НЕЭКСПОРТНАЯ цель (_meta.non_export_target=True): вызывающие — только вызовы без точки из своего\n"
         "  #   модуля (и точные ребра заимствованного модуля расширения); строки «по имени» из чужих модулей\n"
-        "  #   не приходят. Граница: `Модуль.` ⏎ `Метод(` (перенос или пробел после точки) сборщик пишет\n"
+        "  #   не приходят. На индексе до v18 `Модуль.` ⏎ `Метод(` (перенос или пробел после точки) записан\n"
         "  #   голым вызовом — точная строка своего модуля бывает таким вызовом: проверь строку line и предыдущую.\n"
         "  # СТРАНИЦА: на индексе offset/limit/total_callers — в СТРОКАХ; на FS-маршруте\n"
         "  #   (_meta.exact_available=False) offset/limit/has_more — в ФАЙЛАХ-кандидатах, а total_callers —\n"
@@ -23967,6 +24415,7 @@ def make_bsl_helpers(
         "  attrs = find_attributes(object_name='РеализацияТоваровУслуг')\n"
         "  # Only dimensions of a register:\n"
         "  dims = find_attributes(object_name='ТоварыОрганизаций', kind='dimension')\n"
+        "  # Реквизиты адресации задачи: kind='addressing_attribute'. В индексе и обработки, отчеты, БП, задачи, планы.\n"
         "  # БЕЗ ИНДЕКСА: find_attributes(name='X') без object_name вернёт [] — невозможно сканировать всю кодовую базу.\n"
         "  # Решение: всегда передавай object_name на проектах без индекса.",
     )
@@ -24092,6 +24541,7 @@ def make_bsl_helpers(
         "      print(f\"  измерение {d['name']}: {d['type']}\")\n"
         "  for r in reg.get('resources', []):\n"
         "      print(f\"  ресурс {r['name']}: {r['type']}\")\n"
+        "  # У задачи — addressing_attributes:[{name, synonym, type}] (реквизиты адресации); у прочих ключа нет.\n"
         "  # _meta.index_used=False означает live XML fallback (синонимы ТЧ доступны только в этом режиме)\n"
         "  if not s['_meta']['index_used']:\n"
         "      print('Fallback:', s['_meta']['fallback_reason'])\n"
@@ -24332,7 +24782,7 @@ def make_bsl_helpers(
         "  #   недоступен, и причина стоит в _meta.unresolved_reason.\n"
         "  # evidence есть не всегда: у строки ЖИВОГО происхождения (CFE-движение,\n"
         "  #   алиас main) и на индексе v15 оно None — это контракт, а не пропуск.\n"
-        "  # ФОРМА ответа: code_registers — СЛОВАРИ (у каждого есть source: code|manager_code),\n"
+        "  # ФОРМА ответа: code_registers — СЛОВАРИ (source: code|manager_code|movement_table),\n"
         "  #   а erp_mechanisms / manager_tables / adapted_registers — списки ИМЕН-СТРОК.\n"
         "  # modules_scanned — ObjectModule документа, чьи движения учтены: основной конфигурации\n"
         "  #   первым, затем прочитанные модули расширений; partial=True — часть CFE не прочитана\n"
@@ -24392,21 +24842,27 @@ def make_bsl_helpers(
     _reg(
         "find_register_writers",
         find_register_writers,
-        "find_register_writers(reg_name) -> {writers:[{document,source|lines,file}],runtime_filtered:false,hint}",
+        "find_register_writers(reg_name) -> {writers:[{document,source|lines,file}],declared_documents,runtime_filtered,hint}",
         "business",
         ["писатели регистра", "кто пишет", "register writer", "writer"],
         "FIND STATIC WRITER CANDIDATES:\n"
         "  result = find_register_writers('ТоварыНаСкладах')\n"
         "  # runtime_filtered=False: CFE/Posting проверь через forward; свежесть main-строки — по живому файлу\n"
-        "  # source: code | manager_code | erp_mechanism | manager_table | adapted.\n"
+        "  # source: code | manager_code | movement_table | erp_mechanism | manager_table | adapted.\n"
         "  #   manager_code — набор записей из МОДУЛЯ МЕНЕДЖЕРА документа, имя сверено\n"
         "  #   с каталогом регистров. Схемы, где имя регистра собирается в структуре\n"
         "  #   во время исполнения, статически неразрешимы и сюда НЕ попадают.\n"
         "  # На индексе строка — пара (документ, источник, файл) без повторов, total_writers — их число;\n"
         "  #   total_documents_scanned=None (файлы не читались). Без индекса — строки с lines.\n"
+        "  # declared_documents — документы, объявившие регистр в движениях (RegisterRecords), полный список:\n"
+        "  #   регистраторы, в том числе те, чья запись идет общими механизмами проведения и в writers не видна\n"
+        "  #   (типовые учетные конфигурации: writers пуст, регистраторов десятки). writers — только запись в коде.\n"
+        "  #   _meta.declared_source: index | live; _meta.declared_unreadable — нечитаемые описатели (без индекса).\n"
         "  for w in result['writers']:\n"
         "      detail = w.get('lines') or w.get('source', '')\n"
-        "      print(f\"  {w['document']} ({detail})\")",
+        "      print(f\"  {w['document']} ({detail})\")\n"
+        "  silent = sorted(set(result['declared_documents']) - {w['document'] for w in result['writers']})\n"
+        "  print('объявили, записи в коде нет:', len(silent), silent[:10])",
     )
     _reg(
         "find_based_on_documents",
@@ -24877,7 +25333,9 @@ def make_bsl_helpers(
         "  for u in res['usages'][:20]:\n"
         "      tail = f\" .{u['member']}\" if u['member'] else ''\n"
         "      print(f\"  {u['kind']:8s} {u['path']}:{u['line']}{tail}\")\n"
-        "  # kind: 'manager' (Документы.X) | 'ref_type' (\"ДокументСсылка.X\") | 'query' (Документ.X.ТЧ)\n"
+        "  # kind: 'manager' (Документы.X.Член) | 'ref_type' (\"ДокументСсылка.X\") | 'query' (Документ.X.ТЧ)\n"
+        "  #   | 'metadata' (Метаданные.Документы.X) | 'form' (\"Документ.X.Форма.Ф\"); member — член, ТЧ, имя формы\n"
+        "  # _meta.kinds_unavailable не пуст — индекс собран до этих видов (rlm_index update).\n"
         "  # Голое имя — ссылка единственной категории (_meta.resolved_ref); омоним — ValueError; нет — hint.\n"
         "  # Ссылка на несуществующий объект ('Документ.Нет') — ValueError «объекта … нет» (search_objects).\n"
         "  # Filter: find_code_usages('Документ.X', kind='query') — работает на ИНДЕКСНОМ\n"
@@ -24937,7 +25395,9 @@ def make_bsl_helpers(
         "  # Если есть индекс v9+ — предпочитай get_overrides() (мгновенно из SQLite).\n"
         "  # find_ext_overrides — для live-проверки на проектах без индекса или для верификации.\n"
         "  # ext_line (= line) — строка АННОТАЦИИ (&Перед/&После/&Вместо) в модуле расширения;\n"
-        "  #   объявление метода расширения — ниже. Тело: read_procedure(ov['extension_file'],\n"
+        "  #   объявление метода расширения — ниже (у перехвата из формы, где задан form_event,\n"
+        "  #   аннотации нет: line — само объявление; None — обработчика, названного формой, в модуле\n"
+        "  #   нет или модуль не прочитан). Тело: read_procedure(ov['extension_file'],\n"
         "  #   ov['extension_method']), а не чтение файла с ext_line.\n"
         "  # v1.37.0: строки несут extension_file — '../'-путь от корня СЕССИИ. Здесь\n"
         "  #   extension_path задаёт ПРОИЗВОЛЬНЫЙ корень, и если его нет среди корней сессии,\n"
@@ -24985,7 +25445,9 @@ def make_bsl_helpers(
         "  #   сессии; он же равен find_module(...)['path'] для того же физического файла.\n"
         "  #   Пустая строка = корень недостижим из этой сессии; КЛЮЧ присутствует всегда.\n"
         "  # ext_line (= line) — строка АННОТАЦИИ (&Перед/&После/&Вместо) в модуле расширения;\n"
-        "  #   объявление метода расширения — ниже. Тело: read_procedure(ov['extension_file'],\n"
+        "  #   объявление метода расширения — ниже (у перехвата из формы, где задан form_event,\n"
+        "  #   аннотации нет: line — само объявление; None — обработчика, названного формой, в модуле\n"
+        "  #   нет или модуль не прочитан). Тело: read_procedure(ov['extension_file'],\n"
         "  #   ov['extension_method']), а не чтение файла с ext_line.\n"
         "  # To read extension method body:\n"
         "  body = read_procedure(path, 'MethodName', include_overrides=True)\n"

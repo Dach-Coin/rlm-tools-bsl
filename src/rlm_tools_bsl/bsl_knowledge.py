@@ -640,7 +640,7 @@ find_references_to_object → based_on vs find_based_on_documents:
 
 find_register_movements(doc) vs find_register_writers(reg):
   - find_register_movements: документ → какие регистры пишет (есть is_postable).
-  - find_register_writers: регистр → статические ссылки документов (runtime_filtered=False).
+  - find_register_writers: регистр → документы: запись в коде и объявившие (declared_documents).
   find_register_movements применяет Posting/CFE, но main-строки берет из снимка индекса;
   после изменения main-кода проверь живое тело файла кандидата.
 
@@ -655,10 +655,10 @@ find_roles(object_name) vs find_references_to_object(ref, kinds=['role_rights'])
   ТРИ разных вопроса, а не расхождение. Bare-name в точных маршрутах запрещён.
 
 find_references_to_object(ref) vs find_code_usages(ref):
-  - find_references_to_object → ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов,
-    владелец, основание ввода, подсистемы, права, ФО, ПВХ, DefinedType. Код НЕ сканирует.
-  - find_code_usages → ОБРАЩЕНИЯ В КОДЕ: Документы.X (manager), "ДокументСсылка.X"
-    (ref_type), запросы Документ.X.ТЧ (query, member=имя ТЧ). Метаданные-XML НЕ сканирует.
+  - find_references_to_object → ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов, владелец, основание
+    ввода, подсистемы, права, ФО, ПВХ, DefinedType, журналы, критерии отбора, связующие свойства, формы. Код НЕ сканирует.
+  - find_code_usages → ОБРАЩЕНИЯ В КОДЕ: Документы.X.Член (manager), "ДокументСсылка.X" (ref_type), запросы
+    Документ.X.ТЧ (query), Метаданные.Документы.X (metadata), "Документ.X.Форма.Ф" (form). Метаданные-XML НЕ сканирует.
   Это РАЗНЫЕ слои. Нужны оба — find_references_to_object(obj, include_code=True).
   Доступ через локальные переменные — вне охвата find_code_usages; охват кода
   расширений зависит от маршрута и назван в _meta.extensions_included.
@@ -670,7 +670,7 @@ search(q, scope='X') vs search_X(q):
 
 read_procedure(path, name) vs read_procedure(path, name, include_overrides=True):
   - Без флага: только оригинальное тело.
-  - С include_overrides: оригинал + тело перехвата с маркером "=== Перехвачен &Аннотация ===".
+  - С include_overrides: оригинал + секции "=== Перехвачен …" (аннотация или callType формы).
   - Используй с include_overrides когда rlm_start обнаружил расширения (extension_context).
 
 get_object_modules(name) vs analyze_object(name):
@@ -883,10 +883,10 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "print(res['by_kind'], res['total'])",
             "Голое имя — ссылка единственной категории (_meta.resolved_ref); омоним — ValueError",
             "Filter by kind: find_references_to_object('Справочник.Х', kinds=['attribute_type'])",
-            "_meta.kinds_applied — что применено ПОСЛЕ выбора маршрута; unsupported_kinds — LIVE, на index пуст; _meta.expanded_on_read — раскрыто при чтении",
-            "Членство в подсистемах: find_references_to_object('Документ.Х', kinds=['subsystem_content']); на устаревшем индексе состав подсистем мог измениться — проверь live (rlm_index build)",
+            "_meta.kinds_applied — что применено ПОСЛЕ выбора маршрута; unsupported_kinds — LIVE, на index пуст; kinds_unavailable — индекс до v18; _meta.expanded_on_read — раскрыто при чтении",
+            "Членство в подсистемах: kinds=['subsystem_content']; на устаревшем индексе состав подсистем мог измениться — проверь live (rlm_index build)",
             "code = find_code_usages('Документ.ПриобретениеТоваровУслуг')  # обращения в коде",
-            "print(code['by_kind'])  # {'manager':.., 'ref_type':.., 'query':..}; u['member'] = имя ТЧ для query",
+            "print(code['by_kind'])  # manager/ref_type/query/metadata/form; u['member']: член, ТЧ, имя формы",
             "Filter by kind: find_code_usages('Документ.Х', kind='query') — только обращения к ТЧ/реквизитам в запросах",
             "Полная картина одним вызовом: find_references_to_object('Документ.Х', include_code=True) → + ключи code_*",
             "Если res['partial'] / code['partial'] — индекс старый, запустить rlm_index(action='build')",
@@ -1032,17 +1032,16 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file → read_procedure",
             "get_overrides() → вся конфигурация: сначала partial. False → агрегаты по ВСЕМ перехватам; True → нижняя оценка, причины в _meta.failed_extension_roots. НЕ группируй overrides — это срез 200",
             "extract_procedures(path) → поле overridden_by у перехваченных методов",
-            "read_procedure(path, name, include_overrides=True) → оригинал + тело расширения с аннотацией",
+            "read_procedure(path, name, include_overrides=True) → оригинал + тело метода расширения",
             "find_module/find_attributes/parse_object_xml/search видят объекты ext конфигов; пути начинаются на '../' — передавай их в read_procedure/extract_procedures напрямую",
         ],
         "full": [
             "get_overrides() → перехваты конфигурации. СНАЧАЛА partial: False — total/агрегаты по полному выбранному источнику; True — только по прочитанной части, причины в _meta.failed_extension_roots. overrides = отсортированный срез 200, total/truncated сигналят обрезку; сводку по срезу не строй",
             "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file исполним в read_procedure",
             "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_* — ЧИСЛА: unique_objects/unique_methods СЧИТАЮТ ИМЕНА, unique_object_methods — ПАРЫ объект+метод",
-            "target_method_line=None — валидно: метода нет в базовом модуле — обычно перехват события платформы (ПриЗаписи, ОбработкаПроведения) без обработчика в основной конфигурации; у общего модуля событий платформы нет — там это расхождение версий основной конфигурации и расширения; либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
-            "extract_procedures(path) → overridden_by=[{annotation, extension_name, extension_method, extension_root, ext_module_path, ext_line, extension_file}]",
-            "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
-            "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",
+            "target_method_line=None и ext_line=None — валидны: метода нет в базовом модуле (событие платформы без обработчика в основной; у общего модуля — расхождение версий) либо обработчика, названного формой, нет в модуле расширения (или он не прочитан); или строка без source-привязки. Не ошибка индекса, не перепроверяй",
+            "extract_procedures(path) → overridden_by=[{annotation, extension_name, extension_method, extension_root, ext_module_path, ext_line, extension_file, form_item?, form_event?}]; form_* — callType формы, target_method бывает ''",
+            "read_procedure(path, name) → ТОЛЬКО оригинал; include_overrides=True → + секции «=== Перехвачен … в расширении ИмяРасш ===» (аннотация или callType формы; без тела — пометка)",
             "ALT live (без индекса): detect_extensions() + find_ext_overrides(ext_path, 'ИмяОбъекта') — на СВЕЖЕМ индексе совпадает с index по количеству; на устаревшем может расходиться (контракт: index = снимок)",
             "Объекты и модули расширения видны из main-сессии: find_module/find_by_type/find_attributes/find_predefined/parse_object_xml/search возвращают пути с префиксом '../'. Передавай эти пути напрямую в read_procedure/extract_procedures — они читают расширение внутренне.",
             "read_file/grep/glob_files на путях с '../' дадут PermissionError (sandbox base-only)",
@@ -2173,7 +2172,7 @@ def _extension_strategy(ext_context, ext_overrides: dict, *, slim: bool = False)
         lines.append(
             (f"\n== {header} ==\n" if slim else f"\n{header} ")
             + "(name/prefix/overrides_count в extension_context.nearby_extensions)\n"
-            "Extensions OVERRIDE methods in this config via annotations:\n"
+            "Extensions OVERRIDE methods in this config via annotations and form event/command callType (form XML):\n"
             "  &Перед (Before), &После (After), &Вместо (Instead), &ИзменениеИКонтроль (ChangeAndValidate)\n"
             "YOU MUST mention overridden methods in your response.\n"
             "Extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.\n"

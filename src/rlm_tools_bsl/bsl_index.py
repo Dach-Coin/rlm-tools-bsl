@@ -39,11 +39,14 @@ from rlm_tools_bsl.format_detector import BslFileInfo, parse_bsl_path
 from rlm_tools_bsl.bsl_xml_parsers import (
     CATEGORY_TO_REF_HEAD as _CATEGORY_TO_REF_HEAD,
     _CODE_MANAGER_COLLECTIONS,
+    _CODE_METADATA_COLLECTIONS,
     _CODE_QUERY_COLLECTIONS,
     _RU_META_FORMS,
     _RU_REFTYPE_TO_CANONICAL,
+    _STANDARD_FORM_NAMES,
     canonicalize_type_ref,
     classify_subscription_row,
+    normalize_type_string,
     normalize_used_in,
 )
 
@@ -108,7 +111,7 @@ def _row_type_sets(row) -> list[str]:
     return _json_list(raw)
 
 
-BUILDER_VERSION = 17
+BUILDER_VERSION = 18
 
 # Недостачи индекса ПРЕЖНЕГО поколения по сравнению с текущим — одна строка на бамп.
 # rlm_start склеивает тексты всех строк с порогом выше версии индекса. Последняя строка
@@ -122,6 +125,15 @@ OLD_INDEX_GAPS: tuple[tuple[int, str], ...] = (
         "(ФоновыеЗадания.Выполнить, ДлительныеОперации) и вызовов из кода расширений, основной слой "
         "find_unresolved_calls недоступен; также нет длинных сигнатур, шапок под лицензией "
         "и типов параметров команд объектов EDT",
+    ),
+    (
+        18,
+        "в нем нет перехватов событий и команд форм расширений через callType, реквизитов и ссылок описателей "
+        "вне шести категорий и объектов выгрузки Конфигуратора без каталога, ссылок из форм и текстов их "
+        "запросов, журналов, критериев отбора, связующих свойств, подписок на определяемый тип, команд объектов "
+        "и типов-наборов выгрузки Конфигуратора; find_code_usages не видит Метаданные.<Коллекция>.X, путей форм и члена менеджера; "
+        "вызов, разорванный переносом строки или пробелом, записан голым; нет движений таблиц БГУ и делегата "
+        "модуля объекта, состояния регламентных заданий EDT и объектов без синонима",
     ),
 )
 
@@ -288,14 +300,49 @@ def _is_chain_member_in_lines(masked: list[str], idx: int, pos: int) -> bool:
 
 
 # Reverse code-usage extraction (v1.14.0, metadata_code_usages):
-#   _CODE_DOTTED_RE — a dotted identifier pair, applied to *stripped* code
-#                     (no strings/comments) to catch manager collection access
-#                     `Документы.X` / `Documents.X`.
+#   _CODE_MANAGER_RE — v1.47.0 (прежде `_CODE_DOTTED_RE`, пара `X.Y`): manager collection
+#                     access `Документы.X[.Член]` on *stripped* code (no strings/comments).
 #   _CODE_PATH_RE   — a 2- or 3-segment dotted path, applied to the *contents*
 #                     of string literals to catch reference types and query
 #                     metadata paths (incl. an optional tabular-section segment).
-_CODE_DOTTED_RE = re.compile(r"(\w+)\.(\w+)")
 _CODE_PATH_RE = re.compile(r"(\w+)\.(\w+)(?:\.(\w+))?")
+# v1.47.0: менеджер с членом — `Документы.X[.Член]`, пробелы вокруг точек допустимы; `member` — идентификатор после
+# `X.` (метод, свойство, значение перечисления, предопределённый). Голова с точкой слева — член цепочки, а не
+# коллекция (`Форма.Объект.Отчеты.Количество()`: `Отчеты` — табличная часть); через пробел после точки — та же
+# проверка `_is_chain_member`. Ретроспективная проверка `(?<![\w.])` ещё и вдвое удешевляет поиск против прежней
+# пары `(\w+)\.(\w+)`: старт внутри слова отсекается сразу (замер на 155 тыс. строк кода — 0,31 с против 0,53 с).
+_CODE_MANAGER_RE = re.compile(r"(?<![\w.])(\w+)\s*\.\s*(\w+)(?:\s*\.\s*(\w+))?")
+# v1.47.0: `Метаданные.<Коллекция>.X[.Член]` / `Metadata.<Collection>.X[.Member]` по коду — то же совпадение
+# `_CODE_MANAGER_RE` (голова — `Метаданные`/`Metadata` в любом регистре, как и имя коллекции; отдельный проход
+# регуляркой не нужен), член — сегмент после `X`. Поиск построчный, как у менеджера: перенос строки внутри такого
+# обращения (по одному на крупных ERP-конфигурациях) не поддерживается.
+# v1.47.0: у обоих видов `X` со скобкой сразу следом — вызов, а не объект: ни менеджер объекта, ни объект метаданных
+# не вызываются. Это метод коллекции (`Метаданные.Справочники.Найти(Имя)`, `ПланыОбмена.ГлавныйУзел()`,
+# `Справочники.ТипВсеСсылки()`, `Константы.СоздатьНабор()`) либо метод переменной с именем коллекции
+# (`Документы.Добавить(Док)`); прежде такие вызовы давали строки несуществующих объектов (`Catalog.Найти`,
+# `ExchangePlan.ГлавныйУзел`) — на конфигурации документооборота четверть строк `metadata`. Перепись семи выгрузок:
+# у `manager` существующий объект со скобкой сразу следом — 0 из ~770 тыс. совпадений; без скобки это свойство.
+_CODE_METADATA_HEADS: frozenset[str] = frozenset({"метаданные", "metadata"})
+_CODE_MEMBER_AFTER_RE = re.compile(r"\s*\.\s*(\w+)")
+# v1.47.0: имя формы — сегмент после `<Вид>.X.Форма` в пути литерала.
+_CODE_FORM_NAME_AFTER_RE = re.compile(r"\.(\w+)")
+_CODE_FORM_SEGMENTS: frozenset[str] = frozenset({"форма", "form"})
+
+
+def _literal_form_member(segment: str | None, content: str, end: int) -> str | None:
+    """Путь формы в литерале (v1.47.0) — имя формы для ``member``, иначе ``None`` (путь не формы).
+
+    ``<Вид>.X.Форма.<Имя>`` → ``<Имя>``; ``<Вид>.X.Форма`` в конце пути (форма по умолчанию обработки и отчёта) →
+    ``Форма``; ``<Вид>.X.<Стандартная>`` (`_STANDARD_FORM_NAMES`) → её имя. ``end`` — конец трёхсегментного
+    совпадения: четвёртый сегмент читается только у формы, прочие пути режутся на трёх, как прежде."""
+    if not segment:
+        return None
+    folded = segment.casefold()
+    if folded in _CODE_FORM_SEGMENTS:
+        name = _CODE_FORM_NAME_AFTER_RE.match(content, end)
+        return name.group(1) if name else segment
+    return segment if folded in _STANDARD_FORM_NAMES else None
+
 
 # BSL keywords to exclude from call graph
 _BSL_KEYWORDS: frozenset[str] = frozenset(
@@ -1373,7 +1420,11 @@ CREATE TABLE IF NOT EXISTS extension_overrides (
     extension_method TEXT,
     extension_root TEXT NOT NULL,
     ext_module_path TEXT NOT NULL,
-    ext_line INTEGER
+    ext_line INTEGER,
+    -- v18: перехват из XML формы расширения (callType) — элемент ('' — сама форма; у команды —
+    -- имя команды) и событие платформы (у команды — 'Action'); у строк из аннотаций оба NULL
+    form_item TEXT,
+    form_event TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eo_object ON extension_overrides(object_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_eo_method ON extension_overrides(target_method COLLATE NOCASE);
@@ -1579,6 +1630,10 @@ _CATEGORY_TO_TYPE_PREFIX: dict[str, str] = {
     "DefinedTypes": "DefinedType",
     "CommonCommands": "CommonCommand",
     "DocumentJournals": "DocumentJournal",
+    "FilterCriteria": "FilterCriterion",
+    # v1.47.0: владелец форм — строки ссылок из форм (`_FORM_SOURCE_REF_KINDS`) называют его типом, как прочих
+    # владельцев (прежде голова `used_in` была именем папки `SettingsStorages`).
+    "SettingsStorages": "SettingsStorage",
 }
 
 # Top-level categories that contribute rows into metadata_references.
@@ -1606,6 +1661,7 @@ _METADATA_REFERENCES_TRIGGER_CATEGORIES: frozenset[str] = frozenset(
         "BusinessProcesses",
         "Constants",
         "DocumentJournals",
+        "FilterCriteria",
         "Reports",
         "DataProcessors",
     }
@@ -1613,7 +1669,12 @@ _METADATA_REFERENCES_TRIGGER_CATEGORIES: frozenset[str] = frozenset(
 
 _SYNONYM_CATEGORIES: frozenset[str] = frozenset(_CATEGORY_RU.keys())
 
-# Categories with object attributes (реквизиты, измерения, ресурсы, ТЧ)
+# Categories with object attributes (реквизиты, измерения, ресурсы, ТЧ).
+# v1.47.0: и восемь категорий вне прежних шести — их описатели дают в индекс строки `object_attributes` и все
+# ссылки, которые разбирает `parse_metadata_xml`, тем же циклом (прежде у бизнес-процессов, задач, планов счетов,
+# видов расчёта и обмена отдельный цикл v16 эмитил только `based_on`, а у обработок, отчётов и регистров расчёта —
+# ничего). Каждая категория списка обязана быть в `_METADATA_REFERENCES_TRIGGER_CATEGORIES` (тест), иначе
+# bulk-fallback не сотрёт её ссылок. Список не управляет whitelist'ом точечного обновления (`_POINTWISE_ELIGIBLE_*`).
 _ATTR_CATEGORIES: list[str] = [
     "Documents",
     "Catalogs",
@@ -1621,16 +1682,24 @@ _ATTR_CATEGORIES: list[str] = [
     "AccumulationRegisters",
     "AccountingRegisters",
     "ChartsOfCharacteristicTypes",
+    "BusinessProcesses",
+    "Tasks",
+    "ChartsOfAccounts",
+    "ChartsOfCalculationTypes",
+    "ExchangePlans",
+    "DataProcessors",
+    "Reports",
+    "CalculationRegisters",
 ]
 
+# v1.47.0: категории, чей описатель даёт только ссылки (реквизитов нет): журнал документов — регистрируемые
+# документы, критерий отбора — тип и состав. Каждая обязана быть в `_METADATA_REFERENCES_TRIGGER_CATEGORIES` (тест).
+_REFS_ONLY_CATEGORIES: list[str] = ["DocumentJournals", "FilterCriteria"]
+
 # v16 (Задача 9): категории, которые ПОДДЕРЖИВАЮТ ввод на основании, но в
-# `_ATTR_CATEGORIES` не входят. Для них эмитится ТОЛЬКО `based_on` и ТОЛЬКО
-# отдельным циклом.
-#
-# Почему отдельный цикл, а не расширение `_ATTR_CATEGORIES`: тот список управляет
-# ещё и `object_attributes`, `predefined_items` и whitelist'ом pointwise-обновления,
-# и расширение потянуло бы за собой три чужих домена и рост индекса, которого
-# релиз не заказывал.
+# прежние шесть категорий `_ATTR_CATEGORIES` не входили. v1.47.0: все они — в общем
+# цикле `_ATTR_CATEGORIES` (отдельный цикл «только `based_on`» удалён, иначе строки
+# задвоились бы); список остаётся частью `BASED_ON_EMITTING_CATEGORIES`.
 #
 # `Reports` и `DataProcessors` сюда НЕ входят — ввода на основании у них нет.
 _BASED_ON_EXTRA_CATEGORIES: list[str] = [
@@ -1708,7 +1777,39 @@ def _find_metadata_xml(obj_dir: Path, category: str) -> Path | None:
     return None
 
 
+def _iter_category_descriptors(base: Path, category: str) -> list[tuple[str, Path]]:
+    """``(имя объекта, описатель)`` всех объектов категории в порядке имени — общий перечислитель циклов сборки.
+
+    v1.47.0: объект выгрузки Конфигуратора без модулей, форм, макетов и предопределённых — один файл
+    ``Категория/Имя.xml`` без каталога; прежние циклы шли по КАТАЛОГАМ объектов (``iterdir`` + ``is_dir``) и
+    такой объект пропускали, а точечный ``_refresh_object`` (``_find_metadata_xml``) его строки вставлял —
+    ``update ≢ build``. Объект с каталогом — ``_find_metadata_xml`` (как прежде), без каталога — ``Категория/Имя.xml``.
+    Подсистемы не обслуживает (у них свой рекурсивный обход)."""
+    cat_dir = base / category
+    if not cat_dir.is_dir():
+        return []
+    out: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    # Каталог объекта и его описатель рядом соседствуют в сортировке (`X` < `X.xml` < `XA`): имена идут в том же
+    # порядке, что у прежних циклов по каталогам.
+    for entry in sorted(cat_dir.iterdir()):
+        if entry.is_dir():
+            name, descriptor = entry.name, _find_metadata_xml(entry, category)
+        elif entry.suffix.lower() == ".xml" and entry.is_file() and not (cat_dir / entry.stem).is_dir():
+            name, descriptor = entry.stem, entry
+        else:
+            continue
+        if descriptor is None or name in seen:
+            continue
+        seen.add(name)
+        out.append((name, descriptor))
+    return out
+
+
 # Categories that host per-object Commands (Catalogs/X/Commands/...)
+# v1.47.0: и журналы документов, и критерии отбора — у них тоже есть команды. Обе категории не входят в Group A
+# (их строки обновляет bulk-fallback по категории), а цикл команд сборки гейтится `_ref_allowed(category)`, поэтому
+# каждая категория списка обязана быть в `_METADATA_REFERENCES_TRIGGER_CATEGORIES` (тест).
 _CMD_HOST_CATS: tuple[str, ...] = (
     "Catalogs",
     "Documents",
@@ -1723,6 +1824,8 @@ _CMD_HOST_CATS: tuple[str, ...] = (
     "ExchangePlans",
     "Reports",
     "DataProcessors",
+    "DocumentJournals",
+    "FilterCriteria",
 )
 
 # ---------------------------------------------------------------------------
@@ -3428,23 +3531,44 @@ def _extract_code_usages(
       - ``ref_type`` — reference type in a *string literal*:
         `"ДокументСсылка.X"` (RU) or `"DocumentRef.X"` (EN, via canonicalize_type_ref).
       - ``query``    — metadata path in a *string literal* (query text):
-        `Документ.X` and `Документ.X.Товары` (3rd segment = tabular section name).
+        `Документ.X` and `Документ.X.Товары` (3rd segment of the path).
         Multi-line query literals are covered.
+      - ``metadata`` (v1.47.0) — `Метаданные.<Коллекция>.X` / `Metadata.<Collection>.X` in *code*
+        (the 16 managed collections, as for ``manager``; the head in any case); ``member`` — the next
+        segment or ``None``. A collection method followed by a parenthesis
+        (`Метаданные.Справочники.Найти(Имя)`) is not an object.
+      - ``form`` (v1.47.0) — form path in a *string literal*: `<Вид>.X.Форма.<Имя>` (``member`` — form
+        name), `<Вид>.X.Форма` (default form, ``member='Форма'``), `<Вид>.X.<Стандартная>` (closed list
+        ``_STANDARD_FORM_NAMES``); such a path no longer yields ``query``.
 
     Returns list of ``(object_ref, member_path, usage_kind, line)`` where
     ``object_ref`` is canonical (e.g. ``Document.ПриобретениеТоваровУслуг``),
-    ``member_path`` is the tabular-section name for ``query`` (else ``None``).
+    ``member_path`` is the 3rd path segment for ``query``, the member after ``X.`` for
+    ``manager``/``metadata`` (v1.47.0), the form name for ``form`` (else ``None``).
     Does NOT resolve local-variable types (`Док.Товары` is out of scope).
     """
     out: list[tuple[str, str | None, str, int]] = []
 
     for lineno, code, strings in _scan_module(lines):
-        # manager — only on real code (no strings/comments, multiline-aware)
+        # manager / metadata — only on real code (no strings/comments, multiline-aware)
         if "." in code:
-            for m in _CODE_DOTTED_RE.finditer(code):
-                canonical = _CODE_MANAGER_COLLECTIONS.get(m.group(1).lower())
+            for m in _CODE_MANAGER_RE.finditer(code):
+                head = m.group(1).lower()
+                canonical = _CODE_MANAGER_COLLECTIONS.get(head)
                 if canonical:
-                    out.append((canonical + m.group(2), None, "manager", lineno))
+                    # Голова через пробел после точки — тоже член цепочки (`Объект. Отчеты.Количество()`);
+                    # скобка сразу за X — вызов, а не объект (`ПланыОбмена.ГлавныйУзел()`, см. `_CODE_METADATA_HEADS`).
+                    if not _is_chain_member(code, m.start(1)) and not _LEADING_PAREN_RE.match(code, m.end(2)):
+                        out.append((canonical + m.group(2), m.group(3) or None, "manager", lineno))
+                elif head in _CODE_METADATA_HEADS and m.group(3):
+                    md_canonical = _CODE_METADATA_COLLECTIONS.get(m.group(2).lower())
+                    if (
+                        md_canonical
+                        and not _is_chain_member(code, m.start(1))
+                        and not _LEADING_PAREN_RE.match(code, m.end(3))
+                    ):
+                        member = _CODE_MEMBER_AFTER_RE.match(code, m.end())
+                        out.append((md_canonical + m.group(3), member.group(1) if member else None, "metadata", lineno))
 
         # ref_type / query — only inside string-literal content
         for content in strings:
@@ -3459,7 +3583,12 @@ def _extract_code_usages(
                     continue
                 query_canon = _CODE_QUERY_COLLECTIONS.get(low)
                 if query_canon:
-                    out.append((query_canon + g2, g3 or None, "query", lineno))
+                    # v1.47.0: путь формы — вид `form` (прежде — `query` с `member='Форма'`).
+                    form = _literal_form_member(g3, content, pm.end())
+                    if form:
+                        out.append((query_canon + g2, form, "form", lineno))
+                    else:
+                        out.append((query_canon + g2, g3 or None, "query", lineno))
                     continue
                 # v16 (Задача 10): `fold_case=False` СНЯТ — сборка приведена к той же
                 # канонизации, что публичный поиск (регистронезависимой с v1.28).
@@ -4760,6 +4889,92 @@ def _refresh_launch_rows(conn: sqlite3.Connection, base_path: str, rel_paths: li
     return refreshed
 
 
+def _prev_code_char(masked: list[str], idx: int, pos: int) -> tuple[int, int] | None:
+    """Значащий символ перед ``(idx, pos)`` маски тела — ``(строка, позиция)``: пробельные символы, перевод строки,
+    пустые строки и погашенные маской комментарии пропускаются (как в `_is_chain_member_in_lines`); дошли до начала
+    тела — ``None``."""
+    code = masked[idx]
+    j = pos - 1
+    while True:
+        while j >= 0 and code[j].isspace():
+            j -= 1
+        if j >= 0:
+            return idx, j
+        idx -= 1
+        if idx < 0:
+            return None
+        code = masked[idx]
+        j = len(code) - 1
+
+
+def _ident_ending_at(code: str, j: int) -> int | None:
+    """Начало идентификатора, последний символ которого — ``code[j]``; ``code[j]`` не символ слова — ``None``."""
+    ch = code[j]
+    if not (ch.isalnum() or ch == "_"):
+        return None
+    k = j
+    while k > 0 and (code[k - 1].isalnum() or code[k - 1] == "_"):
+        k -= 1
+    return k
+
+
+def _head_before_dot(masked: list[str], idx: int, pos: int) -> tuple[str, int, int] | None:
+    """Голова квалифицированного вызова (v1.47.0) для имени на ``(idx, pos)`` маски тела.
+
+    Перед именем точка — через пробельные символы и перевод строки (``Модуль.`` ⏎ ``Метод(``, ``Модуль. Метод(``,
+    ``Модуль .Метод(``, ``Модуль`` ⏎ ``.Метод(``), — ``(голова, строка головы, позиция головы)``: идентификатор перед
+    точкой (тоже через пробелы и перевод строки). Точки нет либо перед ней не идентификатор (``Получить().Член(``,
+    ``Элементы[Имя].Член(``) — ``None``."""
+    loc = _prev_code_char(masked, idx, pos)
+    if loc is None or masked[loc[0]][loc[1]] != ".":
+        return None
+    loc = _prev_code_char(masked, loc[0], loc[1])
+    if loc is None:
+        return None
+    i, j = loc
+    k = _ident_ending_at(masked[i], j)
+    if k is None:
+        return None
+    return masked[i][k : j + 1], i, k
+
+
+def _name_before_paren(masked: list[str], idx: int) -> tuple[str, int, int] | None:
+    """Имя вызова с переносом перед скобкой (v1.47.0): строка ``idx`` маски тела начинается с ``(`` (после пробельных
+    символов) — ``(имя, строка имени, позиция имени)``: идентификатор в конце предыдущей значащей строки В ПРЕДЕЛАХ
+    ТЕЛА (пустые строки и погашенные комментарии пропускаются). Нет идентификатора в конце — ``None``."""
+    code = masked[idx]
+    p = len(code) - len(code.lstrip())
+    if p >= len(code) or code[p] != "(":
+        return None
+    loc = _prev_code_char(masked, idx, p)
+    if loc is None:
+        return None
+    i, j = loc
+    k = _ident_ending_at(masked[i], j)
+    if k is None:
+        return None
+    return masked[i][k : j + 1], i, k
+
+
+def _qualified_edge_meta(masked: list[str], h_idx: int, h_pos: int) -> tuple[str | None, str | None]:
+    """``(via, kind)`` квалифицированного ребра по голове на ``(h_idx, h_pos)`` — правила той же строки: ``via`` —
+    категория коллекции, если голова — второе звено ``Коллекция.X.`` (коллекция без точки слева); ``kind='member'``,
+    если перед головой точка и это не коллекция (получатель — значение, а не модуль)."""
+    pre = _head_before_dot(masked, h_idx, h_pos)
+    if pre is not None:
+        coll, c_idx, c_pos = pre
+        category = _CALL_MANAGER_COLLECTIONS.get(coll.casefold())
+        if category is not None and not _is_chain_member_in_lines(masked, c_idx, c_pos):
+            return category, None
+    if _is_chain_member_in_lines(masked, h_idx, h_pos):
+        return None, "member"
+    return None, None
+
+
+# v1.47.0 (П12): строка, код которой начинается с «(», — продолжение вызова с переносом перед скобкой.
+_LEADING_PAREN_RE = re.compile(r"\s*\(")
+
+
 def _extract_calls_from_body(
     lines: list[str],
     start_line: int,
@@ -4821,6 +5036,9 @@ def _extract_calls_from_body(
         full = module_mask[0][body_start:body_end]
     else:
         full = mask_comments_and_strings(lines[body_start:body_end])
+    # Дедуп по строке ИМЕНИ (v1.47.0: ребро переноса перед скобкой пишется строкой имени и дедупится с её рёбрами).
+    seen_q_at: dict[int, set[tuple[str, str | None, str | None]]] = {}
+    seen_bare_at: dict[int, set[str]] = {}
     for idx, code in enumerate(full):
         # Все три регулярки вызова требуют «(» в той же строке: строка без нее ребер не дает.
         if "(" not in code:
@@ -4831,8 +5049,32 @@ def _extract_calls_from_body(
         # Дедуп на строке — по (callee_name, via, kind) у квалифицированных и по имени у
         # голых: прямой вызов и член цепочки одного имени — РАЗНЫЕ рёбра. Квалифицированные
         # имена содержат точку, поэтому с голыми не пересекаются.
-        seen_q: set[tuple[str, str | None, str | None]] = set()
-        seen_bare: set[str] = set()
+        seen_q = seen_q_at.setdefault(idx, set())
+        seen_bare = seen_bare_at.setdefault(idx, set())
+
+        # v1.47.0 (П12): «Имя» ⏎ «(» — ребро имени в конце предыдущей значащей строки, как в одну строку:
+        # ключевое слово — ребра нет, точка перед именем — квалифицированное, иначе голое (с фильтром платформы).
+        if _LEADING_PAREN_RE.match(code):
+            before = _name_before_paren(full, idx)
+            if before is not None and before[0].lower() not in _BSL_KEYWORDS_LOWER:
+                name, n_idx, n_pos = before
+                n_line = body_start + n_idx + 1
+                head = _head_before_dot(full, n_idx, n_pos)
+                if head is not None:
+                    if head[0].lower() not in _BSL_KEYWORDS_LOWER:
+                        via, kind = _qualified_edge_meta(full, head[1], head[2])
+                        item = (f"{head[0]}.{name}", via, kind)
+                        n_seen = seen_q_at.setdefault(n_idx, set())
+                        if item not in n_seen:
+                            n_seen.add(item)
+                            calls.append((item[0], n_line, via, kind))
+                elif (
+                    not _is_chain_member_in_lines(full, n_idx, n_pos) and name.casefold() not in _BSL_GLOBAL_FUNCS_LOWER
+                ):
+                    n_bare = seen_bare_at.setdefault(n_idx, set())
+                    if name not in n_bare:
+                        n_bare.add(name)
+                        calls.append((name, n_line, None, None))
 
         # Коллекция.X.Метод( — позиция X → категория. Дешёвый префильтр: у такого
         # вызова в строке не меньше двух точек.
@@ -4865,16 +5107,39 @@ def _extract_calls_from_body(
             func_name = sm.group(1)
             if func_name.lower() in _BSL_KEYWORDS_LOWER:
                 continue
+            # v1.47.0 (Д12): точка перед именем через пробел или перевод строки (`Модуль.` ⏎ `Метод(`,
+            # `Модуль. Метод(`, `Модуль .Метод(`, `Модуль` ⏎ `.Метод(`) — квалифицированное ребро со строкой ИМЕНИ, голого
+            # нет; перед точкой не идентификатор (`…().` ⏎ `Метод(`, `…[…].` ⏎ `Метод(`) — ребра нет.
+            # Голова ищется, только когда перед именем точка, пробельный символ или начало строки.
+            start_pos = sm.start()
+            prev_ch = code[start_pos - 1] if start_pos > 0 else ""
+            if prev_ch == ".":
+                if start_pos > 1 and (code[start_pos - 2].isalnum() or code[start_pos - 2] == "_"):
+                    continue  # `Голова.Имя(` вплотную — ребро квалифицированной ветки выше
+                need_head = True
+            elif not prev_ch or prev_ch.isspace():
+                left = code[:start_pos].rstrip()
+                need_head = not left or left[-1] == "."
+            else:
+                need_head = False
+            if need_head:
+                head = _head_before_dot(full, idx, start_pos)
+                if head is not None:
+                    if head[0].lower() not in _BSL_KEYWORDS_LOWER:
+                        via, kind = _qualified_edge_meta(full, head[1], head[2])
+                        item = (f"{head[0]}.{func_name}", via, kind)
+                        if item not in seen_q:
+                            seen_q.add(item)
+                            calls.append((item[0], line_number, via, kind))
+                    continue
+                if _is_chain_member_in_lines(full, idx, start_pos):
+                    continue  # метод выражения (`Получить().` ⏎ `Член(`) — получатель не модуль, голого ребра нет
             # Drop bare calls to reserved platform globals (Сообщить/НСтр/Новый
             # Структура(/…): permanently unresolved navigation noise. Applied
             # ONLY here, never to the qualified Module.Method branch above.
             if func_name.casefold() in _BSL_GLOBAL_FUNCS_LOWER:
                 continue
             if func_name not in seen_bare:
-                # Check this isn't the method part of a qualified call
-                start_pos = sm.start()
-                if start_pos > 0 and code[start_pos - 1] == ".":
-                    continue
                 seen_bare.add(func_name)
                 calls.append((func_name, line_number, None, None))
 
@@ -5199,7 +5464,6 @@ def _collect_metadata_tables(
     """
     from rlm_tools_bsl.bsl_xml_parsers import (
         canonicalize_type_ref,
-        normalize_type_string,
         parse_command_parameter_type,
         parse_defined_type,
         parse_enum_xml,
@@ -5330,22 +5594,9 @@ def _collect_metadata_tables(
                 json.dumps(source_type_sets, ensure_ascii=False),
             )
         )
-        # Emit metadata_references for each source type
+        # Emit metadata_references for each source type (v1.47.0 — и для набора `DefinedType.X`)
         if _ref_allowed("EventSubscriptions"):
-            for st in source_types:
-                canon = canonicalize_type_ref(st)
-                if canon:
-                    result["metadata_references"].append(
-                        (
-                            parsed["name"],
-                            "EventSubscriptions",
-                            canon,
-                            "event_subscription_source",
-                            f"EventSubscription.{parsed['name']}.Source",
-                            rel,
-                            None,
-                        )
-                    )
+            result["metadata_references"].extend(_event_subscription_source_rows(parsed, rel))
 
     # ScheduledJobs
     for fp in _glob_xml("ScheduledJobs") if collect_sj else []:
@@ -5432,25 +5683,9 @@ def _collect_metadata_tables(
                     )
 
     # --- v16: свойства общих модулей ---
-    # Раскладка «объект в своём подкаталоге» (EDT) и «файл рядом» (CF) —
-    # одна и та же у CommonModules и Constants, поэтому обход общий.
-    def _iter_flat_objects(category: str):
-        """(имя объекта, путь к описателю) для CF-sibling и EDT-каталожной раскладок."""
-        cat_dir = base / category
-        if not cat_dir.is_dir():
-            return
-        for entry in sorted(cat_dir.iterdir()):
-            if entry.is_file() and entry.suffix.lower() == ".xml":
-                yield entry.stem, entry
-            elif entry.is_dir():
-                mdo = entry / f"{entry.name}.mdo"
-                if mdo.is_file():
-                    yield entry.name, mdo
-                    continue
-                # CF-раскладка с подкаталогом: CommonModules/<Имя>/Ext/Module.bsl
-                # описателя не несёт — sibling-XML уже отдан веткой выше.
-
-    for obj_name, fp in _iter_flat_objects("CommonModules") if collect_common_modules else []:
+    # v1.47.0: общий перечислитель описателей (`_iter_category_descriptors`) — тот же, что у циклов реквизитов,
+    # ПВХ и констант; прежнее замыкание `_iter_flat_objects` было второй реализацией того же факта.
+    for obj_name, fp in _iter_category_descriptors(base, "CommonModules") if collect_common_modules else []:
         content = _read(fp)
         if not content:
             continue
@@ -5474,14 +5709,33 @@ def _collect_metadata_tables(
         )
 
     # --- v16: константы (имя, синоним, ТИП ЗНАЧЕНИЯ) ---
-    for obj_name, fp in _iter_flat_objects("Constants") if collect_constants else []:
+    # v1.47.0: и ссылки описателя константы (`Constant.X.Type` — тип значения) — тем же проходом, один `_read`
+    # на описатель. Строка `constants` — под `collect_constants`, ссылки — под единственным гейтом
+    # `_ref_allowed("Constants")` (правило «гейт ссылок ровно один»); реквизитов у константы нет.
+    constants_refs = _ref_allowed("Constants")
+    for obj_name, fp in _iter_category_descriptors(base, "Constants") if collect_constants or constants_refs else []:
         content = _read(fp)
         if not content:
+            continue
+        rel = fp.relative_to(base).as_posix()
+        if constants_refs:
+            try:
+                parsed_metadata = parse_metadata_xml(content)
+            except Exception:
+                parsed_metadata = None
+            if parsed_metadata:
+                _emit_refs(
+                    parsed_metadata.get("references", []),
+                    obj_name,
+                    "Constants",
+                    rel,
+                    content_lines=content.splitlines(),
+                )
+        if not collect_constants:
             continue
         parsed = parse_constant_xml(content)
         if not parsed or not parsed.get("name"):
             continue
-        rel = fp.relative_to(base).as_posix()
         result["constants"].append((parsed["name"], parsed.get("synonym") or "", parsed.get("value_type") or "", rel))
 
     # --- v16: макеты (три раскладки, а не две) ---
@@ -5623,18 +5877,9 @@ def _collect_metadata_tables(
     for category in _ATTR_CATEGORIES:
         if category not in _active_attr_cats:
             continue
-        cat_dir = base / category
-        if not cat_dir.is_dir():
-            continue
-        for obj_dir in sorted(cat_dir.iterdir()):
-            if not obj_dir.is_dir():
-                continue
-            obj_name = obj_dir.name
-
-            xml_path = _find_metadata_xml(obj_dir, category)
-            if xml_path is None:
-                continue
-
+        # v1.47.0: и объект выгрузки Конфигуратора без каталога (только `Категория/Имя.xml`) — прежде цикл
+        # шёл по каталогам объектов и его реквизиты и ссылки в индекс не попадали.
+        for obj_name, xml_path in _iter_category_descriptors(base, category):
             content = _read(xml_path)
             if not content:
                 continue
@@ -5666,93 +5911,22 @@ def _collect_metadata_tables(
                 for reg_ref in parsed.get("register_records") or []:
                     result["declared_register_records"].append((doc_ref, reg_ref, rel))
 
-            for attr in parsed.get("attributes", []):
-                result["object_attributes"].append(
-                    (
-                        obj_name,
-                        category,
-                        attr.get("name", ""),
-                        attr.get("synonym", ""),
-                        normalize_type_string(attr.get("type", "")),
-                        "attribute",
-                        None,
-                        rel,
-                    )
-                )
+            # v1.47.0: общий построитель строк с точечным путём (`_insert_attributes_for_object`).
+            result["object_attributes"].extend(_object_attribute_rows(obj_name, category, parsed, rel))
 
-            for dim in parsed.get("dimensions", []):
-                result["object_attributes"].append(
-                    (
-                        obj_name,
-                        category,
-                        dim.get("name", ""),
-                        dim.get("synonym", ""),
-                        normalize_type_string(dim.get("type", "")),
-                        "dimension",
-                        None,
-                        rel,
-                    )
-                )
+    # v1.47.0: отдельного цикла `based_on` для `_BASED_ON_EXTRA_CATEGORIES` больше нет — все пять его категорий в
+    # общем цикле `_ATTR_CATEGORIES` выше (иначе строки `based_on` задвоились бы). Ловушка гейта прежнего цикла
+    # (selective-ветка считает `attrs_cats = changed ∩ (_ATTR_CATEGORIES | _PREDEFINED_CATEGORIES)`, и категория вне
+    # этих списков не собиралась бы никогда, хотя её ссылки DELETE уже снёс) снята по построению: категории в списке.
 
-            for res in parsed.get("resources", []):
-                result["object_attributes"].append(
-                    (
-                        obj_name,
-                        category,
-                        res.get("name", ""),
-                        res.get("synonym", ""),
-                        normalize_type_string(res.get("type", "")),
-                        "resource",
-                        None,
-                        rel,
-                    )
-                )
-
-            for ts in parsed.get("tabular_sections", []):
-                ts_name = ts.get("name", "")
-                for ts_attr in ts.get("attributes", []):
-                    result["object_attributes"].append(
-                        (
-                            obj_name,
-                            category,
-                            ts_attr.get("name", ""),
-                            ts_attr.get("synonym", ""),
-                            normalize_type_string(ts_attr.get("type", "")),
-                            "ts_attribute",
-                            ts_name,
-                            rel,
-                        )
-                    )
-
-    # --- v16 (Задача 9): based_on для категорий ВНЕ _ATTR_CATEGORIES ---
-    # Проверка на боевом индексе: строк `based_on` с source_category='BusinessProcesses'
-    # было НОЛЬ, хотя в исходнике бизнес-процесс `Задание` объявляет 267 оснований,
-    # включая Document.РеализацияТоваровУслуг. Без этого цикла сверка `declared` для
-    # таких кандидатов невозможна, и они обязаны получать None.
-    # Гейт ровно ОДИН — `_ref_allowed`, то есть `collect_metadata_refs_categories`.
-    # Второго гейта по `collect_attrs_categories` здесь быть НЕ МОЖЕТ, и это не
-    # стилистика: на selective-обновлении `attrs_cats` считается как
-    # `changed ∩ (_ATTR_CATEGORIES | _PREDEFINED_CATEGORIES)`, а ни одна из ЧЕТЫРЁХ
-    # категорий `BusinessProcesses` / `Tasks` / `ChartsOfCalculationTypes` /
-    # `ExchangePlans` в эти списки не входит по построению. Сбор пропускался бы
-    # всегда, а `_insert_metadata_tables_selective` БЕЗУСЛОВНО делает
-    # `DELETE FROM metadata_references WHERE source_category IN (triggered)` — то есть
-    # обычный инкрементальный `update` после правки бизнес-процесса СНОСИЛ бы его
-    # строки `based_on` и не восстанавливал до полной пересборки, а `index info`
-    # отрапортовал бы успех. Ровно тот класс отказа, который этот цикл и заводился
-    # чинить (см. точечный путь в `_refresh_object`).
-    for category in _BASED_ON_EXTRA_CATEGORIES:
+    # v1.47.0: журналы документов и критерии отбора — описатель даёт ссылки (`document_journal_content`,
+    # `filter_criterion_type`, `filter_criterion_content`), реквизитов у них нет. Единственный гейт —
+    # `_ref_allowed(category)`: обе категории — в `_METADATA_REFERENCES_TRIGGER_CATEGORIES`, и bulk-fallback по
+    # категории их строки стирает и собирает заново.
+    for category in _REFS_ONLY_CATEGORIES:
         if not _ref_allowed(category):
             continue
-        cat_dir = base / category
-        if not cat_dir.is_dir():
-            continue
-        for obj_dir in sorted(cat_dir.iterdir()):
-            if not obj_dir.is_dir():
-                continue
-            xml_path = _find_metadata_xml(obj_dir, category)
-            if xml_path is None:
-                continue
+        for obj_name, xml_path in _iter_category_descriptors(base, category):
             content = _read(xml_path)
             if not content:
                 continue
@@ -5762,12 +5936,9 @@ def _collect_metadata_tables(
                 continue
             if not parsed:
                 continue
-            based_on_refs = [r for r in parsed.get("references", []) if r.get("ref_kind") == "based_on"]
-            if not based_on_refs:
-                continue
             _emit_refs(
-                based_on_refs,
-                obj_dir.name,
+                parsed.get("references", []),
+                obj_name,
                 category,
                 xml_path.relative_to(base).as_posix(),
                 content_lines=content.splitlines(),
@@ -5959,49 +6130,27 @@ def _collect_metadata_tables(
 
     # ChartsOfCharacteristicTypes (specialised characteristic_types + Type refs)
     if collect_pvh_types:
-        pvh_dir = base / "ChartsOfCharacteristicTypes"
-        if pvh_dir.is_dir():
-            for obj_dir in sorted(pvh_dir.iterdir()):
-                if not obj_dir.is_dir():
-                    continue
-                obj_name = obj_dir.name
-                # Locate metadata XML using same fallback as attributes loop
-                xml_path = None
-                # EDT
-                mdo = obj_dir / f"{obj_name}.mdo"
-                if mdo.is_file():
-                    xml_path = mdo
-                else:
-                    sibling = obj_dir.parent / f"{obj_name}.xml"
-                    if sibling.is_file():
-                        xml_path = sibling
-                    else:
-                        ext_dir = obj_dir / "Ext"
-                        if ext_dir.is_dir():
-                            for fp in sorted(ext_dir.iterdir()):
-                                if fp.suffix.lower() == ".xml" and fp.is_file():
-                                    xml_path = fp
-                                    break
-                if xml_path is None:
-                    continue
-                text = _read(xml_path)
-                if not text:
-                    continue
-                parsed_pvh = parse_pvh_characteristics(text)
-                if not parsed_pvh:
-                    continue
-                rel = xml_path.relative_to(base).as_posix()
-                canonical_refs = []
-                for type_str in parsed_pvh.get("types", []):
-                    canon = canonicalize_type_ref(type_str)
-                    if canon:
-                        canonical_refs.append(canon)
-                result["characteristic_types"].append(
-                    (parsed_pvh["pvh_name"], json.dumps(canonical_refs, ensure_ascii=False), rel)
-                )
-                # Refs already emitted via parse_metadata_xml.references for the same object;
-                # but only if ChartsOfCharacteristicTypes was processed via the attributes loop.
-                # We don't double-emit characteristic_type refs here to avoid duplicates.
+        # v1.47.0: тот же перечислитель описателей, что у цикла реквизитов (и ПВХ выгрузки Конфигуратора без
+        # каталога — только `ChartsOfCharacteristicTypes/Имя.xml`).
+        for _obj_name, xml_path in _iter_category_descriptors(base, "ChartsOfCharacteristicTypes"):
+            text = _read(xml_path)
+            if not text:
+                continue
+            parsed_pvh = parse_pvh_characteristics(text)
+            if not parsed_pvh:
+                continue
+            rel = xml_path.relative_to(base).as_posix()
+            canonical_refs = []
+            for type_str in parsed_pvh.get("types", []):
+                canon = canonicalize_type_ref(type_str)
+                if canon:
+                    canonical_refs.append(canon)
+            result["characteristic_types"].append(
+                (parsed_pvh["pvh_name"], json.dumps(canonical_refs, ensure_ascii=False), rel)
+            )
+            # Refs already emitted via parse_metadata_xml.references for the same object;
+            # but only if ChartsOfCharacteristicTypes was processed via the attributes loop.
+            # We don't double-emit characteristic_type refs here to avoid duplicates.
 
     # CommonCommands and per-object commands → command_parameter_type. v17: внешний gate —
     # единый перечень владельцев _CMD_HOST_CATS (прежний список не знал Reports/DataProcessors, и
@@ -6044,7 +6193,8 @@ def _collect_metadata_tables(
                                 )
                             )
 
-        # Per-object commands: owner .mdo (EDT) + Catalogs/X/Commands/*.xml | Y/Y.command (CF).
+        # Per-object commands: описатель владельца (EDT .mdo; v1.47.0 — и CF <Категория>/<Имя>.xml)
+        # + Catalogs/X/Commands/*.xml | Y/Y.command.
         # Общий построитель с точечным обновлением (_emit_object_command_refs): одно правило.
         for category in _CMD_HOST_CATS:
             if not _ref_allowed(category):
@@ -6349,13 +6499,15 @@ def _insert_metadata_tables_selective(
             tables["predefined_items"],
         )
 
-    # Category-aware DELETE for metadata_references (v1.9.0)
+    # Category-aware DELETE for metadata_references (v1.9.0). v1.47.0: строки форм (`_FORM_SOURCE_REF_KINDS`) пишет шаг
+    # `form_elements` — правка описателя их не стирает (иначе bulk-fallback категории терял бы ссылки её форм).
     triggered_ref_cats = _METADATA_REFERENCES_TRIGGER_CATEGORIES & changed_categories
     if triggered_ref_cats:
         placeholders = ",".join("?" for _ in triggered_ref_cats)
         try:
             conn.execute(
-                f"DELETE FROM metadata_references WHERE source_category IN ({placeholders})",  # noqa: S608
+                f"DELETE FROM metadata_references WHERE source_category IN ({placeholders}) "  # noqa: S608
+                f"AND ref_kind NOT IN {_FORM_SOURCE_REF_KINDS_SQL}",
                 tuple(triggered_ref_cats),
             )
         except sqlite3.OperationalError:
@@ -6584,16 +6736,18 @@ def _can_use_pointwise(
 # 3000 ссылок attribute_type строка НИ РАЗУ не совпала со строкой тега типа,
 # а 30% имён реквизитов встречаются в одном XML больше одного раза.
 # ---------------------------------------------------------------------------
+# v1.47.0: и реквизиты адресации задачи (`<AddressingAttribute>` CF, `<addressingAttributes>` EDT).
 _SECTION_OPEN_RE = re.compile(
-    r"<\s*(Attribute|Dimension|Resource|TabularSection"
-    r"|attributes|dimensions|resources|tabularSections)\b"
+    r"<\s*(Attribute|Dimension|Resource|TabularSection|AddressingAttribute"
+    r"|attributes|dimensions|resources|tabularSections|addressingAttributes)\b"
 )
 _TS_CLOSE_RE = re.compile(r"</\s*(?:TabularSection|tabularSections)\s*>")
 _ANCHOR_NAME_RE = re.compile(r"<\s*[Nn]ame\s*>([^<]+)<\s*/\s*[Nn]ame\s*>")
 _TYPE_BLOCK_OPEN_RE = re.compile(r"<\s*(?:Type|type|valueType)\s*>")
 _TYPE_BLOCK_CLOSE_RE = re.compile(r"</\s*(?:Type|type|valueType)\s*>")
-# Отдельный ТИП внутри блока: его текст нужен, чтобы сопоставить строку с ref_object
-_TYPE_ITEM_RE = re.compile(r"<\s*(?:v8:Type|types)\s*>([^<]+)<")
+# Отдельный ТИП внутри блока: его текст нужен, чтобы сопоставить строку с ref_object.
+# v1.47.0: и тип-набор <v8:TypeSet> — якорь ссылки из набора — строка самого токена, а не <Type>.
+_TYPE_ITEM_RE = re.compile(r"<\s*(?:v8:Type|v8:TypeSet|types)\s*>([^<]+)<")
 # ref_kind -> охватывающий тег (CF-вариант, EDT-вариант). Нужен, чтобы owner и
 # based_on с ОДНИМ ref_object не схлопнулись в одну строку: такие пары есть в боевых
 # конфигурациях, и порядок секций у CF и EDT противоположный.
@@ -6648,6 +6802,9 @@ _ANCHOR_KIND_BY_TAG = {
     "resources": "Resource",
     "tabularsection": "TabularSection",
     "tabularsections": "TabularSection",
+    # v1.47.0: без перевода тег дал бы None, и владелец ссылки не записался бы
+    "addressingattribute": "AddressingAttribute",
+    "addressingattributes": "AddressingAttribute",
 }
 
 
@@ -6741,7 +6898,7 @@ class _RefAnchorIndex:
     @staticmethod
     def _key(ref: dict) -> tuple[str, str, str] | None:
         suffix = ref.get("used_in_suffix", "") or ""
-        if suffix.startswith(("Attribute.", "Dimension.", "Resource.")):
+        if suffix.startswith(("Attribute.", "Dimension.", "Resource.", "AddressingAttribute.")):
             head, rest = suffix.split(".", 1)
             return head, "", rest.split(".", 1)[0]
         if suffix.startswith("TabularSection.") and ".Attribute." in suffix:
@@ -6936,55 +7093,27 @@ def _insert_references_for_object(
         )
 
 
-def _insert_attributes_for_object(
-    conn: sqlite3.Connection,
-    category: str,
-    object_name: str,
-    parsed: dict,
-    rel_path: str,
-) -> None:
-    from rlm_tools_bsl.bsl_xml_parsers import normalize_type_string
+def _object_attribute_rows(object_name: str, category: str, parsed: dict, rel_path: str) -> list[tuple]:
+    """Строки ``object_attributes`` одного описателя — общий построитель полной сборки и точечного обновления.
 
+    ``(object_name, category, attr_name, attr_synonym, attr_type, attr_kind, ts_name, source_file)`` в порядке:
+    реквизиты, измерения, ресурсы, колонки табличных частей, реквизиты адресации задачи (v1.47.0,
+    ``attr_kind='addressing_attribute'``). Прежде — две копии одного кода (цикл сборки и точечный путь)."""
     rows: list[tuple] = []
-    for attr in parsed.get("attributes", []):
-        rows.append(
-            (
-                object_name,
-                category,
-                attr.get("name", ""),
-                attr.get("synonym", ""),
-                normalize_type_string(attr.get("type", "")),
-                "attribute",
-                None,
-                rel_path,
+    for section, kind in (("attributes", "attribute"), ("dimensions", "dimension"), ("resources", "resource")):
+        for item in parsed.get(section, []):
+            rows.append(
+                (
+                    object_name,
+                    category,
+                    item.get("name", ""),
+                    item.get("synonym", ""),
+                    normalize_type_string(item.get("type", "")),
+                    kind,
+                    None,
+                    rel_path,
+                )
             )
-        )
-    for dim in parsed.get("dimensions", []):
-        rows.append(
-            (
-                object_name,
-                category,
-                dim.get("name", ""),
-                dim.get("synonym", ""),
-                normalize_type_string(dim.get("type", "")),
-                "dimension",
-                None,
-                rel_path,
-            )
-        )
-    for res in parsed.get("resources", []):
-        rows.append(
-            (
-                object_name,
-                category,
-                res.get("name", ""),
-                res.get("synonym", ""),
-                normalize_type_string(res.get("type", "")),
-                "resource",
-                None,
-                rel_path,
-            )
-        )
     for ts in parsed.get("tabular_sections", []):
         ts_name = ts.get("name", "")
         for ts_attr in ts.get("attributes", []):
@@ -7000,6 +7129,30 @@ def _insert_attributes_for_object(
                     rel_path,
                 )
             )
+    for addr in parsed.get("addressing_attributes", []):
+        rows.append(
+            (
+                object_name,
+                category,
+                addr.get("name", ""),
+                addr.get("synonym", ""),
+                normalize_type_string(addr.get("type", "")),
+                "addressing_attribute",
+                None,
+                rel_path,
+            )
+        )
+    return rows
+
+
+def _insert_attributes_for_object(
+    conn: sqlite3.Connection,
+    category: str,
+    object_name: str,
+    parsed: dict,
+    rel_path: str,
+) -> None:
+    rows = _object_attribute_rows(object_name, category, parsed, rel_path)
     if rows:
         conn.executemany(
             "INSERT INTO object_attributes "
@@ -7103,18 +7256,21 @@ def _object_command_ref_rows(base: Path, category: str, obj_dir: Path) -> list[t
     ``Commands/<Имя>/`` лежит только модуль) — НЕЗАВИСИМО от наличия каталога ``Commands/``: команда
     может быть объявлена без выгруженного модуля. Затем прежний обход ``Commands/*`` для CF-дескрипторов
     (``*.xml``) и ``<Имя>/<Имя>.command|.mdo``; команда, уже описанная владельцем, второй строкой не
-    дублируется."""
+    дублируется.
+
+    v1.47.0: описатель владельца — ``_find_metadata_xml`` (``.mdo`` EDT, иначе ``<Категория>/<Имя>.xml`` CF): у
+    выгрузки Конфигуратора команда объекта тоже описана в описателе владельца (``<ChildObjects><Command>``)."""
     from rlm_tools_bsl.bsl_xml_parsers import parse_command_parameter_type, parse_object_commands_parameter_types
 
     obj_name = obj_dir.name
     type_prefix = _CATEGORY_TO_TYPE_PREFIX.get(category, category)
     rows: list[tuple] = []
     owner_cmds: set[str] = set()
-    owner_mdo = obj_dir / f"{obj_name}.mdo"
-    if owner_mdo.is_file():
-        text = _read_text(owner_mdo)
+    owner_descriptor = _find_metadata_xml(obj_dir, category)
+    if owner_descriptor is not None:
+        text = _read_text(owner_descriptor)
         if text:
-            rel = owner_mdo.relative_to(base).as_posix()
+            rel = owner_descriptor.relative_to(base).as_posix()
             for ref_dict in parse_object_commands_parameter_types(text):
                 cmd_name = ref_dict["command_name"]
                 owner_cmds.add(cmd_name.casefold())
@@ -7174,7 +7330,7 @@ def _emit_object_command_refs(
     category: str,
     object_name: str,
 ) -> None:
-    """Refs команд объекта (owner .mdo + ``Commands/*``) — ref_kind='command_parameter_type'."""
+    """Refs команд объекта (описатель владельца + ``Commands/*``) — ref_kind='command_parameter_type'."""
     obj_dir = Path(base_path) / category / object_name
     if not obj_dir.is_dir():
         return
@@ -7258,11 +7414,12 @@ def _insert_synonym_for_object(
     parsed: dict,
     rel_path: str,
 ) -> None:
-    raw_synonym = parsed.get("synonym") or ""
-    if not raw_synonym:
+    if not parsed or parsed.get("error"):
         return
+    # v1.47.0: объект без синонима — тоже строка, с пустым синонимом «<Категория>: » (как у сборщика,
+    # `_collect_object_synonyms`); прежде такой объект строки не получал.
     prefix = _CATEGORY_RU.get(category, category)
-    synonym = f"{prefix}: {raw_synonym}"
+    synonym = f"{prefix}: {parsed.get('synonym') or ''}"
     conn.execute(
         "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES (?, ?, ?, ?)",
         (object_name, category, synonym, rel_path),
@@ -7293,8 +7450,10 @@ def _refresh_object(
         (category, object_name),
     )
     if opt.get("has_metadata_references_table"):
+        # v1.47.0: строки форм объекта (`_FORM_SOURCE_REF_KINDS`) обновляет шаг `form_elements`, не точечный путь.
         conn.execute(
-            "DELETE FROM metadata_references WHERE source_category=? AND source_object=?",
+            "DELETE FROM metadata_references WHERE source_category=? AND source_object=? "  # noqa: S608
+            f"AND ref_kind NOT IN {_FORM_SOURCE_REF_KINDS_SQL}",
             (category, object_name),
         )
     if opt.get("has_synonyms") and opt.get("has_synonyms_table"):
@@ -7369,27 +7528,14 @@ def _refresh_object(
         # Refs из parsed.references — bulk collector эмитит их ТОЛЬКО в loop по
         # _ATTR_CATEGORIES, поэтому pointwise обязан эмитить РОВНО тот же набор:
         # иначе точечный путь разошёлся бы со свежей полной сборкой.
+        # v1.47.0: ChartsOfAccounts — в общем списке, его ссылки (реквизиты, `based_on`, связующие свойства)
+        # идут этой веткой; прежняя ветка «только `based_on`» для `_BASED_ON_EXTRA_CATEGORIES` удалена.
         if category in _ATTR_CATEGORIES:
             _insert_references_for_object(
                 conn,
                 category,
                 object_name,
                 parsed.get("references", []),
-                rel,
-                content_lines=content.splitlines(),
-            )
-        elif category in _BASED_ON_EXTRA_CATEGORIES:
-            # v16 (Задача 9): ИНВАРИАНТ ПЕРЕВЕРНУЛСЯ. Прежде ChartsOfAccounts
-            # НАМЕРЕННО не эмитил ссылок здесь — bulk-коллектор их тоже не эмитил.
-            # Теперь bulk эмитит для этих категорий `based_on`, а `_refresh_object`
-            # БЕЗУСЛОВНО делает DELETE FROM metadata_references по объекту, то есть
-            # без этой ветки правка плана счетов УДАЛИЛА бы его строки `based_on` и
-            # не восстановила, а `index info` отрапортовал бы успех.
-            _insert_references_for_object(
-                conn,
-                category,
-                object_name,
-                [r for r in parsed.get("references", []) if r.get("ref_kind") == "based_on"],
                 rel,
                 content_lines=content.splitlines(),
             )
@@ -7665,33 +7811,45 @@ def _insert_xdto_package(
     )
 
 
+def _event_subscription_source_rows(parsed: dict, rel_path: str) -> list[tuple]:
+    """Строки ``event_subscription_source`` подписки — общие для сборки и точечного пути Group B.
+
+    Перечень типов (``source_types``) — строка на тип. v1.47.0: и набор ``DefinedType.X`` из ``source_type_sets`` —
+    определяемый тип сам объект метаданных, и прежде ``find_references_to_object('ОпределяемыйТип.X')`` подписку на
+    него не называл. Бесточечные платформенные наборы (``DocumentObject``) строк не дают: их члены раскрываются на
+    чтении (``SourceTypeSet``), и это не меняется."""
+    from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref
+
+    name = parsed.get("name") or ""
+    if not name:
+        return []
+    tokens = list(parsed.get("source_types") or [])
+    tokens += [t for t in parsed.get("source_type_sets") or [] if t.split(".", 1)[0].casefold() == "definedtype"]
+    rows: list[tuple] = []
+    for st in tokens:
+        canon = canonicalize_type_ref(st)
+        if canon:
+            rows.append(
+                (
+                    name,
+                    "EventSubscriptions",
+                    canon,
+                    "event_subscription_source",
+                    f"EventSubscription.{name}.Source",
+                    rel_path,
+                    None,
+                )
+            )
+    return rows
+
+
 def _emit_event_subscription_source_refs(
     conn: sqlite3.Connection,
     parsed: dict,
     rel_path: str,
 ) -> None:
-    """Refs из source_types — ref_kind='event_subscription_source'."""
-    from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref
-
-    name = parsed.get("name") or ""
-    if not name:
-        return
-    rows: list[tuple] = []
-    for st in parsed.get("source_types") or []:
-        canon = canonicalize_type_ref(st)
-        if not canon:
-            continue
-        rows.append(
-            (
-                name,
-                "EventSubscriptions",
-                canon,
-                "event_subscription_source",
-                f"EventSubscription.{name}.Source",
-                rel_path,
-                None,
-            )
-        )
+    """Refs подписки (`_event_subscription_source_rows`) — ref_kind='event_subscription_source'."""
+    rows = _event_subscription_source_rows(parsed, rel_path)
     if rows:
         conn.executemany(
             "INSERT INTO metadata_references "
@@ -7950,32 +8108,53 @@ def _collect_file_paths(base_path: str) -> list[tuple]:
 
     Returns list of tuples ready for INSERT:
         (rel_path, extension, dir_path, filename, depth, size, mtime)
-    """
-    base = Path(base_path)
-    rows: list[tuple] = []
 
-    for dirpath, dirnames, filenames in os.walk(base):
-        # Filter out hidden/skip directories
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS_NAV and not d.startswith(".")]
-        for fname in filenames:
+    v1.47.0: обход — тот же, что у прежнего ``os.walk`` (сверху вниз, подкаталоги в порядке листинга, в ссылки на
+    каталоги не заходит, каталог, листинг которого оборвался ошибкой, пропускается целиком), но размер и время файла
+    берутся из записи каталога (``DirEntry.stat()``): на Windows — без отдельного открытия каждого файла (на крупной
+    ERP-конфигурации ~23 с → ~6 с). Состав и порядок строк прежние.
+    """
+    rows: list[tuple] = []
+    stack: list[tuple[str, str]] = [(os.fspath(Path(base_path)), "")]
+    while stack:
+        top, rel_dir = stack.pop()
+        subdirs: list[tuple[str, str]] = []
+        files: list[os.DirEntry] = []
+        try:
+            with os.scandir(top) as it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir()
+                    except OSError:
+                        is_dir = False
+                    if not is_dir:
+                        files.append(entry)
+                        continue
+                    name = entry.name
+                    if name in _SKIP_DIRS_NAV or name.startswith("."):
+                        continue
+                    try:
+                        is_link = entry.is_symlink()
+                    except OSError:  # как `os.path.islink` у `os.walk`: ошибка — не ссылка
+                        is_link = False
+                    if not is_link:
+                        subdirs.append((entry.path, f"{rel_dir}/{name}" if rel_dir else name))
+        except OSError:
+            continue
+        for entry in files:
+            fname = entry.name
             if fname.startswith("."):
                 continue
             ext = os.path.splitext(fname)[1].lower()
             if ext not in _FILE_NAV_EXTENSIONS:
                 continue
-
-            full_path = Path(dirpath) / fname
             try:
-                st = full_path.stat()
+                st = entry.stat()
             except OSError:
                 continue
-
-            rel = full_path.relative_to(base).as_posix()
-            parts = rel.split("/")
-            dir_path = "/".join(parts[:-1]) if len(parts) > 1 else ""
-            depth = len(parts)
-
-            rows.append((rel, ext, dir_path, fname, depth, st.st_size, st.st_mtime))
+            rel = f"{rel_dir}/{fname}" if rel_dir else fname
+            rows.append((rel, ext, rel_dir, fname, rel.count("/") + 1, st.st_size, st.st_mtime))
+        stack.extend(reversed(subdirs))
 
     return rows
 
@@ -8105,6 +8284,10 @@ _REGISTER_CATALOG_DIRS = (
     "CalculationRegisters",
 )
 
+# v1.47.0 (issue #42): головы видов регистров в канонической ссылке `<Голова>.<Имя>` (`register_ref` объявленного
+# состава движений) — каталог без конечной `s`. По ним обратный ход объявленного состава ищет регистр по имени.
+_REGISTER_REF_HEADS = tuple(cat[:-1] for cat in _REGISTER_CATALOG_DIRS)
+
 
 def _known_register_names(base: Path) -> frozenset[str]:
     """Имена всех регистров конфигурации (нижний регистр) — по каталогам на диске.
@@ -8128,6 +8311,115 @@ def _known_register_names(base: Path) -> frozenset[str]:
         except OSError:
             continue
     return frozenset(names)
+
+
+# v1.47.0 (Д13): таблица движений БГУ — модуль менеджера документа называет регистр литералом
+# `ТаблицыДляДвижений.Вставить("<Регистр>", …)` / `ТаблицыЗапроса.Добавить("<Регистр>")`, а пишет общий
+# `ПроведениеСервер.ОтразитьДвиженияПоРегистрам`. Строка `register_movements` — только если имя есть в каталоге
+# регистров (сверка при вставке, как у `manager_code`); иное имя — просто таблица, строки нет вовсе. Голова
+# бывает свойством структуры (`ДополнительныеСвойства.ТаблицыДляДвижений.Вставить(…)` — так в большинстве модулей
+# БГУ), поэтому слева отсекается только символ слова, а не точка.
+MOVEMENT_SOURCE_TABLE = "movement_table"
+_MOVEMENT_TABLE_RE = re.compile(
+    r"(?<!\w)(?:ТаблицыДляДвижений\s*\.\s*Вставить|ТаблицыЗапроса\s*\.\s*Добавить)\s*\(\s*\"(\w+)\"",
+    re.IGNORECASE,
+)
+# Внутренний источник строки делегата «регистр по имени» модуля объекта: при вставке литерал из каталога
+# регистров становится строкой `code`, иной — `unresolved/unknown_register` (как раскрытие на чтении). В таблицу
+# этот источник не попадает.
+_MOVEMENT_SOURCE_BY_NAME = "code_by_name"
+
+
+# Идентификатор — непустой литерал целиком, а не \w+: БСП допускает список
+# «Акт,Счет», и прежний \w+ терял такую команду целиком.
+# v1.47.0: переехал из bsl_helpers вместе с `_pf_call_args` и делегатами «регистр по имени» — им пользуется и
+# сборщик (`_extract_movements`), а bsl_index импортировать bsl_helpers не может; хелперы импортируют обратно.
+_PF_ID_LITERAL_RE = re.compile(r'"((?:[^"]|"")+)"')
+
+
+def _pf_call_args(text: str, start: int) -> list[str]:
+    """Аргументы вызова от позиции сразу после `(` — балансом скобок и кавычек
+    (`""` внутри строки 1С — экранированная кавычка). Регулярка `[^,]+` рвётся на
+    `НСтр("…, …")`, поэтому аргументы разбираются посимвольно."""
+    args: list[str] = []
+    cur: list[str] = []
+    depth, i, in_str = 0, start, False
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            cur.append(ch)
+            if ch == '"':
+                if text[i + 1 : i + 2] == '"':
+                    cur.append('"')
+                    i += 1
+                else:
+                    in_str = False
+        elif ch == '"':
+            in_str = True
+            cur.append(ch)
+        elif ch == "(":
+            depth += 1
+            cur.append(ch)
+        elif ch == ")":
+            if depth == 0:
+                args.append("".join(cur))
+                return args
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    return args  # незакрытый вызов: что успели разобрать
+
+
+# Делегаты, которые пишут набор движений по ИМЕНИ регистра из аргумента (v1.43.0):
+# (модуль, метод) в нижнем регистре → индекс аргумента (с нуля) с именем регистра.
+# Таблица, а не общее правило «процедура пишет Движения[<параметр>]»: среди таких процедур
+# есть очистка (УдалитьДвиженияДокумента — Движения[Имя].Очистить()), и общее правило дало
+# бы ложные движения. Каждая запись — с замером:
+#   БГУ: ПроведениеСервер.ОтразитьДвиженияПоРегистру(ДополнительныеСвойства, Движения, Отказ, ИмяТаблицы)
+#        — тело: Движения[ИмяТаблицы].Записывать = Истина; …Загрузить(…); 184 вызова в 60 модулях
+#        объектов документов. В ERP (ПроведениеДокументов.ОтразитьДвижения) из модулей объектов
+#        документов не вызывается — записи нет.
+# v1.47.0: и строка сборщика (`_extract_movements`, модуль объекта); раскрытие на чтении остаётся для
+# индекса прежнего поколения и расширений.
+_REGISTER_BY_NAME_DELEGATES: dict[tuple[str, str], int] = {
+    ("проведениесервер", "отразитьдвиженияпорегистру"): 3,
+}
+_REGISTER_BY_NAME_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\.\s*(\w+)\s*\(", re.IGNORECASE)
+
+
+def _register_by_name_refs(body: str) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """``(литеральные (имя, строка), вычисляемые (выражение, строка))`` вызовов делегатов
+    ``_REGISTER_BY_NAME_DELEGATES``. Две маски одной длины (приём ``_parse_print_commands``):
+    вызов ищется по коду без комментариев и строк, аргументы читаются с содержимым строк —
+    имя регистра лежит в литерале. Аргумент может быть перенесён и отделён комментарием."""
+    literal: list[tuple[str, int]] = []
+    dynamic: list[tuple[str, int]] = []
+    # Дешёвый префильтр по сырому тексту: маска всего модуля стоит десятки миллисекунд, а
+    # функцию зовут на каждом find_register_movements — у 99 % документов делегата нет.
+    low = body.casefold()
+    if not any(method in low for _module, method in _REGISTER_BY_NAME_DELEGATES):
+        return literal, dynamic
+    lines = body.splitlines()
+    code = "\n".join(mask_comments_and_strings(lines))
+    text = "\n".join(mask_comments_and_strings(lines, keep_string_content=True))
+    for m in _REGISTER_BY_NAME_CALL_RE.finditer(code):
+        pos = _REGISTER_BY_NAME_DELEGATES.get((m.group(1).casefold(), m.group(2).casefold()))
+        if pos is None:
+            continue
+        line_no = code.count("\n", 0, m.start()) + 1
+        args = _pf_call_args(text, m.end())
+        arg = args[pos].strip() if len(args) > pos else ""
+        lit = _PF_ID_LITERAL_RE.fullmatch(arg)
+        if lit and re.fullmatch(r"\w+", lit.group(1)):
+            literal.append((lit.group(1), line_no))
+        else:
+            dynamic.append((arg[:80] or f"{m.group(1)}.{m.group(2)}", line_no))
+    return literal, dynamic
 
 
 # ---------------------------------------------------------------------------
@@ -8269,7 +8561,35 @@ def _movement_rows_for_insert(results, known_registers: frozenset[str]) -> tuple
     for r in results:
         if not r.movements or not r.info.object_name:
             continue
+        # v1.47.0: строка `code` делегата дополняет прямые `Движения.X` того же модуля, а не повторяет их — ключ
+        # раскрытия на чтении (`_merge_movement_rows`: регистр без учёта регистра букв, источник, файл; у результата
+        # один файл); повторный вызов делегата с тем же регистром — та же одна строка (первый вызов). Иначе улики
+        # разведут строки в `SELECT DISTINCT` ридера, а ответ хелпера без улики отдаст одинаковые.
+        code_names = {reg.casefold() for reg, source, *_rest in r.movements if source == "code"}
         for reg_name, source, file_path_str, evidence, kind in r.movements:
+            # v1.47.0: таблица движений с именем вне каталога регистров — просто таблица, а не обращение к
+            # регистру: строки нет вовсе (в отличие от `manager_code`, где литерал — в выражении менеджера).
+            if source == MOVEMENT_SOURCE_TABLE and reg_name.lower() not in known_registers:
+                continue
+            # v1.47.0: делегат «регистр по имени» модуля объекта — та же развилка, что у раскрытия на чтении:
+            # литерал из каталога — строка `code`, иной — `unresolved/unknown_register` с литералом в `evidence`.
+            if source == _MOVEMENT_SOURCE_BY_NAME:
+                if reg_name.lower() in known_registers:
+                    if reg_name.casefold() not in code_names:
+                        code_names.add(reg_name.casefold())
+                        rows.append((r.info.object_name, reg_name, "code", file_path_str, evidence, None))
+                else:
+                    rows.append(
+                        (
+                            r.info.object_name,
+                            "",
+                            MOVEMENT_SOURCE_UNRESOLVED,
+                            file_path_str,
+                            reg_name,
+                            MOVEMENT_KIND_UNKNOWN,
+                        )
+                    )
+                continue
             if source == "manager_code" and reg_name.lower() not in known_registers:
                 dropped += 1
                 rows.append(
@@ -8324,7 +8644,26 @@ def _extract_movements(
             if reg.lower() in _MOVEMENT_METHOD_NOISE:
                 continue
             results.append(_row(reg, "code", m))
+        # v1.47.0 (П8): делегат «регистр по имени» (`ПроведениеСервер.ОтразитьДвиженияПоРегистру(…, "<Регистр>")`) —
+        # строка сборщика: литерал сверяется с каталогом регистров при вставке (`_MOVEMENT_SOURCE_BY_NAME`),
+        # вычисляемое имя — `unresolved/dynamic_name` с выражением в `evidence`, как у раскрытия на чтении.
+        by_name_literal, by_name_dynamic = _register_by_name_refs(content)
+        for reg, line_no in by_name_literal:
+            evidence = (
+                " ".join(src_lines[line_no - 1].split())[:_EVIDENCE_MAX_CHARS] if line_no <= len(src_lines) else ""
+            )
+            results.append((reg, _MOVEMENT_SOURCE_BY_NAME, rel_path, evidence, None))
+        for expr, _line_no in by_name_dynamic:
+            results.append(("", MOVEMENT_SOURCE_UNRESOLVED, rel_path, expr, MOVEMENT_KIND_DYNAMIC))
     elif info.module_type == "ManagerModule":
+        # v1.47.0 (Д13): таблица движений БГУ. Совпадение — по маске `comments_only` (литерал цел), голова
+        # обязана быть кодом и по маске `full` (те же смещения, приём `_MANAGER_INDEXER_RE`): в литерале или
+        # комментарии строки нет.
+        for m in _MOVEMENT_TABLE_RE.finditer(comments_only):
+            head_end = m.start(1) - 1
+            if full[m.start() : head_end] != comments_only[m.start() : head_end]:
+                continue
+            results.append(_row(m.group(1), MOVEMENT_SOURCE_TABLE, m))
         for m in _ERP_MECHANISM_RE.finditer(comments_only):
             results.append(_row(m.group(1), "erp_mechanism", m))
         for m in _MANAGER_TABLE_RE.finditer(full):
@@ -8545,13 +8884,18 @@ def _collect_role_data(base_path: str) -> _RoleData:
     # Find all rights files
     rights_files: list[tuple[str, Path]] = []
 
+    # v1.47.0: каталог `Roles` в корне — маски от него, без рекурсивного `**`: тот обходит всё дерево (на крупной
+    # ERP-конфигурации ~20 с из ~25 с фазы прав). Состав и порядок прежние: `**` первыми отдаёт совпадения самого
+    # корня. Нет `Roles` в корне (контейнер, конфигурации глубже) — прежний рекурсивный поиск.
+    prefix = "" if (base / "Roles").is_dir() else "**/"
+
     # CF format: Roles/*/Ext/Rights.xml
-    for f in base.glob("**/Roles/*/Ext/Rights.xml"):
+    for f in base.glob(f"{prefix}Roles/*/Ext/Rights.xml"):
         role_name = f.parent.parent.name
         rights_files.append((role_name, f))
 
     # EDT format: Roles/*/*.rights
-    for f in base.glob("**/Roles/*/*.rights"):
+    for f in base.glob(f"{prefix}Roles/*/*.rights"):
         role_name = f.parent.name
         rights_files.append((role_name, f))
 
@@ -8830,14 +9174,14 @@ def _collect_object_synonyms(
                 fp,
             )
             return None, False
-        if not parsed:
+        if not parsed or parsed.get("error"):
+            # Валидный XML без объекта метаданных — успешно обработанный кандидат без строки.
             return None, True
-        raw_synonym = parsed.get("synonym") or ""
-        if not raw_synonym:
-            # Валидный XML БЕЗ <Synonym> — успешно обработанный кандидат, не failure.
-            return None, True
+        # v1.47.0: объект без синонима (<Synonym/>) — тоже строка, с пустым синонимом «<Категория>: »:
+        # поиск по виду и по техническому имени его находит, наружу синоним — '' (strip_category_prefix).
+        # Прежде строки не было, и search_objects не находил такой объект даже по имени.
         prefix = _CATEGORY_RU.get(cat, cat)
-        synonym = f"{prefix}: {raw_synonym}"
+        synonym = f"{prefix}: {parsed.get('synonym') or ''}"
         return (obj_name, cat, synonym, rel), True
 
     workers = min(os.cpu_count() or 4, 8)
@@ -8913,6 +9257,17 @@ def _detect_prefixes(conn: sqlite3.Connection) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# v1.47.0: ЕДИНЫЙ INSERT строк перехватов — сборка, полный скан и git-быстрый путь `update` (прежде три копии
+# текста; колонки `form_item`/`form_event` — у перехватов из форм расширения, у строк из аннотаций NULL).
+_EXTENSION_OVERRIDES_INSERT = (
+    "INSERT INTO extension_overrides "
+    "(object_name, source_path, source_module_id, target_method, "
+    "target_method_line, annotation, extension_name, extension_purpose, "
+    "extension_method, extension_root, ext_module_path, ext_line, form_item, form_event) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
 def _collect_extension_overrides(
     base_path: str,
     conn: sqlite3.Connection,
@@ -8985,10 +9340,11 @@ def _collect_extension_overrides(
     current = ext_context.current
 
     if current.role == ConfigRole.MAIN and ext_context.nearby_extensions:
-        # Main config: scan each nearby extension
+        # Main config: scan each nearby extension. v1.47.0: `main_root` — цель перехвата из формы расширения
+        # (callType) — обработчик той же пары (элемент, событие) формы основной конфигурации.
         for ext in ext_context.nearby_extensions:
             try:
-                overrides = find_extension_overrides(ext.path)
+                overrides = find_extension_overrides(ext.path, main_root=base_path)
             except Exception as exc:
                 logger.warning("Override scan failed for extension %s: %s", ext.path, exc)
                 continue
@@ -9008,13 +9364,17 @@ def _collect_extension_overrides(
                         ext.path,
                         ov.get("module_path", ""),
                         ov.get("line"),
+                        ov.get("form_item"),
+                        ov.get("form_event"),
                     )
                 )
 
     elif current.role == ConfigRole.EXTENSION:
-        # Extension config: record overrides without source linking
+        # Extension config: record overrides without source linking. v1.47.0: цель перехвата из формы — по
+        # основной конфигурации рядом, если она найдена; иначе цель пуста.
+        main_root = ext_context.nearby_main.path if ext_context.nearby_main is not None else None
         try:
-            overrides = find_extension_overrides(base_path)
+            overrides = find_extension_overrides(base_path, main_root=main_root)
         except Exception as exc:
             logger.warning("Override scan failed for extension %s: %s", base_path, exc)
             return []
@@ -9033,6 +9393,8 @@ def _collect_extension_overrides(
                     current.path,
                     ov.get("module_path", ""),
                     ov.get("line"),
+                    ov.get("form_item"),
+                    ov.get("form_event"),
                 )
             )
 
@@ -9044,14 +9406,73 @@ def _collect_extension_overrides(
 # ---------------------------------------------------------------------------
 
 
-def _collect_form_elements(base_path: str) -> list[tuple]:
+# v1.47.0: виды ссылок из форм — строки `metadata_references`, которые пишет шаг `form_elements` (тем же разбором
+# формы). Их инвалидация — вместе с `form_elements`: на изменении любой формы строки этих видов пересобираются
+# целиком, а DELETE точечного обновления объекта и bulk-fallback по категории их НЕ трогают (`AND ref_kind NOT IN`).
+# Не путать с `bsl_xml_parsers._FORM_REF_KINDS` — там виды ссылок описателя НА формы (`default_object_form`, …).
+_FORM_SOURCE_REF_KINDS: frozenset[str] = frozenset({"form_attribute_type", "form_main_table", "form_query"})
+_FORM_SOURCE_REF_KINDS_SQL = "(" + ", ".join(f"'{k}'" for k in sorted(_FORM_SOURCE_REF_KINDS)) + ")"
+
+
+def _query_text_refs(text: str) -> list[str]:
+    """Объекты, названные в тексте запроса динамического списка формы (v1.47.0) — канонические ``ref_object``.
+
+    Путь ``<Вид>.X[.…]`` (`_CODE_PATH_RE`) с головой из `_CODE_QUERY_COLLECTIONS` — единственное число RU/EN, те же
+    правила, что у вида ``query`` в коде (`_extract_code_usages`); комментарии и строковые литералы запроса погашены
+    маской (`mask_comments_and_strings`). Порядок первой встречи, без повторов."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in mask_comments_and_strings((text or "").splitlines()):
+        if "." not in line:
+            continue
+        for pm in _CODE_PATH_RE.finditer(line):
+            query_canon = _CODE_QUERY_COLLECTIONS.get(pm.group(1).lower())
+            if query_canon:
+                ref = query_canon + pm.group(2)
+                if ref not in seen:
+                    seen.add(ref)
+                    out.append(ref)
+    return out
+
+
+def _replace_form_refs(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    """Строки видов форм (`_FORM_SOURCE_REF_KINDS`) в `metadata_references` — целиком заново (v1.47.0).
+
+    Один путь записи для сборки, полного скана и git-пути: DELETE по видам форм и вставка. Таблицы нет (индекс
+    без метаданных) — ничего не делает."""
+    try:
+        conn.execute(
+            f"DELETE FROM metadata_references WHERE ref_kind IN {_FORM_SOURCE_REF_KINDS_SQL}"  # noqa: S608
+        )
+        if rows:
+            conn.executemany(
+                "INSERT INTO metadata_references "
+                "(source_object, source_category, ref_object, ref_kind, used_in, path, line) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+    except sqlite3.OperationalError:
+        pass
+
+
+def _collect_form_elements(base_path: str) -> tuple[list[tuple], list[tuple]]:
     """Collect form elements (handlers, commands, attributes) from all forms.
 
-    Returns list of tuples ready for INSERT into form_elements:
+    Returns ``(form_elements rows, metadata_references rows)``. Первые — для INSERT в form_elements:
     (object_name, category, form_name, kind, scope, element_name, element_type,
      event, handler, data_path, main_table, attribute_is_main, extra_json, file).
+
+    v1.47.0: вторые — ссылки формы видов `_FORM_SOURCE_REF_KINDS` (`parse_form_type_refs` и `_query_text_refs` по тому
+    же корню, что разбор элементов: один ``ET.fromstring`` на форму):
+    ``(владелец, категория владельца, ref_object, kind, "<Тип>.<Объект>.Form.<Ф>.<суффикс>", путь формы, None)``;
+    у общей формы ``used_in`` — ``CommonForm.<Ф>.<суффикс>``, категория ``CommonForms``.
     """
-    from rlm_tools_bsl.bsl_xml_parsers import parse_form_xml
+    from rlm_tools_bsl.bsl_xml_parsers import (
+        _parse_form_cf,
+        _parse_form_edt,
+        _parse_form_root,
+        parse_form_type_refs,
+    )
     from rlm_tools_bsl.format_detector import METADATA_CATEGORIES
 
     base = Path(base_path)
@@ -9098,18 +9519,33 @@ def _collect_form_elements(base_path: str) -> list[tuple]:
                 form_files.append(("CommonForms", form_dir.name, form_dir.name, ff))
 
     if not form_files:
-        return []
+        return [], []
 
-    def _process_form(item: tuple[str, str, str, Path]) -> list[tuple]:
+    def _process_form(item: tuple[str, str, str, Path]) -> tuple[list[tuple], list[tuple]]:
         cat, obj_name, frm_name, fpath = item
         try:
             content = fpath.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
-            return []
-        parsed = parse_form_xml(content)
-        if parsed is None:
-            return []
+            return [], []
+        form_root = _parse_form_root(content)
+        if form_root is None:
+            return [], []
+        root, fmt = form_root
+        parsed = _parse_form_edt(root) if fmt == "edt" else _parse_form_cf(root)
         rel = fpath.relative_to(base).as_posix()
+        used_in_root = (
+            f"CommonForm.{frm_name}"
+            if cat == "CommonForms"
+            else f"{_CATEGORY_TO_TYPE_PREFIX.get(cat, cat)}.{obj_name}.Form.{frm_name}"
+        )
+        type_refs, query_texts = parse_form_type_refs(root, fmt)
+        ref_rows: list[tuple] = [
+            (obj_name, cat, r["ref_object"], r["kind"], f"{used_in_root}.{r['used_in_suffix']}", rel, None)
+            for r in type_refs
+        ]
+        for suffix, text in query_texts:
+            for ref in _query_text_refs(text):
+                ref_rows.append((obj_name, cat, ref, "form_query", f"{used_in_root}.{suffix}", rel, None))
         rows: list[tuple] = []
         for h in parsed.get("handlers", []):
             rows.append(
@@ -9178,18 +9614,22 @@ def _collect_form_elements(base_path: str) -> list[tuple]:
                     rel,
                 )
             )
-        return rows
+        return rows, ref_rows
 
     all_results: list[tuple] = []
+    all_refs: list[tuple] = []
     if len(form_files) > 1:
         workers = min(os.cpu_count() or 4, 8)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for batch in pool.map(_process_form, form_files):
+            for batch, refs_batch in pool.map(_process_form, form_files):
                 all_results.extend(batch)
+                all_refs.extend(refs_batch)
     elif form_files:
-        all_results.extend(_process_form(form_files[0]))
+        batch, refs_batch = _process_form(form_files[0])
+        all_results.extend(batch)
+        all_refs.extend(refs_batch)
 
-    return all_results
+    return all_results, all_refs
 
 
 _FORM_ELEMENTS_SCHEMA = (
@@ -9828,11 +10268,7 @@ class IndexBuilder:
         override_rows = _collect_extension_overrides(base_path, conn)
         if override_rows:
             conn.executemany(
-                "INSERT INTO extension_overrides "
-                "(object_name, source_path, source_module_id, target_method, "
-                "target_method_line, annotation, extension_name, extension_purpose, "
-                "extension_method, extension_root, ext_module_path, ext_line) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _EXTENSION_OVERRIDES_INSERT,
                 override_rows,
             )
             conn.commit()
@@ -9850,11 +10286,13 @@ class IndexBuilder:
         fe_rows: list[tuple] = []
         if build_metadata:
             conn.executescript(_FORM_ELEMENTS_SCHEMA)
-            fe_rows = _collect_form_elements(base_path)
+            fe_rows, form_ref_rows = _collect_form_elements(base_path)
             if fe_rows:
                 conn.executemany(_FORM_ELEMENTS_INSERT, fe_rows)
-                conn.commit()
                 logger.info("Form elements: %d entries", len(fe_rows))
+            # v1.47.0: ссылки форм — после ссылок описателей, тем же разбором формы.
+            _replace_form_refs(conn, form_ref_rows)
+            conn.commit()
         conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
             ("has_form_elements", "1" if build_metadata else "0"),
@@ -9940,25 +10378,39 @@ class IndexBuilder:
         lock = _BuildLock(db_path)
         lock.acquire()
         conn = None
+        prefetch: list[_DescriptorPrefetch] = []  # v1.47.0: прогрев полного скана (его заводит _update_locked)
         try:
             # connect INSIDE the try (codex): a connect-time sqlite3.Error/OSError must
             # NOT leak the acquired lock — otherwise it stays in _active_locks and blocks
             # later builds/updates in the same process.
             conn = sqlite3.connect(str(db_path))  # M1: closed in finally
-            return self._update_locked(base_path, db_path, conn)
+            return self._update_locked(base_path, db_path, conn, prefetch)
         finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            lock.release()
+            try:
+                for warmer in prefetch:
+                    warmer.close()
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                lock.release()
 
-    def _update_locked(self, base_path: str, db_path: Path, conn: sqlite3.Connection) -> dict:
+    def _update_locked(
+        self,
+        base_path: str,
+        db_path: Path,
+        conn: sqlite3.Connection,
+        prefetch: list[_DescriptorPrefetch] | None = None,
+    ) -> dict:
         """Internal update with lock held and the connection opened by the caller
         (M1: ``update()`` closes it in a finally). Existing explicit ``conn.close()``
         calls before each return remain (idempotent double-close — the safety net only
-        fires on an exception path)."""
+        fires on an exception path).
+
+        ``prefetch`` (v1.47.0) — список вызывающего: ветка полного скана кладёт туда прогрев описателей, а
+        вызывающий закрывает его в своём ``finally``. ``None`` — без прогрева."""
         t0 = time.time()
         base = Path(base_path)
 
@@ -10040,9 +10492,17 @@ class IndexBuilder:
         # (сигнатуры длиннее 20 строк), `module_headers` (шапка под лицензией) и
         # `metadata_references` (типы параметров команд объектов EDT), которое инкрементом
         # не перечитывается: нетронутые модули и XML дельта полного скана не видит.
+        #
+        # v18 — всё производное от НЕИЗМЕННЫХ исходников: перехваты событий и команд форм
+        # расширений (две колонки `extension_overrides`), реквизиты и ссылки описателей вне шести
+        # категорий и объектов CF без каталога, ссылки форм, журналов, критериев, связующих свойств,
+        # подписок на определяемый тип, команд объектов CF и типов-наборов, виды `metadata`/`form` и
+        # член менеджера в `metadata_code_usages`, вызовы через перенос строки, движения таблиц БГУ и
+        # делегата модуля объекта, `use` заданий EDT, объекты без синонима. Полный скан по mtime/size
+        # их не перечитал бы.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 17:
+        if old_version < 18:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -10184,6 +10644,13 @@ class IndexBuilder:
 
         if fallback_reason:
             logger.info("Git fast path unavailable (%s), using full scan", fallback_reason)
+
+        # v1.47.0: прогрев описателей на время полного скана — тот же, что у полной сборки (`_DescriptorPrefetch`):
+        # полный скан перечитывает все описатели подряд (метаданные, синонимы, права, формы), и на холодном кеше
+        # файлов (после загрузки ОС или обновления сигнатур антивируса) одни метаданные крупной ERP-конфигурации шли
+        # минуты (замер: 511 с против 31 с на тёплом). Закрывает его `update()` — и при исключении.
+        if prefetch is not None:
+            prefetch.append(_DescriptorPrefetch(base_path))
 
         # --- Fallback: full scan (original logic) ---
         bsl_files = sorted(base.rglob("*.bsl"))
@@ -10631,7 +11098,9 @@ class IndexBuilder:
             "extension_method TEXT, "
             "extension_root TEXT NOT NULL, "
             "ext_module_path TEXT NOT NULL, "
-            "ext_line INTEGER);\n"
+            "ext_line INTEGER, "
+            "form_item TEXT, "
+            "form_event TEXT);\n"
             "CREATE INDEX IF NOT EXISTS idx_eo_object ON extension_overrides(object_name COLLATE NOCASE);\n"
             "CREATE INDEX IF NOT EXISTS idx_eo_method ON extension_overrides(target_method COLLATE NOCASE);\n"
             "CREATE INDEX IF NOT EXISTS idx_eo_source ON extension_overrides(source_module_id);\n"
@@ -10641,11 +11110,7 @@ class IndexBuilder:
         override_rows = _collect_extension_overrides(base_path, conn)
         if override_rows:
             conn.executemany(
-                "INSERT INTO extension_overrides "
-                "(object_name, source_path, source_module_id, target_method, "
-                "target_method_line, annotation, extension_name, extension_purpose, "
-                "extension_method, extension_root, ext_module_path, ext_line) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _EXTENSION_OVERRIDES_INSERT,
                 override_rows,
             )
             logger.info("Extension overrides: %d entries", len(override_rows))
@@ -10662,10 +11127,12 @@ class IndexBuilder:
         if has_metadata:
             conn.executescript(_FORM_ELEMENTS_SCHEMA)
             conn.execute("DELETE FROM form_elements")
-            fe_rows = _collect_form_elements(base_path)
+            fe_rows, form_ref_rows = _collect_form_elements(base_path)
             if fe_rows:
                 conn.executemany(_FORM_ELEMENTS_INSERT, fe_rows)
                 logger.info("Form elements: %d entries", len(fe_rows))
+            # v1.47.0: ссылки форм — вместе с form_elements (DELETE по видам форм и вставка).
+            _replace_form_refs(conn, form_ref_rows)
             conn.execute(
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                 ("has_form_elements", "1"),
@@ -11056,9 +11523,11 @@ class IndexBuilder:
                 conn.execute("DELETE FROM form_elements")
             except sqlite3.OperationalError:
                 pass
-            fe_rows = _collect_form_elements(base_path)
+            fe_rows, form_ref_rows = _collect_form_elements(base_path)
             if fe_rows:
                 conn.executemany(_FORM_ELEMENTS_INSERT, fe_rows)
+            # v1.47.0: ссылки форм — вместе с form_elements; DELETE описателей их не трогает.
+            _replace_form_refs(conn, form_ref_rows)
             conn.execute(
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                 ("has_form_elements", "1"),
@@ -11143,11 +11612,7 @@ class IndexBuilder:
             override_rows = _collect_extension_overrides(base_path, conn)
             if override_rows:
                 conn.executemany(
-                    "INSERT INTO extension_overrides "
-                    "(object_name, source_path, source_module_id, target_method, "
-                    "target_method_line, annotation, extension_name, extension_purpose, "
-                    "extension_method, extension_root, ext_module_path, ext_line) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    _EXTENSION_OVERRIDES_INSERT,
                     override_rows,
                 )
             conn.execute(
@@ -15134,8 +15599,8 @@ class IndexReader:
         # раскладки, — поэтому здесь матчим ИМЯ как второй, независимый от раскладки
         # источник. Синоним матчим только на прежнем basename-кандидате: иначе
         # read-time bugfix незаметно становится новым глобальным synonym-search.
-        # Одного его мало: строка появляется ТОЛЬКО при НЕПУСТОМ <Synonym>, то
-        # есть на подсистеме без синонима второй источник молчит.
+        # Одного его мало: до v1.47.0 строка появлялась ТОЛЬКО при НЕПУСТОМ <Synonym>, и на
+        # подсистеме без синонима второй источник молчал (с v1.47.0 у неё строка с пустым синонимом).
         for r in synonym_rows:
             raw = strip_category_prefix("Subsystems", r["synonym"] or "")
             obj = r["object_name"] or ""
@@ -15494,8 +15959,10 @@ class IndexReader:
                 )
             return results
 
-    # Priority for ORDER BY (matches _REF_KIND_PRIORITY in bsl_helpers.py).
-    # Lower number = higher priority = surfaced first when results are truncated.
+    # Priority for ORDER BY. Lower number = higher priority = surfaced first when results are truncated.
+    # v1.47.0: ЕДИНСТВЕННАЯ карта приоритетов — `_REF_KIND_PRIORITY` хелперов строится из неё (прежде — ручная
+    # копия). Ридер сортирует по ней в SQL ДО `LIMIT`: вид вне карты получал бы `ELSE 99` и терялся бы при усечении.
+    # Ключи — закрытый набор `kinds` хелперов `find_references_to_object`/`find_data_path`.
     _REF_KIND_SQL_PRIORITY: dict[str, int] = {
         "attribute_type": 0,
         "subsystem_content": 1,
@@ -15515,6 +15982,13 @@ class IndexReader:
         "default_list_form": 15,
         "command_parameter_type": 16,
         "predefined_characteristic_type": 17,
+        "document_journal_content": 18,
+        "filter_criterion_type": 19,
+        "filter_criterion_content": 20,
+        "linked_object": 21,
+        "form_attribute_type": 22,
+        "form_main_table": 23,
+        "form_query": 24,
     }
 
     @_transient_safe(lambda: None)
@@ -15792,6 +16266,27 @@ class IndexReader:
                 (document_ref,),
             ).fetchall()
             return [r["register_ref"] for r in rows]
+
+    @_transient_safe(lambda: None)
+    def get_declaring_documents(self, register_name: str) -> list[str] | None:
+        """Обратный ход объявленного состава (v1.47.0, issue #42): имена документов, объявивших регистр с этим именем
+        в движениях, — любого из четырёх видов регистров, без повторов, без порядка (его задаёт хелпер). Имя
+        сравнивается как у ``get_register_writers`` (``COLLATE NOCASE``), поэтому ответ ``find_register_writers`` внутри
+        себя не расходится. ``None`` — канал недоступен (индекс до v16)."""
+        if not self.has_declared_composition:
+            return None
+        refs = [f"{head}.{register_name}" for head in _REGISTER_REF_HEADS]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT document_ref FROM declared_register_records "
+                f"WHERE register_ref COLLATE NOCASE IN ({', '.join('?' * len(refs))})",  # noqa: S608
+                refs,
+            ).fetchall()
+            prefix = "Document."
+            return [
+                r["document_ref"][len(prefix) :] if r["document_ref"].startswith(prefix) else r["document_ref"]
+                for r in rows
+            ]
 
     @_transient_safe(lambda: None)
     def get_common_module_props(self, name: str = "", flag: str = "", limit: int = 200) -> dict | None:

@@ -799,8 +799,11 @@ class TestGroupBDeletionCFExtLayout:
 
 
 class TestChartOfAccountsRefsParity:
-    """Medium finding: full collector НЕ эмитит parsed.references для CoA
-    (CoA не в _ATTR_CATEGORIES); pointwise тоже не должен — иначе Tier 5 fail."""
+    """Medium finding: точечный путь и полная сборка эмитят ссылки плана счетов ОДИНАКОВО — иначе Tier 5 fail.
+
+    v1.47.0: прежде здесь стояло «full collector НЕ эмитит parsed.references для CoA (CoA не в
+    _ATTR_CATEGORIES); pointwise тоже не должен» — теперь план счетов в `_ATTR_CATEGORIES`, и ОБА пути эмитят
+    его ссылки (реквизиты, `based_on`, связующие свойства); паритет — тот же инвариант."""
 
     def test_coa_pointwise_matches_full_build(self, tmp_path, monkeypatch):
         root = tmp_path

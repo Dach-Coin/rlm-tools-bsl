@@ -1689,7 +1689,9 @@ def test_absent_method_note_matches_the_module_kind(
 def test_override_help_explains_absent_target_line_like_the_note(tmp_path):
     """Справка о `target_method_line=None` (рецепт `help('override')` и тема «расширения» `rlm_help`) объясняет то
     же, что пометка `read_procedure`: у общего модуля событий платформы нет — там это расхождение версий основной
-    конфигурации и расширения. Раньше справка называла любую такую строку событием платформы."""
+    конфигурации и расширения. Раньше справка называла любую такую строку событием платформы. С v1.47.0 тема
+    «расширения» говорит это короче (бюджет полной формы рецепта) — проверяется смысл: у общего модуля — расхождение
+    версий."""
     import json
 
     from rlm_tools_bsl.bsl_knowledge import _get_topic_recipe
@@ -1700,7 +1702,7 @@ def test_override_help_explains_absent_target_line_like_the_note(tmp_path):
     for text in (recipe, topic):
         flat = " ".join(text.replace("#", " ").split())
         assert "target_method_line=None" in flat
-        assert "у общего модуля событий платформы нет" in flat, flat
+        assert "у общего модуля" in flat and "расхождение версий" in flat, flat
 
 
 _EVENT_FILTER_RE = re.compile(r"event_filter\s*=\s*(?:\[([^\]]*)\]|\(([^)]*)\)|(['\"])(.*?)\3)")

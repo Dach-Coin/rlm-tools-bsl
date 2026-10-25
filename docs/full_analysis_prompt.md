@@ -409,6 +409,7 @@ Replace `<path>` with the actual path to your 1C source code that has nearby ext
    - get_overrides() без фильтров → сначала проверь `partial`. При `partial=False` `total` и агрегаты посчитаны по ПОЛНОМУ выбранному источнику; при `partial=True` это нижняя оценка по успешно прочитанной части, а причины перечислены в `_meta.failed_extension_roots`. **Сводку строй по АГРЕГАТАМ**, а не по срезу: `by_annotation`, `by_object_top` (топ-20 объектов), `by_extension_top` (топ-20 расширений), `unique_objects`/`unique_methods`/`unique_object_methods`/`unique_extensions`. **Все ЧЕТЫРЕ `unique_*` — ЧИСЛА** (`len()` по ним падает), и считают они РАЗНОЕ: `unique_objects` СЧИТАЕТ ИМЕНА объектов (`Documents.Заказ` и `Catalogs.Заказ` — один), `unique_methods` — ИМЕНА методов, `unique_object_methods` (**v1.37.0**) — ПАРЫ объект+метод с учётом категории; модули уровня конфигурации (сеанса, приложения) в пары не входят, их перехваты считает отдельный `config_level_overrides` (**v1.45.0**) — это число ПЕРЕХВАТОВ, а не методов: один метод модуля сеанса могут перехватить несколько расширений. «Сколько методов перехвачено» отвечает `unique_object_methods` плюс различные методы уровня конфигурации (их строки — с пустым `object_name`), а не сумма с `config_level_overrides`. Три `by_*` — это **dict `{имя: количество}`**, а не список записей: итерируй `.items()`, срез бери как `list(d.items())[:N]`. Список `overrides` — усечённый срез (первые 200), **группировать его вручную НЕЛЬЗЯ**. `target_method_line=None` у строки — валидное значение (у перехвата нет привязки к строке объявления в базовом модуле), не ошибка индекса
    - Разбивка по расширениям — из `by_extension_top` (+ `unique_extensions`); назначение (purpose) каждого расширения возьми из extension_context/detect_extensions()
    - Разбивка по типам аннотаций (&Перед, &После, &Вместо, &ИзменениеИКонтроль) — из `by_annotation`
+   - **v1.47.0:** перехваты событий и команд форм расширений (`callType` в XML формы) — строки с `form_item`/`form_event` (у строк из аннотаций — `None`); их `target_method` — обработчик той же пары в форме основной конфигурации, `''` — если его там нет
 
 3. **Прицельный поиск перехватов**:
    - Выбери объект с наибольшим количеством перехватов — из `by_object_top` (НЕ из среза `overrides`)
@@ -423,8 +424,8 @@ Replace `<path>` with the actual path to your 1C source code that has nearby ext
 5. **Чтение тела метода с перехватом**:
    - Выбери перехваченный метод из п.4
    - read_procedure(path, method_name) → только оригинальное тело (регрессия: без include_overrides по умолчанию)
-   - read_procedure(path, method_name, include_overrides=True) → оригинал + тело расширенного метода с аннотацией
-   - Сравни два вызова: второй должен содержать секцию "=== Перехвачен &Аннотация в расширении..."
+   - read_procedure(path, method_name, include_overrides=True) → оригинал + тело расширенного метода
+   - Сравни два вызова: второй должен содержать секцию "=== Перехвачен ... в расширении..."
 
 6. **Сравнение index vs live**:
    - get_overrides('ИмяОбъекта') → source должен быть "index" (мгновенно, из SQLite)
@@ -463,7 +464,7 @@ This prompt verifies the extension overrides indexing pipeline from v1.5.0: the 
 | Filtered overrides | `get_overrides(object_name)` | Correct filtering by object |
 | Procedure enrichment | `extract_procedures(path)` | overridden_by field on intercepted methods |
 | Read original | `read_procedure(path, name)` | Clean body without override data (regression) |
-| Read with overrides | `read_procedure(path, name, include_overrides=True)` | Original + extension body with annotation header |
+| Read with overrides | `read_procedure(path, name, include_overrides=True)` | Original + override sections (header: `&Annotation` or form `callType`) with the extension method body |
 | Live fallback | `detect_extensions()` + `find_ext_overrides()` | Live matches index on a FRESH index (may differ on stale — index is a snapshot; documented caveat) |
 | Help recipe | `help('override')` | Recipe displayed correctly |
 | WORKFLOW Step 5 | Strategy | get_overrides, read_procedure(include_overrides), overridden_by |
@@ -889,11 +890,12 @@ Replace `Справочник.ВидыПодарочныхСертификато
 
 ## What it covers
 
-Покрывает 18 видов ссылок (`ref_kind`):
+Покрывает 25 видов ссылок (`ref_kind`; четыре из них объявлены, но строк не производят; семь — с v1.47.0,
+в индексе — после пересборки v18):
 
 | `ref_kind`                       | Источник                                                              |
 |----------------------------------|------------------------------------------------------------------------|
-| `attribute_type`                 | Тип реквизита/измерения/ресурса/колонки ТЧ другого объекта            |
+| `attribute_type`                 | Тип реквизита/измерения/ресурса/колонки ТЧ другого объекта (с v1.47.0 — и у обработок, отчётов, бизнес-процессов, задач, планов обмена, счетов, видов расчёта, регистров расчёта, констант) |
 | `subsystem_content`              | Объект в составе подсистемы                                           |
 | `exchange_plan_content`          | Объект в составе плана обмена                                         |
 | `functional_option_content`      | Объект в составе функциональной опции                                 |
@@ -903,12 +905,17 @@ Replace `Справочник.ВидыПодарочныхСертификато
 | `characteristic_type`            | Тип в составе ПВХ                                                     |
 | `owner`                          | Владелец справочника                                                  |
 | `based_on`                       | Документ-основание                                                    |
-| `main_form` / `list_form`        | MainForm / ListForm                                                    |
+| `main_form` / `list_form`        | MainForm / ListForm (объявлены, строк не производят)                   |
 | `default_object_form` / `default_list_form` | DefaultObjectForm / DefaultListForm                          |
-| `command_parameter_type`         | Тип параметра команды (объектной или CommonCommands)                  |
+| `command_parameter_type`         | Тип параметра команды (объектной, журнала, критерия отбора или CommonCommands) |
 | `predefined_characteristic_type` | Тип у предопределённого вида характеристики                           |
-| `choice_parameter_link`          | ChoiceParameterLinks (зарезервировано)                                |
-| `link_by_type`                   | LinkByType (зарезервировано)                                          |
+| `choice_parameter_link`          | ChoiceParameterLinks (объявлен, строк не производит)                   |
+| `link_by_type`                   | LinkByType (объявлен, строк не производит)                             |
+| `document_journal_content`       | Документ в составе журнала документов (v1.47.0)                        |
+| `filter_criterion_type` / `filter_criterion_content` | Тип и состав критерия отбора (v1.47.0)                |
+| `linked_object`                  | Связующее свойство: план счетов регистра бухгалтерии, виды субконто, план видов расчёта и график регистра расчёта, базовые виды расчёта, задача бизнес-процесса (v1.47.0) |
+| `form_attribute_type`            | Тип реквизита, колонки или параметра формы (v1.47.0)                   |
+| `form_main_table` / `form_query` | Основная таблица и текст запроса динамического списка формы (v1.47.0)  |
 
 ## Expected results (v1.9.0, ERP 24K+ files)
 
@@ -931,11 +938,11 @@ Replace `Справочник.ВидыПодарочныхСертификато
 документа ПриобретениеТоваровУслуг — обращения к нему, к его реквизитам/ТЧ».
 
 ```
-# Обращения в коде (manager/ref_type/query):
+# Обращения в коде (manager/ref_type/query; с v1.47.0 — и metadata/form):
 res = find_code_usages('Документ.ПриобретениеТоваровУслуг')
-print(res['total'], res['by_kind'])   # {'manager': .., 'ref_type': .., 'query': ..}
+print(res['total'], res['by_kind'])   # {'manager': .., 'ref_type': .., 'query': .., 'metadata': .., 'form': ..}
 for u in res['usages'][:20]:
-    tail = f" .{u['member']}" if u['member'] else ''   # member = имя ТЧ для query
+    tail = f" .{u['member']}" if u['member'] else ''   # member: третий сегмент пути у query, член у manager
     print(f"  {u['kind']:8s} {u['path']}:{u['line']}{tail}")
 
 # Метаданные-XML + код одним вызовом:
@@ -949,7 +956,8 @@ print(full['total'], full['code_total'], full['code_by_kind'])
 | `find_code_usages(...)` ответ по индексу | мгновенно (indexed exact-lookup по `object_ref_key`) |
 | `partial` на индексе v13 | `false` (пустой результат — валидный ответ `total=0`) |
 | `partial` на индексе старее v13 | `true` (ограниченный `safe_grep`-фолбэк, нужен rebuild) |
-| `member` для `query`-обращений к ТЧ (`Документ.X.Товары`) | имя ТЧ (`Товары`) |
+| `member` для `query`-обращений к ТЧ (`Документ.X.Товары`) | имя ТЧ (`Товары`) — третий сегмент пути |
+| `member` для `manager` (v1.47.0, индекс v18) | член менеджера (`Документы.X.СоздатьДокумент()` → `СоздатьДокумент`) |
 | `metadata_code_usages` size on ERP | ориентировочно ≤ `calls`; один индекс (`idx_mcu_ref`) |
 | Первый `update`/`rlm_start` на индексе старее v13 | разовый полный rebuild (код-производная таблица) |
 
@@ -1398,8 +1406,8 @@ in scan order are not lost before rank-merge.
    или has_metadata_code_usages = False — сообщи, что нужен rebuild индекса (v13).
 
 2. Обращения в коде — find_code_usages('Документ.РеализацияТоваровУслуг'):
-   - выведи total и by_kind (manager / ref_type / query);
-   - покажи первые 15 usages: kind, path, line, member (имя ТЧ для query);
+   - выведи total и by_kind (manager / ref_type / query / metadata / form);
+   - покажи первые 15 usages: kind, path, line, member (имя ТЧ для query, член менеджера для manager);
    - убедись, что partial = False (ответ из индекса, не live-fallback).
 
 3. По видам отдельно — find_code_usages(obj, kind='manager'),
@@ -1441,6 +1449,8 @@ include_code, has_metadata_code_usages, metadata_code_usages_count, и выво�
 | Обращение к менеджеру коллекции (`Документы.X` / `Documents.X`) | `find_code_usages`, `kind='manager'` |
 | Ссылочный тип в строковом литерале (`"ДокументСсылка.X"` / `"DocumentRef.X"`) | `kind='ref_type'` |
 | Путь метаданных в тексте запроса (`Документ.X` и `Документ.X.ТЧ`) | `kind='query'`, поле `member` |
+| Путь формы в строковом литерале (`"Документ.X.Форма.ФормаДокумента"`, v1.47.0) | `kind='form'` (прежде — `query`) |
+| Обращение через `Метаданные.<Коллекция>.X` (v1.47.0) | `kind='metadata'` |
 | Многострочные запросы (путь на continuation-строке) | `find_code_usages` (scan строк-литералов) |
 | Метаданные-XML + код одним вызовом | `find_references_to_object(include_code=True)` → `code_*` |
 | Capability / размер таблицы | `get_index_info()['has_metadata_code_usages' / 'metadata_code_usages_count']` |
@@ -1586,7 +1596,7 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Recipes (NEW) | `help('достижимость')`, `help('путь данных')` | recipes resolve |
 | Contract: get_overrides | `get_overrides()` | dict `{overrides,total,offset,returned,has_more,truncated,partial,source,by_annotation,by_object_top,by_extension_top,unique_objects,unique_methods,unique_object_methods,unique_extensions,config_level_overrides,_meta?}`; `overrides`=отсортированный срез первых 200. При `partial=false` агрегаты полны для выбранного источника; при `true` — нижняя оценка, см. `_meta.failed_extension_roots`. Каждый row несёт `extension_name` (incl. live extension session). `by_*` — dict `{имя: количество}` (итерировать `.items()`); `target_method_line=None` валиден. **v1.30.0**: набор ключей строки одинаков у `get_overrides` и `find_ext_overrides` (алиасы `module_path`↔`ext_module_path`, `line`↔`ext_line`, `module_type`), состав и порядок среза 200 не изменились. **v1.37.0**: строка несёт `extension_file` — `../`-путь от корня сессии, исполнимый как `read_procedure(row['extension_file'], row['extension_method'])`; `unique_*` — ЧИСЛА: `unique_objects`/`unique_methods` СЧИТАЮТ ИМЕНА, `unique_object_methods` — ПАРЫ объект+метод с категорией |
 | Contract: register movements | `find_register_movements()` | `code_registers`=Posting/CFE-фильтрованные кандидаты list[dict]; main-строки — снимок SQLite и после изменения кода проверяются по живому файлу. При `is_postable=False` строки статические; если хотя бы один CFE `&Вместо` не вызывает напрямую `ПродолжитьВызов`/`ProceedWithCall`, handler-only main rows переходят в `suppressed_main_code_registers` и объясняются в `_meta.cfe_posting_replacement`; `erp_mechanisms`/`manager_tables`/`adapted_registers`=list[str] |
-| Contract: register writers | `find_register_writers()` | `writers` — статические кандидаты, `runtime_filtered=false`: CFE/`Posting=Deny` не применены; forward-helper применяет эти фильтры, свежесть main-строки проверяется по живому файлу |
+| Contract: register writers | `find_register_writers()` | `writers` — статические кандидаты, `runtime_filtered=false`: CFE/`Posting=Deny` не применены; forward-helper применяет эти фильтры, свежесть main-строки проверяется по живому файлу. **v1.47.0**: `declared_documents` — документы, объявившие регистр в движениях (`RegisterRecords`), в порядке имени: регистраторы, в том числе пишущие общими механизмами проведения (`writers` для них пуст); `_meta.declared_source` — `index`/`live` |
 | Contract: roles | `find_roles()` | `rights` = list[str] |
 | Contract: doc flow | `analyze_document_flow()` | dict with documented keys |
 | Contract: form attrs | `parse_form()` | attribute key `types` (not `attr_type`) |
@@ -1926,7 +1936,7 @@ like a complete one. Both cases are now diagnosable.
 
 ```
 Проанализируй граф вызовов конфигурации {путь} (сессия на ОСНОВНОЙ конфигурации; рядом есть расширения).
-Индекс должен быть v17 с графом: если rlm_start предупреждает о старом индексе — остановись и сообщи.
+Индекс должен быть v17 или новее с графом: если rlm_start предупреждает о старом индексе — остановись и сообщи.
 
 1. **Запуски по имени**:
    - найди 3 процедуры общих модулей, которые запускаются через ФоновыеЗадания.Выполнить или

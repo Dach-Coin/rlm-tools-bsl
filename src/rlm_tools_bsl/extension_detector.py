@@ -649,6 +649,8 @@ def find_extension_overrides(
     extension_path: str,
     object_name: str | None = None,
     diagnostics: dict | None = None,
+    *,
+    main_root: str | None = None,
 ) -> list[dict]:
     """Find method interception annotations in BSL files of an extension.
 
@@ -658,10 +660,19 @@ def find_extension_overrides(
             (case-insensitive match on object_name from path parsing).
         diagnostics: Optional mutable mapping populated with scan completeness,
             counters, unreadable files, and directory traversal errors.
+        main_root: v1.47.0 — корень основной конфигурации: цель перехвата из формы — обработчик той же пары
+            (элемент, событие) её формы; ``None`` — цель не разрешается (``''``).
 
     Returns:
         List of dicts with keys: annotation, target_method, extension_method,
-        module_path, object_name, module_type, line.
+        module_path, object_name, module_type, line. v1.47.0 — и перехваты из форм расширения
+        (``Forms/<Ф>/Ext/Form.xml``, ``CommonForms/<Ф>/Ext/Form.xml``: ``callType`` события формы, элемента
+        или действия команды): ``annotation`` — ``Перед``/``После``/``Вместо``, ``module_path`` — модуль формы
+        расширения (``…/Ext/Form/Module.bsl``, даже если модуля нет), ``line`` — строка объявления метода
+        расширения в нём (``None`` — не найдено или модуль не прочитан: тогда обход неполон), ``target_method``
+        — обработчик пары формы основной конфигурации либо ``''``, и ключи ``form_item`` (``''`` — сама форма, у команды — её имя) и ``form_event`` (у команды —
+        ``'Action'``). События и команды своих элементов формы расширения (имени нет в ``<BaseForm>``) строк не
+        дают: перехватывать им нечего. У строк из аннотаций этих двух ключей нет. EDT-формы не читаются (граница).
     """
     ext_base = Path(extension_path)
     scan_diagnostics = {
@@ -698,6 +709,22 @@ def find_extension_overrides(
     for dirpath, dirnames, filenames in os.walk(ext_base, onerror=_record_walk_error):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
         for fname in filenames:
+            if fname.casefold() == "form.xml" and os.path.basename(dirpath).casefold() == "ext":
+                # v1.47.0: форма расширения выгрузки Конфигуратора — перехваты через callType.
+                fpath = os.path.join(dirpath, fname)
+                rel_path = Path(fpath).relative_to(ext_base).as_posix()
+                module_rel = rel_path[: -len(fname)] + "Form/Module.bsl"
+                if object_filter:
+                    form_info = parse_bsl_path(os.path.join(str(ext_base), module_rel), str(ext_base))
+                    if not form_info.object_name or form_info.object_name.lower() != object_filter:
+                        continue
+                scan_diagnostics["candidate_files"] += 1
+                if _scan_form_for_call_types(fpath, rel_path, module_rel, str(ext_base), main_root, results):
+                    scan_diagnostics["files_scanned"] += 1
+                else:
+                    scan_diagnostics["complete"] = False
+                    scan_diagnostics["unreadable_files"].append(rel_path)
+                continue
             if not fname.casefold().endswith(".bsl"):
                 continue
 
@@ -724,6 +751,76 @@ def find_extension_overrides(
     if diagnostics is not None:
         diagnostics.update(scan_diagnostics)
     return results
+
+
+def _procedure_declaration_lines(module_path: Path) -> dict[str, int]:
+    """``{имя процедуры (casefold): строка объявления}`` модуля по маске; модуля нет или не прочитан — ``{}``."""
+    try:
+        lines = module_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return {}
+    out: dict[str, int] = {}
+    for i, mline in enumerate(mask_comments_and_strings(lines)):
+        pm = _PROC_DEF_RE.match(mline)
+        if pm:
+            out.setdefault(pm.group(1).casefold(), i + 1)
+    return out
+
+
+def _scan_form_for_call_types(
+    fpath: str,
+    rel_path: str,
+    module_rel: str,
+    ext_base: str,
+    main_root: str | None,
+    results: list[dict],
+) -> bool:
+    """Перехваты формы расширения CF через ``callType`` (v1.47.0) — строки ``find_extension_overrides``.
+
+    Префильтр по сырым байтам (``callType``): у большинства форм расширения перехватов нет. Своих элементов и
+    команд расширения в перехватах нет — их отбрасывает разбор формы (``parse_form_event_handlers``, по
+    ``<BaseForm>``). Цель — обработчик той же пары (элемент, событие) формы основной конфигурации по тому же
+    относительному пути (``main_root``); нет основной, формы или пары — ``''``. ``False`` — файл формы не прочитан."""
+    from rlm_tools_bsl.bsl_xml_parsers import FORM_CALL_TYPE_ANNOTATIONS, parse_form_event_handlers
+
+    try:
+        raw = Path(fpath).read_bytes()
+    except OSError:
+        return False
+    if b"callType" not in raw:
+        return True
+    _own, intercepts = parse_form_event_handlers(raw.decode("utf-8-sig", errors="replace"))
+    if not intercepts:
+        return True
+    base_handlers: dict[tuple[str, str], str] = {}
+    if main_root:
+        try:
+            main_text = Path(main_root, rel_path).read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            main_text = ""
+        handlers, _base_intercepts = parse_form_event_handlers(main_text)
+        base_handlers = {(item.casefold(), event.casefold()): h for (item, event), h in handlers.items()}
+    module_abs = Path(ext_base, module_rel)
+    info = parse_bsl_path(str(module_abs), ext_base)
+    declarations = _procedure_declaration_lines(module_abs)
+    for it in intercepts:
+        annotation = FORM_CALL_TYPE_ANNOTATIONS.get(it["call_type"])
+        if annotation is None:
+            continue
+        results.append(
+            {
+                "annotation": annotation,
+                "target_method": base_handlers.get((it["item"].casefold(), it["event"].casefold()), ""),
+                "extension_method": it["handler"],
+                "module_path": module_rel,
+                "object_name": info.object_name or "",
+                "module_type": info.module_type or "",
+                "line": declarations.get(it["handler"].casefold()),
+                "form_item": it["item"],
+                "form_event": it["event"],
+            }
+        )
+    return True
 
 
 def _scan_bsl_for_annotations(

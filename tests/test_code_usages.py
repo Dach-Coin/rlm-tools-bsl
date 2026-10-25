@@ -61,11 +61,13 @@ _USAGE_MODULE = """\
 class TestExtractor:
     def test_manager_ru(self):
         rows = _extract_code_usages(["Док = Документы.ПриобретениеТоваровУслуг.Создать();"])
-        assert ("Document.ПриобретениеТоваровУслуг", None, "manager", 1) in rows
+        # v1.47.0: прежде здесь стоял member=None — у manager member теперь идентификатор после `X.`.
+        assert ("Document.ПриобретениеТоваровУслуг", "Создать", "manager", 1) in rows
 
     def test_manager_en(self):
         rows = _extract_code_usages(["X = Documents.Acme.CreateDocument();"])
-        assert ("Document.Acme", None, "manager", 1) in rows
+        # v1.47.0: прежде здесь стоял member=None.
+        assert ("Document.Acme", "CreateDocument", "manager", 1) in rows
 
     def test_reftype_ru(self):
         rows = _extract_code_usages(['Т = Тип("СправочникСсылка.Контрагенты");'])
@@ -135,7 +137,8 @@ class TestExtractor:
         # "" is an escaped quote inside the string, not a terminator — the manager
         # call after the literal must still be detected.
         rows = _extract_code_usages(['А = "x""y"; Док = Документы.Заказ.Создать();'])
-        assert ("Document.Заказ", None, "manager", 1) in rows
+        # v1.47.0: прежде здесь стоял member=None.
+        assert ("Document.Заказ", "Создать", "manager", 1) in rows
 
     def test_source_aware_manager_not_in_comment(self):
         rows = _extract_code_usages(["// Документы.ПриобретениеТоваровУслуг.Создать();"])
@@ -161,7 +164,8 @@ class TestExtractor:
 
     def test_manager_after_closing_string_on_same_line(self):
         rows = _extract_code_usages(['Сообщить("x"); Док = Документы.Заказ.Создать();'])
-        assert ("Document.Заказ", None, "manager", 1) in rows
+        # v1.47.0: прежде здесь стоял member=None.
+        assert ("Document.Заказ", "Создать", "manager", 1) in rows
 
     def test_reftype_not_caught_outside_string(self):
         # ДокументСсылка.X written as bare code (not a literal) must NOT be ref_type.
@@ -174,9 +178,10 @@ class TestExtractor:
         assert kinds == {"manager", "ref_type", "query"}
         objects = {r[0] for r in rows}
         assert objects == {"Document.ПриобретениеТоваровУслуг"}
-        # member only on the query row
+        # v1.47.0: прежде здесь стояло «member only on the query row» — у manager member теперь метод.
         query = [r for r in rows if r[2] == "query"]
         assert query and query[0][1] == "Товары"
+        assert [r[1] for r in rows if r[2] == "manager"] == ["СоздатьДокумент"]
 
 
 # ---------------------------------------------------------------------------

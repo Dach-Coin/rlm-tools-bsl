@@ -7,7 +7,7 @@
 [![CI](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml/badge.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/rlm-tools-bsl.svg)](https://pypi.org/project/rlm-tools-bsl/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Coverage](https://img.shields.io/badge/coverage-87%25-brightgreen.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-88%25-brightgreen.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 MCP-сервер для токен-эффективного анализа кодовых баз 1С (BSL).
@@ -188,7 +188,7 @@ RLM не конкурирует с RAG. Это разные инструмент
 
 ### Предварительное индексирование (опционально, но желательно)
 
-> **Обновление на v1.38.0 требует ПОЛНОЙ ПЕРЕСБОРКИ индексов.** Схема выросла на шесть таблиц и три колонки (объявленный состав конфигурации: наборы типов у подписок, состав движений документа, права по флагу роли, свойства общих модулей, константы, макеты), поэтому `rlm-bsl-index index update <path>` на старом индексе сам уходит в полную пересборку. Сессию, открытую ДО пересборки, нужно переоткрыть: поколение индекса читается один раз при открытии.
+> **Обновление на v1.47.0 требует ПОЛНОЙ ПЕРЕСБОРКИ индексов (схема v18).** Индекс начинает видеть то, что выгрузка называет явно: перехваты событий и команд форм расширений, реквизиты и ссылки описателей всех категорий с реквизитами, ссылки из форм, обращения через `Метаданные`, вызовы с переносом строки, таблицы движений БГУ. До пересборки старый индекс работает, а `rlm_start` перечисляет, чего в нём нет; `rlm-bsl-index index update <path>` на индексе прежнего поколения сам уходит в полную пересборку (разовая длительная операция) — так же, как при обязательных пересборках v1.38.0 и v1.42.0. Сессию, открытую ДО пересборки, нужно переоткрыть: поколение индекса читается один раз при открытии.
 
 Для ускорения работы на больших конфигурациях можно предварительно построить SQLite-индекс методов и графа вызовов — см. **[docs/INDEXING.md](docs/INDEXING.md)**. На ПК с медленными дисками (HDD, сетевые ресурсы) индексирование фактически обязательно: без индекса файловые операции на конфигурациях размера ERP (20K+ BSL-файлов) приводят к таймаутам (60-90с на каждый вызов `glob_files`/`tree`/`find_files`). Помимо ускорения, предварительно созданные индексы помогают слабым моделям (Minimax, Gemini Flash и др.) выполнять качественный анализ на больших кодовых базах — мгновенные ответы хелперов вместо таймаутов устраняют основную причину ошибок. Поиски по ссылкам для объектов метаданных 1С, связи, типы реквизитов и т.д. - без предварительно построенных индексов ответы на такие запросы будут неточными и шумными.
 
@@ -266,4 +266,4 @@ MIT (наследуется от [rlm-tools](https://github.com/stefanoshea/rlm-
 
 ## В каталогах
 
-[![Проверено SkillFoxx](https://skillfoxx.ru/badges/mcp/rlm-tools-bsl.svg)](https://skillfoxx.ru/mcp/rlm-tools-bsl?utm_source=github&utm_medium=badge&utm_campaign=readme)
+[![В каталоге SkillFoxx](https://img.shields.io/endpoint?url=https%3A%2F%2Fskillfoxx.ru%2Fbadges%2Fmcp%2Frlm-tools-bsl.json&style=flat)](https://skillfoxx.ru/mcp/rlm-tools-bsl?utm_source=github&utm_medium=badge&utm_campaign=readme)

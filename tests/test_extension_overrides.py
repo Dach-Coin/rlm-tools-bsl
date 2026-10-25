@@ -382,7 +382,8 @@ class TestGetOverridesTruncated:
 
         monkeypatch.setattr(ed, "detect_extension_context", lambda _p: _Ctx())
 
-        def _find(_p, _o=None, diagnostics=None):
+        # v1.47.0: прежде здесь не было `main_root` — живой сканер получает корень основной конфигурации
+        def _find(_p, _o=None, diagnostics=None, main_root=None):
             if diagnostics is not None:
                 diagnostics.update({"complete": True})
             return list(big)
@@ -412,7 +413,8 @@ class TestGetOverridesTruncated:
             current = _Cur()
             nearby_extensions = [_Ext("РасшA", "/ext/a"), _Ext("РасшB", "/ext/b")]
 
-        def _find(path, _object=None, diagnostics=None):
+        # v1.47.0: прежде здесь не было `main_root` — живой сканер получает корень основной конфигурации
+        def _find(path, _object=None, diagnostics=None, main_root=None):
             if path == "/ext/b":
                 raise PermissionError("denied")
             diagnostics.update(
@@ -461,7 +463,8 @@ class TestGetOverridesTruncated:
             current = _Cur()
             nearby_extensions = [_Ext()]
 
-        def _find(path, _object=None, diagnostics=None):
+        # v1.47.0: прежде здесь не было `main_root` — живой сканер получает корень основной конфигурации
+        def _find(path, _object=None, diagnostics=None, main_root=None):
             diagnostics.update(
                 {
                     "root": path,
@@ -529,7 +532,8 @@ class TestGetOverridesTruncated:
             current = _Cur()
             nearby_extensions = [_Ext()]
 
-        def _find(path, _object=None, diagnostics=None):
+        # v1.47.0: прежде здесь не было `main_root` — живой сканер получает корень основной конфигурации
+        def _find(path, _object=None, diagnostics=None, main_root=None):
             assert path == "/ext/known"
             diagnostics.update({"complete": True, "files_scanned": 1})
             return [{"object_name": "Док", "target_method": "ПриЗаписи", "annotation": "После"}]
@@ -550,7 +554,8 @@ class TestGetOverridesTruncated:
 
         big = [{"target_method": f"M{i}", "annotation": "Перед"} for i in range(250)]
 
-        def _find(_p, _o=None, diagnostics=None):
+        # v1.47.0: прежде здесь не было `main_root` — живой сканер получает корень основной конфигурации
+        def _find(_p, _o=None, diagnostics=None, main_root=None):
             if diagnostics is not None:
                 diagnostics.update({"complete": True})
             return list(big)
@@ -568,7 +573,8 @@ class TestGetOverridesTruncated:
 
         small = [{"target_method": f"M{i}", "annotation": "Перед"} for i in range(5)]
 
-        def _find(_p, _o=None, diagnostics=None):
+        # v1.47.0: прежде здесь не было `main_root` — живой сканер получает корень основной конфигурации
+        def _find(_p, _o=None, diagnostics=None, main_root=None):
             if diagnostics is not None:
                 diagnostics.update({"complete": False, "unreadable_files": ["Module.bsl"]})
             return list(small)

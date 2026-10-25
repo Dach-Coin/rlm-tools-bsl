@@ -144,7 +144,7 @@ LLM (if available):
    Значения index | live | index+live | unavailable — у ВЕРХНЕУРОВНЕВОГО source и
    _meta.source тех хелперов, что объявляют coverage-контракт. Поле перегружено:
    у секций get_object_profile это index|live|mixed|unknown, у строк code_registers
-   в find_register_movements — code|manager_code. Значения смотри у своего хелпера.
+   в find_register_movements — code|manager_code|movement_table. Значения смотри у своего хелпера.
 2. owner — КОМУ принадлежит КОНКРЕТНАЯ строка: 'main' либо 'extension:<Имя>'.
    Признак расширения — owner.startswith('extension:'), имя — хвост после ':'.
    Ключ безусловен (в том числе на конфигурации БЕЗ расширений) в тех строковых
@@ -269,7 +269,7 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "pair": ("find_register_movements", "find_register_writers"),
         "summary": "document → Posting/CFE-filtered candidates vs register → static candidates",
         "when_a": "документ → какие регистры пишет (есть is_postable).",
-        "when_b": "регистр → статические ссылки документов (runtime_filtered=False).",
+        "when_b": "регистр → документы: запись в коде и объявившие (declared_documents).",
         "rule": "find_register_movements применяет Posting/CFE; main-строка остается снимком и после изменения кода требует проверки живого модуля.",
         "tags": ["registers", "document"],
     },
@@ -284,8 +284,8 @@ DISAMBIGUATION_PAIRS: list[dict] = [
     {
         "pair": ("find_references_to_object", "find_code_usages"),
         "summary": "metadata-XML references vs in-code usages",
-        "when_a": "find_references_to_object — ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов, владелец, основание ввода, подсистемы, права, ФО, ПВХ, DefinedType. Код модулей НЕ сканирует.",
-        "when_b": 'find_code_usages — ОБРАЩЕНИЯ В КОДЕ: Документы.X (manager), "ДокументСсылка.X" (ref_type), запросы Документ.X.ТЧ (query, member=имя ТЧ). Метаданные-XML НЕ сканирует.',
+        "when_a": "find_references_to_object — ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов, владелец, основание ввода, подсистемы, права, ФО, ПВХ, DefinedType, журналы, критерии отбора, связующие свойства, формы. Код модулей НЕ сканирует.",
+        "when_b": 'find_code_usages — ОБРАЩЕНИЯ В КОДЕ: Документы.X.Член (manager), "ДокументСсылка.X" (ref_type), запросы Документ.X.ТЧ (query), Метаданные.Документы.X (metadata), пути форм "Документ.X.Форма.Ф" (form). Метаданные-XML НЕ сканирует.',
         "rule": "Это РАЗНЫЕ слои. «Где объявлен/связан» → find_references_to_object. «Где используется в коде» → find_code_usages. Нужны оба — find_references_to_object(obj, include_code=True). Доступ к реквизитам через локальные переменные — вне охвата find_code_usages; охват кода расширений зависит от маршрута и назван в _meta.extensions_included.",
         "tags": ["references", "code", "usages"],
     },

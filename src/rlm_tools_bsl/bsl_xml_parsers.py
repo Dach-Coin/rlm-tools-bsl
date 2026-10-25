@@ -105,16 +105,27 @@ def _cf_find_synonym(props, ns: dict = _NS_CF) -> str:
     return ""
 
 
-def _cf_parse_type(props, ns: dict = _NS_CF) -> str:
-    """Extract type string from CF <Type> element."""
-    type_el = props.find("md:Type", ns)
+def _cf_type_tokens(type_el) -> list[str]:
+    """Токены типа CF-узла ``<Type>``: тексты дочерних ``<v8:Type>`` и ``<v8:TypeSet>`` в порядке документа.
+
+    v1.47.0: тип-набор (``<v8:TypeSet>cfg:DefinedType.X</v8:TypeSet>``, ``cfg:ChartOfAccountsRef``,
+    ``cfg:Characteristic.X`` — значения характеристик ПВХ) — тоже тип:
+    прежде читался только ``<v8:Type>``, и реквизит определяемого типа получал пустой тип. EDT пишет те же токены
+    в ``<types>`` (без ``cfg:``), поэтому одна конфигурация в двух форматах теперь отвечает одинаково. Имя тега —
+    локальное: тот же узел у описателей объектов (пространство ``md``) и у реквизитов форм (``logform``)."""
     if type_el is None:
-        return ""
-    types = []
-    for t in type_el.findall("v8:Type", ns):
-        if t.text:
-            types.append(t.text.strip())
-    return ", ".join(types)
+        return []
+    tokens: list[str] = []
+    for t in type_el:
+        local = t.tag.split("}")[-1] if "}" in t.tag else t.tag
+        if local in ("Type", "TypeSet") and t.text and t.text.strip():
+            tokens.append(t.text.strip())
+    return tokens
+
+
+def _cf_parse_type(props, ns: dict = _NS_CF) -> str:
+    """Extract type string from CF <Type> element (``<v8:Type>`` и ``<v8:TypeSet>``, v1.47.0)."""
+    return ", ".join(_cf_type_tokens(props.find("md:Type", ns)))
 
 
 _XS_TYPE_MAP: dict[str, str] = {
@@ -708,6 +719,30 @@ def _build_ru_reftype_map() -> dict[str, str]:
 _CODE_MANAGER_COLLECTIONS: dict[str, str] = _build_manager_collection_map()
 _CODE_QUERY_COLLECTIONS: dict[str, str] = _build_query_collection_map()
 _RU_REFTYPE_TO_CANONICAL: dict[str, str] = _build_ru_reftype_map()
+# v1.47.0: коллекции `Метаданные.<Коллекция>.X` / `Metadata.<Collection>.X` в коде — те же множественные формы
+# управляемых категорий, что у менеджера; коллекции без менеджера (`ОпределяемыеТипы`, `Роли`, `Подсистемы`, …)
+# вне охвата `find_code_usages`.
+_CODE_METADATA_COLLECTIONS: dict[str, str] = _CODE_MANAGER_COLLECTIONS
+# v1.47.0: стандартные формы объекта третьим сегментом пути литерала (`"Справочник.X.ФормаВыбора"`) — закрытый
+# список, без учёта регистра: третий сегмент на «Форма…» бывает и именем табличной части или реквизита
+# (`ФормаОплаты`, `ФормаДокумента`), поэтому по префиксу форма не узнаётся.
+_STANDARD_FORM_NAMES: frozenset[str] = frozenset(
+    name.casefold()
+    for name in (
+        "ФормаОбъекта",
+        "ФормаСписка",
+        "ФормаВыбора",
+        "ФормаГруппы",
+        "ФормаВыбораГруппы",
+        "ФормаЗаписи",
+        "ObjectForm",
+        "ListForm",
+        "ChoiceForm",
+        "FolderForm",
+        "FolderChoiceForm",
+        "RecordForm",
+    )
+)
 
 # Категория-папка → голова канонической ссылки: ``Documents`` → ``Document``,
 # ``ChartsOfAccounts`` → ``ChartOfAccounts``. Производная от того же
@@ -743,6 +778,65 @@ def _ref_each(raw: str):
         canon = canonicalize_type_ref(part)
         if canon:
             yield canon
+
+
+# v1.47.0: связующие свойства описателя — ``тип объекта → ((тег CF, тег EDT), …)``; суффикс ``used_in`` — тег CF
+# (написание Конфигуратора, как у ``BasedOn``). Перечень закрыт переписью выгрузок: вытесняющие и ведущие виды расчёта —
+# стандартные табличные части плана видов расчёта, а не свойства. У EDT свойство — только прямой потомок корня:
+# ``extDimensionTypes`` встречается и во вложенных узлах (``producedTypes``, табличные части).
+_LINKED_OBJECT_PROPS: dict[str, tuple[tuple[str, str], ...]] = {
+    "AccountingRegister": (("ChartOfAccounts", "chartOfAccounts"),),
+    "ChartOfAccounts": (("ExtDimensionTypes", "extDimensionTypes"),),
+    "CalculationRegister": (("ChartOfCalculationTypes", "chartOfCalculationTypes"), ("Schedule", "schedule")),
+    "ChartOfCalculationTypes": (("BaseCalculationTypes", "baseCalculationTypes"),),
+    "BusinessProcess": (("Task", "task"),),
+}
+
+
+def _journal_content_refs(registered: list[str]) -> list[dict]:
+    """v1.47.0: журнал регистрирует документ — ``document_journal_content``, суффикс ``RegisteredDocuments``."""
+    out: list[dict] = []
+    for text in registered:
+        canon = canonicalize_type_ref(text)
+        if canon:
+            out.append(
+                {"ref_object": canon, "ref_kind": "document_journal_content", "used_in_suffix": "RegisteredDocuments"}
+            )
+    return out
+
+
+def _filter_criterion_refs(type_tokens: list[str], content_items: list[str]) -> list[dict]:
+    """v1.47.0: критерий отбора — тип (``filter_criterion_type``, суффикс ``Type``) и состав
+    (``filter_criterion_content``, суффикс ``Content``).
+
+    Элемент состава — путь реквизита (``Document.X.Attribute.Y``, ``Document.X.TabularSection.T.Attribute.Y``);
+    ссылка — на ОБЪЕКТ: два первых сегмента, затем ``canonicalize_type_ref`` (по полному пути она отдала бы путь
+    целиком). Одна строка на объект: в составе один документ стоит многими реквизитами."""
+    out: list[dict] = []
+    for token in type_tokens:
+        canon = canonicalize_type_ref(token)
+        if canon:
+            out.append({"ref_object": canon, "ref_kind": "filter_criterion_type", "used_in_suffix": "Type"})
+    seen: set[str] = set()
+    for item in content_items:
+        parts = item.split(".")
+        if len(parts) < 2:
+            continue
+        canon = canonicalize_type_ref(".".join(parts[:2]))
+        if canon and canon not in seen:
+            seen.add(canon)
+            out.append({"ref_object": canon, "ref_kind": "filter_criterion_content", "used_in_suffix": "Content"})
+    return out
+
+
+def _linked_object_refs(prop: str, values: list[str]) -> list[dict]:
+    """v1.47.0: связующее свойство (`_LINKED_OBJECT_PROPS`) — ``linked_object``, суффикс — имя свойства."""
+    out: list[dict] = []
+    for text in values:
+        canon = canonicalize_type_ref(text)
+        if canon:
+            out.append({"ref_object": canon, "ref_kind": "linked_object", "used_in_suffix": prop})
+    return out
 
 
 def _parse_cf_xml(root) -> dict:
@@ -875,6 +969,26 @@ def _parse_cf_xml(root) -> dict:
     if resources:
         result["resources"] = resources
 
+    # v1.47.0: реквизиты адресации задачи (<ChildObjects><AddressingAttribute>) — прежде не читались вовсе.
+    addressing = []
+    for addr_el in search_el.findall("md:AddressingAttribute", ns):
+        addr_props = addr_el.find("md:Properties", ns)
+        if addr_props is None:
+            continue
+        addr_name = _xml_find_text(addr_props, "md:Name", ns)
+        addr_type = _cf_parse_type(addr_props, ns)
+        addressing.append({"name": addr_name, "synonym": _cf_find_synonym(addr_props, ns), "type": addr_type})
+        for canon in _ref_each(addr_type):
+            references.append(
+                {
+                    "ref_object": canon,
+                    "ref_kind": "attribute_type",
+                    "used_in_suffix": f"AddressingAttribute.{addr_name}.Type",
+                }
+            )
+    if addressing:
+        result["addressing_attributes"] = addressing
+
     if props is not None:
         content_el = props.find("md:Content", ns)
         if content_el is not None:
@@ -955,12 +1069,12 @@ def _parse_cf_xml(root) -> dict:
                             }
                         )
 
-        # ChartsOfCharacteristicTypes Type list
+        # ChartsOfCharacteristicTypes Type list (v1.47.0: и тип-набор <v8:TypeSet>)
         type_el = props.find("md:Type", ns)
         if type_el is not None and meta_tag in ("ChartOfCharacteristicTypes", "Constant"):
-            for t in type_el.findall("v8:Type", ns):
-                if t.text:
-                    canon = canonicalize_type_ref(t.text.strip())
+            for token in _cf_type_tokens(type_el):
+                if token:
+                    canon = canonicalize_type_ref(token)
                     if canon:
                         references.append(
                             {
@@ -1017,6 +1131,24 @@ def _parse_cf_xml(root) -> dict:
                         break
             if posting_text:
                 result["posting"] = posting_text
+
+        # v1.47.0: журнал документов, критерий отбора и связующие свойства — ссылки, которые описатель называет явно.
+        if meta_tag == "DocumentJournal":
+            reg_el = props.find("md:RegisteredDocuments", ns)
+            registered = [i.text.strip() for i in reg_el.findall("xr:Item", ns) if i.text] if reg_el is not None else []
+            references.extend(_journal_content_refs(registered))
+        elif meta_tag == "FilterCriterion":
+            references.extend(
+                _filter_criterion_refs(_cf_type_tokens(props.find("md:Type", ns)), result.get("content") or [])
+            )
+        for cf_tag, _edt_tag in _LINKED_OBJECT_PROPS.get(meta_tag, ()):
+            link_el = props.find(f"md:{cf_tag}", ns)
+            if link_el is None:
+                continue
+            values = [i.text.strip() for i in link_el.findall("xr:Item", ns) if i.text]
+            if not values and link_el.text and link_el.text.strip():
+                values = [link_el.text.strip()]
+            references.extend(_linked_object_refs(cf_tag, values))
 
     # v1.44.0: имена форм и команд — паритет с EDT-веткой. В выгрузке Конфигуратора форма —
     # текстовый узел `<Form>Имя</Form>`, команда — `<Command><Properties><Name>`; прежде
@@ -1198,6 +1330,26 @@ def _parse_mdo_xml(root) -> dict:
     if resources:
         result["resources"] = resources
 
+    # v1.47.0: реквизиты адресации задачи (<addressingAttributes>) — прежде не читались вовсе.
+    addressing = []
+    for ch in root:
+        local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
+        if local != "addressingAttributes":
+            continue
+        addr_name = _xml_direct_text(ch, "name")
+        addr_type = _mdo_parse_type(ch)
+        addressing.append({"name": addr_name, "synonym": _mdo_find_synonym(ch), "type": addr_type})
+        for canon in _ref_each(addr_type):
+            references.append(
+                {
+                    "ref_object": canon,
+                    "ref_kind": "attribute_type",
+                    "used_in_suffix": f"AddressingAttribute.{addr_name}.Type",
+                }
+            )
+    if addressing:
+        result["addressing_attributes"] = addressing
+
     # Subsystem content: <content> direct children with text
     content_items = []
     for ch in root:
@@ -1355,6 +1507,22 @@ def _parse_mdo_xml(root) -> dict:
             result["posting"] = posting_text
         elif _xml_direct_text(root, "objectBelonging") != "Adopted":
             result["posting"] = "Allow"
+
+    # v1.47.0: журнал документов, критерий отбора и связующие свойства — те же строки, что у CF-ветки.
+    def _local(el) -> str:
+        return el.tag.split("}")[-1] if "}" in el.tag else el.tag
+
+    if meta_tag == "DocumentJournal":
+        registered = [ch.text.strip() for ch in root if _local(ch) == "registeredDocuments" and ch.text]
+        references.extend(_journal_content_refs(registered))
+    elif meta_tag == "FilterCriterion":
+        type_tokens = [
+            t.text.strip() for ch in root if _local(ch) == "type" for t in ch if _local(t) == "types" and t.text
+        ]
+        references.extend(_filter_criterion_refs(type_tokens, content_items))
+    for cf_tag, edt_tag in _LINKED_OBJECT_PROPS.get(meta_tag, ()):
+        values = [ch.text.strip() for ch in root if _local(ch) == edt_tag and ch.text and ch.text.strip()]
+        references.extend(_linked_object_refs(cf_tag, values))
 
     if references:
         result["references"] = references
@@ -1579,7 +1747,10 @@ def _parse_mdo_scheduled_job(xml_content: str) -> dict | None:
         "name": name,
         "synonym": synonym,
         "method_name": method_name,
-        "use": True,  # EDT format doesn't have explicit <use> — defaults to true
+        # v1.47.0: EDT пишет `<use>true</use>` и опускает значение по умолчанию `false` — узла нет,
+        # значит задание выключено (прежде здесь стояло безусловное True: на боевой EDT-конфигурации
+        # «включены» были все 247 заданий при 81 настоящем `<use>true</use>`).
+        "use": _xml_direct_text(root, "use").lower() == "true",
         "predefined": predefined_text.lower() == "true" if predefined_text else False,
         "restart_on_failure": {
             "count": int(restart_count) if restart_count else 0,
@@ -2491,11 +2662,8 @@ def parse_pvh_characteristics(xml_content: str) -> dict | None:
         if props is None:
             return None
         name = _xml_find_text(props, "md:Name", ns)
-        type_el = props.find("md:Type", ns)
-        if type_el is not None:
-            for t in type_el.findall("v8:Type", ns):
-                if t.text:
-                    types.append(_strip_ns_prefix(t.text.strip()))
+        # v1.47.0: и тип-набор <v8:TypeSet> (cfg:DefinedType.X) — как <types> у EDT
+        types.extend(_strip_ns_prefix(token) for token in _cf_type_tokens(props.find("md:Type", ns)))
 
     if not name:
         return None
@@ -2583,19 +2751,36 @@ def parse_command_parameter_type(xml_content: str) -> list[dict]:
 
 
 def parse_object_commands_parameter_types(mdo_text: str) -> list[dict]:
-    """EDT: типы параметров команд ОБЪЕКТА из .mdo владельца — ``[{command_name, ref_object}]``.
+    """Типы параметров команд ОБЪЕКТА из описателя владельца — ``[{command_name, ref_object}]``.
 
     В EDT команда объекта описана внутри описателя владельца (``<commands>`` →
     ``<commandParameterType>`` → ``<types>``); в каталоге ``Commands/<Имя>/`` лежит только модуль.
     Корень — любой объект mdclass. Локальные имена тегов допускают XML-префикс и атрибуты:
-    точный поиск открывающего тега отрезал бы валидный ``<mdclass:commandParameterType>``."""
-    if not mdo_text or "commandParameterType" not in mdo_text:
+    точный поиск открывающего тега отрезал бы валидный ``<mdclass:commandParameterType>``.
+
+    v1.47.0 — и описатель выгрузки Конфигуратора: ``<MetaDataObject>`` → объект → ``<ChildObjects><Command>``
+    → ``<Properties><CommandParameterType>`` (``<v8:Type>`` и ``<v8:TypeSet>``, ``_cf_type_tokens``); прежде
+    команды объектов CF в ссылки не попадали. Префильтр по сырому тексту принимает оба написания тега."""
+    if not mdo_text or ("commandParameterType" not in mdo_text and "CommandParameterType" not in mdo_text):
         return []
     try:
         root = ET.fromstring(mdo_text)
     except ET.ParseError:
         return []
     out: list[dict] = []
+    if (root.tag.split("}")[-1] if "}" in root.tag else root.tag) == "MetaDataObject":
+        for obj_el in root:
+            children = obj_el.find("md:ChildObjects", _NS_CF)
+            for cmd_el in children.findall("md:Command", _NS_CF) if children is not None else []:
+                props = cmd_el.find("md:Properties", _NS_CF)
+                if props is None:
+                    continue
+                name = _xml_find_text(props, "md:Name", _NS_CF)
+                for token in _cf_type_tokens(props.find("md:CommandParameterType", _NS_CF)):
+                    canon = canonicalize_type_ref(token)
+                    if canon:
+                        out.append({"command_name": name, "ref_object": canon})
+        return out
     for ch in root:
         if (ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag) != "commands":
             continue
@@ -3292,14 +3477,9 @@ def _parse_form_cf(root) -> dict:
                 if el is not None and el.text:
                     is_main = el.text.strip().lower() == "true"
                     break
-            # type
-            type_el = attr.find("{%s}Type" % _FORM_NS_CF)
-            types: list[str] = []
-            if type_el is not None:
-                for t in type_el:
-                    t_local = t.tag.split("}")[-1] if "}" in t.tag else t.tag
-                    if t_local == "Type" and t.text:
-                        types.append(t.text.strip())
+            # type — v1.47.0: и тип-набор <v8:TypeSet> (токен с префиксом, как прочие типы CF);
+            # пустой список — только у реквизита без типа (<Type/>)
+            types: list[str] = _cf_type_tokens(attr.find("{%s}Type" % _FORM_NS_CF))
             # DynamicList settings
             main_table = ""
             query_text = ""
@@ -3325,12 +3505,12 @@ def _parse_form_cf(root) -> dict:
     return {"handlers": handlers, "commands": commands, "attributes": attributes}
 
 
-def parse_form_xml(xml_content: str) -> dict | None:
-    """Parse a 1C form XML (CF or EDT) → handlers, commands, attributes.
+def _parse_form_root(xml_content: str) -> tuple[ET.Element, str] | None:
+    """Корень формы и её формат (``'cf'``/``'edt'``) — v1.47.0: один ``ET.fromstring`` на форму.
 
-    Auto-detects format by namespace.
-    Returns None on parse error.
-    """
+    Сборщик отдаёт этот корень и разбору элементов (`_parse_form_cf`/`_parse_form_edt`), и разбору
+    ссылок (`parse_form_type_refs`): второй разбор той же формы стоил бы заметной доли полной сборки.
+    Пустой текст, битый XML или не форма — ``None``."""
     if not xml_content or not xml_content.strip():
         return None
     try:
@@ -3339,7 +3519,232 @@ def parse_form_xml(xml_content: str) -> dict | None:
         return None
 
     if _FORM_NS_EDT in xml_content:
-        return _parse_form_edt(root)
+        return root, "edt"
     if _FORM_NS_CF in xml_content:
-        return _parse_form_cf(root)
+        return root, "cf"
     return None
+
+
+def parse_form_xml(xml_content: str) -> dict | None:
+    """Parse a 1C form XML (CF or EDT) → handlers, commands, attributes.
+
+    Auto-detects format by namespace.
+    Returns None on parse error.
+    """
+    parsed = _parse_form_root(xml_content)
+    if parsed is None:
+        return None
+    root, fmt = parsed
+    return _parse_form_edt(root) if fmt == "edt" else _parse_form_cf(root)
+
+
+# v1.47.0: `callType` перехвата формы расширения → аннотация перехвата метода (тот же словарь, что у `&…`).
+FORM_CALL_TYPE_ANNOTATIONS: dict[str, str] = {"Before": "Перед", "After": "После", "Override": "Вместо"}
+
+# Узлы формы с атрибутом `name`, которые не элементы: реквизиты, их колонки, параметры, команды (у команд свой
+# список), события и действия. Имена прочих узлов `<BaseForm>` — перенятые расширением элементы.
+_FORM_NON_ELEMENT_TAGS = frozenset({"Attribute", "Column", "Parameter", "Command", "Event", "Action"})
+
+
+def parse_form_event_handlers(xml_content: str) -> tuple[dict[tuple[str, str], str], list[dict]]:
+    """Обработчики событий и действий команд формы выгрузки Конфигуратора (v1.47.0) — для перехватов расширений.
+
+    Возвращает ``(обработчики без callType {(элемент, событие): процедура}, перехваты [{item, event, call_type,
+    handler, line}])``. Узел — ``<Event name="…">Процедура</Event>`` (событие — атрибут ``name``) и
+    ``<Action>Процедура</Action>`` команды (событие — ``'Action'``); элемент — имя ближайшего предка с атрибутом
+    ``name`` (``''`` — сама форма, у команды — имя команды); ``line`` — строка узла в XML. Копия базовой формы
+    внутри ``<BaseForm>`` (её пишет расширение) как обработчики не читается: из неё берутся только имена перенятого.
+    Перехват — только у перенятого: в форме с ``<BaseForm>`` платформа пишет ``callType`` у КАЖДОГО обработчика, в
+    том числе у своих элементов и команд расширения, а им перехватывать нечего — событие или действие команды, чьего
+    имени нет среди узлов ``<BaseForm>`` того же вида (действие команды — среди команд, событие — среди элементов), в
+    перехваты не попадает; событие самой формы — перехват. В форме без ``<BaseForm>`` отбора нет (своих форм с
+    ``callType`` на корпусе нет). EDT (``Form.form``) — ``({}, [])``: граница — перехватов форм EDT на корпусе нет.
+    Битый XML — ``({}, [])``."""
+    if not xml_content or _FORM_NS_CF not in xml_content:
+        return {}, []
+    import xml.parsers.expat as expat
+
+    handlers: dict[tuple[str, str], str] = {}
+    intercepts: list[dict] = []
+    stack: list[str | None] = []  # атрибут name узлов-предков
+    state: dict = {"base_depth": None, "current": None, "has_base": False}
+    base_commands: set[str] = set()  # имена перенятых команд и элементов (из `<BaseForm>`), casefold
+    base_elements: set[str] = set()
+    parser = expat.ParserCreate()
+
+    def _local(tag: str) -> str:
+        return tag.rsplit(":", 1)[-1]
+
+    def _start(tag: str, attrs: dict) -> None:
+        local = _local(tag)
+        if state["base_depth"] is None and local == "BaseForm":
+            state["base_depth"] = len(stack)
+            state["has_base"] = True
+        elif state["base_depth"] is not None and attrs.get("name") is not None:
+            if local == "Command":
+                base_commands.add(attrs["name"].casefold())
+            elif local not in _FORM_NON_ELEMENT_TAGS:
+                base_elements.add(attrs["name"].casefold())
+        if state["base_depth"] is None and local in ("Event", "Action") and state["current"] is None:
+            item = next((name for name in reversed(stack) if name is not None), "")
+            state["current"] = {
+                "item": item,
+                "event": attrs.get("name", "") if local == "Event" else "Action",
+                "call_type": attrs.get("callType") or "",
+                "line": parser.CurrentLineNumber,
+                "depth": len(stack),
+                "text": [],
+            }
+        stack.append(attrs.get("name"))
+
+    def _end(tag: str) -> None:
+        stack.pop()
+        current = state["current"]
+        if current is not None and len(stack) == current["depth"]:
+            handler = "".join(current["text"]).strip()
+            if handler:
+                if current["call_type"]:
+                    intercepts.append(
+                        {
+                            "item": current["item"],
+                            "event": current["event"],
+                            "call_type": current["call_type"],
+                            "handler": handler,
+                            "line": current["line"],
+                        }
+                    )
+                else:
+                    handlers.setdefault((current["item"], current["event"]), handler)
+            state["current"] = None
+        if state["base_depth"] is not None and len(stack) == state["base_depth"] and _local(tag) == "BaseForm":
+            state["base_depth"] = None
+
+    def _chars(data: str) -> None:
+        if state["current"] is not None:
+            state["current"]["text"].append(data)
+
+    parser.StartElementHandler = _start
+    parser.EndElementHandler = _end
+    parser.CharacterDataHandler = _chars
+    try:
+        parser.Parse(xml_content, True)
+    except expat.ExpatError:
+        return {}, []
+    if state["has_base"]:
+        intercepts = [
+            it
+            for it in intercepts
+            if not it["item"] or it["item"].casefold() in (base_commands if it["event"] == "Action" else base_elements)
+        ]
+    return handlers, intercepts
+
+
+_V8_CORE_NS = "http://v8.1c.ru/8.1/data/core"
+
+
+def parse_form_type_refs(root: ET.Element, fmt: str) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Ссылки формы на объекты метаданных и тексты запросов динамических списков (v1.47.0).
+
+    ``fmt`` — ``'cf'``/``'edt'`` (`_parse_form_root`). Возвращает ``(ссылки, тексты)``:
+
+    * ссылки — ``{ref_object, kind, used_in_suffix}``, одна на пару (ссылка, суффикс):
+      ``form_attribute_type`` — каждый ссылочный тип под узлом реквизита формы на любой глубине (сам реквизит,
+      колонки и дополнительные колонки, типы элементов списка значений, параметры динамического списка) и под
+      параметром формы; суффикс ``Attribute.<Р>.Type``, ``Attribute.<Р>.Column.<К>.Type`` (ближайшая колонка),
+      ``Parameter.<П>.Type``. Контейнер типа — узел с прямыми потомками ``<v8:Type>``/``<v8:TypeSet>`` (CF:
+      ``<Type>``, ``<Settings xsi:type="v8:TypeDescription">``, ``<dcssch:valueType>``) либо ``<types>`` (EDT:
+      ``valueType``, ``itemValueType``). ``form_main_table`` — основная таблица динамического списка (два первых
+      сегмента пути), суффикс ``Attribute.<Р>.MainTable``;
+    * тексты — ``[("Attribute.<Р>.QueryText", полный текст)]`` (не усечённый, в отличие от ``query_text``
+      у `parse_form_xml`); объекты в них называет `bsl_index._query_text_refs`."""
+    refs: list[dict] = []
+    texts: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _local(el) -> str:
+        return el.tag.split("}")[-1] if "}" in el.tag else el.tag
+
+    def _add(kind: str, token: str, suffix: str) -> None:
+        canon = canonicalize_type_ref(token)
+        if canon and (canon, suffix) not in seen:
+            seen.add((canon, suffix))
+            refs.append({"ref_object": canon, "kind": kind, "used_in_suffix": suffix})
+
+    def _main_table(text: str, attr: str) -> None:
+        parts = (text or "").strip().split(".")
+        if len(parts) >= 2:
+            _add("form_main_table", ".".join(parts[:2]), f"Attribute.{attr}.MainTable")
+
+    if fmt == "cf":
+        type_tags = (f"{{{_V8_CORE_NS}}}Type", f"{{{_V8_CORE_NS}}}TypeSet")
+        column_tag = f"{{{_FORM_NS_CF}}}Column"
+
+        def _walk_cf(el, prefix: str, column: str | None) -> None:
+            suffix = f"{prefix}.Column.{column}.Type" if column else f"{prefix}.Type"
+            for ch in el:
+                if ch.tag in type_tags:
+                    if ch.text and ch.text.strip():
+                        _add("form_attribute_type", ch.text.strip(), suffix)
+                elif ch.tag == column_tag:
+                    _walk_cf(ch, prefix, ch.get("name") or column)
+                else:
+                    _walk_cf(ch, prefix, column)
+
+        attrs_el = root.find("{%s}Attributes" % _FORM_NS_CF)
+        for attr in attrs_el if attrs_el is not None else []:
+            name = attr.get("name", "") if _local(attr) == "Attribute" else ""
+            if not name:
+                continue
+            _walk_cf(attr, f"Attribute.{name}", None)
+            settings_el = attr.find("{%s}Settings" % _FORM_NS_CF)
+            xsi_type = (
+                settings_el.get("{http://www.w3.org/2001/XMLSchema-instance}type", "")
+                if settings_el is not None
+                else ""
+            )
+            if "DynamicList" in xsi_type:
+                mt_el = settings_el.find("{%s}MainTable" % _FORM_NS_CF)
+                if mt_el is not None and mt_el.text:
+                    _main_table(mt_el.text, name)
+                qt_el = settings_el.find("{%s}QueryText" % _FORM_NS_CF)
+                if qt_el is not None and qt_el.text and qt_el.text.strip():
+                    texts.append((f"Attribute.{name}.QueryText", qt_el.text))
+        params_el = root.find("{%s}Parameters" % _FORM_NS_CF)
+        for param in params_el if params_el is not None else []:
+            name = param.get("name", "") if _local(param) == "Parameter" else ""
+            if name:
+                _walk_cf(param, f"Parameter.{name}", None)
+        return refs, texts
+
+    def _walk_edt(el, prefix: str, column: str | None) -> None:
+        suffix = f"{prefix}.Column.{column}.Type" if column else f"{prefix}.Type"
+        for ch in el:
+            local = _local(ch)
+            if local == "types":
+                if ch.text and ch.text.strip():
+                    _add("form_attribute_type", ch.text.strip(), suffix)
+            elif local == "columns":
+                _walk_edt(ch, prefix, _xml_direct_text(ch, "name") or column)
+            else:
+                _walk_edt(ch, prefix, column)
+
+    for ch in root:
+        local = _local(ch)
+        if local not in ("attributes", "parameters"):
+            continue
+        name = _xml_direct_text(ch, "name")
+        if not name:
+            continue
+        if local == "parameters":
+            _walk_edt(ch, f"Parameter.{name}", None)
+            continue
+        _walk_edt(ch, f"Attribute.{name}", None)
+        ext = _find_child(ch, "extInfo")
+        if ext is not None:
+            main_table = _xml_direct_text(ext, "mainTable")
+            if main_table:
+                _main_table(main_table, name)
+            qt_el = _find_child(ext, "queryText")
+            if qt_el is not None and qt_el.text and qt_el.text.strip():
+                texts.append((f"Attribute.{name}.QueryText", qt_el.text))
+    return refs, texts

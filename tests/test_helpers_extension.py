@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import textwrap
 
 import pytest
@@ -114,7 +115,8 @@ _EXT_PREDEFINED_XML = textwrap.dedent("""\
 
 
 # Subsystem with empty <Synonym> — exercises the "metadata-XML pass without synonym filter"
-# branch. _collect_object_synonyms drops these; _iter_metadata_xml_files keeps them.
+# branch. _iter_metadata_xml_files keeps them; _collect_object_synonyms dropped them before
+# v1.47.0 (now it writes a row with an empty synonym).
 _EXT_SUBSYSTEM_XML = textwrap.dedent("""\
     <?xml version="1.0" encoding="UTF-8"?>
     <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
@@ -519,8 +521,8 @@ class TestExtensionAttributes:
     def test_parse_object_xml_for_xml_only_extension_object_without_synonym(self, helpers_with_ext):
         """Subsystems/ExtSubsystemNoSyn has empty <Synonym>.
 
-        ``_collect_object_synonyms`` drops it; ``_extension_metadata_xml`` must
-        still include it via the independent path-scan (round-3 H1).
+        ``_extension_metadata_xml`` must include it via the independent path-scan
+        (round-3 H1) — ``_collect_object_synonyms`` dropped it before v1.47.0.
         """
         bsl, _cf, _cfe = helpers_with_ext
         parsed = bsl["parse_object_xml"]("Subsystems/ExtSubsystemNoSyn")
@@ -828,9 +830,19 @@ def test_analyze_subsystem_empty_cfe_ext_layout_is_found(tmp_path, monkeypatch, 
                     "SELECT COUNT(*) FROM object_synonyms "
                     "WHERE category='Subsystems' AND object_name='ExtSubsystemNoSyn'"
                 ).fetchone()[0]
-            assert (n_content, n_synonyms) == (0, 0), (
-                "предусловие: единственным индексным источником обязан быть file_paths"
-            )
+            # v1.47.0: прежде здесь стояло `(0, 0)` — строки синонима у подсистемы без `<Synonym>` не было.
+            # Теперь она есть (пустой синоним), и кандидата дают оба источника — одним путём. Предикат
+            # `file_paths` проверяется в одиночку: строка синонима снимается.
+            assert (n_content, n_synonyms) == (0, 1), "предусловие: строк состава нет, строка синонима — пустая"
+            assert reader.get_subsystem_lookup("ExtSubsystemNoSyn")["direct_candidates"] == [rel]
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    "DELETE FROM object_synonyms WHERE category='Subsystems' AND object_name='ExtSubsystemNoSyn'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
             lookup = reader.get_subsystem_lookup("ExtSubsystemNoSyn")
             assert lookup["direct"] == []
             assert lookup["direct_candidates"] == [rel]

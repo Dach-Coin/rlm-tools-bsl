@@ -1292,15 +1292,21 @@ def test_selective_collection_keeps_based_on_for_the_extra_categories(tmp_path):
     def _bp_rows(tables):
         return [r for r in tables["metadata_references"] if r[1] == "BusinessProcesses" and r[3] == "based_on"]
 
+    from rlm_tools_bsl.bsl_index import _ATTR_CATEGORIES, _PREDEFINED_CATEGORIES
+
     full = _bp_rows(_collect_metadata_tables(str(tmp_path)))
     assert len(full) == 1, full
     # Ровно те аргументы, которые считает selective-ветка при правке бизнес-процесса:
-    # attrs_cats = changed ∩ (_ATTR_CATEGORIES | _PREDEFINED_CATEGORIES) — БЕЗ него.
+    # attrs_cats = changed ∩ (_ATTR_CATEGORIES | _PREDEFINED_CATEGORIES).
+    # v1.47.0: прежде здесь стоял список `{"Documents"}` (бизнес-процесса в _ATTR_CATEGORIES не было, и
+    # отдельный цикл `based_on` гейтился одними ссылками); теперь — тем же выражением, что в коде: бизнес-процесс
+    # в общем цикле `_ATTR_CATEGORIES`, и его `based_on` собирается вместе с реквизитами.
+    changed = {"BusinessProcesses"}
     selective = _bp_rows(
         _collect_metadata_tables(
             str(tmp_path),
-            collect_attrs_categories={"Documents"},
-            collect_metadata_refs_categories={"BusinessProcesses"},
+            collect_attrs_categories=changed & (set(_ATTR_CATEGORIES) | set(_PREDEFINED_CATEGORIES)),
+            collect_metadata_refs_categories=changed,
         )
     )
     assert selective == full, "selective-сбор потерял based_on, а DELETE его уже снёс"
@@ -1566,7 +1572,7 @@ def _default_reuse_fixture(tmp_path, *, edt: bool):
     Якорный `.bsl` обязателен (см. `_seed_one_module`): на дереве без единого
     модуля сборка идёт путём пустого репозитория и метаданные не собирает вовсе.
     Своей строки в `common_module_props` якорь не даёт — у его каталога нет
-    описателя, а `_iter_flat_objects` отдаёт только sibling-XML и `<Имя>/<Имя>.mdo`.
+    описателя (v1.47.0: перечислитель — `_iter_category_descriptors`, прежде `_iter_flat_objects`).
     """
     _seed_one_module(tmp_path)
     if edt:

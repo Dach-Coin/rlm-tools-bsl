@@ -1425,6 +1425,8 @@ def test_default_kinds_still_names_unsupported_kinds(cf):
     # v1.46.0: прежде здесь стояло `Document.Цель` — такого объекта в дереве нет (шлюз существования, Д3, отвергает
     # ссылку на него); перечень видов от объекта не зависит, спрашивается существующий `ТестДок`.
     default = bsl["find_references_to_object"]("Document.ТестДок")["_meta"]["unsupported_kinds"]
+    # v1.47.0: прежде здесь стояли шесть видов — виды форм (`form_*`) пишет только сборщик индекса,
+    # живой обход форм не разбирает и называет их здесь же.
     assert set(default) == {
         "choice_parameter_link",
         "event_subscription_source",
@@ -1432,6 +1434,9 @@ def test_default_kinds_still_names_unsupported_kinds(cf):
         "link_by_type",
         "predefined_characteristic_type",
         "role_rights",
+        "form_attribute_type",
+        "form_main_table",
+        "form_query",
     }, default
     # Явный запрос по-прежнему сужается до запрошенного.
     narrow = bsl["find_references_to_object"]("Document.ТестДок", kinds=["role_rights", "owner"])
@@ -1915,10 +1920,12 @@ def test_builder_path_contract_is_pinned_per_candidate_class(tmp_path):
 
     cats = frozenset({"Documents"})
     rows = _collect_object_synonyms(str(root), categories=cats)
-    # СТРОКУ даёт ровно объект с <Synonym>; остальные три класса — ни строки.
-    assert [r[0] for r in rows] == ["ССиноним"], rows
-    assert rows[0][1] == "Documents" and rows[0][3].endswith("Documents/ССиноним/Ext/Document.xml"), rows[0]
-    assert rows[0][2].endswith("Синоним А"), rows[0]
+    # СТРОКУ даёт разобранный объект: с <Synonym> — синоним, без него — пустой (v1.47.0: прежде здесь
+    # стояло «строку даёт ровно объект с <Synonym>»); битый XML и чужой корень — ни строки.
+    assert [r[0] for r in rows] == ["БезСинонима", "ССиноним"], rows
+    assert rows[0][1:3] == ("Documents", "Документ: "), rows[0]
+    assert rows[1][1] == "Documents" and rows[1][3].endswith("Documents/ССиноним/Ext/Document.xml"), rows[1]
+    assert rows[1][2].endswith("Синоним А"), rows[1]
     # Все четыре объекта — кандидаты discovery.
     locs = _iter_metadata_xml_files(str(root), categories=cats)
     assert sorted(o for _c, o, _r in locs) == ["БезСинонима", "Битый", "ССиноним", "Чужой"], locs

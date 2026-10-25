@@ -185,12 +185,16 @@ def _auto_scan_overrides(ext_context) -> dict[str, list[dict]]:
     current = ext_context.current
 
     try:
+        # v1.47.0: `main_root` — цель перехвата из формы расширения (callType) — обработчик той же пары формы
+        # основной конфигурации; корень тот же, что у сборщика и живых хелперов: свой у основной, основная рядом
+        # у расширения (нет её — цель пуста).
         if current.role == ConfigRole.EXTENSION:
-            result["self"] = find_extension_overrides(current.path)
+            main_root = ext_context.nearby_main.path if ext_context.nearby_main is not None else None
+            result["self"] = find_extension_overrides(current.path, main_root=main_root)
 
         elif current.role == ConfigRole.MAIN and ext_context.nearby_extensions:
             for ext in ext_context.nearby_extensions:
-                result[ext.path] = find_extension_overrides(ext.path)
+                result[ext.path] = find_extension_overrides(ext.path, main_root=current.path)
     except Exception:
         pass  # non-critical, don't fail rlm_start
 

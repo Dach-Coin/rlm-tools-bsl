@@ -713,7 +713,13 @@ def test_extensions_recipe_names_the_real_overridden_by_keys(ov_index):
     line = next(s for s in _BUSINESS_RECIPES["расширения"]["full"] if "overridden_by" in s)
     documented = {k.strip() for k in re.search(r"\{([^}]*)\}", line).group(1).split(",")}
     [proc] = [p for p in bsl["extract_procedures"]("Catalogs/Товары/Ext/ObjectModule.bsl") if p.get("overridden_by")]
-    assert documented == set(proc["overridden_by"][0])
+    # v1.47.0: прежде здесь стояло `assert documented == set(proc["overridden_by"][0])`. Рецепт объявляет и
+    # необязательные ключи с «?» — они есть только у перехвата из формы расширения (callType), у строки из
+    # аннотации их нет (прежний ответ побайтно); сами формовые строки — tests/test_v1_47_0.py.
+    required = {k for k in documented if not k.endswith("?")}
+    optional = {k.rstrip("?") for k in documented if k.endswith("?")}
+    assert required == set(proc["overridden_by"][0])
+    assert optional == {"form_item", "form_event"}
 
 
 def test_ext_line_points_at_the_annotation(ov_index):

@@ -900,12 +900,13 @@ class TestNonExportCallers:
         assert res["_meta"]["non_export_target"] is True
 
     def test_index_route_builder_edge_is_the_declared_boundary(self, tmp_path, monkeypatch):
-        # граница Д5 (Р4): сборщик пишет «ЧужойМодуль.» ⏎ «Локальная()» голым вызовом — точное ребро в свой
-        # модуль остаётся; тест падает, когда сборщик исправят, — тогда граница снимается вместе с ним
+        # граница Д5 (Р4) снята в v1.47.0: прежде здесь стояло `6 in lines and 8 in lines` — сборщик писал
+        # «ЧужойМодуль.» ⏎ «Локальная()» голым вызовом с точным ребром в свой модуль; теперь вызов с переносом
+        # или пробелом после точки — квалифицированный (`ЧужойМодуль.Локальная`), и точное ребро — только строка 8
         root = _cf_doc_tree(tmp_path / "cf", _NE_LOCAL_SPEC)
         res = _bsl_for(root, _reader_for(root, monkeypatch))["find_callers_context"]("Локальная", _NE_LOCAL_MOD)
         lines = {c["line"] for c in res["callers"] if c["edge_exact"]}
-        assert 6 in lines and 8 in lines
+        assert lines == {8}
 
     def test_export_object_method_keeps_name_rows(self, tmp_path, monkeypatch):
         # граница: экспорт модуля объекта — строки «по имени» через переменные-объекты, как прежде

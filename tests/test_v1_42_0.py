@@ -103,7 +103,8 @@ def built_v17_no_calls(tmp_path):
 
 class TestSchemaV17:
     def test_builder_version_and_gap_table(self):
-        assert BUILDER_VERSION == 17
+        # v1.47.0: прежде здесь стояло BUILDER_VERSION == 17 — поколение индекса v18
+        assert BUILDER_VERSION == 18
         # последняя строка таблицы недостач несёт порог текущей версии: бамп без новой
         # строки ронял бы этот тест, а не выдавал старый текст
         assert OLD_INDEX_GAPS[-1][0] == BUILDER_VERSION
@@ -121,7 +122,8 @@ class TestSchemaV17:
     def test_update_on_v16_index_forces_full_rebuild(self, built_v16_copy):
         _db_path, base = built_v16_copy
         res = IndexBuilder().update(str(base))
-        assert res["rebuild_reason"] == "schema upgrade v16->17"
+        # v1.47.0: прежде здесь стояло "schema upgrade v16->17" — пересборка идёт в текущее поколение v18
+        assert res["rebuild_reason"] == "schema upgrade v16->18"
 
     def test_reader_on_v16_index_has_no_call_audit(self, built_v16_copy):
         db_path, _base = built_v16_copy
@@ -138,7 +140,8 @@ class TestSchemaV17:
         db_path, _base = built_v17
         r = IndexReader(db_path)
         try:
-            assert r.builder_version == 17
+            # v1.47.0: прежде здесь стояло 17 — фикстура собирает индекс текущим сборщиком (v18)
+            assert r.builder_version == 18
             assert r.has_call_audit is True
         finally:
             r.close()
@@ -147,7 +150,8 @@ class TestSchemaV17:
         db_path, _base = built_v17_no_calls
         r = IndexReader(db_path)
         try:
-            assert r.builder_version == 17
+            # v1.47.0: прежде здесь стояло 17 — фикстура собирает индекс текущим сборщиком (v18)
+            assert r.builder_version == 18
             assert r.has_call_audit is False  # схема v17 есть, граф выключен
         finally:
             r.close()
