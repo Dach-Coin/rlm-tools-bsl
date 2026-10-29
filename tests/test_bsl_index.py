@@ -373,7 +373,7 @@ class TestInPlaceRebuild:
         def boom(self, *a, **k):
             raise RuntimeError("injected mid-build failure")
 
-        monkeypatch.setattr(IndexBuilder, "_bulk_insert", boom)
+        monkeypatch.setattr(IndexBuilder, "_bulk_insert_batches", boom)
         with pytest.raises(RuntimeError):
             builder.build(str(tmp_bsl_project))
 

@@ -3208,6 +3208,10 @@ def _rlm_index(
             db_existed = db_path.exists()
             if db_existed:
                 db_path.unlink()
+                # v1.48.0: служебный снимок входов сборки уходит вместе с индексом.
+                from rlm_tools_bsl._index_snapshot import discard_snapshot
+
+                discard_snapshot(db_path)
                 # Remove parent dir if empty
                 try:
                     db_path.parent.rmdir()
@@ -3314,36 +3318,58 @@ def _server_log_path() -> pathlib.Path:
     return log_dir / "server.log"
 
 
+def _route_records_to_service_stderr() -> None:
+    """Под Windows-службой — записи с временем в stderr (его вычитывает служба, единственный писатель
+    ``server.log``). Обработчик stderr от ``basicConfig`` получает формат файла; нет его — ставится один, и
+    повторный вызов второго не добавит."""
+    from rlm_tools_bsl._service_logging import LOG_DATEFMT, LOG_FORMAT
+
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if type(handler) is logging.StreamHandler and handler.stream in (sys.stderr, sys.__stderr__):
+            handler.setFormatter(formatter)
+            return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(formatter)
+    root.addHandler(handler)
+
+
 def _setup_file_logging():
-    """Add rotating file handler for HTTP transport mode."""
+    """Add rotating file handler for HTTP transport mode.
+
+    v1.48.0: под Windows-службой (``RLM_UNDER_SERVICE``) у ``server.log`` один писатель — служба
+    (``_service_logging``): она вычитывает stdout/stderr ребёнка через PIPE и сама ведёт ротацию. Здесь записи с
+    временем уходят в stderr, файл не открывается вовсе.
+    """
     from logging.handlers import RotatingFileHandler
+
+    from rlm_tools_bsl._service_logging import LOG_BACKUP_COUNT, LOG_DATEFMT, LOG_FORMAT, LOG_MAX_BYTES
 
     # Use RLM_CONFIG_FILE-derived path if set (Windows service / Session 0)
     log_path = _server_log_path()
+    if os.environ.get("RLM_UNDER_SERVICE"):
+        _route_records_to_service_stderr()
+        logging.getLogger("uvicorn.access").addFilter(_HealthLogFilter())
+        _install_asyncio_conn_reset_filter()
+        logger.info("Logging to stderr; server.log is written by the Windows service: %s", log_path)
+        return
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Time-based retention: drop entries older than RLM_LOG_RETENTION_DAYS (default 20)
-    # so server.log doesn't grow unbounded. Skipped under the Windows service
-    # (RLM_UNDER_SERVICE=1) — there the service purges before it opens the file for the
-    # child's stderr redirect, so the child must not truncate a file the service holds open.
-    retention_stats = None
-    if not os.environ.get("RLM_UNDER_SERVICE"):
-        from rlm_tools_bsl.log_retention import log_retention_days, purge_log_older_than
+    # so server.log doesn't grow unbounded. Under the Windows service the service purges
+    # before its own sink opens the file (see the branch above).
+    from rlm_tools_bsl.log_retention import log_retention_days, purge_log_older_than
 
-        retention_stats = purge_log_older_than(log_path, days=log_retention_days())
+    retention_stats = purge_log_older_than(log_path, days=log_retention_days())
 
     handler = RotatingFileHandler(
         log_path,
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=3,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
         encoding="utf-8",
     )
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
     logging.getLogger().addHandler(handler)
     logging.getLogger("uvicorn.access").addFilter(_HealthLogFilter())
     # Drop benign Windows ProactorEventLoop teardown noise (ConnectionResetError

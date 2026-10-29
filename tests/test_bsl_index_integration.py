@@ -1037,7 +1037,7 @@ def test_interrupted_v15_rebuild_is_detected_and_retryable(tmp_bsl_project, tmp_
 
     monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
     # Дерево ОБЯЗАНО содержать хотя бы один .bsl: при пустом наборе build() уходит в
-    # ранний `return db_path` ДО `_bulk_insert`, инъекция отказа не срабатывает
+    # ранний `return db_path` ДО `_bulk_insert_batches`, инъекция отказа не срабатывает
     # и `pytest.raises` падает, ничего не проверив.
     root = tmp_bsl_project
     db_path = IndexBuilder().build(str(root), build_calls=False, build_metadata=True)
@@ -1054,20 +1054,20 @@ def test_interrupted_v15_rebuild_is_detected_and_retryable(tmp_bsl_project, tmp_
     finally:
         con.close()
 
-    real_bulk = IndexBuilder._bulk_insert
+    real_bulk = IndexBuilder._bulk_insert_batches
 
-    def _explode(self, conn, results, build_calls):
+    def _explode(self, conn, batches, build_calls):
         raise RuntimeError("инъекция отказа посреди пересборки")
 
     # context(), а не setattr+undo: undo откатил бы и RLM_INDEX_DIR, и повтор
     # ушёл бы в ДРУГУЮ базу — тест бы прошёл, ничего не проверив.
     with monkeypatch.context() as mp:
-        mp.setattr(IndexBuilder, "_bulk_insert", _explode)
+        mp.setattr(IndexBuilder, "_bulk_insert_batches", _explode)
         with pytest.raises(RuntimeError):
             IndexBuilder().update(str(root))
         assert index_incomplete(db_path), "незавершённая сборка обязана детектироваться"
 
-    assert IndexBuilder._bulk_insert is real_bulk
+    assert IndexBuilder._bulk_insert_batches is real_bulk
     delta = IndexBuilder().update(str(root))
     assert delta.get("rebuild_reason") == "incomplete prior build", delta
     assert not index_incomplete(db_path), "повторная сборка обязана снять маркер"
@@ -1083,11 +1083,11 @@ def test_incomplete_index_is_reported_by_public_start(tmp_bsl_project, tmp_path,
     root = tmp_bsl_project  # пустое дерево не годится: см. ранний return в build()
     db_path = IndexBuilder().build(str(root), build_calls=False, build_metadata=True)
 
-    def _explode(self, conn, results, build_calls):
+    def _explode(self, conn, batches, build_calls):
         raise RuntimeError("инъекция отказа посреди пересборки")
 
     with monkeypatch.context() as mp:
-        mp.setattr(IndexBuilder, "_bulk_insert", _explode)
+        mp.setattr(IndexBuilder, "_bulk_insert_batches", _explode)
         with pytest.raises(RuntimeError):
             IndexBuilder().build(str(root), build_calls=False, build_metadata=True)
     assert index_incomplete(db_path)

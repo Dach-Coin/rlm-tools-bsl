@@ -125,6 +125,7 @@ def _run(monkeypatch, tmp_path, request, *, stopping=False, **kwargs) -> tuple[_
         "subprocess",
         types.SimpleNamespace(
             Popen=world.popen,
+            PIPE=subprocess.PIPE,
             STDOUT=subprocess.STDOUT,
             TimeoutExpired=subprocess.TimeoutExpired,
         ),

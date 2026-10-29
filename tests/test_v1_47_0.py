@@ -4098,6 +4098,8 @@ class TestBuildSpeedWithoutIndexChange:
             {"Catalogs/А/Ext/ObjectModule.bsl": "Процедура П2()\nКонецПроцедуры\n"},
         )
         started = self._spy_prefetch(monkeypatch)
+        # v1.48.0: прогрев — у крупной выгрузки (у малой опись снимка и коллекторы читают описатели сами).
+        monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)
         res = IndexBuilder().update(str(base))
         assert res["git_fast_path"] is False and res["changed"] == 1, res
         assert started == [str(base)]

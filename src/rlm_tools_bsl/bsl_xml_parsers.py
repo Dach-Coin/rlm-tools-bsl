@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import functools
 import json
 import logging
 import xml.etree.ElementTree as ET
@@ -476,6 +478,24 @@ def classify_subscription_row(
 
 
 def canonicalize_type_ref(type_str: str, *, fold_case: bool = True) -> str:
+    """Канонизация ссылки типа (``_canonicalize_type_ref_impl``) с ограниченным кешем по ``(строка, fold_case)``
+    (v1.48.0): сборка зовёт её десятки тысяч раз на одних и тех же строках. Кешируется только ``str`` — иной вход
+    идёт прежним путём (тот же ответ и та же ошибка, что до кеша)."""
+    if type(type_str) is str:
+        return _canonicalize_type_ref_cached(type_str, bool(fold_case))
+    return _canonicalize_type_ref_impl(type_str, fold_case=fold_case)
+
+
+# Ёмкость кеша канонизации: уникальных строк типов у ERP — десятки тысяч; запись ~200 байт.
+_CANONICALIZE_CACHE_SIZE = 1 << 16
+
+
+@functools.lru_cache(maxsize=_CANONICALIZE_CACHE_SIZE)
+def _canonicalize_type_ref_cached(type_str: str, fold_case: bool) -> str:
+    return _canonicalize_type_ref_impl(type_str, fold_case=fold_case)
+
+
+def _canonicalize_type_ref_impl(type_str: str, *, fold_case: bool = True) -> str:
     """Convert 1C reference type form to canonical metadata reference.
 
     Examples:

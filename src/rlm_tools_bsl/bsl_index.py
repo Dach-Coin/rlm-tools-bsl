@@ -10,9 +10,11 @@ import bisect
 import errno
 import functools
 import hashlib
+import itertools
 import json
 import logging
 import os
+import pickle
 import re
 import shutil
 import sqlite3
@@ -21,13 +23,21 @@ import subprocess
 import threading
 import time
 from bisect import insort
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
 from rlm_tools_bsl._git_process import run_git
+from rlm_tools_bsl._index_snapshot import load_snapshot, remove_snapshot
+from rlm_tools_bsl._index_workers import (
+    IndexTaskPool,
+    ResultSpool,
+    bsl_batches,
+    in_index_worker,
+    resolve_index_workers,
+)
 from rlm_tools_bsl.bsl_knowledge import (
     BSL_PATTERNS,
     _merge_proc_continuations_with_mask,
@@ -1890,6 +1900,9 @@ class _GitDirtyResult(NamedTuple):
 
     paths: set[str]
     unreliable_reason: str | None = None
+    # v1.48.0: у ``_git_changed_files`` — та же часть дельты, что дал бы ``_git_current_dirty`` (staged, unstaged,
+    # untracked тех же команд): конечный dirty-снимок операции берётся отсюда, а не вторым запуском git.
+    dirty: set[str] | None = None
 
 
 def _git_dirty_timeout() -> int:
@@ -2233,7 +2246,28 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
         "untracked",
     )
 
-    return _GitDirtyResult(_strip_prefix(git_root_paths) | ls_paths, unreliable_reason)
+    return _GitDirtyResult(
+        _strip_prefix(git_root_paths) | ls_paths,
+        unreliable_reason,
+        _strip_prefix(staged | unstaged) | ls_paths,
+    )
+
+
+def _path_inside(path: str | Path, root: str | Path) -> bool:
+    """``path`` внутри каталога ``root`` (сравнение нормализованных абсолютных путей)."""
+    try:
+        Path(os.path.abspath(path)).relative_to(os.path.abspath(root))
+    except ValueError:
+        return False
+    return True
+
+
+def _planner_stats_present(conn: sqlite3.Connection) -> bool:
+    """Статистика планировщика (``sqlite_stat1``) уже собрана и не пуста."""
+    try:
+        return conn.execute("SELECT 1 FROM sqlite_stat1 LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
 
 
 def _git_current_dirty(base_path: str, prefix: str) -> _GitDirtyResult:
@@ -5167,10 +5201,11 @@ def _parse_configuration_meta(base_path: str) -> dict[str, str]:
     """
     import xml.etree.ElementTree as ET
 
-    from rlm_tools_bsl.format_detector import SourceFormat, detect_format
+    from rlm_tools_bsl.format_detector import SourceFormat, _detect_format_listing
 
     base = Path(base_path)
-    fmt_info = detect_format(base_path)
+    # v1.48.0: тот же FormatInfo, что detect_format, вдвое дешевле — Level-1 считается на каждом update.
+    fmt_info = _detect_format_listing(base_path)
     # detect_format returns FormatInfo; extract the primary_format enum value
     if hasattr(fmt_info, "primary_format"):
         fmt_str = fmt_info.primary_format.value
@@ -8174,6 +8209,34 @@ def _insert_file_paths(conn: sqlite3.Connection, rows: list[tuple]) -> None:
         )
 
 
+def _apply_file_paths(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    """Свежий навигационный обход — разностью со строками таблицы (v1.48.0): удаляются исчезнувшие и изменившиеся
+    строки, вставляются новые и изменившиеся. Итог — тот же, что ``_insert_file_paths`` (DELETE всех и вставка; при
+    повторе пути побеждает последняя строка, как у ``INSERT OR REPLACE``)."""
+    try:
+        existing = {
+            r[0]: tuple(r[1:])
+            for r in conn.execute("SELECT rel_path, extension, dir_path, filename, depth, size, mtime FROM file_paths")
+        }
+    except sqlite3.OperationalError:
+        _insert_file_paths(conn, rows)
+        return
+    fresh: dict[str, tuple] = {}
+    for row in rows:
+        fresh[row[0]] = row
+    stale = [rel for rel, values in existing.items() if rel not in fresh or tuple(fresh[rel][1:]) != values]
+    added = [row for rel, row in fresh.items() if existing.get(rel) != tuple(row[1:])]
+    for chunk in _chunked(stale):
+        conn.execute(f"DELETE FROM file_paths WHERE rel_path IN ({','.join('?' * len(chunk))})", chunk)  # noqa: S608
+    if added:
+        conn.executemany(
+            "INSERT OR REPLACE INTO file_paths "
+            "(rel_path, extension, dir_path, filename, depth, size, mtime) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            added,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Regex for register movements (in-band extraction from Document BSL)
 # ---------------------------------------------------------------------------
@@ -8392,7 +8455,9 @@ _REGISTER_BY_NAME_DELEGATES: dict[tuple[str, str], int] = {
 _REGISTER_BY_NAME_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\.\s*(\w+)\s*\(", re.IGNORECASE)
 
 
-def _register_by_name_refs(body: str) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+def _register_by_name_refs(
+    body: str, *, masks: tuple[str, str] | None = None
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
     """``(литеральные (имя, строка), вычисляемые (выражение, строка))`` вызовов делегатов
     ``_REGISTER_BY_NAME_DELEGATES``. Две маски одной длины (приём ``_parse_print_commands``):
     вызов ищется по коду без комментариев и строк, аргументы читаются с содержимым строк —
@@ -8404,9 +8469,13 @@ def _register_by_name_refs(body: str) -> tuple[list[tuple[str, int]], list[tuple
     low = body.casefold()
     if not any(method in low for _module, method in _REGISTER_BY_NAME_DELEGATES):
         return literal, dynamic
-    lines = body.splitlines()
-    code = "\n".join(mask_comments_and_strings(lines))
-    text = "\n".join(mask_comments_and_strings(lines, keep_string_content=True))
+    if masks is not None:
+        # v1.48.0: те же две маски, уже посчитанные разбором модуля (`_extract_movements`).
+        code, text = masks
+    else:
+        lines = body.splitlines()
+        code = "\n".join(mask_comments_and_strings(lines))
+        text = "\n".join(mask_comments_and_strings(lines, keep_string_content=True))
     for m in _REGISTER_BY_NAME_CALL_RE.finditer(code):
         pos = _REGISTER_BY_NAME_DELEGATES.get((m.group(1).casefold(), m.group(2).casefold()))
         if pos is None:
@@ -8536,6 +8605,17 @@ class FileResult(NamedTuple):
     launch_marker: bool | None = None
 
 
+class _BulkInsertStats:
+    """Итоги записи BSL (``IndexBuilder._bulk_insert_batches``): счётчики для журнала сборки и результаты с
+    движениями — без методов и вызовов, для ``_movement_rows_for_insert`` после записи метаданных."""
+
+    def __init__(self) -> None:
+        self.modules = 0
+        self.methods = 0
+        self.calls = 0
+        self.movement_results: list[FileResult] = []
+
+
 _MOVEMENTS_INSERT_SQL = (
     "INSERT INTO register_movements (document_name, register_name, source, file, evidence, kind) "
     "VALUES (?, ?, ?, ?, ?, ?)"
@@ -8611,6 +8691,9 @@ def _extract_movements(
     content: str,
     info: BslFileInfo,
     rel_path: str,
+    *,
+    masked: list[str] | None = None,
+    comments_only: str | None = None,
 ) -> list[tuple[str, str, str, str, str | None]]:
     """Extract register movements from Document modules (in-band, no extra I/O).
 
@@ -8630,8 +8713,11 @@ def _extract_movements(
 
     results: list[tuple[str, str, str, str, str | None]] = []
     src_lines = content.splitlines()
-    full = "\n".join(mask_comments_and_strings(src_lines))
-    comments_only = "\n".join(mask_comments_and_strings(src_lines, keep_string_content=True))
+    # v1.48.0: полная маска — уже посчитанная разбором модуля (`masked` той же `content.splitlines()`), маска только
+    # комментариев — одна на модуль: делегат «регистр по имени» получает обе готовыми.
+    full = "\n".join(masked if masked is not None else mask_comments_and_strings(src_lines))
+    if comments_only is None:
+        comments_only = "\n".join(mask_comments_and_strings(src_lines, keep_string_content=True))
 
     def _row(reg: str, source: str, match, kind: str | None = None):
         return (reg, source, rel_path, _evidence_of(content, match.start(), match.end()), kind)
@@ -8647,7 +8733,7 @@ def _extract_movements(
         # v1.47.0 (П8): делегат «регистр по имени» (`ПроведениеСервер.ОтразитьДвиженияПоРегистру(…, "<Регистр>")`) —
         # строка сборщика: литерал сверяется с каталогом регистров при вставке (`_MOVEMENT_SOURCE_BY_NAME`),
         # вычисляемое имя — `unresolved/dynamic_name` с выражением в `evidence`, как у раскрытия на чтении.
-        by_name_literal, by_name_dynamic = _register_by_name_refs(content)
+        by_name_literal, by_name_dynamic = _register_by_name_refs(content, masks=(full, comments_only))
         for reg, line_no in by_name_literal:
             evidence = (
                 " ".join(src_lines[line_no - 1].split())[:_EVIDENCE_MAX_CHARS] if line_no <= len(src_lines) else ""
@@ -8765,7 +8851,7 @@ def _process_single_file(
 
     # In-band: extract register movements from Document modules (no extra I/O)
     rel_path = info.relative_path
-    movements = _extract_movements(content, info, rel_path)
+    movements = _extract_movements(content, info, rel_path, masked=masked)
 
     # In-band: parse regions and header comment (zero extra I/O)
     regions = _parse_regions(lines)
@@ -8788,6 +8874,53 @@ def _process_single_file(
         code_usages,
         launch_marker,
     )
+
+
+# v1.48.0: разбор BSL в процессах — только когда файлов больше порога: малой дельте и небольшой выгрузке старт
+# пула spawn дороже самого разбора (последовательно — те же функции в координаторе, данные те же).
+_PARALLEL_MIN_BSL_FILES = 256
+
+
+def _large_export(base_path: str) -> bool:
+    """Выгрузка крупнее порога параллельного разбора (``.bsl`` больше ``_PARALLEL_MIN_BSL_FILES``) — ей нужны фоновые
+    прогрев описателей и опись снимка. Счёт — тем же ``rglob``, что обнаружение BSL, и обрывается на первом файле сверх
+    порога: у крупной выгрузки это доли секунды, а не полный обход."""
+    found = itertools.islice(Path(base_path).rglob("*.bsl"), _PARALLEL_MIN_BSL_FILES + 1)
+    return sum(1 for _ in found) > _PARALLEL_MIN_BSL_FILES
+
+
+def _parse_bsl_batch(paths: list[Path], base_path: str, build_calls: bool) -> list[FileResult]:
+    """Задача воркера сборки: разбор порции BSL в исходном порядке. Непрочитанный файл (``None``) в результат не
+    попадает — как прежде."""
+    results: list[FileResult] = []
+    for file_path in paths:
+        result = _process_single_file(file_path, base_path, build_calls)
+        if result is not None:
+            results.append(result)
+    return results
+
+
+def _parse_bsl_files(paths: list[Path], base_path: str, build_calls: bool) -> list[FileResult]:
+    """Разбор списка BSL в памяти (дельта git-быстрого пути): больше ``_PARALLEL_MIN_BSL_FILES`` — в процессах,
+    иначе — в координаторе; порядок результатов — порядок ``paths``."""
+    workers, _workers_source = resolve_index_workers()
+    if len(paths) <= _PARALLEL_MIN_BSL_FILES:
+        workers = 1
+    results: list[FileResult] = []
+    with IndexTaskPool(workers, label="update") as pool:
+        for blob in pool.map_ordered(
+            _parse_bsl_batch,
+            ((batch, base_path, build_calls) for batch in bsl_batches(paths, pool.workers)),
+            window=4 * pool.workers,
+        ):
+            results.extend(pickle.loads(blob))
+    return results
+
+
+def _collector_threads() -> int:
+    """Ширина внутренних пулов потоков коллекторов. В воркере сборки — один поток: бюджет CPU у задач общий
+    (``_index_workers``), а вложенный пул только спорит за GIL."""
+    return 1 if in_index_worker() else min(os.cpu_count() or 4, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -8874,11 +9007,9 @@ def _insert_role_flags(conn: sqlite3.Connection, data: "_RoleData") -> None:
         )
 
 
-def _collect_role_data(base_path: str) -> _RoleData:
-    """Права, флаг ``setForNewObjects`` и исключения — за один проход по файлам прав и один разбор
-    каждого файла (``parse_rights_for_index``)."""
-    from rlm_tools_bsl.bsl_xml_parsers import parse_rights_for_index
-
+def _rights_file_items(base_path: str) -> list[tuple[str, Path]]:
+    """Файлы прав ``(роль, путь)`` в порядке сборки: сначала CF ``Roles/*/Ext/Rights.xml``, затем EDT
+    ``Roles/*/*.rights``."""
     base = Path(base_path)
 
     # Find all rights files
@@ -8898,43 +9029,155 @@ def _collect_role_data(base_path: str) -> _RoleData:
     for f in base.glob(f"{prefix}Roles/*/*.rights"):
         role_name = f.parent.name
         rights_files.append((role_name, f))
+    return rights_files
 
-    def _process_rights_file(item: tuple[str, Path]) -> _RoleData:
-        role_name, f = item
-        try:
-            content = f.read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeDecodeError):
-            return _RoleData([], [], [])
-        rel = f.relative_to(base).as_posix()
-        # Исключения хранятся ТОЛЬКО у флагованных ролей: у обычной роли запись с
-        # false означает просто «право не выдано», и таких на боевой конфигурации
-        # сотни тысяч — таблица выросла бы на порядок без единого потребителя.
-        # Поэтому парсер и считает их только у флагованной роли.
-        granted, flagged, denied = parse_rights_for_index(content)
-        rights = _role_rights_rows(granted, role_name, rel)
-        flags = [(role_name, 1 if flagged else 0, rel)]
-        exclusions: list[tuple[str, str, str, str]] = []
-        for entry in denied:
-            for right in entry.get("rights") or []:
-                exclusions.append((role_name, entry["object"], right, rel))
-        return _RoleData(rights, flags, exclusions)
 
+def _rights_file_data(base: Path, item: tuple[str, Path]) -> _RoleData:
+    """Три выхода одного файла прав — одним чтением и одним разбором (``parse_rights_for_index``)."""
+    from rlm_tools_bsl.bsl_xml_parsers import parse_rights_for_index
+
+    role_name, f = item
+    try:
+        content = f.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return _RoleData([], [], [])
+    rel = f.relative_to(base).as_posix()
+    # Исключения хранятся ТОЛЬКО у флагованных ролей: у обычной роли запись с
+    # false означает просто «право не выдано», и таких на боевой конфигурации
+    # сотни тысяч — таблица выросла бы на порядок без единого потребителя.
+    # Поэтому парсер и считает их только у флагованной роли.
+    granted, flagged, denied = parse_rights_for_index(content)
+    rights = _role_rights_rows(granted, role_name, rel)
+    flags = [(role_name, 1 if flagged else 0, rel)]
+    exclusions: list[tuple[str, str, str, str]] = []
+    for entry in denied:
+        for right in entry.get("rights") or []:
+            exclusions.append((role_name, entry["object"], right, rel))
+    return _RoleData(rights, flags, exclusions)
+
+
+def _merge_role_data(parts: Iterable[_RoleData]) -> _RoleData:
+    """Склейка выходов файлов прав в порядке файлов (от него зависит дедуп ссылок ``role_rights``)."""
     all_rights: list[tuple[str, str, str, str]] = []
     all_flags: list[tuple[str, int, str]] = []
     all_exclusions: list[tuple[str, str, str, str]] = []
-    batches: list[_RoleData] = []
-    if len(rights_files) > 1:
-        workers = min(os.cpu_count() or 4, 8)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            batches = list(pool.map(_process_rights_file, rights_files))
-    elif rights_files:
-        batches = [_process_rights_file(rights_files[0])]
-    for batch in batches:
+    for batch in parts:
         all_rights.extend(batch.rights)
         all_flags.extend(batch.flags)
         all_exclusions.extend(batch.exclusions)
-
     return _RoleData(all_rights, all_flags, all_exclusions)
+
+
+def _rights_batch_data(base_path: str, items: list[tuple[str, Path]]) -> _RoleData:
+    """Задача воркера сборки (v1.48.0): права порции файлов в исходном порядке."""
+    base = Path(base_path)
+    return _merge_role_data(_rights_file_data(base, item) for item in items)
+
+
+def _collect_role_data(base_path: str) -> _RoleData:
+    """Права, флаг ``setForNewObjects`` и исключения — за один проход по файлам прав и один разбор
+    каждого файла (``parse_rights_for_index``)."""
+    base = Path(base_path)
+    rights_files = _rights_file_items(base_path)
+    batches: list[_RoleData] = []
+    if len(rights_files) > 1:
+        with ThreadPoolExecutor(max_workers=_collector_threads()) as pool:
+            batches = list(pool.map(functools.partial(_rights_file_data, base), rights_files))
+    elif rights_files:
+        batches = [_rights_file_data(base, rights_files[0])]
+    return _merge_role_data(batches)
+
+
+_ROLE_TABLES = ("role_rights", "role_flags", "role_exclusions")
+_ROLE_RIGHTS_INSERT = "INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)"
+# v1.48.0: файлы прав Git-дельты — дословно маски прежнего обнаружения (`_rights_file_items`) от корня `Roles`.
+_CF_RIGHTS_DELTA_RE = re.compile(r"^Roles/(?P<role>[^/]+)/Ext/Rights\.xml$")
+_EDT_RIGHTS_DELTA_RE = re.compile(r"^Roles/(?P<role>[^/]+)/[^/]+\.rights$")
+_RIGHTS_LIKE_RE = re.compile(r"(?:^|/)roles/.*(?:/ext/rights\.xml|\.rights)$", re.IGNORECASE)
+
+
+def _insert_role_rights_refs(conn: sqlite3.Connection, role_rights: list[tuple[str, str, str, str]]) -> None:
+    """Ссылки ``role_rights`` в ``metadata_references`` (категория ``Roles``) — по строкам прав."""
+    rr_refs = _role_rights_to_references(role_rights)
+    if rr_refs:
+        try:
+            conn.executemany(
+                "INSERT INTO metadata_references "
+                "(source_object, source_category, ref_object, ref_kind, used_in, path, line) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rr_refs,
+            )
+        except sqlite3.OperationalError:
+            pass
+
+
+def _refresh_rights_selective(conn: sqlite3.Connection, base_path: str, delta_paths: Iterable[str]) -> bool:
+    """Права Git-пути по самой дельте (v1.48.0): перечитать ровно файлы прав из дельты и заменить их строки
+    ``role_rights``/``role_flags``/``role_exclusions`` по ``file``; ссылки ``role_rights`` в ``metadata_references`` —
+    производная проекция с дедупом (роль, объект) — пересобрать ЦЕЛИКОМ из итоговой ``role_rights``: DELETE
+    bulk-fallback категории ``Roles`` стирает ссылки всех ролей.
+
+    ``False`` — нужен прежний полный проход: корня ``Roles`` нет (контейнер, рекурсивные маски), строки прежнего
+    прохода — не под корнем ``Roles``, путь прав из дельты не совпадает с масками или каталог роли на диске в другом
+    регистре, строки прав записаны с написанием пути, которого прежний проход уже не дал бы (каталог роли переименован
+    только регистром между операциями), у роли больше одного файла прав (дедуп ссылок зависел бы от порядка файлов).
+    Пути строк прежний проход берёт из обхода — с написанием диска, а дельта и строки здесь сравниваются по точному
+    пути; регистр меняется только у каталога роли (имя объекта метаданных) — ``Roles``, ``Ext``, ``Rights.xml``
+    называет платформа. Проверки, решающие до записи, идут до неё; после записи — только последняя, и прежний полный
+    проход тогда перезаписывает таблицы целиком."""
+    base = Path(base_path)
+    listing: dict[Path, set[str] | None] = {}
+    if not (base / "Roles").is_dir():
+        return False
+    try:
+        for table in _ROLE_TABLES:
+            if conn.execute(f"SELECT 1 FROM {table} WHERE file NOT LIKE 'Roles/%' LIMIT 1").fetchone():  # noqa: S608
+                return False
+    except sqlite3.OperationalError:
+        return False
+    items: dict[str, tuple[str, Path]] = {}
+    for path in delta_paths:
+        m = _CF_RIGHTS_DELTA_RE.match(path) or _EDT_RIGHTS_DELTA_RE.match(path)
+        if m is None:
+            if _RIGHTS_LIKE_RE.search(path):
+                return False
+            continue
+        role = m["role"]
+        if _spelling(base / "Roles", role, listing) == "case":
+            return False
+        items[path] = (role, base / path)
+    # Каталог роли, переименованный только регистром между операциями (Git с `core.ignorecase` смену регистра латиницы
+    # не видит): прежний полный проход написал бы пути с нынешним написанием — его даёт прежнее обнаружение, у файла из
+    # дельты, которого на диске нет, — путь дельты. Строка с иным написанием того же пути — прежний полный проход.
+    # У каждого прочитанного файла прав ровно одна строка role_flags — её путей достаточно.
+    spelled = {rel.casefold(): rel for rel in items}
+    for _role, path in _rights_file_items(base_path):
+        rel = path.relative_to(base).as_posix()
+        spelled[rel.casefold()] = rel
+    if any(spelled.get(rel.casefold(), rel) != rel for (rel,) in conn.execute("SELECT file FROM role_flags")):
+        return False
+    for rel in sorted(items):
+        for table in _ROLE_TABLES:
+            conn.execute(f"DELETE FROM {table} WHERE file = ?", (rel,))  # noqa: S608
+    data = _merge_role_data(_rights_file_data(base, items[rel]) for rel in sorted(items) if items[rel][1].is_file())
+    if data.rights:
+        conn.executemany(_ROLE_RIGHTS_INSERT, data.rights)
+    if data.flags:
+        conn.executemany("INSERT INTO role_flags (role_name, set_for_new_objects, file) VALUES (?, ?, ?)", data.flags)
+    if data.exclusions:
+        conn.executemany(
+            "INSERT INTO role_exclusions (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
+            data.exclusions,
+        )
+    if conn.execute("SELECT 1 FROM role_flags GROUP BY role_name HAVING COUNT(*) > 1 LIMIT 1").fetchone():
+        return False
+    try:
+        conn.execute("DELETE FROM metadata_references WHERE source_category = 'Roles'")
+    except sqlite3.OperationalError:
+        pass
+    rows = [tuple(r) for r in conn.execute("SELECT role_name, object_name, right_name, file FROM role_rights")]
+    _insert_role_rights_refs(conn, rows)
+    return True
 
 
 def _collect_role_rights(base_path: str) -> list[tuple[str, str, str, str]]:
@@ -9087,7 +9330,7 @@ def _iter_metadata_xml_files(
     if not cats_list:
         return all_results
 
-    workers = min(os.cpu_count() or 4, 8)
+    workers = _collector_threads()
     if _status is None:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for batch in pool.map(_collect_category, cats_list):
@@ -9184,7 +9427,7 @@ def _collect_object_synonyms(
         synonym = f"{prefix}: {parsed.get('synonym') or ''}"
         return (obj_name, cat, synonym, rel), True
 
-    workers = min(os.cpu_count() or 4, 8)
+    workers = _collector_threads()
 
     if _status is None:
         # BUILDER-ПУТЬ. Рамка релиза запрещает трогать билдер, а не «менять его так,
@@ -9268,15 +9511,44 @@ _EXTENSION_OVERRIDES_INSERT = (
 )
 
 
+class _ExtensionDetection:
+    """Детект конфигураций рядом (``detect_extension_context``) — один на операцию (v1.48.0): перехваты и дайджест
+    перехватов для снимка берут один результат. Детект перебирает соседние каталоги корня, и второй вызов удваивал
+    его цену. Ошибка детекта запоминается и поднимается у каждого потребителя — как у прежнего отдельного вызова."""
+
+    def __init__(self, base_path: str) -> None:
+        self._base_path = base_path
+        self._lock = threading.Lock()
+        self._done = False
+        self._context = None
+        self._error: Exception | None = None
+
+    def get(self):
+        from rlm_tools_bsl.extension_detector import detect_extension_context
+
+        with self._lock:
+            if not self._done:
+                try:
+                    self._context = detect_extension_context(self._base_path)
+                except Exception as exc:  # noqa: BLE001 — решает потребитель, как при отдельном вызове
+                    self._error = exc
+                self._done = True
+        if self._error is not None:
+            raise self._error
+        return self._context
+
+
 def _collect_extension_overrides(
     base_path: str,
     conn: sqlite3.Connection,
+    detection: _ExtensionDetection | None = None,
 ) -> list[tuple]:
     """Collect extension override data for indexing.
 
     For MAIN configs: scans nearby extensions, links overrides to source modules.
     For EXTENSION configs: records overrides without source linking.
     Returns list of tuples ready for INSERT into extension_overrides.
+    ``detection`` (v1.48.0) — детект операции, общий с дайджестом снимка; без него — свой вызов, как прежде.
     """
     from rlm_tools_bsl.extension_detector import (
         ConfigRole,
@@ -9285,7 +9557,7 @@ def _collect_extension_overrides(
     )
 
     try:
-        ext_context = detect_extension_context(base_path)
+        ext_context = detection.get() if detection is not None else detect_extension_context(base_path)
     except Exception as exc:
         logger.warning("Extension detection failed for %s, overrides skipped: %s", base_path, exc)
         return []
@@ -9455,27 +9727,12 @@ def _replace_form_refs(conn: sqlite3.Connection, rows: list[tuple]) -> None:
         pass
 
 
-def _collect_form_elements(base_path: str) -> tuple[list[tuple], list[tuple]]:
-    """Collect form elements (handlers, commands, attributes) from all forms.
-
-    Returns ``(form_elements rows, metadata_references rows)``. Первые — для INSERT в form_elements:
-    (object_name, category, form_name, kind, scope, element_name, element_type,
-     event, handler, data_path, main_table, attribute_is_main, extra_json, file).
-
-    v1.47.0: вторые — ссылки формы видов `_FORM_SOURCE_REF_KINDS` (`parse_form_type_refs` и `_query_text_refs` по тому
-    же корню, что разбор элементов: один ``ET.fromstring`` на форму):
-    ``(владелец, категория владельца, ref_object, kind, "<Тип>.<Объект>.Form.<Ф>.<суффикс>", путь формы, None)``;
-    у общей формы ``used_in`` — ``CommonForm.<Ф>.<суффикс>``, категория ``CommonForms``.
-    """
-    from rlm_tools_bsl.bsl_xml_parsers import (
-        _parse_form_cf,
-        _parse_form_edt,
-        _parse_form_root,
-        parse_form_type_refs,
-    )
+def _form_files(base: Path) -> list[tuple[str, str, str, Path]]:
+    """Формы конфигурации ``(категория, объект, форма, путь)``: ``<Категория>/<Объект>/Forms/<Форма>/`` и
+    ``CommonForms/<Форма>/``; в каталоге формы канонический файл — ``Form.form`` (EDT), иначе ``Ext/Form.xml``
+    (CF)."""
     from rlm_tools_bsl.format_detector import METADATA_CATEGORIES
 
-    base = Path(base_path)
     form_files: list[tuple[str, str, str, Path]] = []  # (category, object_name, form_name, path)
 
     # Discover forms in standard categories
@@ -9518,118 +9775,281 @@ def _collect_form_elements(base_path: str) -> tuple[list[tuple], list[tuple]]:
             if ff.is_file():
                 form_files.append(("CommonForms", form_dir.name, form_dir.name, ff))
 
+    return form_files
+
+
+def _form_rows(base: Path, item: tuple[str, str, str, Path]) -> tuple[list[tuple], list[tuple]]:
+    """Строки ``form_elements`` и ссылки видов форм ОДНОЙ формы — один разбор корня (``_parse_form_root``).
+    ``item`` — ``(категория, объект, форма, путь)`` прежнего обнаружения (``_form_files``)."""
+    from rlm_tools_bsl.bsl_xml_parsers import (
+        _parse_form_cf,
+        _parse_form_edt,
+        _parse_form_root,
+        parse_form_type_refs,
+    )
+
+    cat, obj_name, frm_name, fpath = item
+    try:
+        content = fpath.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return [], []
+    form_root = _parse_form_root(content)
+    if form_root is None:
+        return [], []
+    root, fmt = form_root
+    parsed = _parse_form_edt(root) if fmt == "edt" else _parse_form_cf(root)
+    rel = fpath.relative_to(base).as_posix()
+    used_in_root = (
+        f"CommonForm.{frm_name}"
+        if cat == "CommonForms"
+        else f"{_CATEGORY_TO_TYPE_PREFIX.get(cat, cat)}.{obj_name}.Form.{frm_name}"
+    )
+    type_refs, query_texts = parse_form_type_refs(root, fmt)
+    ref_rows: list[tuple] = [
+        (obj_name, cat, r["ref_object"], r["kind"], f"{used_in_root}.{r['used_in_suffix']}", rel, None)
+        for r in type_refs
+    ]
+    for suffix, text in query_texts:
+        for ref in _query_text_refs(text):
+            ref_rows.append((obj_name, cat, ref, "form_query", f"{used_in_root}.{suffix}", rel, None))
+    rows: list[tuple] = []
+    for h in parsed.get("handlers", []):
+        rows.append(
+            (
+                obj_name,
+                cat,
+                frm_name,
+                "handler",
+                h.get("scope", ""),
+                h.get("element", ""),
+                h.get("element_type", ""),
+                h.get("event", ""),
+                h.get("handler", ""),
+                h.get("data_path", ""),
+                "",
+                0,
+                "",
+                rel,
+            )
+        )
+    for c in parsed.get("commands", []):
+        rows.append(
+            (
+                obj_name,
+                cat,
+                frm_name,
+                "command",
+                "",
+                c.get("name", ""),
+                "",
+                "",
+                c.get("action", ""),
+                "",
+                "",
+                0,
+                "",
+                rel,
+            )
+        )
+    for a in parsed.get("attributes", []):
+        # v1.33.0: parse_form_xml отдаёт types СПИСКОМ. Колонка element_type — TEXT,
+        # и передача списка дала бы sqlite3.InterfaceError на первой же форме.
+        # Формат хранения НЕ меняется (v14 и v15 идентичны): ", ".join — и он же
+        # единственный источник истины, дублировать types в extra_json не надо
+        # (замер: 455 912 XML-узлов типов, значений со встроенной запятой — 0).
+        types_list = a.get("types") or []
+        if isinstance(types_list, str):  # толерантность к старому shape
+            types_list = [t.strip() for t in types_list.split(",") if t.strip()]
+        qt = a.get("query_text", "")
+        extra = json.dumps({"query_text": qt}, ensure_ascii=False) if qt else ""
+        rows.append(
+            (
+                obj_name,
+                cat,
+                frm_name,
+                "attribute",
+                "",
+                a.get("name", ""),
+                ", ".join(types_list),
+                "",
+                "",
+                "",
+                a.get("main_table", ""),
+                1 if a.get("main") else 0,
+                extra,
+                rel,
+            )
+        )
+    return rows, ref_rows
+
+
+def _collect_form_elements(base_path: str) -> tuple[list[tuple], list[tuple]]:
+    """Collect form elements (handlers, commands, attributes) from all forms.
+
+    Returns ``(form_elements rows, metadata_references rows)``. Первые — для INSERT в form_elements:
+    (object_name, category, form_name, kind, scope, element_name, element_type,
+     event, handler, data_path, main_table, attribute_is_main, extra_json, file).
+
+    v1.47.0: вторые — ссылки формы видов `_FORM_SOURCE_REF_KINDS` (`parse_form_type_refs` и `_query_text_refs` по тому
+    же корню, что разбор элементов: один ``ET.fromstring`` на форму):
+    ``(владелец, категория владельца, ref_object, kind, "<Тип>.<Объект>.Form.<Ф>.<суффикс>", путь формы, None)``;
+    у общей формы ``used_in`` — ``CommonForm.<Ф>.<суффикс>``, категория ``CommonForms``.
+    """
+    base = Path(base_path)
+    form_files = _form_files(base)
     if not form_files:
         return [], []
-
-    def _process_form(item: tuple[str, str, str, Path]) -> tuple[list[tuple], list[tuple]]:
-        cat, obj_name, frm_name, fpath = item
-        try:
-            content = fpath.read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeDecodeError):
-            return [], []
-        form_root = _parse_form_root(content)
-        if form_root is None:
-            return [], []
-        root, fmt = form_root
-        parsed = _parse_form_edt(root) if fmt == "edt" else _parse_form_cf(root)
-        rel = fpath.relative_to(base).as_posix()
-        used_in_root = (
-            f"CommonForm.{frm_name}"
-            if cat == "CommonForms"
-            else f"{_CATEGORY_TO_TYPE_PREFIX.get(cat, cat)}.{obj_name}.Form.{frm_name}"
-        )
-        type_refs, query_texts = parse_form_type_refs(root, fmt)
-        ref_rows: list[tuple] = [
-            (obj_name, cat, r["ref_object"], r["kind"], f"{used_in_root}.{r['used_in_suffix']}", rel, None)
-            for r in type_refs
-        ]
-        for suffix, text in query_texts:
-            for ref in _query_text_refs(text):
-                ref_rows.append((obj_name, cat, ref, "form_query", f"{used_in_root}.{suffix}", rel, None))
-        rows: list[tuple] = []
-        for h in parsed.get("handlers", []):
-            rows.append(
-                (
-                    obj_name,
-                    cat,
-                    frm_name,
-                    "handler",
-                    h.get("scope", ""),
-                    h.get("element", ""),
-                    h.get("element_type", ""),
-                    h.get("event", ""),
-                    h.get("handler", ""),
-                    h.get("data_path", ""),
-                    "",
-                    0,
-                    "",
-                    rel,
-                )
-            )
-        for c in parsed.get("commands", []):
-            rows.append(
-                (
-                    obj_name,
-                    cat,
-                    frm_name,
-                    "command",
-                    "",
-                    c.get("name", ""),
-                    "",
-                    "",
-                    c.get("action", ""),
-                    "",
-                    "",
-                    0,
-                    "",
-                    rel,
-                )
-            )
-        for a in parsed.get("attributes", []):
-            # v1.33.0: parse_form_xml отдаёт types СПИСКОМ. Колонка element_type — TEXT,
-            # и передача списка дала бы sqlite3.InterfaceError на первой же форме.
-            # Формат хранения НЕ меняется (v14 и v15 идентичны): ", ".join — и он же
-            # единственный источник истины, дублировать types в extra_json не надо
-            # (замер: 455 912 XML-узлов типов, значений со встроенной запятой — 0).
-            types_list = a.get("types") or []
-            if isinstance(types_list, str):  # толерантность к старому shape
-                types_list = [t.strip() for t in types_list.split(",") if t.strip()]
-            qt = a.get("query_text", "")
-            extra = json.dumps({"query_text": qt}, ensure_ascii=False) if qt else ""
-            rows.append(
-                (
-                    obj_name,
-                    cat,
-                    frm_name,
-                    "attribute",
-                    "",
-                    a.get("name", ""),
-                    ", ".join(types_list),
-                    "",
-                    "",
-                    "",
-                    a.get("main_table", ""),
-                    1 if a.get("main") else 0,
-                    extra,
-                    rel,
-                )
-            )
-        return rows, ref_rows
 
     all_results: list[tuple] = []
     all_refs: list[tuple] = []
     if len(form_files) > 1:
-        workers = min(os.cpu_count() or 4, 8)
+        workers = _collector_threads()
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for batch, refs_batch in pool.map(_process_form, form_files):
+            for batch, refs_batch in pool.map(functools.partial(_form_rows, base), form_files):
                 all_results.extend(batch)
                 all_refs.extend(refs_batch)
     elif form_files:
-        batch, refs_batch = _process_form(form_files[0])
+        batch, refs_batch = _form_rows(base, form_files[0])
         all_results.extend(batch)
         all_refs.extend(refs_batch)
 
     return all_results, all_refs
+
+
+# v1.48.0: выборочные формы Git-пути. Пути, которые находит прежнее обнаружение (`_form_files`), — дословно его
+# правила: регистр букв, литералы `Forms`, `Ext`, `Form.xml`, `Form.form`, глубина.
+_FORM_DELTA_RE = re.compile(r"^(?P<cat>[^/]+)/(?P<obj>[^/]+)/Forms/(?P<form>[^/]+)/(?:Form\.form|Ext/Form\.xml)$")
+_COMMON_FORM_DELTA_RE = re.compile(r"^CommonForms/(?P<form>[^/]+)/(?:Form\.form|Ext/Form\.xml)$")
+
+
+def _spelling(directory: Path, name: str, cache: dict[Path, set[str] | None]) -> str:
+    """Запись ``name`` в каталоге: ``exact`` — с ТОЧНО таким написанием; ``absent`` — нет ни в каком регистре (или
+    нет каталога: объект удалён); ``case`` — есть только в другом регистре."""
+    if directory not in cache:
+        try:
+            cache[directory] = set(os.listdir(directory))
+        except OSError:
+            cache[directory] = None
+    names = cache[directory]
+    if names is None:
+        return "absent"
+    if name in names:
+        return "exact"
+    folded = name.casefold()
+    return "case" if any(n.casefold() == folded for n in names) else "absent"
+
+
+def _form_dirs_from_delta(paths: Iterable[str], base_path: str) -> list[tuple[str, str, str, str]] | None:
+    """Каталоги форм, затронутые путями Git-дельты: ``(категория, объект, форма, каталог)`` в форме прежнего
+    обнаружения. Путь формы, которого прежнее обнаружение не знает (иное имя файла, глубина, регистр), или каталог,
+    чьё написание на диске отличается от пути дельты, — ``None``: прежний полный проход."""
+    from rlm_tools_bsl.format_detector import METADATA_CATEGORIES
+
+    base = Path(base_path)
+    listing: dict[Path, set[str] | None] = {}
+    found: dict[str, tuple[str, str, str, str]] = {}
+    for path in paths:
+        common = _COMMON_FORM_DELTA_RE.match(path)
+        if common is not None:
+            form = common["form"]
+            key = ("CommonForms", form, form, f"CommonForms/{form}")
+            spelled = _spelling(base / "CommonForms", form, listing)
+        else:
+            m = _FORM_DELTA_RE.match(path)
+            if m is None or m["cat"] not in METADATA_CATEGORIES:
+                return None
+            cat, obj, form = m["cat"], m["obj"], m["form"]
+            key = (cat, obj, form, f"{cat}/{obj}/Forms/{form}")
+            spelled = _spelling(base / cat, obj, listing)
+            if spelled == "exact":
+                spelled = _spelling(base / cat / obj / "Forms", form, listing)
+        if spelled == "case":
+            return None
+        found[key[3]] = key
+    return [found[d] for d in sorted(found)]
+
+
+def _form_rows_spelled_differently(
+    conn: sqlite3.Connection, base_path: str, form_dirs: list[tuple[str, str, str, str]]
+) -> bool:
+    """Строки форм записаны в индексе с написанием пути, которого прежний полный проход уже не дал бы: каталог объекта
+    или формы переименован только регистром между операциями (Git с ``core.ignorecase`` смену регистра латиницы не
+    видит). Прежнее обнаружение (``_form_files``) берёт оба этих звена из листинга диска, остальные — литералами:
+    у каждой проиндексированной формы они сверяются с листингом родителя; строки формы из дельты, которой на диске нет,
+    — с путём дельты без учёта регистра. Путь вне прежних правил обнаружения — тоже ``True``: нужен прежний полный
+    проход."""
+    base = Path(base_path)
+    listing: dict[Path, set[str] | None] = {}
+    exact = {path for *_, form_dir in form_dirs for path in (f"{form_dir}/Form.form", f"{form_dir}/Ext/Form.xml")}
+    folded = {path.casefold() for path in exact}
+    paths = {path for (path,) in conn.execute("SELECT DISTINCT file FROM form_elements")}
+    paths.update(
+        path
+        for (path,) in conn.execute(
+            f"SELECT DISTINCT path FROM metadata_references WHERE ref_kind IN {_FORM_SOURCE_REF_KINDS_SQL}"  # noqa: S608
+        )
+    )
+    for path in paths:
+        if path not in exact and path.casefold() in folded:
+            return True
+        common = _COMMON_FORM_DELTA_RE.match(path)
+        if common is not None:
+            spelled = _spelling(base / "CommonForms", common["form"], listing)
+        else:
+            m = _FORM_DELTA_RE.match(path)
+            if m is None:
+                return True
+            spelled = _spelling(base / m["cat"], m["obj"], listing)
+            if spelled == "exact":
+                spelled = _spelling(base / m["cat"] / m["obj"] / "Forms", m["form"], listing)
+        if spelled == "case":
+            return True
+    return False
+
+
+def _tables_exist(conn: sqlite3.Connection, names: tuple[str, ...]) -> bool:
+    """Все таблицы ``names`` есть в схеме индекса."""
+    placeholders = ",".join("?" * len(names))
+    found = conn.execute(
+        f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ({placeholders})",  # noqa: S608
+        names,
+    ).fetchone()[0]
+    return found == len(names)
+
+
+def _refresh_form_dirs(conn: sqlite3.Connection, base_path: str, form_dirs: list[tuple[str, str, str, str]]) -> int:
+    """Перечитать ровно эти каталоги форм: строки ``form_elements`` и ссылки видов форм с путём любого из двух
+    файлов каталога удаляются (и у удалённой формы), канонический файл — прежним правилом (``Form.form``, иначе
+    ``Ext/Form.xml``). Возвращает число разобранных форм."""
+    base = Path(base_path)
+    rows: list[tuple] = []
+    refs: list[tuple] = []
+    parsed = 0
+    for cat, obj, form, form_dir in form_dirs:
+        candidates = (f"{form_dir}/Form.form", f"{form_dir}/Ext/Form.xml")
+        conn.execute("DELETE FROM form_elements WHERE file IN (?, ?)", candidates)
+        conn.execute(
+            f"DELETE FROM metadata_references WHERE path IN (?, ?) AND ref_kind IN {_FORM_SOURCE_REF_KINDS_SQL}",  # noqa: S608
+            candidates,
+        )
+        for rel in candidates:
+            path = base / rel
+            if path.is_file():
+                form_rows, form_refs = _form_rows(base, (cat, obj, form, path))
+                rows.extend(form_rows)
+                refs.extend(form_refs)
+                parsed += 1
+                break
+    if rows:
+        conn.executemany(_FORM_ELEMENTS_INSERT, rows)
+    if refs:
+        conn.executemany(
+            "INSERT INTO metadata_references "
+            "(source_object, source_category, ref_object, ref_kind, used_in, path, line) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            refs,
+        )
+    return parsed
 
 
 _FORM_ELEMENTS_SCHEMA = (
@@ -9766,6 +10186,403 @@ class _DescriptorPrefetch:
 
 
 # ---------------------------------------------------------------------------
+# v1.48.0: задачи сборки в общем пуле процессов (_index_workers)
+# ---------------------------------------------------------------------------
+def _rights_batches(base_path: str, workers: int) -> list[list[tuple[str, Path]]]:
+    """Файлы прав порциями по объёму (крупный файл прав CF — десятки МБ): воркеру уходят пути, не содержимое.
+    Последовательно — одна порция."""
+    items = _rights_file_items(base_path)
+    if workers <= 1 or len(items) <= 1:
+        return [items] if items else []
+    sizes: list[int] = []
+    for _role_name, path in items:
+        try:
+            sizes.append(path.stat().st_size)
+        except OSError:
+            sizes.append(0)
+    target = max(1, sum(sizes) // (workers * 3))
+    batches: list[list[tuple[str, Path]]] = []
+    current: list[tuple[str, Path]] = []
+    acc = 0
+    for item, size in zip(items, sizes):
+        current.append(item)
+        acc += size
+        if acc >= target:
+            batches.append(current)
+            current, acc = [], 0
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _submit_descriptor_jobs(
+    pool: IndexTaskPool,
+    base_path: str,
+    *,
+    build_metadata: bool,
+    build_synonyms: bool,
+    skip: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """Коллекторы описателей полной сборки — независимые задачи общего пула: ставятся раньше батчей BSL, чтобы
+    их очередь не оказалась за всем разбором. Каждый коллектор — прежняя функция с прежним результатом; права —
+    порциями файлов (``_rights_batches``). ``skip`` — домены, чьи входы доказанно не менялись (полный скан со
+    снимком): их коллекторы не ставятся."""
+    jobs: dict[str, object] = {}
+    if build_metadata and "metadata" not in skip:
+        jobs["metadata"] = pool.submit(_collect_metadata_tables, base_path)
+    if build_metadata and "forms" not in skip:
+        jobs["forms"] = pool.submit(_collect_form_elements, base_path)
+    if "rights" not in skip:
+        jobs["roles"] = [
+            pool.submit(_rights_batch_data, base_path, items) for items in _rights_batches(base_path, pool.workers)
+        ]
+    if build_synonyms and "synonyms" not in skip:
+        jobs["synonyms"] = pool.submit(_collect_object_synonyms, base_path)
+    jobs["file_paths"] = pool.submit(_collect_file_paths, base_path)
+    jobs["config_meta"] = pool.submit(_parse_configuration_meta, base_path)
+    return jobs
+
+
+def _descriptor_results(pool: IndexTaskPool, jobs: dict[str, object]) -> dict[str, object]:
+    """Результаты задач ``_submit_descriptor_jobs``; права склеиваются в порядке файлов."""
+    out: dict[str, object] = {}
+    for name, job in jobs.items():
+        if name == "roles":
+            out[name] = _merge_role_data(pool.result(future) for future in job)  # type: ignore[union-attr]
+        else:
+            out[name] = pool.result(job)  # type: ignore[arg-type]
+    return out
+
+
+class _ParseProgress:
+    """Прогресс разбора BSL по фактически завершённым файлам: порции завершаются не по порядку, и крупный ранний
+    модуль не скрывает работу остальных. Вызывается из потока пула — под замком."""
+
+    def __init__(self, total: int, t0: float) -> None:
+        self._total = total
+        self._t0 = t0
+        self._done = 0
+        self._next = 1000
+        self._lock = threading.Lock()
+
+    def add(self, count: int) -> None:
+        with self._lock:
+            self._done += count
+            while self._done >= self._next:
+                elapsed = time.time() - self._t0
+                logger.info(
+                    "Progress: %d/%d files (%.0f files/sec)",
+                    self._next,
+                    self._total,
+                    self._next / elapsed if elapsed > 0 else 0,
+                )
+                self._next += 1000
+
+
+# ---------------------------------------------------------------------------
+# v1.48.0: снимок входов доменов описателей (_index_snapshot) — пропуск неизменных доменов полным сканом
+# ---------------------------------------------------------------------------
+# Категории, чьи поддеревья `_collect_metadata_tables` читает целиком (`_glob_xml`: все .xml/.mdo) — там и содержимое
+# `Template.xml` входит в описатели (тест сверяет список с вызовами `_glob_xml`).
+_GLOB_XML_CATEGORIES = frozenset(
+    {
+        "EventSubscriptions",
+        "ScheduledJobs",
+        "FunctionalOptions",
+        "Enums",
+        "Subsystems",
+        "HTTPServices",
+        "WebServices",
+        "XDTOPackages",
+    }
+)
+# Файлы, которые коллекторы описателей открывают по содержимому (`.xdto` — пакеты EDT, `.command` — команды EDT).
+_INPUT_HASH_SUFFIXES = (".xml", ".mdo", ".xdto", ".command", ".form", ".rights")
+_SNAPSHOT_DOMAINS = ("descriptors", "forms", "rights", "synonyms", "overrides")
+
+
+def _descriptor_hash_rule(rel: str) -> bool:
+    """Хешировать ли файл описи основной: всё, что коллекторы могут прочитать по содержимому. Содержимое макета —
+    `Template.xml` в каталоге `Ext` (`…/Templates/<Имя>/Ext/`, `CommonTemplates/<Имя>/Ext/`) — только в поддеревьях
+    `_GLOB_XML_CATEGORIES`; прочие решает `_payloads_read_as_descriptor`. Имя `Template.xml` вне `Ext` — описатель
+    (макет, общий макет, объект, команда с именем `Template`): хешируется."""
+    low = rel.lower()
+    if not low.endswith(_INPUT_HASH_SUFFIXES):
+        return False
+    if low.endswith("/ext/template.xml"):
+        return rel.split("/", 1)[0] in _GLOB_XML_CATEGORIES
+    return True
+
+
+def _payloads_read_as_descriptor(inv) -> list[str]:
+    """`<Категория>/<Объект>/Ext/Template.xml` объекта без `<Объект>.xml` рядом и без `<Объект>/<Объект>.mdo`:
+    последний шаг `_find_metadata_xml` (и выбор описателя синонимов) берёт первый `.xml` из `Ext` — им может оказаться
+    содержимое общего макета. Такой файл хешируется; содержимое макетов объектов (`…/Templates/…`) коллекторы не
+    читают."""
+    files = set(inv.files)
+    out: list[str] = []
+    for rel in inv.files:
+        parts = rel.split("/")
+        if rel in inv.hashes or len(parts) != 4 or parts[3].lower() != "template.xml" or parts[2].lower() != "ext":
+            continue
+        cat, obj = parts[0], parts[1]
+        if f"{cat}/{obj}.xml" not in files and f"{cat}/{obj}/{obj}.mdo" not in files:
+            out.append(rel)
+    return out
+
+
+def _overrides_inputs_digest(
+    base_path: str, descriptors: str | None, detection: _ExtensionDetection | None = None
+) -> str | None:
+    """Входы перехватов основной конфигурации: результат детекта соседей, деревья расширений (пути, каталоги, хеши
+    BSL и описателей) и дайджест описателей основной (формы основной — цель перехвата из формы). Модули и методы
+    основной — из БД: пропуск перехватов допустим только без BSL-дельты (решает вызывающий). Индекс на самом
+    расширении — ``None``: перехваты перечитываются всегда. ``detection`` — детект операции, общий с перехватами."""
+    from rlm_tools_bsl._index_snapshot import UNREADABLE, digest, inventory_tree
+    from rlm_tools_bsl.extension_detector import ConfigRole
+
+    if descriptors is None:
+        return None
+    try:
+        ctx = (detection or _ExtensionDetection(base_path)).get()
+    except Exception:
+        return None
+    current = ctx.current
+    if current.role == ConfigRole.EXTENSION:
+        return None
+    parts: list = [["role", str(getattr(current.role, "value", current.role))], ["main", descriptors]]
+    if current.role == ConfigRole.MAIN:
+        for ext in ctx.nearby_extensions:
+            inv = inventory_tree(ext.path, hash_rule=lambda rel: rel.lower().endswith((*_INPUT_HASH_SUFFIXES, ".bsl")))
+            if not inv.usable or UNREADABLE in inv.hashes.values():
+                return None
+            parts.append(["ext", str(ext.path), ext.name, ext.purpose, inv.dirs, inv.files, sorted(inv.hashes.items())])
+    return digest(parts)
+
+
+def _input_digests(
+    base_path: str,
+    *,
+    build_metadata: bool,
+    build_synonyms: bool,
+    stop: threading.Event | None = None,
+    detection: _ExtensionDetection | None = None,
+) -> dict[str, str | None]:
+    """Дайджесты входов доменов описателей по СОДЕРЖИМОМУ (хеш) для снимка ``_index_snapshot``: ``descriptors`` —
+    надмножество входов ``_collect_metadata_tables`` (все каталоги, пути всех файлов, кроме BSL, хеши описателей);
+    ``forms``/``rights``/``synonyms`` — прежнее обнаружение своего коллектора с хешами найденных файлов (у прав — и
+    порядок: от него зависит дедуп ссылок); ``overrides`` — ``_overrides_inputs_digest`` (``detection`` — детект
+    операции, общий с перехватами). ``None`` у домена — доказать неизменность нельзя (ссылка на каталог, непрочитанный
+    каталог или файл)."""
+    from rlm_tools_bsl._index_snapshot import UNREADABLE, digest, file_hash, inventory_tree
+
+    base = Path(base_path)
+    inv = inventory_tree(
+        base, hash_rule=_descriptor_hash_rule, skip_file=lambda rel: rel.lower().endswith(".bsl"), stop=stop
+    )
+    for rel in _payloads_read_as_descriptor(inv):
+        inv.hashes[rel] = file_hash(base / rel)
+    out: dict[str, str | None] = dict.fromkeys(_SNAPSHOT_DOMAINS)
+    if not inv.usable or UNREADABLE in inv.hashes.values():
+        return out
+
+    def _hash(path: Path) -> tuple[str, str]:
+        rel = path.relative_to(base).as_posix()
+        value = inv.hashes.get(rel)
+        return rel, value if value is not None else file_hash(path)
+
+    def _domain(entries: list) -> str | None:
+        return None if any(entry[-1] == UNREADABLE for entry in entries) else digest(entries)
+
+    out["descriptors"] = digest([inv.dirs, [[rel, inv.hashes.get(rel, "")] for rel in inv.files]])
+    if build_metadata:
+        out["forms"] = _domain(sorted([cat, obj, form, *_hash(path)] for cat, obj, form, path in _form_files(base)))
+    layout = "root" if (base / "Roles").is_dir() else "nested"
+    rights = [[role, *_hash(path)] for role, path in _rights_file_items(base_path)]
+    out["rights"] = _domain([["layout", layout], *rights]) if all(r[-1] != UNREADABLE for r in rights) else None
+    if build_synonyms:
+        out["synonyms"] = _domain(
+            sorted([cat, obj, *_hash(base / rel)] for cat, obj, rel in _iter_metadata_xml_files(base_path))
+        )
+    out["overrides"] = _overrides_inputs_digest(base_path, out["descriptors"], detection)
+    return out
+
+
+class _InputFingerprint:
+    """Расчёт ``_input_digests`` для снимка. ``background`` (крупная выгрузка) — в фоне на время сборки: опись с хешами
+    идёт рядом с разбором BSL. Иначе — в вызывающем потоке в ``result()`` (в конце сборки): у малой выгрузки фоновый
+    поток только спорит с коллекторами за GIL. Сбой — без снимка (следующий полный скан идёт прежним путём), сборку он
+    не касается."""
+
+    def __init__(
+        self,
+        base_path: str,
+        *,
+        build_metadata: bool,
+        build_synonyms: bool,
+        background: bool = True,
+        detection: _ExtensionDetection | None = None,
+    ) -> None:
+        self._args = (base_path, build_metadata, build_synonyms)
+        self._detection = detection
+        self._digests: dict[str, str | None] | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        if background:
+            self._thread = threading.Thread(target=self._run, name="rlm-index-inputs-walk", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        base_path, build_metadata, build_synonyms = self._args
+        try:
+            self._digests = _input_digests(
+                base_path,
+                build_metadata=build_metadata,
+                build_synonyms=build_synonyms,
+                stop=self._stop,
+                detection=self._detection,
+            )
+        except Exception:
+            logger.warning("index input fingerprint failed; no snapshot this time", exc_info=True)
+
+    def result(self) -> dict[str, str | None] | None:
+        if self._thread is None:
+            self._run()
+        else:
+            self._thread.join()
+        return None if self._stop.is_set() else self._digests
+
+    def close(self) -> None:
+        """Остановить расчёт (сборка завершилась или упала) и дождаться потока: после возврата ни один файл описью
+        не открыт."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+
+def _skipped_domains(
+    snapshot: dict | None, digests: dict[str, str | None], conn: sqlite3.Connection, bsl_changed: bool
+) -> frozenset[str]:
+    """Домены полного скана, которые не перечитываются: дайджест входов совпал со снимком, привязанным к этому
+    индексу (``_snapshot_binds``). Перехваты — только без BSL-дельты: их привязка читает modules/methods основной.
+    Права при перечитываемых метаданных — только если у каждой роли один файл прав: тогда ссылки ролей выводятся из
+    итоговой role_rights без зависимости от порядка файлов."""
+    if snapshot is None:
+        return frozenset()
+    stored = snapshot.get("domains") or {}
+
+    def same(name: str) -> bool:
+        return digests.get(name) is not None and stored.get(name) == digests[name]
+
+    skip = {
+        domain for domain, key in (("metadata", "descriptors"), ("forms", "forms"), ("rights", "rights")) if same(key)
+    }
+    if same("synonyms"):
+        skip.add("synonyms")
+    if same("overrides") and not bsl_changed:
+        skip.add("overrides")
+    if "rights" in skip and "metadata" not in skip and not _one_rights_file_per_role(conn):
+        skip.discard("rights")
+    return frozenset(skip)
+
+
+def _one_rights_file_per_role(conn: sqlite3.Connection) -> bool:
+    try:
+        return (
+            conn.execute("SELECT 1 FROM role_flags GROUP BY role_name HAVING COUNT(*) > 1 LIMIT 1").fetchone() is None
+        )
+    except sqlite3.OperationalError:
+        return False
+
+
+def _form_ref_rows(conn: sqlite3.Connection) -> list[tuple]:
+    """Строки видов форм в metadata_references — сохранить на время перезаписи ссылок описателей."""
+    try:
+        return [
+            tuple(r)
+            for r in conn.execute(
+                "SELECT source_object, source_category, ref_object, ref_kind, used_in, path, line "
+                f"FROM metadata_references WHERE ref_kind IN {_FORM_SOURCE_REF_KINDS_SQL}"  # noqa: S608
+            )
+        ]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _insert_ref_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    conn.executemany(
+        "INSERT INTO metadata_references (source_object, source_category, ref_object, ref_kind, used_in, path, line) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+
+
+def _rebuild_role_rights_refs(conn: sqlite3.Connection) -> None:
+    """Ссылки ролей (категория ``Roles``) заново из итоговой role_rights — тот же итог, что у шага прав."""
+    try:
+        conn.execute("DELETE FROM metadata_references WHERE source_category = 'Roles'")
+    except sqlite3.OperationalError:
+        return
+    rows = [tuple(r) for r in conn.execute("SELECT role_name, object_name, right_name, file FROM role_rights")]
+    if rows:
+        _insert_role_rights_refs(conn, rows)
+
+
+def _snapshot_options(conn: sqlite3.Connection) -> dict[str, str | None]:
+    return {key: IndexBuilder._meta_get(conn, key) for key in ("has_calls", "has_metadata", "has_fts", "has_synonyms")}
+
+
+def _publish_snapshot(conn: sqlite3.Connection, db_path: Path, digests: dict[str, str | None] | None) -> None:
+    """Опубликовать снимок после успешной операции (сборка, полный скан): привязка — к только что записанным
+    ``built_at``, поколению, опциям, корню и коду."""
+    from rlm_tools_bsl._index_snapshot import code_fingerprint, write_snapshot
+
+    if digests is None:
+        return
+    write_snapshot(
+        db_path,
+        {
+            "builder_version": BUILDER_VERSION,
+            "code": code_fingerprint(),
+            "base_path": IndexBuilder._meta_get(conn, "base_path"),
+            "built_at": IndexBuilder._meta_get(conn, "built_at"),
+            "options": _snapshot_options(conn),
+            "domains": digests,
+        },
+    )
+
+
+def _snapshot_binds(snapshot: dict | None, conn: sqlite3.Connection) -> bool:
+    """Снимок описывает именно этот индекс: поколение, код, корень, опции и точный ``built_at``."""
+    from rlm_tools_bsl._index_snapshot import code_fingerprint
+
+    if snapshot is None:
+        return False
+    return (
+        snapshot.get("builder_version") == BUILDER_VERSION
+        and IndexBuilder._meta_get(conn, "builder_version") == str(BUILDER_VERSION)
+        and snapshot.get("code") == code_fingerprint()
+        and snapshot.get("base_path") == IndexBuilder._meta_get(conn, "base_path")
+        and snapshot.get("built_at") == IndexBuilder._meta_get(conn, "built_at")
+        and snapshot.get("options") == _snapshot_options(conn)
+    )
+
+
+def _remove_stale_spools(index_dir: Path) -> None:
+    """Удалить spool прерванной операции (процесс убит до ``close``): операция держит блокировку индекса, поэтому
+    любой spool в его каталоге — чужой и мёртвый."""
+    try:
+        stale = list(index_dir.glob(".bsl_index.spool-*.tmp"))
+    except OSError:
+        return
+    for path in stale:
+        try:
+            path.unlink()
+        except OSError:
+            logger.debug("stale index spool %s not removed", path, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # IndexBuilder
 # ---------------------------------------------------------------------------
 class IndexBuilder:
@@ -9778,6 +10595,7 @@ class IndexBuilder:
         prefix: str,
         *,
         preserve_on_unreliable: bool,
+        current: _GitDirtyResult | None = None,
     ) -> str | None:
         """Persist the git dirty snapshot together with its reliability flag.
 
@@ -9792,8 +10610,11 @@ class IndexBuilder:
         build, no prior snapshot) the partial set is stored as best-effort info.
 
         Returns the unreliable reason (or ``None`` when reliable).
+
+        ``current`` (v1.48.0) — уже снятый надёжный набор тех же команд (начало git-быстрого пути): исходники в
+        пределах операции не меняются, второй запуск git дал бы тот же набор.
         """
-        result = _git_current_dirty(base_path, prefix)
+        result = current if current is not None else _git_current_dirty(base_path, prefix)
         if result.unreliable_reason is not None:
             conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('git_dirty_unreliable', '1')")
             if not preserve_on_unreliable:
@@ -10058,14 +10879,37 @@ class IndexBuilder:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path))
         try:
-            # Описатели прогреваются в фоне, пока идет разбор BSL (см. _DescriptorPrefetch).
-            prefetch = _DescriptorPrefetch(base_path)
+            # Описатели прогреваются в фоне, пока идет разбор BSL (см. _DescriptorPrefetch); v1.48.0 — рядом дайджесты
+            # входов для снимка (_InputFingerprint). Оба закрываются здесь же — и при ошибке сборки. v1.48.0: только у
+            # крупной выгрузки — у малой коллекторы читают описатели сразу (последовательный режим), а фоновые потоки
+            # лишь спорят с ними за GIL; дайджесты малой считаются в конце сборки.
+            large = _large_export(base_path)
+            prefetch = _DescriptorPrefetch(base_path) if large else None
+            # Детект соседних конфигураций — один на сборку: перехваты и дайджест перехватов для снимка.
+            detection = _ExtensionDetection(base_path)
+            fingerprint = _InputFingerprint(
+                base_path,
+                build_metadata=build_metadata,
+                build_synonyms=build_synonyms,
+                background=large,
+                detection=detection,
+            )
             try:
                 return self._build_into_conn(
-                    conn, base_path, db_path, build_calls, build_metadata, build_fts, build_synonyms
+                    conn,
+                    base_path,
+                    db_path,
+                    build_calls,
+                    build_metadata,
+                    build_fts,
+                    build_synonyms,
+                    fingerprint,
+                    detection,
                 )
             finally:
-                prefetch.close()
+                fingerprint.close()
+                if prefetch is not None:
+                    prefetch.close()
         finally:
             conn.close()
 
@@ -10078,6 +10922,8 @@ class IndexBuilder:
         build_metadata: bool,
         build_fts: bool,
         build_synonyms: bool,
+        fingerprint: _InputFingerprint | None = None,
+        detection: _ExtensionDetection | None = None,
     ) -> Path:
         """Build into an already-open connection (the caller opened it and closes it in
         a finally — M1). In-place: set the marker + clear the schema before populating,
@@ -10088,6 +10934,8 @@ class IndexBuilder:
             "has_fts": build_fts,
             "has_synonyms": build_synonyms,
         }
+        # v1.48.0: снимок входов прежней сборки — удалить до первой записи (не удалось — ошибка до изменений БД).
+        remove_snapshot(db_path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         # Кеш страниц на время сборки (соединение закрывает вызывающий): со штатными ~2 МБ вставка
@@ -10159,42 +11007,56 @@ class IndexBuilder:
         rel_paths = [Path(f).relative_to(base).as_posix() for f in bsl_files]
         paths_hash = _paths_hash(rel_paths)
 
-        # Parallel processing
-        results: list[tuple[BslFileInfo, float, int, list[dict], list[tuple[int, str, int]]]] = []
-        workers = min(os.cpu_count() or 4, 8)
+        # v1.48.0: разбор BSL — порциями в процессах, вместе с коллекторами описателей в одном бюджете CPU;
+        # результаты разбора — во временный spool рядом с индексом, а не в память. Схема очищается только после
+        # разбора: сбой разбора или коллектора оставляет прежний индекс целым.
+        workers, workers_source = resolve_index_workers()
+        if total_files <= _PARALLEL_MIN_BSL_FILES:
+            workers = 1
+        _remove_stale_spools(db_path.parent)
+        spool = ResultSpool(db_path.parent)
+        try:
+            with IndexTaskPool(workers, label="build") as pool:
+                jobs = _submit_descriptor_jobs(
+                    pool, base_path, build_metadata=build_metadata, build_synonyms=build_synonyms
+                )
+                progress = _ParseProgress(total_files, t0)
+                for blob in pool.map_ordered(
+                    _parse_bsl_batch,
+                    ((batch, base_path, build_calls) for batch in bsl_batches(bsl_files, pool.workers)),
+                    window=4 * pool.workers,
+                    on_done=progress.add,
+                    weights=lambda item: len(item[0]),
+                ):
+                    spool.append(blob)
+                descriptors = _descriptor_results(pool, jobs)
+                parallel = pool.parallel
+                granted = pool.workers
+            logger.info(
+                "Parsed %d .bsl files in %.1fs (%s; workers %s; spool %.1f MB)",
+                total_files,
+                time.time() - t0,
+                "processes" if parallel else "sequential",
+                f"{granted} ({workers_source})" if parallel else 1,
+                spool.bytes / 1e6,
+            )
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_process_single_file, fp, base_path, build_calls): fp for fp in bsl_files}
-            done_count = 0
-            for future in as_completed(futures):
-                done_count += 1
-                if done_count % 1000 == 0:
-                    elapsed = time.time() - t0
-                    rate = done_count / elapsed if elapsed > 0 else 0
-                    logger.info(
-                        "Progress: %d/%d files (%.0f files/sec)",
-                        done_count,
-                        total_files,
-                        rate,
-                    )
-                result = future.result()
-                if result is not None:
-                    results.append(result)
+            # Write to SQLite — in-place: set the build_in_progress marker + clear the schema
+            # before populating (conn is opened AND closed by the caller — M1 try/finally).
+            self._begin_inplace_rebuild(conn, opts, defer_calls_indexes=True)
 
-        # Write to SQLite — in-place: set the build_in_progress marker + clear the schema
-        # before populating (conn is opened AND closed by the caller — M1 try/finally).
-        self._begin_inplace_rebuild(conn, opts, defer_calls_indexes=True)
-
-        self._bulk_insert(conn, results, build_calls)
+            bsl_stats = self._bulk_insert_batches(conn, spool, build_calls)
+        finally:
+            spool.close()
         conn.executescript(_CALLS_INDEX_SQL)
         self._refresh_call_resolution_stats(conn)
 
         # Level-1 metadata: Configuration XML
-        config_meta = _parse_configuration_meta(base_path)
+        config_meta = descriptors["config_meta"]
 
         # Level-2 metadata: ES, SJ, FO
         if build_metadata:
-            md_tables = _collect_metadata_tables(base_path)
+            md_tables = descriptors["metadata"]
             _insert_metadata_tables(conn, md_tables)
 
         # Level-3: register movements (in-band, already extracted)
@@ -10202,7 +11064,7 @@ class IndexBuilder:
         # из ManagerModule статически неоднозначно, и без сверки в таблицу попали бы
         # имена полей набора записей.
         known_registers = _known_register_names(base)
-        all_movements, dropped_manager = _movement_rows_for_insert(results, known_registers)
+        all_movements, dropped_manager = _movement_rows_for_insert(bsl_stats.movement_results, known_registers)
         if all_movements:
             conn.executemany(_MOVEMENTS_INSERT_SQL, all_movements)
             conn.commit()
@@ -10215,7 +11077,7 @@ class IndexBuilder:
         # Level-3: role rights (parallel regex parsing)
         # v16: флаг setForNewObjects и исключения берутся ТЕМ ЖЕ проходом —
         # второе чтение 242 МБ файлов прав ради флага недопустимо.
-        _role_data = _collect_role_data(base_path)
+        _role_data = descriptors["roles"]
         role_rights = _role_data.rights
         _insert_role_flags(conn, _role_data)
         if role_rights:
@@ -10239,7 +11101,7 @@ class IndexBuilder:
                     pass
 
         # Level-4: file navigation index (.bsl/.mdo/.xml paths)
-        file_paths_rows = _collect_file_paths(base_path)
+        file_paths_rows = descriptors["file_paths"]
         _insert_file_paths(conn, file_paths_rows)
         conn.commit()
         logger.info("File paths: %d entries", len(file_paths_rows))
@@ -10255,7 +11117,7 @@ class IndexBuilder:
 
         # Level-6: object synonyms (business-name search)
         if build_synonyms:
-            synonyms = _collect_object_synonyms(base_path)
+            synonyms = descriptors["synonyms"]
             if synonyms:
                 conn.executemany(
                     "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES (?, ?, ?, ?)",
@@ -10265,7 +11127,7 @@ class IndexBuilder:
                 logger.info("Object synonyms: %d entries", len(synonyms))
 
         # Level-8: extension overrides
-        override_rows = _collect_extension_overrides(base_path, conn)
+        override_rows = _collect_extension_overrides(base_path, conn, detection)
         if override_rows:
             conn.executemany(
                 _EXTENSION_OVERRIDES_INSERT,
@@ -10286,7 +11148,7 @@ class IndexBuilder:
         fe_rows: list[tuple] = []
         if build_metadata:
             conn.executescript(_FORM_ELEMENTS_SCHEMA)
-            fe_rows, form_ref_rows = _collect_form_elements(base_path)
+            fe_rows, form_ref_rows = descriptors["forms"]
             if fe_rows:
                 conn.executemany(_FORM_ELEMENTS_INSERT, fe_rows)
                 logger.info("Form elements: %d entries", len(fe_rows))
@@ -10350,15 +11212,16 @@ class IndexBuilder:
         # ANALYZE + VACUUM (best-effort) then clear the marker (success gate). conn is
         # closed by the caller (_build_locked) in a finally — M1.
         self._finalize_build_best_effort(conn)
+        if fingerprint is not None:
+            # v1.48.0: снимок входов (_index_snapshot) — после success gate, к только что записанному built_at.
+            _publish_snapshot(conn, db_path, fingerprint.result())
 
         elapsed = time.time() - t0
-        total_methods = sum(len(r.methods) for r in results)
-        total_calls = sum(len(r.raw_calls) for r in results)
         logger.info(
             "Index built: %d modules, %d methods, %d calls in %.1fs (%.0f files/sec)",
-            len(results),
-            total_methods,
-            total_calls,
+            bsl_stats.modules,
+            bsl_stats.methods,
+            bsl_stats.calls,
             elapsed,
             total_files / elapsed if elapsed > 0 else 0,
         )
@@ -10415,6 +11278,10 @@ class IndexBuilder:
         base = Path(base_path)
 
         conn.row_factory = sqlite3.Row
+        # v1.48.0: снимок входов — в память и с диска ДО первой записи любой ветки: прерванная операция оставляет
+        # только промах кеша. Не удалился — ошибка до изменений БД. Публикует новый только полный скан.
+        snapshot = load_snapshot(db_path)
+        remove_snapshot(db_path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
 
@@ -10613,6 +11480,14 @@ class IndexBuilder:
                             prev_dirty = set(json.loads(stored_dirty_row["value"]))
                             git_changed |= prev_dirty
 
+                        # v1.48.0: dirty-снимок конца операции — из начального набора, если каталог индекса вне
+                        # рабочего дерева (иначе файлы самой БД попали бы в untracked и наборы разошлись бы).
+                        reusable_dirty = (
+                            _GitDirtyResult(git_result.dirty)
+                            if git_result.dirty is not None and not _path_inside(db_path, git_root)
+                            else None
+                        )
+                        noop = not git_changed
                         delta = self._update_git_fast(
                             conn,
                             base_path,
@@ -10624,9 +11499,13 @@ class IndexBuilder:
                             has_metadata,
                             has_fts,
                             has_synonyms,
+                            reusable_dirty,
                         )
                         conn.commit()
-                        conn.execute("ANALYZE")
+                        # v1.48.0: no-op (пустая дельта) данных таблиц не меняет — статистику планировщика при
+                        # уже собранной не пересчитываем; любая дельта — ANALYZE, как прежде.
+                        if not (noop and _planner_stats_present(conn)):
+                            conn.execute("ANALYZE")
                         conn.close()
                         elapsed = time.time() - t0
                         logger.info("Git fast path update done in %.1fs", elapsed)
@@ -10648,8 +11527,9 @@ class IndexBuilder:
         # v1.47.0: прогрев описателей на время полного скана — тот же, что у полной сборки (`_DescriptorPrefetch`):
         # полный скан перечитывает все описатели подряд (метаданные, синонимы, права, формы), и на холодном кеше
         # файлов (после загрузки ОС или обновления сигнатур антивируса) одни метаданные крупной ERP-конфигурации шли
-        # минуты (замер: 511 с против 31 с на тёплом). Закрывает его `update()` — и при исключении.
-        if prefetch is not None:
+        # минуты (замер: 511 с против 31 с на тёплом). Закрывает его `update()` — и при исключении. v1.48.0: только у
+        # крупной выгрузки, как у сборки: у малой опись снимка и коллекторы читают описатели сразу сами.
+        if prefetch is not None and _large_export(base_path):
             prefetch.append(_DescriptorPrefetch(base_path))
 
         # --- Fallback: full scan (original logic) ---
@@ -10712,27 +11592,46 @@ class IndexBuilder:
 
         bsl_changed = bool(to_remove or to_add)
 
+        # v1.48.0: коллекторы описателей полного скана и разбор BSL дельты — задачи одного пула процессов (крупная
+        # выгрузка), раньше любой записи: сбой коллектора не оставляет полуобновлённого индекса. Последовательно —
+        # те же функции в координаторе. Порядок записи ниже прежний.
+        # v1.48.0: домены описателей, чьи входы по СОДЕРЖИМОМУ (хеш) совпали со снимком прошлой сборки или полного
+        # скана, не перечитываются; без снимка — прежний полный объём (и снимок для следующего раза).
+        # Детект соседних конфигураций — один на полный скан: дайджест перехватов и сами перехваты.
+        detection = _ExtensionDetection(base_path)
+        digests = _input_digests(
+            base_path, build_metadata=has_metadata, build_synonyms=has_synonyms, detection=detection
+        )
+        skip = _skipped_domains(snapshot if _snapshot_binds(snapshot, conn) else None, digests, conn, bsl_changed)
+        if skip:
+            logger.info("Full scan: descriptor domains unchanged by content, not re-read: %s", ", ".join(sorted(skip)))
+        add_paths = [disk_files[rel] for rel in sorted(to_add) if rel in disk_files]
+        # Процессы — только под крупную работу: BSL-дельта больше порога или коллекторы описателей крупной выгрузки.
+        # No-op (домены пропущены, дельты нет) оставляет навигацию и уровень конфигурации — их старт пула не окупает.
+        heavy = {"rights"}
+        if has_metadata:
+            heavy |= {"metadata", "forms"}
+        if has_synonyms:
+            heavy.add("synonyms")
+        collectors_due = bool(heavy - skip) and len(bsl_files) > _PARALLEL_MIN_BSL_FILES
+        workers, _workers_source = resolve_index_workers()
+        if len(add_paths) <= _PARALLEL_MIN_BSL_FILES and not collectors_due:
+            workers = 1
+        results: list[FileResult] = []
+        with IndexTaskPool(workers, label="update") as pool:
+            jobs = _submit_descriptor_jobs(
+                pool, base_path, build_metadata=has_metadata, build_synonyms=has_synonyms, skip=skip
+            )
+            for blob in pool.map_ordered(
+                _parse_bsl_batch,
+                ((batch, base_path, build_calls) for batch in bsl_batches(add_paths, pool.workers)),
+                window=4 * pool.workers,
+            ):
+                results.extend(pickle.loads(blob))
+            descriptors = _descriptor_results(pool, jobs)
+
         # Process BSL delta (modules, methods, calls, movements)
         if bsl_changed:
-            results: list[FileResult] = []
-            if to_add:
-                workers = min(os.cpu_count() or 4, 8)
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(
-                            _process_single_file,
-                            disk_files[rel],
-                            base_path,
-                            build_calls,
-                        ): rel
-                        for rel in to_add
-                        if rel in disk_files
-                    }
-                    for future in as_completed(futures):
-                        result = future.result()
-                        if result is not None:
-                            results.append(result)
-
             # Casefolded names of common modules touched by this delta — drives the
             # per-delta re-resolve of qualified callee_key on UNCHANGED callers.
             # NEW names from results; OLD names queried from the DB before delete.
@@ -10866,7 +11765,7 @@ class IndexBuilder:
         # маркером запуска. Гейт — build-опция графа, а не has_metadata: контекст читается живьём.
         fresh_file_paths: list[tuple] | None = None
         if build_calls:
-            fresh_file_paths = _collect_file_paths(base_path)
+            fresh_file_paths = descriptors["file_paths"]
             with conn:
                 self._ensure_callee_key_column(conn)
                 owners = _descriptor_delta_owners(conn, fresh_file_paths)
@@ -10875,7 +11774,7 @@ class IndexBuilder:
                     self._refresh_call_resolution_stats(conn)
 
         # Refresh Level-1 metadata (config version may have changed)
-        config_meta = _parse_configuration_meta(base_path)
+        config_meta = descriptors["config_meta"]
         for key, value in config_meta.items():
             conn.execute(
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
@@ -10986,17 +11885,26 @@ class IndexBuilder:
                 "pvh_name TEXT NOT NULL, type_refs_json TEXT NOT NULL, path TEXT NOT NULL);\n"
                 "CREATE INDEX IF NOT EXISTS idx_ct_pvh ON characteristic_types(pvh_name);\n"
             )
-            md_tables = _collect_metadata_tables(base_path)
-            _insert_metadata_tables(conn, md_tables)
-            # Update meta counts for new tables
-            conn.execute(
-                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                ("object_attributes_count", str(len(md_tables.get("object_attributes", [])))),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                ("predefined_items_count", str(len(md_tables.get("predefined_items", [])))),
-            )
+            if "metadata" not in skip:
+                # v1.48.0: _insert_metadata_tables стирает ВСЕ строки metadata_references; ссылки доменов, которые
+                # этот скан не перечитывает (формы, права), возвращаются: формы — сохранёнными строками, права —
+                # из итоговой role_rights (как у выборочного git-пути).
+                kept_form_refs = _form_ref_rows(conn) if "forms" in skip else []
+                md_tables = descriptors["metadata"]
+                _insert_metadata_tables(conn, md_tables)
+                if kept_form_refs:
+                    _insert_ref_rows(conn, kept_form_refs)
+                if "rights" in skip:
+                    _rebuild_role_rights_refs(conn)
+                # Update meta counts for new tables
+                conn.execute(
+                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+                    ("object_attributes_count", str(len(md_tables.get("object_attributes", [])))),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+                    ("predefined_items_count", str(len(md_tables.get("predefined_items", [])))),
+                )
 
         # Level-6: object synonyms (schema upgrade v6→v7, full refresh)
         if has_synonyms:
@@ -11010,13 +11918,14 @@ class IndexBuilder:
                 "CREATE INDEX IF NOT EXISTS idx_synonyms_synonym "
                 "ON object_synonyms(synonym COLLATE NOCASE);\n"
             )
-            conn.execute("DELETE FROM object_synonyms")
-            synonyms = _collect_object_synonyms(base_path)
-            if synonyms:
-                conn.executemany(
-                    "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES (?, ?, ?, ?)",
-                    synonyms,
-                )
+            if "synonyms" not in skip:
+                conn.execute("DELETE FROM object_synonyms")
+                synonyms = descriptors["synonyms"]
+                if synonyms:
+                    conn.executemany(
+                        "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES (?, ?, ?, ?)",
+                        synonyms,
+                    )
             conn.execute(
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                 ("has_synonyms", "1"),
@@ -11029,35 +11938,26 @@ class IndexBuilder:
             "object_name TEXT NOT NULL, right_name TEXT NOT NULL, file TEXT);\n"
             "CREATE INDEX IF NOT EXISTS idx_rr_object ON role_rights(object_name COLLATE NOCASE);\n"
         )
-        conn.execute("DELETE FROM role_rights")
-        _role_data = _collect_role_data(base_path)
-        role_rights = _role_data.rights
-        _insert_role_flags(conn, _role_data)
-        if role_rights:
-            conn.executemany(
-                "INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
-                role_rights,
-            )
-        # v1.9.0: refresh role_rights subset of metadata_references
-        try:
-            conn.execute("DELETE FROM metadata_references WHERE source_category = 'Roles'")
-        except sqlite3.OperationalError:
-            pass
-        if role_rights:
-            rr_refs = _role_rights_to_references(role_rights)
-            if rr_refs:
-                try:
-                    conn.executemany(
-                        "INSERT INTO metadata_references "
-                        "(source_object, source_category, ref_object, ref_kind, used_in, path, line) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        rr_refs,
-                    )
-                except sqlite3.OperationalError:
-                    pass
+        if "rights" not in skip:
+            conn.execute("DELETE FROM role_rights")
+            _role_data = descriptors["roles"]
+            role_rights = _role_data.rights
+            _insert_role_flags(conn, _role_data)
+            if role_rights:
+                conn.executemany(
+                    "INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
+                    role_rights,
+                )
+            # v1.9.0: refresh role_rights subset of metadata_references
+            try:
+                conn.execute("DELETE FROM metadata_references WHERE source_category = 'Roles'")
+            except sqlite3.OperationalError:
+                pass
+            if role_rights:
+                _insert_role_rights_refs(conn, role_rights)
 
         # Refresh file_paths (full rebuild — cheap for 30-50K files)
-        file_paths_rows = fresh_file_paths if fresh_file_paths is not None else _collect_file_paths(base_path)
+        file_paths_rows = descriptors["file_paths"]
         # Ensure table exists (schema upgrade v4→v5)
         conn.executescript(
             "CREATE TABLE IF NOT EXISTS file_paths ("
@@ -11070,7 +11970,7 @@ class IndexBuilder:
             "CREATE INDEX IF NOT EXISTS idx_fp_filename ON file_paths(filename COLLATE NOCASE);\n"
             "CREATE INDEX IF NOT EXISTS idx_fp_depth ON file_paths(depth);\n"
         )
-        _insert_file_paths(conn, file_paths_rows)
+        _apply_file_paths(conn, file_paths_rows)
         conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
             ("file_paths_count", str(len(file_paths_rows))),
@@ -11106,28 +12006,29 @@ class IndexBuilder:
             "CREATE INDEX IF NOT EXISTS idx_eo_source ON extension_overrides(source_module_id);\n"
             "CREATE INDEX IF NOT EXISTS idx_eo_ext ON extension_overrides(extension_name COLLATE NOCASE);\n"
         )
-        conn.execute("DELETE FROM extension_overrides")
-        override_rows = _collect_extension_overrides(base_path, conn)
-        if override_rows:
-            conn.executemany(
-                _EXTENSION_OVERRIDES_INSERT,
-                override_rows,
+        if "overrides" not in skip:
+            conn.execute("DELETE FROM extension_overrides")
+            override_rows = _collect_extension_overrides(base_path, conn, detection)
+            if override_rows:
+                conn.executemany(
+                    _EXTENSION_OVERRIDES_INSERT,
+                    override_rows,
+                )
+                logger.info("Extension overrides: %d entries", len(override_rows))
+            conn.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+                ("has_extension_overrides", "1" if override_rows else "0"),
             )
-            logger.info("Extension overrides: %d entries", len(override_rows))
-        conn.execute(
-            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-            ("has_extension_overrides", "1" if override_rows else "0"),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-            ("extension_overrides_count", str(len(override_rows))),
-        )
+            conn.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+                ("extension_overrides_count", str(len(override_rows))),
+            )
 
         # Level-9: form elements (schema upgrade v9→v10, full refresh)
-        if has_metadata:
+        if has_metadata and "forms" not in skip:
             conn.executescript(_FORM_ELEMENTS_SCHEMA)
             conn.execute("DELETE FROM form_elements")
-            fe_rows, form_ref_rows = _collect_form_elements(base_path)
+            fe_rows, form_ref_rows = descriptors["forms"]
             if fe_rows:
                 conn.executemany(_FORM_ELEMENTS_INSERT, fe_rows)
                 logger.info("Form elements: %d entries", len(fe_rows))
@@ -11179,6 +12080,8 @@ class IndexBuilder:
 
         conn.commit()
         conn.execute("ANALYZE")
+        # v1.48.0: снимок входов для следующего полного скана — после успеха, к только что записанному built_at.
+        _publish_snapshot(conn, db_path, digests)
         conn.close()
 
         elapsed = time.time() - t0
@@ -11204,6 +12107,7 @@ class IndexBuilder:
         has_metadata: bool,
         has_fts: bool,
         has_synonyms: bool,
+        reusable_dirty: _GitDirtyResult | None = None,
     ) -> dict:
         """Git-accelerated incremental update — only process changed files."""
         # --- BSL delta ---
@@ -11254,24 +12158,10 @@ class IndexBuilder:
         bsl_delta = bool(to_remove or to_add)
 
         if bsl_delta:
-            results: list[FileResult] = []
-            if to_add:
-                workers = min(os.cpu_count() or 4, 8)
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(
-                            _process_single_file,
-                            disk_files[rel],
-                            base_path,
-                            build_calls,
-                        ): rel
-                        for rel in to_add
-                        if rel in disk_files
-                    }
-                    for future in as_completed(futures):
-                        result = future.result()
-                        if result is not None:
-                            results.append(result)
+            # v1.48.0: крупная дельта — в процессах (общий исполнитель сборки), малая — в координаторе.
+            results = _parse_bsl_files(
+                [disk_files[rel] for rel in sorted(to_add) if rel in disk_files], base_path, build_calls
+            )
 
             # Casefolded names of common modules touched by this delta (NEW from
             # results, OLD queried before delete) — drives per-delta re-resolve.
@@ -11519,22 +12409,38 @@ class IndexBuilder:
 
         # form_elements: only if .form files changed
         if form_changed and has_metadata:
-            try:
-                conn.execute("DELETE FROM form_elements")
-            except sqlite3.OperationalError:
-                pass
-            fe_rows, form_ref_rows = _collect_form_elements(base_path)
-            if fe_rows:
-                conn.executemany(_FORM_ELEMENTS_INSERT, fe_rows)
-            # v1.47.0: ссылки форм — вместе с form_elements; DELETE описателей их не трогает.
-            _replace_form_refs(conn, form_ref_rows)
+            # v1.48.0: перечитываются только каталоги форм из Git-дельты; путь вне прежних правил обнаружения и строки
+            # форм с написанием пути, которого прежний проход уже не дал бы (каталог переименован только регистром), —
+            # прежний полный проход. Изменение формы вне Git-дельты этот путь не видит (объявленная граница Git-пути).
+            form_dirs = _form_dirs_from_delta(form_changed, base_path)
+            if (
+                form_dirs is not None
+                and _tables_exist(conn, ("form_elements", "metadata_references"))
+                and not _form_rows_spelled_differently(conn, base_path, form_dirs)
+            ):
+                parsed_forms = _refresh_form_dirs(conn, base_path, form_dirs)
+                fe_count = conn.execute("SELECT COUNT(*) FROM form_elements").fetchone()[0]
+                logger.info(
+                    "git fast path: forms refreshed selectively: %d dirs, %d parsed", len(form_dirs), parsed_forms
+                )
+            else:
+                try:
+                    conn.execute("DELETE FROM form_elements")
+                except sqlite3.OperationalError:
+                    pass
+                fe_rows, form_ref_rows = _collect_form_elements(base_path)
+                if fe_rows:
+                    conn.executemany(_FORM_ELEMENTS_INSERT, fe_rows)
+                # v1.47.0: ссылки форм — вместе с form_elements; DELETE описателей их не трогает.
+                _replace_form_refs(conn, form_ref_rows)
+                fe_count = len(fe_rows)
             conn.execute(
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                 ("has_form_elements", "1"),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                ("form_elements_count", str(len(fe_rows))),
+                ("form_elements_count", str(fe_count)),
             )
 
         # object_synonyms: selective by category (only .xml/.mdo trigger).
@@ -11554,7 +12460,10 @@ class IndexBuilder:
                     )
 
         # role_rights: only if .rights files or Roles/.xml changed
-        if rights_changed or (obj_meta_changed and "Roles" in changed_categories):
+        # v1.48.0: по самой дельте (_refresh_rights_selective); нестандартная раскладка — прежний полный проход.
+        if (rights_changed or (obj_meta_changed and "Roles" in changed_categories)) and not (
+            _refresh_rights_selective(conn, base_path, git_changed)
+        ):
             try:
                 conn.execute("DELETE FROM role_rights")
             except sqlite3.OperationalError:
@@ -11587,8 +12496,9 @@ class IndexBuilder:
 
         # file_paths: incremental for BSL-only, full if any meta file changed
         if any_meta_changed:
+            # v1.48.0: прежний полный обход (видит и файлы вне Git-дельты), запись — разностью со строками таблицы.
             file_paths_rows = _collect_file_paths(base_path)
-            _insert_file_paths(conn, file_paths_rows)
+            _apply_file_paths(conn, file_paths_rows)
             conn.execute(
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                 ("file_paths_count", str(len(file_paths_rows))),
@@ -11631,7 +12541,7 @@ class IndexBuilder:
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
             ("git_head_commit", git_head),
         )
-        self._save_dirty_snapshot(conn, base_path, prefix, preserve_on_unreliable=True)
+        self._save_dirty_snapshot(conn, base_path, prefix, preserve_on_unreliable=True, current=reusable_dirty)
 
         # Telemetry — одна INFO-строка с агрегатами pointwise/fallback.
         logger.info(
@@ -11937,219 +12847,251 @@ class IndexBuilder:
         return deleted
 
     @staticmethod
+    def _module_ids(conn: sqlite3.Connection, results: list[FileResult]) -> dict[str, int]:
+        """``rel_path -> modules.id`` для модулей порции: на малой порции — выборка по её путям, на крупной —
+        прежний проход по всей таблице (лимит переменных SQLite)."""
+        path_to_id: dict[str, int] = {}
+        if 0 < len(results) <= 900:
+            paths = [r.info.relative_path for r in results]
+            ph = ",".join("?" * len(paths))
+            cur = conn.execute(f"SELECT id, rel_path FROM modules WHERE rel_path IN ({ph})", paths)  # noqa: S608
+        else:
+            cur = conn.execute("SELECT id, rel_path FROM modules")
+        # rel_path -> module_id (sqlite3 without row_factory returns tuples (id, rel_path))
+        for row in cur:
+            if isinstance(row, sqlite3.Row):
+                path_to_id[row["rel_path"]] = row["id"]
+            else:
+                path_to_id[row[1]] = row[0]
+        return path_to_id
+
+    @staticmethod
     def _bulk_insert(
         conn: sqlite3.Connection,
         results: list[FileResult],
         build_calls: bool,
     ) -> None:
-        """Insert modules, methods, and calls in batch."""
-        module_rows: list[tuple] = []
-        for r in results:
-            module_rows.append(
-                (
-                    r.info.relative_path,
-                    r.info.category,
-                    r.info.object_name,
-                    r.info.module_type,
-                    r.info.form_name,
-                    1 if r.info.is_form_module else 0,
-                    r.mtime,
-                    r.size,
-                    None if r.launch_marker is None else int(r.launch_marker),
-                )
-            )
+        """Insert modules, methods, and calls in batch (результаты в памяти — одной порцией)."""
+        IndexBuilder._bulk_insert_batches(conn, (results,), build_calls)
 
-        conn.executemany(
-            "INSERT OR REPLACE INTO modules "
-            "(rel_path, category, object_name, module_type, form_name, is_form, mtime, size, launch_marker) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            module_rows,
-        )
+    @staticmethod
+    def _bulk_insert_batches(
+        conn: sqlite3.Connection,
+        batches: Iterable[list[FileResult]],
+        build_calls: bool,
+    ) -> _BulkInsertStats:
+        """Insert modules, methods, and calls — две фазы по порциям (v1.48.0).
 
-        # rel_path -> module_id (sqlite3 without row_factory returns tuples (id, rel_path))
-        path_to_id: dict[str, int] = {}
-        for row in conn.execute("SELECT id, rel_path FROM modules"):
-            if isinstance(row, sqlite3.Row):
-                path_to_id[row["rel_path"]] = row["id"]
-            else:
-                path_to_id[row[1]] = row[0]
-
-        # Insert methods; calls map method_idx -> method_id below
-        method_rows: list[tuple] = []
-        # Копия миллионов вызовов не нужна: строки calls собираются из r.raw_calls ниже.
+        Фаза 1 — modules и methods ВСЕХ порций (и привязанные к модулю regions, module_headers, code usages);
+        фаза 2 — calls: локальный и общий адресат, модуль менеджера резолвятся по окончательному набору модулей и
+        методов, поэтому вызов в общий модуль из последней порции получает тот же ``callee_key``, что при одной
+        порции. ``batches`` читается дважды: список порций или ``ResultSpool`` (полная сборка не держит в памяти
+        все ``FileResult``)."""
+        stats = _BulkInsertStats()
+        # Копия миллионов вызовов не нужна: строки calls собираются из r.raw_calls во второй фазе.
         has_calls = False
-
-        for r in results:
-            mod_id = path_to_id.get(r.info.relative_path)
-            if mod_id is None:
-                continue
-            for method in r.methods:
-                method_rows.append(
+        for results in batches:
+            module_rows: list[tuple] = []
+            for r in results:
+                module_rows.append(
                     (
-                        mod_id,
-                        method["name"],
-                        method["type"],
-                        1 if method["is_export"] else 0,
-                        method["params"],
-                        method["line"],
-                        method["end_line"],
-                        method.get("loc"),
+                        r.info.relative_path,
+                        r.info.category,
+                        r.info.object_name,
+                        r.info.module_type,
+                        r.info.form_name,
+                        1 if r.info.is_form_module else 0,
+                        r.mtime,
+                        r.size,
+                        None if r.launch_marker is None else int(r.launch_marker),
                     )
                 )
-            if build_calls and r.raw_calls:
-                has_calls = True
 
-        conn.executemany(
-            "INSERT OR REPLACE INTO methods "
-            "(module_id, name, type, is_export, params, line, end_line, loc) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            method_rows,
-        )
+            conn.executemany(
+                "INSERT OR REPLACE INTO modules "
+                "(rel_path, category, object_name, module_type, form_name, is_form, mtime, size, launch_marker) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                module_rows,
+            )
+            path_to_id = IndexBuilder._module_ids(conn, results)
+
+            # Insert methods; calls map method_idx -> method_id in phase 2
+            method_rows: list[tuple] = []
+            region_rows: list[tuple] = []
+            header_rows: list[tuple] = []
+            usage_rows: list[tuple] = []
+            for r in results:
+                stats.modules += 1
+                stats.methods += len(r.methods)
+                stats.calls += len(r.raw_calls)
+                if r.movements:
+                    stats.movement_results.append(r._replace(methods=[], raw_calls=[], regions=[], code_usages=()))
+                mod_id = path_to_id.get(r.info.relative_path)
+                if mod_id is None:
+                    continue
+                for method in r.methods:
+                    method_rows.append(
+                        (
+                            mod_id,
+                            method["name"],
+                            method["type"],
+                            1 if method["is_export"] else 0,
+                            method["params"],
+                            method["line"],
+                            method["end_line"],
+                            method.get("loc"),
+                        )
+                    )
+                if build_calls and r.raw_calls:
+                    has_calls = True
+                for reg in r.regions:
+                    region_rows.append((mod_id, reg["name"], reg["line"], reg["end_line"]))
+                if r.header_comment is not None:
+                    header_rows.append((mod_id, r.header_comment))
+                # Reverse code-usages (v1.14.0). object_ref_key = object_ref.lower()
+                # computed here for indexed, Cyrillic-aware case-insensitive lookup.
+                for object_ref, member_path, usage_kind, line in r.code_usages:
+                    usage_rows.append((mod_id, object_ref, object_ref.lower(), member_path, usage_kind, line))
+
+            conn.executemany(
+                "INSERT OR REPLACE INTO methods "
+                "(module_id, name, type, is_export, params, line, end_line, loc) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                method_rows,
+            )
+            if region_rows:
+                conn.executemany(
+                    "INSERT INTO regions (module_id, name, line, end_line) VALUES (?, ?, ?, ?)",
+                    region_rows,
+                )
+            if header_rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO module_headers (module_id, header_comment) VALUES (?, ?)",
+                    header_rows,
+                )
+            if usage_rows:
+                conn.executemany(
+                    "INSERT INTO metadata_code_usages "
+                    "(module_id, object_ref, object_ref_key, member_path, usage_kind, line) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    usage_rows,
+                )
 
         # Insert calls — need to resolve method_idx to method_id
-        if has_calls:
-            # Module ids of the CURRENT batch (the only callers we resolve here).
-            # NOTE: path_to_id spans the WHOLE DB, so take ids from ``results``.
-            batch_ids = [path_to_id[r.info.relative_path] for r in results if r.info.relative_path in path_to_id]
-            # On a small increment, narrow the two batch-local lookups to the batch
-            # (indexed IN scan) instead of scanning every method in the DB. The
-            # threshold keeps the IN list under SQLITE_MAX_VARIABLE_NUMBER and lets
-            # large batches / full builds keep the plain full scan. ``common_exported``
-            # always needs whole-DB visibility (handled by _build_common_exported).
-            narrow = 0 < len(batch_ids) <= 900
+        if not has_calls:
+            return stats
+        common_exported = _build_common_exported(conn)
+        # Модули менеджеров — после вставки modules: модули всех порций уже в таблице.
+        managers = _build_manager_modules(conn)
+        for results in batches:
+            IndexBuilder._insert_calls_batch(conn, results, common_exported, managers)
+        return stats
 
-            # Build module_id -> method IDs ORDERED BY line (method_idx in raw_calls
-            # indexes this list; the ORDER BY MUST be preserved or caller_id drifts).
-            methods_by_module: dict[int, list[int]] = {}
-            if narrow:
-                ph = ",".join("?" * len(batch_ids))
-                mbm_cur = conn.execute(
-                    f"SELECT id, module_id FROM methods WHERE module_id IN ({ph}) "  # noqa: S608
-                    "ORDER BY module_id, line",
-                    batch_ids,
-                )
+    @staticmethod
+    def _insert_calls_batch(
+        conn: sqlite3.Connection,
+        results: list[FileResult],
+        common_exported: dict[tuple[str, str], str | None],
+        managers: dict[tuple[str, str], str | None],
+    ) -> None:
+        """Строки calls порции — по окончательным modules/methods (фаза 2 ``_bulk_insert_batches``)."""
+        path_to_id = IndexBuilder._module_ids(conn, results)
+        # Module ids of the CURRENT batch (the only callers we resolve here).
+        # NOTE: path_to_id may span the WHOLE DB, so take ids from ``results``.
+        batch_ids = [path_to_id[r.info.relative_path] for r in results if r.info.relative_path in path_to_id]
+        # On a small increment, narrow the two batch-local lookups to the batch
+        # (indexed IN scan) instead of scanning every method in the DB. The
+        # threshold keeps the IN list under SQLITE_MAX_VARIABLE_NUMBER and lets
+        # large batches / full builds keep the plain full scan. ``common_exported``
+        # always needs whole-DB visibility (handled by _build_common_exported).
+        narrow = 0 < len(batch_ids) <= 900
+
+        # Build module_id -> method IDs ORDERED BY line (method_idx in raw_calls
+        # indexes this list; the ORDER BY MUST be preserved or caller_id drifts).
+        methods_by_module: dict[int, list[int]] = {}
+        if narrow:
+            ph = ",".join("?" * len(batch_ids))
+            mbm_cur = conn.execute(
+                f"SELECT id, module_id FROM methods WHERE module_id IN ({ph}) "  # noqa: S608
+                "ORDER BY module_id, line",
+                batch_ids,
+            )
+        else:
+            mbm_cur = conn.execute("SELECT id, module_id FROM methods ORDER BY module_id, line")
+        for row in mbm_cur:
+            if isinstance(row, sqlite3.Row):
+                mid, modid = row["id"], row["module_id"]
             else:
-                mbm_cur = conn.execute("SELECT id, module_id FROM methods ORDER BY module_id, line")
-            for row in mbm_cur:
-                if isinstance(row, sqlite3.Row):
-                    mid, modid = row["id"], row["module_id"]
-                else:
-                    mid, modid = row[0], row[1]
-                methods_by_module.setdefault(modid, []).append(mid)
+                mid, modid = row[0], row[1]
+            methods_by_module.setdefault(modid, []).append(mid)
 
-            # Resolution lookups. Provably-safe tiers only:
-            #   local           — bare ``B()`` → a method of the caller's own module
-            #                      (caller ∈ batch, so batch-local lookup suffices)
-            #   common_exported — ``A.B()`` → an exported method of common module A
-            #                      (target may be in an UNCHANGED module → whole-DB)
-            #   manager (v17)   — ``Коллекция.X.Метод()`` (via задан) → модуль менеджера X:
-            #                      реальный путь либо синтетический ``/<Кат>/<X>/ManagerModule.bsl``
-            #                      (модуля нет или их несколько) — см. _manager_callee_key.
-            # Variable/value calls (``Объект.Метод``) are intentionally NOT resolved;
-            # ``member`` (``Выражение.Член.Метод``) is never resolved.
-            # Value ``None`` marks an ambiguous key (multiple candidates) → NULL.
-            local_lookup: dict[tuple[int, str], str | None] = {}
-            if narrow:
-                ph = ",".join("?" * len(batch_ids))
-                ll_cur = conn.execute(
-                    "SELECT mod.id AS module_id, mod.rel_path AS rel_path, me.name AS name "
-                    "FROM methods me JOIN modules mod ON me.module_id = mod.id "
-                    f"WHERE mod.id IN ({ph})",  # noqa: S608
-                    batch_ids,
-                )
+        # Resolution lookups. Provably-safe tiers only:
+        #   local           — bare ``B()`` → a method of the caller's own module
+        #                      (caller ∈ batch, so batch-local lookup suffices)
+        #   common_exported — ``A.B()`` → an exported method of common module A
+        #                      (target may be in an UNCHANGED module → whole-DB)
+        #   manager (v17)   — ``Коллекция.X.Метод()`` (via задан) → модуль менеджера X:
+        #                      реальный путь либо синтетический ``/<Кат>/<X>/ManagerModule.bsl``
+        #                      (модуля нет или их несколько) — см. _manager_callee_key.
+        # Variable/value calls (``Объект.Метод``) are intentionally NOT resolved;
+        # ``member`` (``Выражение.Член.Метод``) is never resolved.
+        # Value ``None`` marks an ambiguous key (multiple candidates) → NULL.
+        local_lookup: dict[tuple[int, str], str | None] = {}
+        if narrow:
+            ph = ",".join("?" * len(batch_ids))
+            ll_cur = conn.execute(
+                "SELECT mod.id AS module_id, mod.rel_path AS rel_path, me.name AS name "
+                "FROM methods me JOIN modules mod ON me.module_id = mod.id "
+                f"WHERE mod.id IN ({ph})",  # noqa: S608
+                batch_ids,
+            )
+        else:
+            ll_cur = conn.execute(
+                "SELECT mod.id AS module_id, mod.rel_path AS rel_path, me.name AS name "
+                "FROM methods me JOIN modules mod ON me.module_id = mod.id"
+            )
+        for row in ll_cur:
+            if isinstance(row, sqlite3.Row):
+                module_id, rel_path, mname = row["module_id"], row["rel_path"], row["name"]
             else:
-                ll_cur = conn.execute(
-                    "SELECT mod.id AS module_id, mod.rel_path AS rel_path, me.name AS name "
-                    "FROM methods me JOIN modules mod ON me.module_id = mod.id"
-                )
-            for row in ll_cur:
-                if isinstance(row, sqlite3.Row):
-                    module_id, rel_path, mname = row["module_id"], row["rel_path"], row["name"]
-                else:
-                    module_id, rel_path, mname = row
-                lk = (module_id, mname.casefold())
-                local_lookup[lk] = None if lk in local_lookup else rel_path
+                module_id, rel_path, mname = row
+            lk = (module_id, mname.casefold())
+            local_lookup[lk] = None if lk in local_lookup else rel_path
 
-            common_exported = _build_common_exported(conn)
-            # Модули менеджеров — после вставки modules: модули текущего батча уже в таблице.
-            managers = _build_manager_modules(conn)
+        def _resolve_callee_key(caller_module_id: int, callee: str, via: str | None, kind: str | None) -> str | None:
+            if kind in ("member", "background_dynamic"):
+                return None
+            if via:
+                # Коллекция.X.Метод — уровень manager ПЕРВЫМ.
+                return _manager_callee_key(managers, via, callee)
+            if "." in callee:
+                # Qualified A.B — only common-exported is safe to resolve.
+                a, _, b = callee.partition(".")
+                rel = common_exported.get((a.casefold(), b.casefold()))
+                return _make_callee_key(rel, b) if rel else None
+            # Bare B — resolve only within the caller's own module.
+            rel = local_lookup.get((caller_module_id, callee.casefold()))
+            return _make_callee_key(rel, callee) if rel else None
 
-            def _resolve_callee_key(
-                caller_module_id: int, callee: str, via: str | None, kind: str | None
-            ) -> str | None:
-                if kind in ("member", "background_dynamic"):
-                    return None
-                if via:
-                    # Коллекция.X.Метод — уровень manager ПЕРВЫМ.
-                    return _manager_callee_key(managers, via, callee)
-                if "." in callee:
-                    # Qualified A.B — only common-exported is safe to resolve.
-                    a, _, b = callee.partition(".")
-                    rel = common_exported.get((a.casefold(), b.casefold()))
-                    return _make_callee_key(rel, b) if rel else None
-                # Bare B — resolve only within the caller's own module.
-                rel = local_lookup.get((caller_module_id, callee.casefold()))
-                return _make_callee_key(rel, callee) if rel else None
+        def _call_rows():
+            # Генератор, а не список: миллионы строк не держатся в памяти второй раз.
+            for r in results:
+                mod_id = path_to_id.get(r.info.relative_path)
+                if mod_id is None:
+                    continue
+                method_ids = methods_by_module.get(mod_id, [])
 
-            def _call_rows():
-                # Генератор, а не список: миллионы строк не держатся в памяти второй раз.
-                for r in results:
-                    mod_id = path_to_id.get(r.info.relative_path)
-                    if mod_id is None:
-                        continue
-                    method_ids = methods_by_module.get(mod_id, [])
+                for method_idx, callee_name, call_line, via, kind in r.raw_calls:
+                    if method_idx < len(method_ids):
+                        caller_method_id = method_ids[method_idx]
+                        callee_key = _resolve_callee_key(mod_id, callee_name, via, kind)
+                        yield (caller_method_id, callee_name, call_line, callee_key, via, kind)
 
-                    for method_idx, callee_name, call_line, via, kind in r.raw_calls:
-                        if method_idx < len(method_ids):
-                            caller_method_id = method_ids[method_idx]
-                            callee_key = _resolve_callee_key(mod_id, callee_name, via, kind)
-                            yield (caller_method_id, callee_name, call_line, callee_key, via, kind)
-
-            conn.executemany(
-                "INSERT INTO calls (caller_id, callee_name, line, callee_key, callee_via, call_kind) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                _call_rows(),
-            )
-
-        # Insert regions and module_headers
-        region_rows: list[tuple] = []
-        header_rows: list[tuple] = []
-        for r in results:
-            mod_id = path_to_id.get(r.info.relative_path)
-            if mod_id is None:
-                continue
-            for reg in r.regions:
-                region_rows.append((mod_id, reg["name"], reg["line"], reg["end_line"]))
-            if r.header_comment is not None:
-                header_rows.append((mod_id, r.header_comment))
-
-        if region_rows:
-            conn.executemany(
-                "INSERT INTO regions (module_id, name, line, end_line) VALUES (?, ?, ?, ?)",
-                region_rows,
-            )
-        if header_rows:
-            conn.executemany(
-                "INSERT OR REPLACE INTO module_headers (module_id, header_comment) VALUES (?, ?)",
-                header_rows,
-            )
-
-        # Insert reverse code-usages (v1.14.0). object_ref_key = object_ref.lower()
-        # computed here for indexed, Cyrillic-aware case-insensitive lookup.
-        usage_rows: list[tuple] = []
-        for r in results:
-            mod_id = path_to_id.get(r.info.relative_path)
-            if mod_id is None:
-                continue
-            for object_ref, member_path, usage_kind, line in r.code_usages:
-                usage_rows.append((mod_id, object_ref, object_ref.lower(), member_path, usage_kind, line))
-        if usage_rows:
-            conn.executemany(
-                "INSERT INTO metadata_code_usages "
-                "(module_id, object_ref, object_ref_key, member_path, usage_kind, line) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                usage_rows,
-            )
+        conn.executemany(
+            "INSERT INTO calls (caller_id, callee_name, line, callee_key, callee_via, call_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            _call_rows(),
+        )
 
     @staticmethod
     def _write_meta(

@@ -4292,6 +4292,8 @@ class TestBuildSpeedPrefetch:
             time.sleep(0.3)  # чтение идет в момент закрытия сборки
 
         monkeypatch.setattr(BI, "_warm_file", slow_warm)
+        # v1.48.0: прогрев — у крупной выгрузки; закрытие проверяется на нём.
+        monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)
         files = {"CommonModules/М/Ext/Module.bsl": "Процедура П()\nКонецПроцедуры\n"}
         files.update({f"Catalogs/О{i}.xml": "<x/>" for i in range(40)})
         _write_project(tmp_path, files)
@@ -4304,6 +4306,7 @@ class TestBuildSpeedPrefetch:
             raise RuntimeError("обход упал")
 
         monkeypatch.setattr(BI, "_prefetch_descriptor_paths", boom)
+        monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)  # v1.48.0: прогрев — у крупной выгрузки
         _write_project(tmp_path, {"CommonModules/М/Ext/Module.bsl": "Процедура П()\nКонецПроцедуры\n"})
         db = IndexBuilder().build(str(tmp_path), build_calls=False)
         c = sqlite3.connect(str(db))
@@ -4316,15 +4319,15 @@ class TestBuildSpeedPrefetch:
 class TestBuildSpeedCallsIndexes:
     def test_calls_indexes_built_after_insert_with_schema_sql(self, tmp_path, monkeypatch):
         seen = []
-        real = IndexBuilder._bulk_insert
+        real = IndexBuilder._bulk_insert_batches
 
-        def spy(conn, results, build_calls):
+        def spy(conn, batches, build_calls):
             seen.append(
                 conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='calls'").fetchone()[0]
             )
-            return real(conn, results, build_calls)
+            return real(conn, batches, build_calls)
 
-        monkeypatch.setattr(IndexBuilder, "_bulk_insert", staticmethod(spy))
+        monkeypatch.setattr(IndexBuilder, "_bulk_insert_batches", staticmethod(spy))
         _write_project(tmp_path, SCHEMA_FILES)
         db = IndexBuilder().build(str(tmp_path), build_calls=True)
         assert seen == [0]  # во время массовой вставки индексов calls нет

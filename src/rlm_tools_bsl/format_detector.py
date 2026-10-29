@@ -180,6 +180,62 @@ def detect_format(base_path: str) -> FormatInfo:
     )
 
 
+def _detect_format_listing(base_path: str) -> FormatInfo:
+    """Тот же ``FormatInfo``, что ``detect_format``, дешевле (v1.48.0: Level-1 индекса на каждом ``update``). Обход
+    дословно прежний: каждый каталог читается первым шагом того же ``os.walk`` (тот же разбор записей и ошибок),
+    спуск — тем же правилом ``os.walk`` (``os.path.islink`` на пути), глубины те же (файлы — до глубины 3
+    включительно, имена подкаталогов — до глубины 2, глубже 3 не спускаемся). Глубина ведётся счётчиком, а не
+    ``Path.relative_to`` на каждый каталог — это и было основной ценой. Итоги коммутативны (сумма, «или»,
+    объединение), порядок обхода на результат не влияет. Пул потоков здесь не помогает: короткие системные вызовы
+    под GIL дают «конвой» (замер: в разы медленнее). Живые вызовы ``detect_format`` — прежние."""
+    base = Path(base_path)
+    bsl_file_count = 0
+    has_configuration_xml = False
+    has_ext_dir = False
+    has_mdo_files = False
+    categories_found: set[str] = set()
+
+    stack: list[tuple[str, int]] = [(os.fspath(base), 0)]
+    while stack:
+        top, depth = stack.pop()
+        listed = next(os.walk(top), None)
+        if listed is None:  # каталог не прочитан — os.walk пропускает его молча
+            continue
+        _root, dirs, files = listed
+        if depth >= 3:
+            dirs = []
+        for fname in files:
+            if fname.endswith(".bsl"):
+                bsl_file_count += 1
+            if fname == "Configuration.xml":
+                has_configuration_xml = True
+            if fname.endswith(".mdo"):
+                has_mdo_files = True
+        for dname in dirs:
+            if dname == "Ext":
+                has_ext_dir = True
+            if dname in METADATA_CATEGORIES:
+                categories_found.add(dname)
+            child = os.path.join(top, dname)
+            if not os.path.islink(child):
+                stack.append((child, depth + 1))
+
+    if has_configuration_xml and has_ext_dir:
+        primary_format = SourceFormat.CF
+    elif has_mdo_files and not has_ext_dir:
+        primary_format = SourceFormat.EDT
+    else:
+        primary_format = SourceFormat.UNKNOWN
+
+    return FormatInfo(
+        primary_format=primary_format,
+        root_path=str(base),
+        bsl_file_count=bsl_file_count,
+        has_configuration_xml=has_configuration_xml,
+        metadata_categories_found=sorted(categories_found),
+    )
+
+
 _CF_NS = "http://v8.1c.ru/8.3/MDClasses"
 _EDT_NS = "http://g5.1c.ru/v8/dt/metadata/mdclass"
 

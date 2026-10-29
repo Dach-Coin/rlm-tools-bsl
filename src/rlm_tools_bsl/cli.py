@@ -470,6 +470,10 @@ def _cmd_drop(args: argparse.Namespace) -> None:
 
     size = db_path.stat().st_size
     db_path.unlink()
+    # v1.48.0: служебный снимок входов сборки уходит вместе с индексом.
+    from rlm_tools_bsl._index_snapshot import discard_snapshot
+
+    discard_snapshot(db_path)
     print(f"Index dropped: {db_path} ({_fmt_size(size)})")
 
     # Remove parent dir if empty

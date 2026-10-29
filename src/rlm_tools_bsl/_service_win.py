@@ -24,6 +24,7 @@ import win32serviceutil
 from rlm_tools_bsl._config import SERVICE_NO_ENV_VAR
 from rlm_tools_bsl._git_process import CAPTURE_FILE_GLOB, GIT_CAPTURE_DIR_ENV, SERVICE_CAPTURE_DIRNAME
 from rlm_tools_bsl._service_env import build_service_env_vars
+from rlm_tools_bsl._service_logging import ServiceLogSink, start_output_pump
 from rlm_tools_bsl._service_watchdog import RestartPolicy
 from rlm_tools_bsl.service import (
     _absolute_env_file,
@@ -180,7 +181,10 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
                 pass
 
     def _log_fatal(self, msg: str, *args) -> None:
-        """Best-effort note in server.log. Never raises: this runs on the way out."""
+        """Best-effort note in server.log. Never raises: this runs on the way out.
+
+        Runs after `_serve` has returned or raised, i.e. after its sink is closed — so this
+        short append is still the only writer of the file at that moment."""
         try:
             log_dir = _config_path().parent / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -233,7 +237,7 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "server.log"
 
-        # Time-based retention BEFORE the file is opened below (drop entries older than
+        # Time-based retention BEFORE the sink opens the file below (drop entries older than
         # RLM_LOG_RETENTION_DAYS, default 20). Best-effort — never block service start.
         try:
             from rlm_tools_bsl.log_retention import log_retention_days, purge_log_older_than
@@ -242,31 +246,30 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         except Exception:
             pass
 
+        # v1.48.0: у server.log один писатель — этот sink: строки ребёнка (PIPE) и события watchdog идут через
+        # него, ротацию ведёт только его обработчик (см. _service_logging). Ребёнку файл не передаётся.
+        sink = ServiceLogSink(log_path)
+        try:
+            self._watch(sink, exe, host, port, health_url, env)
+        finally:
+            sink.close()
+
+    def _watch(self, sink: ServiceLogSink, exe: str, host: str, port: str, health_url: str, env: dict) -> None:
         if self._git_capture_dir is None:
             # Одна обезличенная строка: имя класса исключения без пути и ACL-деталей.
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    _log_watchdog(
-                        f,
-                        "Git capture unavailable; Git acceleration disabled (%s)",
-                        self._git_capture_error or "Unknown",
-                    )
-            except OSError:
-                pass
+            sink.watchdog(
+                "Git capture unavailable; Git acceleration disabled (%s)",
+                self._git_capture_error or "Unknown",
+            )
         elif self._git_capture_swept:
             # Штатно тут убирать нечего, поэтому непустой счётчик — сигнал. Но
             # источников у него ДВА, и приписывать его только выключению ОС
             # нельзя: осиротевший git из деградировавшей ветки (без Job) тоже
             # мог пережить остановку службы и оставить своё имя в каталоге.
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    _log_watchdog(
-                        f,
-                        "Git capture: removed %d stale file(s) (unclean shutdown or an orphaned git process)",
-                        self._git_capture_swept,
-                    )
-            except OSError:
-                pass
+            sink.watchdog(
+                "Git capture: removed %d stale file(s) (unclean shutdown or an orphaned git process)",
+                self._git_capture_swept,
+            )
 
         # Every "when do we kill / how long do we wait" decision lives in the policy;
         # this loop only carries them out.  See _service_watchdog.py for why a single
@@ -281,20 +284,22 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             with self._proc_lock:
                 if self._stopping:
                     return  # SvcStop was called: launch nothing more
-                log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-                _log_watchdog(log_file, "Starting subprocess: %s", exe)
+                sink.watchdog("Starting subprocess: %s", exe)
                 self._proc = subprocess.Popen(
                     [exe, "--transport", "streamable-http", "--host", host, "--port", port],
                     env=env,
-                    stdout=log_file,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                 )
+                # Чтение PIPE — отдельным потоком с первой строки: оно не ждёт проверок здоровья, иначе
+                # заполненный PIPE остановил бы сервер на записи в stderr.
+                pump = start_output_pump(self._proc, sink)
             policy.process_started(time.monotonic())
 
             # Grace period for startup
             if self._wait_for_stop(5):
                 self._abandon_child()
-                log_file.close()
+                _finish_output(pump)
                 return  # SvcStop was called
 
             # Health-check loop: check every 30s, poll stop_event every 1s
@@ -304,7 +309,7 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
                 for _ in range(30):
                     if win32event.WaitForSingleObject(self._stop_event, 1000) != win32event.WAIT_TIMEOUT:
                         self._abandon_child()
-                        log_file.close()
+                        _finish_output(pump)
                         return  # SvcStop was called
                     if self._proc.poll() is not None:
                         break
@@ -315,23 +320,21 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
                     # as a missed probe, it would put a wrong reason in the log.
                     if self._wait_for_stop(0):
                         self._abandon_child()
-                        log_file.close()
+                        _finish_output(pump)
                         return  # SvcStop was called
                     if answered:
                         if policy.consecutive_failures:
-                            _log_watchdog(
-                                log_file,
+                            sink.watchdog(
                                 "Health check recovered after %d missed probe(s) (%s)",
                                 policy.consecutive_failures,
                                 health_url,
                             )
                         policy.probe_succeeded(time.monotonic())
                         if first_health_ok:
-                            _log_watchdog(log_file, "Health check OK (%s)", health_url)
+                            sink.watchdog("Health check OK (%s)", health_url)
                             first_health_ok = False
                     elif policy.probe_failed(time.monotonic()):
-                        _log_watchdog(
-                            log_file,
+                        sink.watchdog(
                             "Health check failed %d times in a row (%s), terminating process",
                             policy.consecutive_failures,
                             health_url,
@@ -345,8 +348,7 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
                     else:
                         # Logged, not acted on: a late answer under load is ordinary,
                         # and this line is what makes an eventual kill explicable.
-                        _log_watchdog(
-                            log_file,
+                        sink.watchdog(
                             "Health check missed %d time(s) in a row (%s), giving the server more time",
                             policy.consecutive_failures,
                             health_url,
@@ -356,7 +358,8 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
                     break
 
             exit_code = self._proc.returncode
-            log_file.close()
+            # Хвост вывода умершего ребёнка — в журнал раньше строки о его выходе.
+            _finish_output(pump)
 
             if exit_code == 0 and not health_failed:
                 break  # clean shutdown
@@ -368,22 +371,19 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
                 return  # SvcStop was called
 
             delay = policy.note_restart(time.monotonic())
-            with open(log_path, "a", encoding="utf-8") as f:
-                _log_watchdog(
-                    f,
-                    "Process exited (code=%s health_fail=%s), restarting in %d s...",
-                    exit_code,
-                    health_failed,
-                    round(delay),
+            sink.watchdog(
+                "Process exited (code=%s health_fail=%s), restarting in %d s...",
+                exit_code,
+                health_failed,
+                round(delay),
+            )
+            if policy.backing_off:
+                # Without this the operator sees a long wait with no reason for it.
+                sink.watchdog(
+                    "%d starts in a row failed to stay healthy; backing off. The service "
+                    "keeps retrying and does not give up.",
+                    policy.failed_starts,
                 )
-                if policy.backing_off:
-                    # Without this the operator sees a long wait with no reason for it.
-                    _log_watchdog(
-                        f,
-                        "%d starts in a row failed to stay healthy; backing off. The service "
-                        "keeps retrying and does not give up.",
-                        policy.failed_starts,
-                    )
             # Interruptible on purpose: an uninterruptible sleep here would make
             # `net stop` hang for the whole backoff — up to 15 minutes.
             if self._wait_for_stop(delay):
@@ -682,13 +682,20 @@ def _check_health(url: str) -> bool:
         return False
 
 
+def _finish_output(pump) -> None:
+    """Дочитать вывод вышедшего ребёнка в журнал (ограниченно — см. ``ChildOutputPump.finish``); ``None``
+    (у процесса нет потока вывода) — ничего."""
+    if pump is not None:
+        pump.finish()
+
+
 def _log_watchdog(f, msg: str, *args) -> None:
     """Write a timestamped watchdog message to the log file.
 
-    A write failure costs a line, never the service. `server.log` is line-buffered
-    and shared with the child, so a full disk raises OSError right here -- inside
-    the watchdog loop, where it would escape to the thread body and stop a service
-    whose server is perfectly healthy.
+    A write failure costs a line, never the service: a full disk raises OSError right
+    here, and it must not escape to the thread body and stop a service whose server is
+    perfectly healthy. Since v1.48.0 the watchdog loop writes through `ServiceLogSink`;
+    this function is left for `_log_fatal`, which runs once the sink is closed.
     """
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = msg % args if args else msg

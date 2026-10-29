@@ -98,6 +98,7 @@ def _run_server_once(mod, monkeypatch, tmp_path, *, capture_dir, env_file=None, 
         "subprocess",
         types.SimpleNamespace(
             Popen=fake_popen,
+            PIPE=subprocess.PIPE,
             STDOUT=subprocess.STDOUT,
             TimeoutExpired=subprocess.TimeoutExpired,
         ),
