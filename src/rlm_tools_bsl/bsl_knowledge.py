@@ -710,7 +710,7 @@ If output is truncated (ends with '... [output truncated]'), split into smaller 
 Print only summaries (counts, first N items) — never dump raw data.
 Ответ может нести 'duplicates' (тот же хелпер с теми же args дважды — переиспользуй переменную, они живут между rlm_execute)
   и 'efficiency_hints' (подсказки по батчингу/агрегатам — следуй им).
-Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index; таблицы v16 — при builder_version>=16 и has_object_attributes); вызов на старте = пустая трата execute (число перехватов — get_overrides()['total']).
+Не зови get_index_info на старте — пустая трата execute: основное уже в rlm_start.index (v16 — builder_version>=16 и has_object_attributes; перехваты — get_overrides()['total']); regions_count, modules и прочие счетчики — только в get_index_info().
 
 Call help('keyword') for code recipes — e.g. help('exports'), help('movements'), help('flow')
 """
@@ -1956,11 +1956,12 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
             label += f" v{config_version}"
     label += ")."
     idx_lines.append(label)
-    # Co-located nudge (v1.27.0): the counts/has_*/builder_version below ARE the get_index_info()
-    # payload (rlm_start.index carries the same subset), so calling it on start wastes an execute.
+    # Co-located nudge (v1.27.0): rlm_start.index carries builder_version/has_* and the main
+    # counts of get_index_info(), so calling it on start wastes an execute. v1.49.0 (Д13): не
+    # «все counts» — regions_count, modules и прочие счётчики есть только в get_index_info().
     idx_lines.append(
-        "⚠️ builder_version/has_*/counts уже в rlm_start.index (таблицы v16 — при builder_version>=16 и "
-        "has_object_attributes) — НЕ вызывай get_index_info() на старте; число перехватов — get_overrides()['total']."
+        "⚠️ НЕ зови get_index_info() на старте: основное — в rlm_start.index (v16 — builder_version>=16 и "
+        "has_object_attributes; перехваты — get_overrides()['total'])."
     )
     # v1.41.0: строка «INSTANT from index: …» (перечень индексных хелперов) из slim
     # убрана — она дублирует rlm_help(section='performance'), где та же раскладка

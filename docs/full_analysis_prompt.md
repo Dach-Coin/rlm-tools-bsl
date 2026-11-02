@@ -916,6 +916,7 @@ Replace `Справочник.ВидыПодарочныхСертификато
 | `linked_object`                  | Связующее свойство: план счетов регистра бухгалтерии, виды субконто, план видов расчёта и график регистра расчёта, базовые виды расчёта, задача бизнес-процесса (v1.47.0) |
 | `form_attribute_type`            | Тип реквизита, колонки или параметра формы (v1.47.0)                   |
 | `form_main_table` / `form_query` | Основная таблица и текст запроса динамического списка формы (v1.47.0)  |
+| `characteristic_value_type`      | Реквизит типа «значения характеристик ПВХ» (`Characteristic.X`) у цели-ПВХ; раскрытие на чтении (v1.49.0) |
 
 ## Expected results (v1.9.0, ERP 24K+ files)
 
@@ -1543,7 +1544,10 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
      это строка РЕБРА к следующему узлу, не определения.
    - Несвязанную пару проверь тоже — ожидается found=False; убедись, что _meta.budget_exceeded=False
      (иначе обход обрезан, а не «не достижимо»: res['hint'] называет добор, _meta.truncated_nodes —
-     усечённые узлы) и что нет 'error' (иначе это многозначность, не «не достижимо»).
+     усечённые узлы), что нет 'error' (иначе это многозначность, не «не достижимо») и что нет 'hint'
+     (иначе обход упёрся в max_depth: в пределах глубины пути нет, глубже не искали — повтори с max_depth+1).
+     Пару с несуществующим концом (опечатка в имени) — ожидается hint «метод from='…' не найден … проверь имя:
+     search_methods('<фрагмент>')» вместо подсказки глубины; выполни search_methods из подсказки.
 
 5. **Связь по графу МЕТАДАННЫХ (find_data_path)**:
    - Выбери объект, на который документ ссылается (регистр/справочник) — например через
@@ -1615,9 +1619,9 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | триггеры для проводимого документа | ≥1 `subscription` и/или `form_event`; на перехваченном методе — `cfe_override` |
 | `get_overrides()` | dict; каждый перехват имеет `extension_name`; `source='index'` (или `'live'` на сессии-расширении); `partial=false` либо явные причины неполноты в `_meta` |
 | `find_path` на связанной паре | `found=True`, `path` непустой, `_meta.precision='exact'` при разрешённых рёбрах |
-| `find_path` на несвязанной паре | `found=False`, `budget_exceeded=False`, нет `error` и `hint`; при `budget_exceeded=True` — верхний `hint` с исполнимым добором и `_meta.truncated_nodes` |
+| `find_path` на несвязанной паре | `found=False`, `budget_exceeded=False`, нет `error` и `hint`; при `budget_exceeded=True` — верхний `hint` с исполнимым добором и `_meta.truncated_nodes`; `from` нет среди методов или у `to` нет ни объявления, ни вызывающих — `hint` «метод from='…' не найден …» / «у to='…' в графе вызовов нет …» с `search_methods('<фрагмент>')» |
 | `find_path` многозначное имя без hint | `found=False` + `error`/`hint`/`candidates`, `_meta.ambiguous=True` (обход НЕ запущен); с hint нужного конца — нормальный обход |
-| `find_data_path` (с префиксами) | цепочка рёбер `{from,to,kind}` или `found=False`; неокончательный промах (`budget_exceeded`/`partial`) — с верхним `hint`; **без** Traceback |
+| `find_data_path` (с префиксами) | цепочка рёбер `{from,to,kind}` или `found=False`; неокончательный промах (`budget_exceeded`/`partial`) и промах на предельной глубине (повтори с `max_depth+1`) — с верхним `hint`; **без** Traceback |
 | `find_data_path` (bare endpoint) | `found=False` + `hint`, обход не запущен |
 | Ошибки контрактов (KeyError/AttributeError на get_overrides/find_roles/find_register_movements/parse_form/safe_grep) | 0 |
 | Traceback в серверном логе | 0 |

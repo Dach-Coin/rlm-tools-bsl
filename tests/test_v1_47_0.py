@@ -1509,9 +1509,11 @@ class TestCfTypeSet:
 
     @pytest.mark.parametrize("helpers", ["idx", "live"])
     def test_characteristic_typeset_gives_no_ref_boundary(self, char_tree, helpers):
-        """Обе версии, граница: реквизит хранит значения типов ПВХ, а не ссылку на него, — строки на ПВХ нет."""
+        """Граница: реквизит хранит значения типов ПВХ, а не ссылку на него, — строки `attribute_type` на ПВХ нет."""
         refs = _refs(char_tree[helpers], "ПланВидовХарактеристик.ВидыСубконто")
-        assert not [r for r in refs if ".Аналитика." in r[1]], refs
+        # v1.49.0: прежде здесь стояло «строк с `.Аналитика.` нет вовсе»; реквизит типа «значения характеристик ПВХ» —
+        # теперь строка своего вида `characteristic_value_type` (раскрытие на чтении), ссылкой-типом он не стал.
+        assert {kind for kind, used_in in refs if ".Аналитика." in used_in} == {"characteristic_value_type"}, refs
 
     @pytest.mark.parametrize("route", ["full", "git"])
     def test_update_equals_build(self, world18, route, tmp_path_factory, monkeypatch):
@@ -1725,8 +1727,10 @@ class TestAttrsAndRefsOutsideSixCategories:
     def test_full_structure_enum_values_new_category(self, world18):
         idx = world18["idx"]["get_object_full_structure"]("Обработка.Обр")
         assert [v["name"] for v in idx["enum_values_for_typed_refs"]["EnumRef.Виды"]] == ["Первый", "Второй"]
-        # без индекса — как на HEAD: `cfg:EnumRef.Виды` раскрытие не узнаёт
-        assert world18["live"]["get_object_full_structure"]("Обработка.Обр")["enum_values_for_typed_refs"] == {}
+        # v1.49.0: прежде здесь стояло `== {}` — без индекса тип CF `cfg:EnumRef.Виды` раскрытие не узнавало; теперь
+        # значения — под ключом из `type`.
+        live = world18["live"]["get_object_full_structure"]("Обработка.Обр")["enum_values_for_typed_refs"]
+        assert [v["name"] for v in live["cfg:EnumRef.Виды"]] == ["Первый", "Второй"], live
 
     def test_addressing_ref_has_line(self, world18):
         lines = world18["files"][_descriptor(world18, "Tasks", "Зад")].splitlines()
@@ -4418,9 +4422,13 @@ class TestRegisterWritersDeclared:
         live = tree["live"]["find_register_writers"]("рега")
         assert live["writers"] and live["declared_documents"] == ["ДокКод", "ДокОбщий"], live
         idx = tree["idx"]["find_register_writers"]("рега")
-        assert idx["writers"] == [] and idx["declared_documents"] == [], idx
-        assert "find_register_writers('РегА')" in idx["hint"], idx["hint"]
-        assert "Ни один документ не объявил" not in idx["hint"], idx["hint"]
+        # v1.49.0: прежде здесь стояли `writers == []`, `declared_documents == []` и совет повторить
+        # find_register_writers('РегА'); на индексе кириллица теперь сравнивается без учёта регистра — строки как у
+        # написания с диска.
+        disk = tree["idx"]["find_register_writers"]("РегА")
+        assert idx["writers"] == disk["writers"] and idx["writers"], idx
+        assert idx["declared_documents"] == disk["declared_documents"] == ["ДокКод", "ДокОбщий"], idx
+        assert "повтори" not in idx["hint"], idx["hint"]
 
     @pytest.mark.parametrize("helpers", ["idx", "live"])
     def test_latin_name_other_case_nobody_declares(self, tree, helpers):

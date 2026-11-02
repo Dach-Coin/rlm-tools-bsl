@@ -116,7 +116,7 @@ If output is truncated (ends with '... [output truncated]'), split into smaller 
 Print only summaries (counts, first N items) — never dump raw data.
 Ответ может нести 'duplicates' (тот же хелпер с теми же args дважды — переиспользуй переменную, они живут между rlm_execute)
   и 'efficiency_hints' (подсказки по батчингу/агрегатам — следуй им).
-Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index; таблицы v16 — при builder_version>=16 и has_object_attributes); вызов на старте = пустая трата execute (число перехватов — get_overrides()['total']).
+Не зови get_index_info на старте — пустая трата execute: основное уже в rlm_start.index (v16 — builder_version>=16 и has_object_attributes; перехваты — get_overrides()['total']); regions_count, modules и прочие счетчики — только в get_index_info().
 
 Call help('keyword') for code recipes — e.g. help('exports'), help('movements'), help('flow')""",
     "io": """\

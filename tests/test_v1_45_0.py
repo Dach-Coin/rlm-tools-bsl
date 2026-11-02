@@ -287,7 +287,10 @@ class TestTraversalQueryMemo:
     def test_find_path_conclusive_miss_unchanged_with_fewer_queries(self, chain):
         bsl, calls = chain
         res = bsl["find_path"]("Корень", "Цель", max_depth=3, from_hint=_CHAIN_MOD, to_hint=_CHAIN_MOD)
-        assert res == _PATH_MISS_HEAD
+        # v1.49.0: прежде здесь стояло `res == _PATH_MISS_HEAD` — промах без `hint`; путь `Корень → В → Б → А → Цель` —
+        # 4 ребра при max_depth=3, обход упёрся в глубину, и промах несёт подсказку о ней (прочие поля прежние).
+        assert {k: v for k, v in res.items() if k != "hint"} == _PATH_MISS_HEAD
+        assert "max_depth=3" in res["hint"] and "max_depth=4" in res["hint"], res["hint"]
         assert calls["n"] == res["_meta"]["nodes_expanded"]  # до правки — 6
 
     def test_find_call_hierarchy_does_not_requery_duplicate_queue_entries(self, chain):
@@ -622,7 +625,14 @@ class TestFindPathTruncation:
         assert res["found"] is True and res["path"][0]["module_path"] == from_hint
 
     def test_find_path_conclusive_miss_has_no_hint(self, tmp_path, monkeypatch):
-        root = _cf_doc_tree(tmp_path / "cf", _FP_SPEC)
+        # v1.49.0: прежде здесь стояло дерево `_FP_SPEC`, где метода `НеСвязан` нет вовсе; такой промах теперь
+        # называет отсутствующий конец подсказкой (tests/test_v1_49_0.py::TestDepthLimitMiss::test_absent_end_is_named),
+        # поэтому для окончательного промаха без hint метод `НеСвязан` заведён — существует, но цели не вызывает.
+        unlinked = {
+            "CommonModules/Н/Ext/Module.bsl": "Процедура НеСвязан() Экспорт\nКонецПроцедуры\n",
+            "CommonModules/Н.xml": _cm_descriptor("Н"),
+        }
+        root = _cf_doc_tree(tmp_path / "cf", {**_FP_SPEC, **unlinked})
         bsl = _bsl_for(root, _reader_for(root, monkeypatch), idx_zero_callers_authoritative=True)
         res = bsl["find_path"]("НеСвязан", "ОбщаяЦель", max_depth=2, to_hint=_FP_TARGET)
         assert res["found"] is False and res["_meta"]["budget_exceeded"] is False
@@ -738,7 +748,10 @@ class TestDataPathTruncation:
         # — у узла последнего уровня (`max_depth=1`) дети не раскрывались бы вовсе, и после точечной проверки
         # прямой ссылки промах окончателен.
         res2 = bsl["find_data_path"]("Справочник.А", "Справочник.Изолированный", max_depth=1)
-        assert res2["found"] is False and res2["_meta"]["budget_exceeded"] is False and "hint" not in res2
+        # v1.49.0: прежде здесь стояло `"hint" not in res2` — промах на предельной глубине теперь несёт подсказку о
+        # глубине (`budget_exceeded` и `truncated_nodes` по-прежнему нет: решение 1.46.0 о последнем уровне в силе).
+        assert res2["found"] is False and res2["_meta"]["budget_exceeded"] is False
+        assert "max_depth=1" in res2["hint"], res2
         assert "truncated_nodes" not in res2["_meta"]
 
     @pytest.mark.parametrize("exit_kind", ["node_budget", "no_index", "refs_table_lost"])
@@ -2194,8 +2207,12 @@ class TestPrintFormsRoute:
         manager = f"Documents/Печать/{ext}ManagerModule.bsl"
         _write(root / manager, _PF_PRINT_MANAGER)
         bsl = _bsl_for(root, reader)
-        hint = bsl["find_print_forms"]("Документ.Печать")["hint"]
-        assert hint.startswith("Модуля менеджера в каталоге модулей сессии нет."), hint
+        res = bsl["find_print_forms"]("Документ.Печать")
+        hint = res["hint"]
+        # v1.49.0: прежде здесь стояло `hint.startswith("Модуля менеджера в каталоге модулей сессии нет.")`; модуль
+        # менеджера на диске, которого нет в индексе, теперь назван — с исполнимым чтением процедуры печати.
+        assert manager in hint and f"read_procedure({manager!r}, 'ДобавитьКомандыПечати')" in hint, hint
+        assert res["_meta"]["modules_not_indexed"] == [manager], res["_meta"]
         assert "процедуры ДобавитьКомандыПечати нет" not in hint and "Процедуры ДобавитьКомандыПечати" not in hint, hint
         assert "Накладная" in bsl["read_procedure"](manager, "ДобавитьКомандыПечати")  # тело на диске есть
 

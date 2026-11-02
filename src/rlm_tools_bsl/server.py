@@ -751,7 +751,7 @@ _FILE_HELPER_SIGNATURES = (
     "read_files(paths) -> dict[path, str] — BATCH: читай N файлов одним вызовом вместо N×read_file (numbered)",
     "grep(pattern, path='.') -> list[dict] keys: file, line, text  # пути через /",
     "grep_summary(pattern, path='.') -> compact grouped string  # пути через /",
-    "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files (numbered), summary}  # пути через /",
+    "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches:{file:[{file,line,text}]}, files:{file:numbered}, summary}  # пути через /",
     "glob_files(pattern) -> list[str]  # пути через /",
     "tree(path='.', max_depth=3) -> str",
     "find_files(name) -> list[str]  # пути через /",
@@ -1149,7 +1149,8 @@ def _rlm_start(
                                 f"После сборки индекса мог измениться состав категорий: {', '.join(drift)} (каталог "
                                 "категории изменен: объект добавлен, удален или его описатель перезаписан — так делают "
                                 "и git checkout/pull) — индекс может отставать; вложенную подсистему и модуль, "
-                                "добавленный в существующий объект, эта проверка не видит. Обновить индекс: "
+                                "добавленный в существующий объект, эта проверка не видит — такой модуль называют "
+                                "ответы по объекту (_meta.modules_not_indexed). Обновить индекс: "
                                 f'rlm-bsl-index index update "{resolved}"'
                             )
                             logger.warning("rlm_start: session=%s category_drift=%s", session_id, ",".join(drift))

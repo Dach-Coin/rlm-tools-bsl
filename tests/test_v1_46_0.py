@@ -910,7 +910,12 @@ class TestMissingObject:
         res = world["find_data_path"]("Подсистема.Нет", "Справочник.Спр", max_depth=99)
         assert res["found"] is False and res["path"] is None and res["depth"] == 0 and res["partial"] is False
         assert res["from"] == "Subsystem.Нет" and "нет —" in res["error"], res
-        assert "search_objects('Нет')" in res["hint"], res
+        # v1.49.0 (Н6): прежде здесь и без индекса стоял совет «search_objects('Нет')» — там он неисполним (поиск
+        # пуст); без индекса подсказка называет похожие объекты на диске или их отсутствие.
+        if world.reader is None:
+            assert res["hint"].startswith("проверьте имя: ") and "на диске" in res["hint"], res
+        else:
+            assert "search_objects('Нет')" in res["hint"], res
         assert res["_meta"]["max_depth"] == 8  # ограничение глубины — до проверки концов
         assert "error" in world["find_data_path"]("Документ.Док", "Справочник.Нет")
 
@@ -972,8 +977,10 @@ class TestMissingObject:
         assert [r["role_name"] for r in world["find_roles"]("Док")["roles"]] == ["Роль1"]
 
     def test_overrides_missing_bare_name_has_hint(self, world):
+        # v1.49.0 (Н6): прежде здесь и без индекса стоял совет «search_objects('Нет')» (без индекса неисполним).
+        route = "search_objects('Нет')" if world.reader is not None else "на диске"
         for res in (world["get_overrides"]("Нет"), world["find_ext_overrides"](world.ext_path, "Нет")):
-            assert res["total"] == 0 and "search_objects('Нет')" in res["hint"], res
+            assert res["total"] == 0 and route in res["hint"], res
         for res in (world["get_overrides"]("Пустой"), world["find_ext_overrides"](world.ext_path, "Пустой")):
             assert res["total"] == 0 and "hint" not in res, res
 
@@ -1002,12 +1009,30 @@ class TestMissingObject:
         "НетТакого.Спр",
     ]
 
+    # v1.49.0: объекты видов, на которые в ролях прав не бывает (общая картинка, подписка, роль), — без ролей по флагу.
+    _NO_RIGHTS_FORMS = {
+        "Role.Роль1",
+        "Роль.Роль1",
+        "CommonPictures.Картинка",
+        "ОбщаяКартинка.Картинка",
+        "CommonPictures/Картинка",
+        "CommonPictures/Картинка.xml",
+        "EventSubscriptions/ПодпНабор",
+        "EventSubscription.ПодпНабор",
+        "CommonPictures//Картинка",
+        "CommonPictures/./Картинка",
+        "CommonPictures///Картинка.xml",
+    }
+
     @pytest.mark.parametrize("form", _EXISTING_FORMS)
     def test_existing_object_in_any_form_keeps_flag_roles(self, world, form):
         """Обе версии: форме соответствует существующий объект — роли по флагу и перехваты без подсказки «объекта
         нет»: правило не-ссылки — только для имени, которому не соответствует ни один объект."""
         roles = world["find_roles"](form)["roles"]
-        assert [r["role_name"] for r in roles if r["granted_via"] == "set_for_new_objects"] == ["Роль1"], roles
+        # v1.49.0: прежде здесь стояла роль `Роль1` по флагу у каждой формы; у объекта вида без прав в ролях (общая
+        # картинка, подписка, роль) строк по флагу нет — подсистема, справочник, документ — как прежде.
+        expected = [] if form in self._NO_RIGHTS_FORMS else ["Роль1"]
+        assert [r["role_name"] for r in roles if r["granted_via"] == "set_for_new_objects"] == expected, roles
         for res in (world["get_overrides"](form), world["find_ext_overrides"](world.ext_path, form)):
             assert "hint" not in res, res
 
@@ -1073,8 +1098,16 @@ class TestMissingObject:
     )
     def test_missing_object_in_any_form_gets_the_rule(self, world, form):
         """Формы без объекта ни при одном толковании — правило не-ссылки действует: без ролей по флагу, с `hint`."""
+        if form.startswith("CommonPictures/"):
+            # v1.49.0: прежде здесь стояло правило не-ссылки (`roles == []` и `hint` у `get_overrides`); путь категории
+            # из 17 вне прежнего разбора (`CommonPictures/…`) теперь ссылка — объекта нет: отказ шлюза.
+            for helper in ("find_roles", "get_overrides"):
+                with pytest.raises(ValueError, match=f"^{helper}: объекта CommonPicture.НетТакой нет"):
+                    world[helper](form)
+            return
         assert world["find_roles"](form)["roles"] == []
-        assert "search_objects(" in world["get_overrides"](form)["hint"]
+        # v1.49.0 (Н6): прежде здесь и без индекса стоял совет search_objects (без индекса неисполним).
+        assert ("search_objects(" if world.reader is not None else "на диске") in world["get_overrides"](form)["hint"]
 
     def test_composites_unchanged(self, world):
         """Обе версии: композиты на существующей ссылке отвечают как без стража."""
@@ -1522,7 +1555,14 @@ class TestAskedObject:
         name = res["name"]
         assert name in ("ОбщМод", "ОбщМод2") and res["category"] == "CommonModules", res
         assert res["modules"] and all(m["path"].startswith(f"CommonModules/{name}/") for m in res["modules"])
-        assert f"CommonModules/{name}" in res["hint"] and "search_objects('ОбщМо')" in res["hint"], res
+        assert f"CommonModules/{name}" in res["hint"], res
+        # v1.49.0 (Н6): прежде здесь и без индекса стоял совет «search_objects('ОбщМо')» (без индекса неисполним);
+        # без индекса хвост называет прочие похожие объекты на диске — второй общий модуль.
+        if world.reader is None:
+            (other,) = {"ОбщМод", "ОбщМод2"} - {name}
+            assert f"другие похожие на диске — CommonModules/{other}" in res["hint"], res
+        else:
+            assert "search_objects('ОбщМо')" in res["hint"], res
         fcm = _fcm(world, "ОбщМо")
         assert fcm["modules_analyzed"] == 1 and f"CommonModules/{name}" in fcm["hint"], fcm
         if world.reader is not None:
@@ -1633,7 +1673,9 @@ class TestDataPathLastLevel:
         bsl = _bsl_for(root, _reader_for(root, monkeypatch))
         res = bsl["find_data_path"]("Справочник.А", "Справочник.Изолированный", max_depth=1)
         assert res["found"] is False and res["_meta"]["budget_exceeded"] is False, res
-        assert "hint" not in res and "truncated_nodes" not in res["_meta"], res
+        # v1.49.0: прежде здесь стояло `"hint" not in res` — промах на предельной глубине несёт подсказку о глубине;
+        # `truncated_nodes` по-прежнему нет.
+        assert "max_depth=1" in res["hint"] and "truncated_nodes" not in res["_meta"], res
 
     def test_deeper_truncation_stays_inconclusive(self, tmp_path, monkeypatch, page_one):
         """Обе версии: усечённый узел не последнего уровня — промах неокончательный."""
@@ -2503,7 +2545,14 @@ class TestEnumExactName:
         bsl, route = enum_env
         res = bsl["find_enum_values"]("Ставки")
         assert res.get("name") in ("СпособыЗаполненияСтавкиНДС", "СтавкиНДС"), res
-        assert res["name"] in res["hint"] and "search_objects('Ставки')" in res["hint"], res
+        assert res["name"] in res["hint"], res
+        # v1.49.0 (Н6): прежде здесь и без индекса стоял совет «search_objects('Ставки')» (без индекса неисполним);
+        # без индекса хвост называет второе перечисление с подстрокой на диске.
+        if route == "index":
+            assert "search_objects('Ставки')" in res["hint"], res
+        else:
+            (other,) = {"СпособыЗаполненияСтавкиНДС", "СтавкиНДС"} - {res["name"]}
+            assert f"другие похожие на диске — Enums/{other}" in res["hint"], res
         if route == "index":  # совет исполним: синонимы основной конфигурации ищутся по индексу
             assert "СтавкиНДС" in {r["object_name"] for r in bsl["search_objects"]("Ставки")}
 
@@ -2540,9 +2589,9 @@ class TestEnumExactName:
         bsl, route = enum_env
         expanded = bsl["get_object_full_structure"]("Документ.Док")["enum_values_for_typed_refs"]
         if route == "live" and "EnumRef.СтавкиНДС" not in expanded:
-            # Давнее (и на HEAD), вне Д19: на живом маршруте CF тип реквизита несёт префикс `cfg:`
-            # (`cfg:EnumRef.X`), `_is_enum_ref` его не узнаёт — раскрытия нет вовсе. Кандидат в бэклог.
-            assert expanded == {}, expanded
+            # v1.49.0: прежде здесь стояло `expanded == {}` — на живом маршруте CF тип реквизита несёт префикс `cfg:`
+            # (`cfg:EnumRef.X`), и раскрытия не было; теперь значения — под ключом из `type` (`cfg:EnumRef.СтавкиНДС`).
+            assert [v["name"] for v in expanded["cfg:EnumRef.СтавкиНДС"]] == _ENUM_RATES, expanded
             return
         assert [v["name"] for v in expanded["EnumRef.СтавкиНДС"]] == _ENUM_RATES, expanded
 

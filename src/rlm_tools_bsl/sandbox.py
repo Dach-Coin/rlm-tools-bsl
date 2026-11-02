@@ -154,13 +154,448 @@ _GENERIC_HELPER_SIGNATURES: dict[str, dict] = {
     "read_files": {"sig": "read_files(paths) -> dict[path, str]"},
     "grep": {"sig": "grep(pattern, path='.') -> list[dict] keys: file, line, text  # пути через /"},
     "grep_summary": {"sig": "grep_summary(pattern, path='.') -> str  # пути через /"},
+    # v1.49.0 (Д15): подпись называет форму ответа — `matches` словарь «файл → записи»,
+    # `files` — «файл → текст с номерами»; копия в server._FILE_HELPER_SIGNATURES байт в байт.
     "grep_read": {
-        "sig": "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files, summary}  # пути через /"
+        "sig": "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches:{file:[{file,line,text}]}, files:{file:numbered}, summary}  # пути через /"
     },
     "glob_files": {"sig": "glob_files(pattern) -> list[str]  # пути через /"},
     "tree": {"sig": "tree(path='.', max_depth=3) -> str"},
     "find_files": {"sig": "find_files(name) -> list[str]  # пути через /"},
 }
+
+# v1.49.0 (Д15): подсказку конкретного хелпера выбирает ИСТОЧНИК ошибки, а не текст кода.
+# Прежде `"read_procedure" in code` давал «read_procedure возвращает СТРОКУ» на падение
+# значения grep_read строкой ниже. Источник — строка кода агента из трассировки и привязки
+# имён этой строки по AST кода вызова; переменную прошлого вызова узнаёт только форма
+# значения (_grep_read_shaped). Источник не доказан — подсказки конкретного хелпера нет.
+# Кадр исполнения несёт `, in <module>` (или имя функции агента); у синтаксической ошибки
+# его нет — она случилась до исполнения, и для неё действуют прежние правила.
+_AGENT_FRAME_RE = re.compile(r'File "<rlm-sandbox>", line (\d+), in (\S+)')
+# Сквозь эти вызовы значение сохраняет источник: res['matches'].items(), res.get('files'). `.get()` — только с одним
+# аргументом: запасное значение `.get(ключ, запасное)` — иной источник (ревью Codex).
+_SOURCE_TRANSPARENT_METHODS = frozenset({"items", "keys", "values", "get"})
+_BRANCH_NODES = tuple(getattr(ast, n) for n in ("If", "Try", "TryStar", "Match") if hasattr(ast, n))
+# Тело цикла может не выполниться ни разу: после цикла его привязки (и цель `for`) — как ветвь без `else` (ревью Codex).
+_LOOP_NODES = (ast.For, ast.AsyncFor, ast.While)
+_COND_NODES = _BRANCH_NODES + _LOOP_NODES
+_SCOPE_NODES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.Lambda,
+    ast.ClassDef,  # привязка в теле класса — атрибут класса, а не имя модуля
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+# Тело исполняется позже объявления — при вызове или переборе: внешние имена читаются тогда же.
+_DEFERRED_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.GeneratorExp)
+# Имена кадров трассировки, которые называют вид области, а не её имя (`<listcomp>`… — кадры включений до 3.12).
+_FRAME_KINDS = {
+    "<genexpr>": (ast.GeneratorExp,),
+    "<lambda>": (ast.Lambda,),
+    "<listcomp>": (ast.ListComp,),
+    "<setcomp>": (ast.SetComp,),
+    "<dictcomp>": (ast.DictComp,),
+}
+
+
+def _failing_agent_line(error: str, code: str) -> int | None:
+    """Номер строки кода агента из ПОСЛЕДНЕГО кадра ``File "<rlm-sandbox>", line N`` трассировки."""
+    found = _AGENT_FRAME_RE.findall(error)
+    if not found:
+        return None
+    line_no = int(found[-1][0])
+    return line_no if 1 <= line_no <= len(code.splitlines()) else None
+
+
+def _failing_agent_frame(error: str) -> str | None:
+    """Имя ПОСЛЕДНЕГО кадра кода агента: ``<module>``, имя функции, ``<lambda>``, ``<genexpr>``, имя класса —
+    исполняющий контекст строки ошибки, который номер строки не различает (шестая перепроверка Codex)."""
+    found = _AGENT_FRAME_RE.findall(error)
+    return found[-1][1] if found else None
+
+
+def _grep_read_shaped(value) -> bool:
+    """Значение — ответ grep_read: ровно ``dict`` из трёх ключей ровно типа ``str`` — matches, files, summary.
+    Диагностика ошибки не исполняет код агента: подкласс dict отсекается до вызова его методов, перебор ключей обычного
+    dict их ``__hash__``/``__eq__`` не зовёт, а сравниваются только строки (перепроверка Codex)."""
+    if type(value) is not dict or len(value) != 3:
+        return False
+    keys = list(value)
+    return all(type(key) is str for key in keys) and set(keys) == {"matches", "files", "summary"}
+
+
+@dataclass(eq=False)
+class _Binding:
+    """Привязка имени в коде вызова: с какой строки действует и какое значение несёт."""
+
+    order: tuple[int, int]  # порядок привязок: где имя получает значение
+    anchor: ast.AST  # узел, от которого считаются ветви if/try
+    scope: ast.AST | None  # функция или включение, вне которых привязки нет
+    visible_from: int  # первая строка, на которой привязка уже действует
+    value: ast.AST | None  # выражение-значение; None — источник не выводится
+    cutoff: int  # строка, на которой разрешаются имена значения
+    # Область, вне которой вычисляется значение: первый итератор включения — в окружающей области (цели включения
+    # там не действуют, а имена тела класса видны) — четвёртая перепроверка Codex.
+    outside: ast.AST | None = None
+
+
+class _SourceResolver:
+    """Какой хелпер дал значение имени в точке ошибки — по AST кода одного вызова.
+
+    Берётся ПОСЛЕДНЯЯ до строки ошибки привязка (присваивание, цель ``for``, цель
+    включения); значение — вызов хелпера сквозь подписки, атрибуты и
+    ``.items()/.keys()/.values()/.get()`` либо имя (его источник в точке привязки,
+    рекурсивно). Привязка в ветвях ``if``/``try`` и в теле цикла (оно может не выполниться),
+    вне которых стоит строка ошибки, доказывает источник, только если все привязки внутри и
+    значение до ветвления сходятся; цель ``for`` вне тела цикла (после него и в его ``else``) —
+    так же. Без привязки до ветвления в коде вызова значение до него неизвестно (переменная
+    прошлого вызова) — кроме ``if``/``else``, обе ветви которого привязывают имя.
+    """
+
+    _MAX_DEPTH = 8
+
+    def __init__(self, tree: ast.AST):
+        self._parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        self._bindings: dict[str, list[_Binding]] = {}
+        self._class_inner: dict[ast.AST, list[ast.AST]] = {}
+        self._deferred = [n for n in ast.walk(tree) if isinstance(n, _DEFERRED_NODES)]
+        self._scope_nodes = [n for n in ast.walk(tree) if isinstance(n, _SCOPE_NODES)]
+        for node in ast.walk(tree):
+            self._collect(node)
+
+    def _holds_own(self, node: ast.AST, line_no: int) -> bool:
+        """Строка лежит в теле области (не в её заголовке, который вычисляется в окружающей)."""
+        if not node.lineno <= line_no <= node.end_lineno:
+            return False
+        return any(p.lineno <= line_no <= p.end_lineno for p in self._scope_parts(node)[1])
+
+    def _executing_node(self, line_no: int, frame: str) -> ast.AST | None | bool:
+        """Область, чей код исполняется в кадре ``frame`` на строке ``line_no``: самая внутренняя с тем же именем кадра
+        (``<genexpr>``, ``<lambda>``, ``<listcomp>``… — по виду; иначе функция или класс с этим именем), тело которой
+        держит строку. ``<module>`` — модуль (``None``); не опознана — ``False``."""
+        if frame == "<module>":
+            return None
+        kinds = _FRAME_KINDS.get(frame)
+        found = None
+        for node in self._scope_nodes:
+            if kinds is not None:
+                if not isinstance(node, kinds):
+                    continue
+            elif not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == frame):
+                continue
+            if self._holds_own(node, line_no) and (found is None or self._within(node, found)):
+                found = node
+        return False if found is None else found
+
+    def _deferred_at(self, line_no: int, frame: str | None = None) -> ast.AST | None | bool:
+        """Самая внутренняя функция, лямбда или генераторное выражение, в чьём исполнении идёт строка ``line_no`` —
+        позже объявления, при вызове или переборе: внешние имена читаются тогда же, а не по порядку строк (общестыковая
+        вычитка и шестая перепроверка Codex). ``frame`` — имя кадра строки ошибки: по нему — исполняемая область, а от
+        неё — ближайшая отложенная: тело класса и включения исполняется вместе с окружающей областью (седьмая
+        перепроверка), ``<module>`` и класс верхнего уровня — не отложено (как и первый итератор генератора и значения
+        по умолчанию — они в окружающем кадре). Без кадра — по строкам: на строке и заголовок, и тело — ``False``; вне
+        тел — ``None``."""
+        if frame is not None:
+            node = self._executing_node(line_no, frame)
+            if node is not False:
+                while node is not None and not isinstance(node, _DEFERRED_NODES):
+                    node = self._parents.get(node)
+                return node
+        found = None
+        for node in self._deferred:
+            if not self._holds_own(node, line_no):
+                continue
+            if any(e.lineno <= line_no <= e.end_lineno for e in self._scope_parts(node)[0]):
+                return False
+            if found is None or self._within(node, found):
+                found = node
+        return found
+
+    @staticmethod
+    def _scope_parts(node: ast.AST) -> tuple[list[ast.AST], list[ast.AST]]:
+        """Вложенная область: (выражения, которые вычисляются в ОКРУЖАЮЩЕЙ области — декораторы, значения по
+        умолчанию, аннотации, базы класса, первый итератор включения; части, которые вычисляются в САМОЙ области)."""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = node.args
+            outer = [*a.defaults, *(d for d in a.kw_defaults if d is not None)]
+            if isinstance(node, ast.Lambda):
+                return outer, [node.body]
+            params = (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+            outer += [p.annotation for p in params if p is not None and p.annotation is not None]
+            outer += [*node.decorator_list, *([node.returns] if node.returns is not None else [])]
+            return outer, list(node.body)
+        if isinstance(node, ast.ClassDef):
+            return [*node.decorator_list, *node.bases, *(k.value for k in node.keywords)], list(node.body)
+        first, *rest = node.generators  # включения
+        inner = [first.target, *first.ifs, *(part for gen in rest for part in (gen.target, gen.iter, *gen.ifs))]
+        inner += [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+        return [first.iter], inner
+
+    def _sees(self, scope: ast.AST | None, line_no: int, outside: ast.AST | None = None) -> bool | None:
+        """Привязка области ``scope`` видна на строке ``line_no``: строка внутри области, а у тела класса — ещё и не в
+        теле вложенной функции, лямбды, включения или класса: имена тела класса оттуда не видны (вторая перепроверка
+        Codex), а в их значениях по умолчанию, декораторах, аннотациях, базах и первом итераторе включения — видны
+        (третья). На строке и то, и другое — ``None``: контекст строки неоднозначен. ``outside`` — область, вне
+        которой вычисляется значение (первый итератор включения): её привязки не видны, а сама она имена класса не
+        скрывает (четвёртая)."""
+        if scope is None:
+            return True
+        if scope is outside:
+            return False
+        if not scope.lineno <= line_no <= scope.end_lineno:
+            return False
+        if not isinstance(scope, ast.ClassDef):
+            return True
+        inner = self._class_inner.get(scope)
+        if inner is None:
+            inner = self._class_inner[scope] = [
+                n for n in ast.walk(scope) if n is not scope and isinstance(n, _SCOPE_NODES)
+            ]
+        seen = True
+        for node in inner:
+            if node is outside or not node.lineno <= line_no <= node.end_lineno:
+                continue
+            outer, own = self._scope_parts(node)
+            in_outer = any(e.lineno <= line_no <= e.end_lineno for e in outer)
+            in_own = any(p.lineno <= line_no <= p.end_lineno for p in own)
+            if in_outer and in_own:
+                return None
+            if not in_outer:
+                seen = False
+        return seen
+
+    def bound(self, name: str) -> bool:
+        return name in self._bindings
+
+    def _scope_of(self, node: ast.AST) -> ast.AST | None:
+        parent = self._parents.get(node)
+        while parent is not None and not isinstance(parent, _SCOPE_NODES):
+            parent = self._parents.get(parent)
+        return parent
+
+    def _add(self, name: str, **fields) -> None:
+        self._bindings.setdefault(name, []).append(_Binding(**fields))
+
+    def _collect(self, node: ast.AST) -> None:
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            holder = self._parents.get(node)
+            while isinstance(holder, (ast.Tuple, ast.List, ast.Starred)):
+                holder = self._parents.get(holder)
+            at = (node.lineno, node.col_offset)
+            if isinstance(holder, ast.comprehension):
+                comp = self._parents[holder]
+                self._add(
+                    node.id,
+                    order=at,
+                    anchor=node,
+                    scope=comp,
+                    visible_from=comp.lineno,
+                    value=holder.iter,
+                    cutoff=holder.iter.lineno,  # имена итератора — там, где стоит сам итератор
+                    outside=comp if holder is comp.generators[0] else None,
+                )
+            elif isinstance(holder, (ast.For, ast.AsyncFor)):
+                self._add(
+                    node.id,
+                    order=at,
+                    anchor=holder,
+                    scope=self._scope_of(holder),
+                    visible_from=holder.lineno,
+                    value=holder.iter,
+                    cutoff=holder.lineno,
+                )
+            elif isinstance(holder, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign, ast.Delete)):
+                carries = isinstance(holder, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and isinstance(
+                    node.ctx, ast.Store
+                )
+                self._add(
+                    node.id,
+                    order=(holder.end_lineno, holder.end_col_offset),
+                    anchor=holder,
+                    scope=self._scope_of(holder),
+                    visible_from=holder.end_lineno + 1,
+                    value=holder.value if carries else None,
+                    cutoff=holder.lineno,
+                )
+            else:  # with … as и прочие цели — источник не выводится
+                self._add(
+                    node.id,
+                    order=at,
+                    anchor=node,
+                    scope=self._scope_of(node),
+                    visible_from=node.lineno,
+                    value=None,
+                    cutoff=node.lineno,
+                )
+            return
+        if isinstance(node, ast.arg):
+            name = node.arg
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+            name = node.name
+        elif isinstance(node, ast.alias):
+            name = node.asname or node.name.split(".")[0]
+        elif type(node).__name__ in ("MatchAs", "MatchStar", "MatchMapping"):
+            name = getattr(node, "name", None) or getattr(node, "rest", None)
+        else:
+            return
+        if name:
+            at = (node.lineno, node.col_offset)
+            self._add(
+                name,
+                order=at,
+                anchor=node,
+                scope=self._scope_of(node),
+                visible_from=node.lineno,
+                value=None,
+                cutoff=node.lineno,
+            )
+
+    @staticmethod
+    def _branches(node: ast.AST) -> list[list[ast.AST]]:
+        if isinstance(node, (ast.If, *_LOOP_NODES)):
+            return [node.body, node.orelse]
+        if type(node).__name__ == "Match":
+            return [[case] for case in node.cases]
+        return [node.body, *([h] for h in node.handlers), node.orelse, node.finalbody]
+
+    @staticmethod
+    def _span(stmt: ast.AST) -> tuple[int, int]:
+        if hasattr(stmt, "lineno"):
+            return stmt.lineno, stmt.end_lineno
+        return stmt.pattern.lineno, stmt.body[-1].end_lineno  # match_case без позиции
+
+    @staticmethod
+    def _stores(target: ast.AST, name: str) -> bool:
+        return any(isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store) for n in ast.walk(target))
+
+    @classmethod
+    def _definitely_binds(cls, stmts: list[ast.AST], name: str) -> bool:
+        """Операторы привязывают имя на любом пути: прямое присваивание либо ``if``/``else`` (и цепочка ``elif``),
+        обе ветви которого привязывают."""
+        for stmt in stmts:
+            if isinstance(stmt, ast.Assign) and any(cls._stores(t, name) for t in stmt.targets):
+                return True
+            if isinstance(stmt, ast.AnnAssign) and stmt.value is not None and cls._stores(stmt.target, name):
+                return True
+            if isinstance(stmt, ast.If) and stmt.orelse and cls._exhaustive(stmt, name):
+                return True
+        return False
+
+    @classmethod
+    def _exhaustive(cls, node: ast.AST, name: str) -> bool:
+        """После ``node`` имя привязано наверняка: ``if``/``else``, обе ветви которого его привязывают. Цикл (ноль
+        итераций), ``if`` без ``else``, ``try`` и ``match`` — нет."""
+        return (
+            isinstance(node, ast.If)
+            and bool(node.orelse)
+            and cls._definitely_binds(node.body, name)
+            and cls._definitely_binds(node.orelse, name)
+        )
+
+    def _within(self, node: ast.AST, ancestor: ast.AST) -> bool:
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = self._parents.get(node)
+        return False
+
+    def resolve(
+        self,
+        name: str,
+        line_no: int,
+        depth: int = 0,
+        seen: frozenset = frozenset(),
+        exclude: frozenset = frozenset(),
+        outside: ast.AST | None = None,
+        frame: str | None = None,
+    ) -> str | None:
+        visible = []
+        for b in self._bindings.get(name, ()):
+            if b in exclude or b.visible_from > line_no:
+                continue
+            sees = self._sees(b.scope, line_no, outside)
+            if sees is None:
+                return None  # контекст строки неоднозначен — источник не доказан
+            if sees:
+                visible.append(b)
+        if not visible or depth > self._MAX_DEPTH:
+            return None
+        last = max(visible, key=lambda b: b.order)
+        deferred = self._deferred_at(line_no, frame)
+        if deferred is False or (
+            deferred is not None and (last.scope is None or not self._within(last.scope, deferred))
+        ):
+            return None  # внешнее имя тела функции читается при её вызове — по порядку строк источник не доказан
+        outer = None
+        if isinstance(last.anchor, _LOOP_NODES) and not any(
+            a <= line_no <= z for a, z in map(self._span, last.anchor.body)
+        ):
+            outer = last.anchor  # цель `for` действует только в теле: после цикла и в `else` — и значение до цикла
+        child, node = last.anchor, self._parents.get(last.anchor)
+        while node is not None:
+            if isinstance(node, _COND_NODES):
+                branches = self._branches(node)
+                if not node.lineno <= line_no <= node.end_lineno:
+                    outer = node  # строка ошибки вне ветвления — значение пришло из одной из ветвей
+                else:
+                    of_binding = next((i for i, br in enumerate(branches) if any(s is child for s in br)), None)
+                    of_line = next(
+                        (i for i, br in enumerate(branches) if any(a <= line_no <= z for a, z in map(self._span, br))),
+                        None,
+                    )
+                    if of_binding is None or of_binding != of_line:
+                        return None
+                    break
+            child, node = node, self._parents.get(node)
+        if outer is None:
+            return self._source(last, depth, seen)
+        inside = [b for b in visible if self._within(b.anchor, outer)]
+        sources = {self._source(b, depth, seen) for b in inside}
+        if not self._exhaustive(outer, name):  # значение до ветвления доходит туда, где ветвь не привязала имя
+            if len(inside) < len(visible):
+                # Привязки внутри исключены: цель `for` видна уже со строки заголовка цикла.
+                sources.add(
+                    self.resolve(name, outer.lineno, depth + 1, seen, exclude=frozenset(inside), outside=outside)
+                )
+            else:
+                sources.add(None)  # в коде вызова до ветвления имя не привязано: значение прошлого вызова неизвестно
+        return sources.pop() if len(sources) == 1 else None
+
+    def _source(self, binding: _Binding, depth: int, seen: frozenset) -> str | None:
+        if binding.value is None or binding in seen:
+            return None
+        expr = binding.value
+        while True:
+            if isinstance(expr, (ast.Subscript, ast.Attribute, ast.Starred)):
+                expr = expr.value
+            elif (
+                isinstance(expr, ast.Call)
+                and isinstance(expr.func, ast.Attribute)
+                and expr.func.attr in _SOURCE_TRANSPARENT_METHODS
+                and not expr.keywords
+                and not any(isinstance(arg, ast.Starred) for arg in expr.args)  # `*args` — число не доказано
+                and len(expr.args) == (1 if expr.func.attr == "get" else 0)
+            ):
+                expr = expr.func.value
+            else:
+                break
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+            return expr.func.id
+        if isinstance(expr, ast.Name):
+            return self.resolve(expr.id, binding.cutoff, depth + 1, seen | {binding}, outside=binding.outside)
+        return None
+
+
+def _value_source(code: str, line_no: int, name: str) -> str | None:
+    """Какой хелпер дал значение имени ``name`` в строке ``line_no`` кода агента (None — не доказано)."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return None
+    return _SourceResolver(tree).resolve(name, line_no)
 
 
 @dataclass
@@ -688,8 +1123,10 @@ class Sandbox:
                 }
             )
 
-        # (4) get_index_info() at session start — its payload (builder_version/has_*/counts)
-        # already ships in rlm_start.index, so a discovery call on start wastes a round-trip.
+        # (4) get_index_info() at session start — builder_version/has_* and the main counts
+        # already ship in rlm_start.index, so a discovery call on start wastes a round-trip.
+        # v1.49.0 (Д13): текст называет и то, чего в старте НЕТ (modules, regions_count, …) —
+        # агент, которому это нужно, не должен читать упрёк как «данные уже есть».
         # Gate on the MINIMAL seq of get_index_info in THIS execute: seq<=2 = 1st/2nd call of
         # the session (start signal). A mid-session call for niche fields (has_* таблиц v16,
         # extension_overrides) has a high seq → no false nudge. Throttled once.
@@ -704,10 +1141,13 @@ class Sandbox:
                         "count": len(gii_seqs),
                         "trigger": f"get_index_info() as session call #{min(gii_seqs)} (payload already in rlm_start.index)",
                         "message": (
-                            "builder_version/has_*/counts уже пришли в rlm_start.index (поле index) — "
-                            "не трать execute на get_index_info() на старте. Доступность таблиц v16 "
-                            "(declared_register_records, role_flags, common_module_props, constants, templates) — "
-                            "builder_version >= 16 и has_object_attributes; число перехватов — "
+                            "builder_version/has_* и основные счетчики (methods, calls, object_synonyms, "
+                            "object_attributes_count…) уже пришли в rlm_start.index — не трать execute на "
+                            "get_index_info() на старте. Только get_index_info() отдает modules, regions_count, "
+                            "module_headers_count, extension_overrides, content_sample и прочие счетчики таблиц "
+                            "v12/v16 (exchange_plan_content_count, defined_types_count, … *_count). Доступность "
+                            "таблиц v16 (declared_register_records, role_flags, common_module_props, constants, "
+                            "templates) — builder_version >= 16 и has_object_attributes; число перехватов — "
                             "get_overrides()['total'] (полное при partial=False)."
                         ),
                     }
@@ -890,7 +1330,13 @@ class Sandbox:
             # домешиваем их сигнатуры, иначе kwarg-хинт для grep(..., limit=...) пуст.
             reg = {**_GENERIC_HELPER_SIGNATURES, **(self._namespace.get("_registry") or {})}
             available = {k for k in self._namespace if not k.startswith("_") and callable(self._namespace.get(k))}
-            error = self._add_error_hints(error, code, available_names=available, registry=reg)
+            try:
+                error = self._add_error_hints(
+                    error, code, available_names=available, registry=reg, namespace=self._namespace
+                )
+            except Exception:
+                # v1.49.0: сбой диагностики не роняет ответ (и воркер) — трассировка без подсказок (перепроверка Codex).
+                pass
 
         stdout = stdout_capture.getvalue()
         if getattr(stdout_capture, "truncated", False):
@@ -944,9 +1390,56 @@ class Sandbox:
         code: str,
         available_names: set[str] | None = None,
         registry: dict | None = None,
+        namespace: dict | None = None,
     ) -> str:
-        """Append actionable hints to common errors."""
+        """Append actionable hints to common errors.
+
+        ``namespace`` — переменные сессии: по ним узнаётся значение прошлого вызова (Д15)."""
         hints: list[str] = []
+
+        # v1.49.0 (Д15): источник ошибки — строка кода агента из трассировки и привязки
+        # её имён (узлы ast.Name этой строки, а не подстроки текста).
+        agent_line = _failing_agent_line(error, code)
+        agent_frame = _failing_agent_frame(error)
+        resolver: _SourceResolver | None = None
+        line_names: set[str] = set()
+        line_calls: set[str] = set()
+        if agent_line is not None:
+            # Диагностика не роняет обработку ошибки (ревью Codex): любой сбой разбора — «источник не доказан».
+            try:
+                tree = ast.parse(code)
+                resolver = _SourceResolver(tree)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.lineno == agent_line:
+                        line_names.add(node.id)
+                    elif (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.lineno == agent_line
+                    ):
+                        line_calls.add(node.func.id)
+            except Exception:
+                resolver, line_names, line_calls = None, set(), set()
+
+        def from_helper(helper: str) -> bool:
+            # Строка ошибки зовёт хелпер, либо значение одного из её имён дал он.
+            if resolver is None:
+                return False
+            try:
+                return helper in line_calls or any(
+                    resolver.resolve(n, agent_line, frame=agent_frame) == helper for n in line_names
+                )
+            except Exception:
+                return False
+
+        def previous_grep_read() -> bool:
+            # Имя строки ошибки, не привязанное в коде вызова, — переменная прошлого вызова: узнаётся по форме значения.
+            if resolver is None or namespace is None:
+                return False
+            try:
+                return any(not resolver.bound(n) and _grep_read_shaped(namespace.get(n)) for n in line_names)
+            except Exception:
+                return False
 
         if "FileNotFoundError" in error or "No such file" in error:
             if "parse_object_xml" in code:
@@ -1088,10 +1581,31 @@ class Sandbox:
             )
 
         # read_procedure returns the procedure BODY as a string, not a dict.
-        if "AttributeError" in error and "'str' object has no attribute" in error and "read_procedure" in code:
+        # v1.49.0 (Д15): только когда ошибку дало её значение; без кадра кода агента —
+        # прежнее правило по тексту кода.
+        if "AttributeError" in error and "'str' object has no attribute" in error:
+            if from_helper("read_procedure") if agent_line is not None else "read_procedure" in code:
+                hints.append(
+                    "HINT: read_procedure(path, name) возвращает СТРОКУ (тело метода с номерами "
+                    "строк), не dict. Не вызывай .get()/[ключ] на результате — это уже текст."
+                )
+
+        # v1.49.0 (Д15): grep_read отдаёт словари «файл → записи» и «файл → текст»;
+        # обход matches как списка даёт строку-файл вместо записи. Переменная прошлого
+        # вызова (в коде этого вызова не привязана) узнаётся по форме значения.
+        grep_read_hinted = False
+        grep_read_misuse = (
+            "'str' object has no attribute" in error
+            or "string indices must be integers" in error
+            or "KeyError: 0" in error
+            or "KeyError: -1" in error
+        )
+        if grep_read_misuse and (from_helper("grep_read") or previous_grep_read()):
+            grep_read_hinted = True
             hints.append(
-                "HINT: read_procedure(path, name) возвращает СТРОКУ (тело метода с номерами "
-                "строк), не dict. Не вызывай .get()/[ключ] на результате — это уже текст."
+                "HINT: grep_read возвращает {matches: {файл: [{file, line, text}]}, files: {файл: текст с "
+                "номерами}, summary}: обход — for f, recs in res['matches'].items(): for r in recs: "
+                "print(f, r['line'], r['text']); текст файла — res['files'][f]"
             )
 
         # detect_extensions() returns a dict; agents recurrently treat it as a list
@@ -1139,7 +1653,13 @@ class Sandbox:
                 "{r['name'] for r in result} либо seen=set(); seen.add(r['name'])."
             )
         # (c) KeyError on a result-contract key not covered by the specific hints above.
-        if "KeyError" in error and "slice(" not in error and "get_object_full_structure" not in code:
+        # v1.49.0 (Д15): форму grep_read уже назвала его подсказка — общая лишь уводила бы.
+        if (
+            "KeyError" in error
+            and "slice(" not in error
+            and "get_object_full_structure" not in code
+            and not grep_read_hinted
+        ):
             mk = re.search(r"KeyError: '?([^'\n]+)'?", error)
             bad_key = mk.group(1) if mk else "<key>"
             hints.append(

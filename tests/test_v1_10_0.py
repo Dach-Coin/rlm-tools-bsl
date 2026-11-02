@@ -1738,10 +1738,14 @@ def test_resolve_close_match_used_only_when_no_exact_anywhere(bsl_env):
     bsl = _make_bsl_with_stub_idx(str(bsl_env.path), _StubOnlyCloseInAttrs())
     res = bsl["get_object_full_structure"]("Контрагент")  # substring, не exact
 
-    assert "error" not in res
-    # close-match из object_attributes (Pass 3 fallback)
-    assert res["object_name"] == "Контрагенты"
-    assert res["category"] == "Catalogs"
+    # v1.49.0 (Н5): прежде здесь стоял ответ по close-match (структура `Catalogs/Контрагенты` под именем
+    # «Контрагент») — ДРУГОЙ объект молча. Теперь «не найден», а close-match из object_attributes (Pass 3) назван в
+    # подсказке исполнимым вызовом.
+    assert res["error"] == "Объект 'Контрагент' не найден", res
+    assert (
+        "ближайшее по подстроке — Catalogs/Контрагенты: get_object_full_structure('Catalogs/Контрагенты')"
+        in res["hint"]
+    )
 
 
 def test_resolve_close_match_falls_back_to_enum_values(bsl_env):
@@ -1774,9 +1778,13 @@ def test_resolve_close_match_falls_back_to_enum_values(bsl_env):
     bsl = _make_bsl_with_stub_idx(str(bsl_env.path), _StubOnlyEnumClose())
     res = bsl["get_object_full_structure"]("Статус")
 
-    assert "error" not in res
-    assert res["object_name"] == "СтатусыЗаказов"
-    assert res["category"] == "Enums"
+    # v1.49.0 (Н5): прежде здесь стояла структура перечисления `СтатусыЗаказов` под именем «Статус» — ДРУГОЙ объект
+    # молча. Теперь «не найден», а close-match из enum_values назван в подсказке исполнимым вызовом.
+    assert res["error"] == "Объект 'Статус' не найден", res
+    assert (
+        "ближайшее по подстроке — Enums/СтатусыЗаказов: get_object_full_structure('Enums/СтатусыЗаказов')"
+        in res["hint"]
+    )
 
 
 def test_sandbox_hint_for_key_error_attr_name_in_get_object_full_structure():

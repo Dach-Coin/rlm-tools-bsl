@@ -501,7 +501,11 @@ def test_fragment_resolves_to_the_ranked_nearest_object(tmp_path):
         empty_root = tmp_path / "root"
         empty_root.mkdir()
         bsl = _bsl_for(empty_root, reader)
-        assert bsl["get_object_full_structure"]("Контраге")["object_name"] == "Контрагенты"
+        # v1.49.0 (Н5): прежде здесь стоял ответ структурой `Контрагенты` на фрагмент «Контраге» — ДРУГОЙ объект молча.
+        # Теперь «не найден», а ближайший по ранжированию объект — тот же `Контрагенты` — назван в подсказке.
+        res = bsl["get_object_full_structure"]("Контраге")
+        assert res["error"] == "Объект 'Контраге' не найден", res
+        assert "ближайшее по подстроке — Catalogs/Контрагенты:" in res["hint"], res
     finally:
         reader.close()
 

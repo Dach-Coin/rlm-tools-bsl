@@ -7675,9 +7675,14 @@ def _normalize_role_details_limit(value) -> tuple[int, str | None]:
 class _RoleGroupBuilder:
     """Row-oriented группировка ролей с BOUNDED детализацией.
 
-    Legacy-поля (``role_name``/``object``/``rights``/``file``), их значения и
-    взаимный порядок НЕ меняются: ``object`` остаётся legacy query-or-first-match,
-    ``rights`` — прежним ПОЛНЫМ union прав роли. Additive-часть ограничена
+    Без ``primary_name`` (``get_roles_exact``, секция ``roles`` профиля) legacy-поля
+    (``role_name``/``object``/``rights``/``file``), их значения и взаимный порядок прежние:
+    ``object`` — первый объект потока, ``rights`` — ПОЛНЫЙ union прав роли. v1.49.0 (Д4, П4): с
+    ``primary_name`` (``get_roles``/``find_roles``) ``object`` и ``rights`` — одна пара: ``object`` —
+    точный объект запроса ``<Голова>.<primary_name>`` (два сегмента, без учёта регистра; при нескольких —
+    с головой ``primary_head``, иначе первый по ``(object.casefold(), object)``), а точного среди
+    совпадений роли нет — первый объект потока; ``rights`` — ПОЛНЫЕ права выбранного объекта в порядке
+    первого появления (прежде — union прав всех совпадений). Additive-часть ограничена
     ``details_limit`` distinct-парами на роль, поэтому размер сериализованного
     результата равен ``O(roles * details_limit)``, а не ``O(role_rights)``.
 
@@ -7700,12 +7705,19 @@ class _RoleGroupBuilder:
     зависели и раньше — их семантика намеренно НЕ трогается.
     """
 
-    __slots__ = ("_limit", "_order", "_groups")
+    __slots__ = ("_limit", "_order", "_groups", "_primary", "_primary_head")
 
-    def __init__(self, details_limit: int):
+    def __init__(self, details_limit: int, *, primary_name: str | None = None, primary_head: str | None = None):
         self._limit = max(0, int(details_limit))
         self._order: list[str] = []
         self._groups: dict[str, dict] = {}
+        self._primary = primary_name.casefold() if primary_name else None
+        self._primary_head = primary_head.casefold() if primary_head else None
+
+    def _is_primary(self, object_name: str) -> bool:
+        """Точный объект запроса: два сегмента ``<Голова>.<Имя>``, имя совпадает без учёта регистра."""
+        head, dot, name = object_name.partition(".")
+        return bool(head and dot and name) and "." not in name and name.casefold() == self._primary
 
     def add(self, role_name, object_name, right_name, file) -> None:
         slot = self._groups.get(role_name)
@@ -7723,12 +7735,17 @@ class _RoleGroupBuilder:
                 "pairs": [],
                 "pairs_set": set(),
                 "truncated": False,
+                # v1.49.0 (Д4): полные права кандидатов пары — точных объектов запроса и первого объекта потока
+                # (упорядоченный набор прав: dict); без `primary_name` не копятся.
+                "candidates": {},
             }
             self._groups[role_name] = slot
             self._order.append(role_name)
         if right_name not in slot["rights_set"]:
             slot["rights_set"].add(right_name)
             slot["rights"].append(right_name)
+        if self._primary is not None and (object_name == slot["object"] or self._is_primary(object_name)):
+            slot["candidates"].setdefault(object_name, {})[right_name] = None
         pair = (object_name, right_name)
         if pair in slot["pairs_set"]:
             return
@@ -7760,11 +7777,15 @@ class _RoleGroupBuilder:
             by_object: dict[str, list[str]] = {}
             for obj, right in pairs:
                 by_object.setdefault(obj, []).append(right)
+            obj_out, rights_out = slot["object"], slot["rights"]
+            if self._primary is not None:
+                obj_out = self._pick_primary(slot)
+                rights_out = list(slot["candidates"].get(obj_out, {}))
             out.append(
                 {
                     "role_name": slot["role_name"],
-                    "object": slot["object"],
-                    "rights": slot["rights"],
+                    "object": obj_out,
+                    "rights": rights_out,
                     "file": slot["file"],
                     "matched_objects": list(by_object.keys()),
                     "rights_by_object": [{"object": obj, "rights": rights} for obj, rights in by_object.items()],
@@ -7772,6 +7793,16 @@ class _RoleGroupBuilder:
                 }
             )
         return out
+
+    def _pick_primary(self, slot: dict) -> str:
+        """Объект пары роли (v1.49.0, Д4): точный объект запроса с головой ``primary_head``, иначе первый точный по
+        ``(object.casefold(), object)``; точного среди совпадений роли нет — первый объект потока."""
+        exact = sorted((o for o in slot["candidates"] if self._is_primary(o)), key=lambda o: (o.casefold(), o))
+        if self._primary_head is not None:
+            for obj in exact:
+                if obj.partition(".")[0].casefold() == self._primary_head:
+                    return obj
+        return exact[0] if exact else slot["object"]
 
 
 def _insert_global_object(
@@ -14772,12 +14803,15 @@ class IndexReader:
         """Get documents that write to a given register.
 
         Returns list of {document_name, source, file} or None if table empty/missing.
+
+        v1.49.0 (Д11, У4): имя регистра — без учёта регистра букв и в кириллице (``py_lower`` с обеих сторон, как у
+        ``get_declared_register_records``); прежде ``COLLATE NOCASE`` складывал только латиницу.
         """
         with self._lock:
             try:
                 rows = self._conn.execute(
                     "SELECT document_name, source, file FROM register_movements "
-                    "WHERE register_name = ? COLLATE NOCASE AND source <> 'unresolved'",
+                    "WHERE py_lower(register_name) = py_lower(?) AND source <> 'unresolved'",
                     (register_name,),
                 ).fetchall()
             except sqlite3.OperationalError:
@@ -14803,12 +14837,19 @@ class IndexReader:
             ]
 
     @_transient_safe(lambda: None)
-    def get_roles(self, object_name: str, details_limit: int = _ROLE_DETAILS_DEFAULT) -> list[dict] | None:
+    def get_roles(
+        self, object_name: str, details_limit: int = _ROLE_DETAILS_DEFAULT, *, primary_head: str | None = None
+    ) -> list[dict] | None:
         """Get roles that grant rights to a given object (BROAD literal substring).
 
         Returns list of {role_name, object, rights, file, matched_objects,
         rights_by_object, details_truncated} or None if role_rights table is
         empty/missing.
+
+        v1.49.0 (Д4, П4): ``object`` и ``rights`` строки — одна пара: ``object`` — точный объект
+        ``<Голова>.<object_name>`` (``primary_head`` — голова категории ссылки запроса), если он среди
+        совпадений роли, иначе первое совпадение; ``rights`` — полные права ИМЕННО этого объекта (прежде —
+        объединение прав всех совпадений). Все совпадения — ``matched_objects``/``rights_by_object``.
 
         **v1.34.0 — literal substring, а не SQL-wildcard.** Легальные ``_``/``%`` в
         имени 1С (``тст_Смета``) раньше работали как SQL-метасимволы и давали
@@ -14832,7 +14873,7 @@ class IndexReader:
                 )
                 # Итерируем cursor вместо fetchall: broad-запрос на боевой базе
                 # даёт ~346K строк, и материализовать их в памяти незачем.
-                builder = _RoleGroupBuilder(effective)
+                builder = _RoleGroupBuilder(effective, primary_name=object_name, primary_head=primary_head)
                 for r in cursor:
                     builder.add(r["role_name"], r["object_name"], r["right_name"], r["file"])
             except sqlite3.OperationalError:
@@ -16843,6 +16884,80 @@ class IndexReader:
                 )
             return results
 
+    # v1.49.0 (Д9): `used_in` реквизита по `attr_kind` — те же суффиксы, что у строки `attribute_type` того же реквизита.
+    _CHARACTERISTIC_ATTR_SUFFIX = {
+        "attribute": "Attribute.{name}",
+        "dimension": "Dimension.{name}",
+        "resource": "Resource.{name}",
+        "addressing_attribute": "AddressingAttribute.{name}",
+        "ts_attribute": "TabularSection.{ts}.Attribute.{name}",
+    }
+
+    @_transient_safe(lambda: None)
+    def find_characteristic_value_refs(self, pvh_name: str) -> list[dict] | None:
+        """v1.49.0 (Д9, П5): реквизиты типа «значения характеристик ПВХ» — токен ``Characteristic.<ПВХ>`` в типе. Общий
+        канонизатор строк ссылки токен отбрасывает (строки сборщика на ПВХ протекли бы в состав определяемых типов и
+        подписок), поэтому строки раскрываются на чтении: ``{used_in, path, line: None, kind}``,
+        ``kind='characteristic_value_type'``. Источники: реквизиты объектов (``object_attributes``; ``used_in`` — как у
+        ``attribute_type`` того же реквизита, ``path`` — описатель) и верхние реквизиты форм (``form_elements``,
+        ``kind='attribute'``; ``<Голова>.<Объект>.Form.<Ф>.Attribute.<Р>.Type``, у общей формы — ``CommonForm.<Ф>.…``,
+        ``path`` — файл формы). Имя ПВХ — без учёта регистра (префильтр ``py_lower`` по подстроке, затем точный токен);
+        порядок — ``(path, used_in)``. Таблиц нет — ``None``."""
+        token = f"characteristic.{pvh_name}".casefold()
+        pattern = _like_contains(f"Characteristic.{pvh_name}")
+        with self._lock:
+            try:
+                attr_rows = self._conn.execute(
+                    "SELECT object_name, category, attr_name, attr_type, attr_kind, ts_name, source_file "
+                    "FROM object_attributes WHERE py_lower(attr_type) LIKE py_lower(?) ESCAPE '\\'",
+                    (pattern,),
+                ).fetchall()
+                form_rows = self._conn.execute(
+                    "SELECT object_name, category, form_name, element_name, element_type, file FROM form_elements "
+                    "WHERE kind = 'attribute' AND py_lower(element_type) LIKE py_lower(?) ESCAPE '\\'",
+                    (pattern,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+        out: list[dict] = []
+        for r in attr_rows:
+            try:
+                types = json.loads(r["attr_type"]) if r["attr_type"] else []
+            except (ValueError, TypeError):
+                continue
+            suffix = self._CHARACTERISTIC_ATTR_SUFFIX.get(r["attr_kind"])
+            if suffix is None or not any(isinstance(t, str) and t.casefold() == token for t in types):
+                continue
+            head = _CATEGORY_TO_TYPE_PREFIX.get(r["category"], r["category"])
+            member = suffix.format(name=r["attr_name"], ts=r["ts_name"] or "")
+            out.append(
+                {
+                    "used_in": f"{head}.{r['object_name']}.{member}.Type",
+                    "path": r["source_file"],
+                    "line": None,
+                    "kind": "characteristic_value_type",
+                }
+            )
+        for r in form_rows:
+            tails = [part.strip().rsplit(":", 1)[-1] for part in (r["element_type"] or "").split(",")]
+            if not any(tail.casefold() == token for tail in tails):
+                continue
+            form_root = (
+                f"CommonForm.{r['form_name']}"
+                if r["category"] == "CommonForms"
+                else f"{_CATEGORY_TO_TYPE_PREFIX.get(r['category'], r['category'])}.{r['object_name']}.Form.{r['form_name']}"
+            )
+            out.append(
+                {
+                    "used_in": f"{form_root}.Attribute.{r['element_name']}.Type",
+                    "path": r["file"],
+                    "line": None,
+                    "kind": "characteristic_value_type",
+                }
+            )
+        out.sort(key=lambda row: (row["path"], row["used_in"]))
+        return out
+
     @_transient_safe(lambda: None)
     def get_predefined_items(
         self,
@@ -16931,6 +17046,9 @@ class IndexReader:
         "form_attribute_type": 22,
         "form_main_table": 23,
         "form_query": 24,
+        # v1.49.0 (Д9, П5): реквизит типа «значения характеристик ПВХ» — строки раскрываются на чтении
+        # (`find_characteristic_value_refs`), в `metadata_references` их нет.
+        "characteristic_value_type": 25,
     }
 
     @_transient_safe(lambda: None)
@@ -17213,15 +17331,16 @@ class IndexReader:
     def get_declaring_documents(self, register_name: str) -> list[str] | None:
         """Обратный ход объявленного состава (v1.47.0, issue #42): имена документов, объявивших регистр с этим именем
         в движениях, — любого из четырёх видов регистров, без повторов, без порядка (его задаёт хелпер). Имя
-        сравнивается как у ``get_register_writers`` (``COLLATE NOCASE``), поэтому ответ ``find_register_writers`` внутри
-        себя не расходится. ``None`` — канал недоступен (индекс до v16)."""
+        сравнивается как у ``get_register_writers`` (v1.49.0 — ``py_lower`` с обеих сторон: без учёта регистра букв и в
+        кириллице), поэтому ответ ``find_register_writers`` внутри себя не расходится. ``None`` — канал недоступен
+        (индекс до v16)."""
         if not self.has_declared_composition:
             return None
         refs = [f"{head}.{register_name}" for head in _REGISTER_REF_HEADS]
         with self._lock:
             rows = self._conn.execute(
                 "SELECT DISTINCT document_ref FROM declared_register_records "
-                f"WHERE register_ref COLLATE NOCASE IN ({', '.join('?' * len(refs))})",  # noqa: S608
+                f"WHERE py_lower(register_ref) IN ({', '.join(['py_lower(?)'] * len(refs))})",  # noqa: S608
                 refs,
             ).fetchall()
             prefix = "Document."

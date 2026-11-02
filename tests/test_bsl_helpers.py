@@ -1625,7 +1625,9 @@ def test_find_roles():
         assert "file" in role
         # Fix 5: fallback must include "object" in each role item
         assert "object" in role
-        assert role["object"] == "ПриобретениеТоваров"
+        # v1.49.0: прежде здесь стояла строка запроса ("ПриобретениеТоваров") — живая ветка подставляла её в `object`;
+        # теперь `object` — объект пары с `rights`, как у индексной ветки.
+        assert role["object"] == "Document.ПриобретениеТоваров"
 
 
 def test_find_roles_not_found():
@@ -4450,10 +4452,14 @@ def test_profile_prefix_missing_type_falls_back_honestly():
         )
         try:
             p = bsl["get_object_profile"]("Документ.Заказ")
-            # the object exists only as a Catalog → resolved to its real category, honestly labelled
-            assert p["category"] == "Catalogs"
-            assert p["object_name"] == "Заказ"
-            assert p["_meta"]["identity_source"] == "index", "must NOT claim index_prefix on a fallback"
+            # v1.49.0 (Н5): прежде здесь стоял профиль справочника `Заказ` (`identity_source='index'`, повтор без
+            # категории) — ответ по объекту, которого ссылка не называла. Ссылка теперь строга: документа нет —
+            # «не найден», а справочник с этим именем — в подсказке исполнимым вызовом; лжи `index_prefix` нет и так.
+            assert p["error"] == "Объект 'Документ.Заказ' не найден", p
+            assert p["_meta"]["identity_source"] == "unresolved", p
+            assert "объект с этим именем есть в Catalogs: get_object_profile('Catalogs/Заказ')" in p["hint"], p
+            routed = bsl["get_object_profile"]("Catalogs/Заказ")
+            assert (routed["category"], routed["object_name"]) == ("Catalogs", "Заказ"), routed
         finally:
             reader.close()
 
