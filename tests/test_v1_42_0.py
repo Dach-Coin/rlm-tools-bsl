@@ -104,7 +104,8 @@ def built_v17_no_calls(tmp_path):
 class TestSchemaV17:
     def test_builder_version_and_gap_table(self):
         # v1.47.0: прежде здесь стояло BUILDER_VERSION == 17 — поколение индекса v18
-        assert BUILDER_VERSION == 18
+        # v1.50.0: прежде здесь стояло BUILDER_VERSION == 18 — поколение индекса v19
+        assert BUILDER_VERSION == 19
         # последняя строка таблицы недостач несёт порог текущей версии: бамп без новой
         # строки ронял бы этот тест, а не выдавал старый текст
         assert OLD_INDEX_GAPS[-1][0] == BUILDER_VERSION
@@ -123,7 +124,8 @@ class TestSchemaV17:
         _db_path, base = built_v16_copy
         res = IndexBuilder().update(str(base))
         # v1.47.0: прежде здесь стояло "schema upgrade v16->17" — пересборка идёт в текущее поколение v18
-        assert res["rebuild_reason"] == "schema upgrade v16->18"
+        # v1.50.0: прежде здесь стояло "schema upgrade v16->18" — текущее поколение v19
+        assert res["rebuild_reason"] == "schema upgrade v16->19"
 
     def test_reader_on_v16_index_has_no_call_audit(self, built_v16_copy):
         db_path, _base = built_v16_copy
@@ -141,7 +143,8 @@ class TestSchemaV17:
         r = IndexReader(db_path)
         try:
             # v1.47.0: прежде здесь стояло 17 — фикстура собирает индекс текущим сборщиком (v18)
-            assert r.builder_version == 18
+            # v1.50.0: прежде здесь стояло 18 — текущий сборщик v19
+            assert r.builder_version == 19
             assert r.has_call_audit is True
         finally:
             r.close()
@@ -151,7 +154,8 @@ class TestSchemaV17:
         r = IndexReader(db_path)
         try:
             # v1.47.0: прежде здесь стояло 17 — фикстура собирает индекс текущим сборщиком (v18)
-            assert r.builder_version == 18
+            # v1.50.0: прежде здесь стояло 18 — текущий сборщик v19
+            assert r.builder_version == 19
             assert r.has_call_audit is False  # схема v17 есть, граф выключен
         finally:
             r.close()

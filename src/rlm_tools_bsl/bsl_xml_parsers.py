@@ -772,6 +772,114 @@ CATEGORY_TO_REF_HEAD: dict[str, str] = {
     forms["en_plural"]: prefix.rstrip(".") for prefix, forms in _RU_META_FORMS.items() if forms.get("en_plural")
 }
 
+# v1.50.0 (П5, Д7): единая таблица видов — каталог → голова EN единственного числа у ВСЕХ 47 категорий существования
+# (33 категории индекса и 14 каталогов без модулей). У 26 прежних — те же головы, что у `CATEGORY_TO_REF_HEAD`, видов без
+# ссылочного типа и определяемого типа (тест). Литерал, а не вывод из `bsl_index._CATEGORY_RU`: `bsl_index` импортирует
+# этот модуль. Источник и канонизатора ссылки на объект (`canonicalize_object_ref`), и разбора аргумента хелперов
+# (`bsl_helpers._kind_head_category`, `_head_of_category`); общий канонизатор типов `canonicalize_type_ref` его не читает.
+OBJECT_KIND_HEADS: dict[str, str] = {
+    **CATEGORY_TO_REF_HEAD,
+    "DefinedTypes": "DefinedType",
+    "CommonModules": "CommonModule",
+    "CommonForms": "CommonForm",
+    "CommonCommands": "CommonCommand",
+    "HTTPServices": "HTTPService",
+    "WebServices": "WebService",
+    "DocumentJournals": "DocumentJournal",
+    "FilterCriteria": "FilterCriterion",
+    "SettingsStorages": "SettingsStorage",
+    "ExternalDataSources": "ExternalDataSource",
+    "Roles": "Role",
+    "Subsystems": "Subsystem",
+    "CommonTemplates": "CommonTemplate",
+    "XDTOPackages": "XDTOPackage",
+    "EventSubscriptions": "EventSubscription",
+    "ScheduledJobs": "ScheduledJob",
+    "FunctionalOptions": "FunctionalOption",
+    "Bots": "Bot",
+    "CommandGroups": "CommandGroup",
+    "CommonAttributes": "CommonAttribute",
+    "CommonPictures": "CommonPicture",
+    "DocumentNumerators": "DocumentNumerator",
+    "FunctionalOptionsParameters": "FunctionalOptionsParameter",
+    "IntegrationServices": "IntegrationService",
+    "Interfaces": "Interface",
+    "Languages": "Language",
+    "Sequences": "Sequence",
+    "SessionParameters": "SessionParameter",
+    "StyleItems": "StyleItem",
+    "Styles": "Style",
+    "WSReferences": "WSReference",
+}
+_OBJECT_KIND_HEAD_BY_CASEFOLD: dict[str, str] = {head.casefold(): head for head in OBJECT_KIND_HEADS.values()}
+
+# v1.50.0 (П1, У1): русские головы 21 категории без головы единственного числа в прежнем разборе аргумента — имена
+# платформы (голова `ПолноеИмя()` и коллекция `Метаданные.<…>`): каталог → (единственное, множественное). Пересечений с
+# формами `_RU_META_FORMS` и видов без ссылочного типа нет (тест).
+OBJECT_KIND_RU_FORMS: dict[str, tuple[str, str]] = {
+    "Roles": ("Роль", "Роли"),
+    "Subsystems": ("Подсистема", "Подсистемы"),
+    "CommonTemplates": ("ОбщийМакет", "ОбщиеМакеты"),
+    "XDTOPackages": ("ПакетXDTO", "ПакетыXDTO"),
+    "EventSubscriptions": ("ПодпискаНаСобытие", "ПодпискиНаСобытия"),
+    "ScheduledJobs": ("РегламентноеЗадание", "РегламентныеЗадания"),
+    "FunctionalOptions": ("ФункциональнаяОпция", "ФункциональныеОпции"),
+    "Bots": ("Бот", "Боты"),
+    "CommandGroups": ("ГруппаКоманд", "ГруппыКоманд"),
+    "CommonAttributes": ("ОбщийРеквизит", "ОбщиеРеквизиты"),
+    "CommonPictures": ("ОбщаяКартинка", "ОбщиеКартинки"),
+    "DocumentNumerators": ("НумераторДокументов", "НумераторыДокументов"),
+    "FunctionalOptionsParameters": ("ПараметрФункциональныхОпций", "ПараметрыФункциональныхОпций"),
+    "IntegrationServices": ("СервисИнтеграции", "СервисыИнтеграции"),
+    "Interfaces": ("Интерфейс", "Интерфейсы"),
+    "Languages": ("Язык", "Языки"),
+    "Sequences": ("Последовательность", "Последовательности"),
+    "SessionParameters": ("ПараметрСеанса", "ПараметрыСеанса"),
+    "StyleItems": ("ЭлементСтиля", "ЭлементыСтиля"),
+    "Styles": ("Стиль", "Стили"),
+    "WSReferences": ("WSСсылка", "WSСсылки"),
+}
+
+
+def canonicalize_object_ref(text: str) -> str:
+    """v1.50.0 (П5, Д7, Д8): каноническая ссылка на ОБЪЕКТ ``<Голова>.<Имя>`` из ссылки состава, прав или основной
+    таблицы — с ограниченным кешем, как у ``canonicalize_type_ref``.
+
+    Сперва ``canonicalize_type_ref`` (26 голов, формы ``Ref``/``Object``/``Manager``), иначе голова таблицы
+    ``OBJECT_KIND_HEADS`` без учёта регистра; путь члена (``Document.X.Attribute.Y``, ``Catalog.X.Command.K``) —
+    объект, два первых сегмента; цепочка вложенных подсистем ``Subsystem.A.Subsystem.B[…]`` — последняя подсистема
+    (``Subsystem.B``). Права на саму конфигурацию (``Configuration.X``), UUID-элемент, голова вне таблицы и пустое
+    имя — ``''``. Общий канонизатор типов не меняется: новые головы знает только этот."""
+    if type(text) is str:
+        return _canonicalize_object_ref_cached(text)
+    return _canonicalize_object_ref_impl(text)
+
+
+def _canonicalize_object_ref_impl(text) -> str:
+    if not text:
+        return ""
+    canon = canonicalize_type_ref(text)
+    if canon:
+        head, _, rest = canon.partition(".")
+    else:
+        raw_head, dot, rest = _strip_ns_prefix(text.strip()).partition(".")
+        head = _OBJECT_KIND_HEAD_BY_CASEFOLD.get(raw_head.casefold(), "") if dot else ""
+        if not head:
+            return ""
+    parts = rest.split(".")
+    name = parts[0].strip()
+    if head == "Subsystem":
+        i = 1
+        while i + 1 < len(parts) and parts[i].strip().casefold() == "subsystem" and parts[i + 1].strip():
+            name = parts[i + 1].strip()
+            i += 2
+    return f"{head}.{name}" if name else ""
+
+
+@functools.lru_cache(maxsize=_CANONICALIZE_CACHE_SIZE)
+def _canonicalize_object_ref_cached(text: str) -> str:
+    return _canonicalize_object_ref_impl(text)
+
 
 def _cf_parse_attributes(parent, ns: dict = _NS_CF) -> list[dict]:
     """Parse CF <Attribute> elements under parent."""
@@ -810,6 +918,14 @@ _LINKED_OBJECT_PROPS: dict[str, tuple[tuple[str, str], ...]] = {
     "CalculationRegister": (("ChartOfCalculationTypes", "chartOfCalculationTypes"), ("Schedule", "schedule")),
     "ChartOfCalculationTypes": (("BaseCalculationTypes", "baseCalculationTypes"),),
     "BusinessProcess": (("Task", "task"),),
+    # v1.50.0 (П13, Д15): собственные свойства общего реквизита — значение и использование разделения (параметры
+    # сеанса) и условное разделение реквизита (константа). CF — прямой потомок `<Properties>` в пространстве `md`, не
+    # `xr:ConditionalSeparation` элемента состава (другой узел, в корпусе всегда пуст — граница).
+    "CommonAttribute": (
+        ("DataSeparationValue", "dataSeparationValue"),
+        ("DataSeparationUse", "dataSeparationUse"),
+        ("ConditionalSeparation", "conditionalSeparation"),
+    ),
 }
 
 
@@ -850,13 +966,48 @@ def _filter_criterion_refs(type_tokens: list[str], content_items: list[str]) -> 
 
 
 def _linked_object_refs(prop: str, values: list[str]) -> list[dict]:
-    """v1.47.0: связующее свойство (`_LINKED_OBJECT_PROPS`) — ``linked_object``, суффикс — имя свойства."""
+    """v1.47.0: связующее свойство (`_LINKED_OBJECT_PROPS`) — ``linked_object``, суффикс — имя свойства. v1.50.0 (П13):
+    цель — ``canonicalize_object_ref`` (параметр сеанса общего реквизита — голова вне прежнего графа); у прежних свойств
+    цели — канонические головы, выход прежний."""
     out: list[dict] = []
     for text in values:
-        canon = canonicalize_type_ref(text)
+        canon = canonicalize_object_ref(text)
         if canon:
             out.append({"ref_object": canon, "ref_kind": "linked_object", "used_in_suffix": prop})
     return out
+
+
+# v1.50.0 (П9, П12, У3, У10): умолчания схемы общего реквизита — элемент состава без использования — `Auto`, реквизит
+# без `AutoUse` — `Use` (EDT опускает значение по умолчанию: так у разделителя в корпусе).
+_COMMON_ATTRIBUTE_ITEM_USE_DEFAULT = "Auto"
+_COMMON_ATTRIBUTE_AUTO_USE_DEFAULT = "Use"
+
+
+def _common_attribute_composition(items: list[tuple[str, str]], auto_use: str) -> tuple[dict, list[dict]]:
+    """v1.50.0 (Д9, Д14; П9, П12, У3, У10): состав общего реквизита — ключи ответа и строки ``common_attribute_content``.
+
+    ``items`` — ``(объект, использование)`` элементов состава в порядке документа (объект — узел ``xr:Metadata`` CF /
+    ``<metadata>`` EDT, а не текст блока элемента: прежний разбор отдавал пустые строки). ``content`` — объекты с
+    использованием: ``Use`` и ``Auto`` при ``auto_use == 'Use'``; ``content_excluded`` — объекты ``DontUse``; неявный
+    состав разделителя (``AutoUse=Use``, объект не перечислен) — граница, строк не даёт. Строка — одна на объект
+    (цель — ``canonicalize_object_ref``), суффикс ``Content``."""
+    content: list[str] = []
+    excluded: list[str] = []
+    refs: list[dict] = []
+    seen: set[str] = set()
+    for obj, use in items:
+        if not obj:
+            continue
+        if use == "DontUse":
+            excluded.append(obj)
+            continue
+        if use == "Use" or (use == "Auto" and auto_use == "Use"):
+            content.append(obj)
+            canon = canonicalize_object_ref(obj)
+            if canon and canon not in seen:
+                seen.add(canon)
+                refs.append({"ref_object": canon, "ref_kind": "common_attribute_content", "used_in_suffix": "Content"})
+    return {"content": content, "content_excluded": excluded, "auto_use": auto_use}, refs
 
 
 def _parse_cf_xml(root) -> dict:
@@ -1011,17 +1162,33 @@ def _parse_cf_xml(root) -> dict:
 
     if props is not None:
         content_el = props.find("md:Content", ns)
-        if content_el is not None:
+        if meta_tag == "CommonAttribute":
+            # v1.50.0 (Д14, П12): элемент состава общего реквизита — блок `<xr:Item><xr:Metadata>…<xr:Use>…`, а не
+            # текст; ветка состава подсистемы и критерия отбора (элемент — текст) ниже не меняется.
+            ca_items = [
+                (
+                    _xml_find_text(item, "xr:Metadata", ns),
+                    _xml_find_text(item, "xr:Use", ns) or _COMMON_ATTRIBUTE_ITEM_USE_DEFAULT,
+                )
+                for item in (content_el.findall("xr:Item", ns) if content_el is not None else [])
+            ]
+            composition, ca_refs = _common_attribute_composition(
+                ca_items, _xml_find_text(props, "md:AutoUse", ns) or _COMMON_ATTRIBUTE_AUTO_USE_DEFAULT
+            )
+            result.update(composition)
+            references.extend(ca_refs)
+        elif content_el is not None:
             items = []
             for item in content_el.findall("xr:Item", ns):
                 if item.text:
                     items.append(item.text.strip())
             if items:
                 result["content"] = items
-                # Subsystem content references
+                # Subsystem content references. v1.50.0 (П5, Д7): цель — объект любого из 47 видов
+                # (`canonicalize_object_ref`): общие картинки, элементы стиля, XDTO-пакеты…; UUID-элемент — не объект.
                 if meta_tag == "Subsystem":
                     for ref in items:
-                        canon = canonicalize_type_ref(ref)
+                        canon = canonicalize_object_ref(ref)
                         if canon:
                             references.append(
                                 {
@@ -1372,15 +1539,30 @@ def _parse_mdo_xml(root) -> dict:
 
     # Subsystem content: <content> direct children with text
     content_items = []
+    if meta_tag == "CommonAttribute":
+        # v1.50.0 (Д14, П12): элемент состава общего реквизита — блок `<content><metadata>…<use>…`, а не текст.
+        ca_items = [
+            (
+                _xml_direct_text(ch, "metadata"),
+                _xml_direct_text(ch, "use") or _COMMON_ATTRIBUTE_ITEM_USE_DEFAULT,
+            )
+            for ch in root
+            if (ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag) == "content"
+        ]
+        composition, ca_refs = _common_attribute_composition(
+            ca_items, _xml_direct_text(root, "autoUse") or _COMMON_ATTRIBUTE_AUTO_USE_DEFAULT
+        )
+        result.update(composition)
+        references.extend(ca_refs)
     for ch in root:
         local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
-        if local == "content" and ch.text:
+        if local == "content" and ch.text and meta_tag != "CommonAttribute":
             content_items.append(ch.text.strip())
     if content_items:
         result["content"] = content_items
         if meta_tag == "Subsystem":
             for ref in content_items:
-                canon = canonicalize_type_ref(ref)
+                canon = canonicalize_object_ref(ref)  # v1.50.0 (П5, Д7): объект любого из 47 видов, как у CF-ветки
                 if canon:
                     references.append(
                         {
@@ -3684,16 +3866,18 @@ def parse_form_type_refs(root: ET.Element, fmt: str) -> tuple[list[dict], list[t
     def _local(el) -> str:
         return el.tag.split("}")[-1] if "}" in el.tag else el.tag
 
-    def _add(kind: str, token: str, suffix: str) -> None:
-        canon = canonicalize_type_ref(token)
+    def _add(kind: str, token: str, suffix: str, canonicalize=canonicalize_type_ref) -> None:
+        canon = canonicalize(token)
         if canon and (canon, suffix) not in seen:
             seen.add((canon, suffix))
             refs.append({"ref_object": canon, "kind": kind, "used_in_suffix": suffix})
 
     def _main_table(text: str, attr: str) -> None:
+        # v1.50.0 (П5, Д7): основная таблица — объект любого из 47 видов (`FilterCriterion.X`, таблица внешнего
+        # источника — `ExternalDataSource.X`); типы реквизитов формы — прежний `canonicalize_type_ref`.
         parts = (text or "").strip().split(".")
         if len(parts) >= 2:
-            _add("form_main_table", ".".join(parts[:2]), f"Attribute.{attr}.MainTable")
+            _add("form_main_table", ".".join(parts[:2]), f"Attribute.{attr}.MainTable", canonicalize_object_ref)
 
     if fmt == "cf":
         type_tags = (f"{{{_V8_CORE_NS}}}Type", f"{{{_V8_CORE_NS}}}TypeSet")

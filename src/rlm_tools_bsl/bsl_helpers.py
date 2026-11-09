@@ -218,6 +218,9 @@ _REF_KINDS_SINCE_V18: frozenset[str] = frozenset(
         "characteristic_value_type",
     }
 )
+# v1.50.0 (Д9, Д10): виды ссылок, которых индекс прежнего поколения (`builder_version < 19`) не производит. Признак
+# `kinds_unavailable` — объединение поколений: у индекса до v18 — оба набора.
+_REF_KINDS_SINCE_V19: frozenset[str] = frozenset({"common_attribute_content", "template_query"})
 
 
 def _closed_values(helper: str, param: str, values, allowed, *, fold=str.casefold) -> list[str]:
@@ -245,6 +248,9 @@ def _closed_values(helper: str, param: str, values, allowed, *, fold=str.casefol
 logger = logging.getLogger(__name__)
 from rlm_tools_bsl.bsl_xml_parsers import (
     CATEGORY_TO_REF_HEAD as _CATEGORY_TO_REF_HEAD,
+    OBJECT_KIND_HEADS as _OBJECT_KIND_HEADS,
+    OBJECT_KIND_RU_FORMS as _OBJECT_KIND_RU_FORMS,
+    _CANONICAL_REF_HEADS,
     _RU_META_FORMS,
     _normalize_category,
     cf_form_event_scope,
@@ -257,6 +263,12 @@ from rlm_tools_bsl.bsl_xml_parsers import (
     parse_rights_meta,
     parse_rights_xml,
 )
+
+# v1.50.0 (П5, Д7): головы, которые граф ссылок хранит с v19, — таблица видов без канонических голов
+# `canonicalize_type_ref`: 21 голова (общий макет, XDTO-пакет, веб- и HTTP-сервис, критерий отбора, хранилище настроек,
+# внешний источник данных и 14 каталогов без модулей). Вывод, а не ручной список: другое множество, чем 21 категория
+# форм аргумента (`OBJECT_KIND_RU_FORMS` — роли, подсистемы, ФО, подписки и задания в графе были и прежде).
+_GRAPH_HEADS_SINCE_V19: frozenset[str] = frozenset(_OBJECT_KIND_HEADS.values()) - frozenset(_CANONICAL_REF_HEADS)
 
 # Прямое обращение к коллекции движений в ЖИВОМ модуле: ``Движения.<Регистр>``.
 # Lookahead-before-capture отбрасывает вызовы методов самой коллекции
@@ -743,7 +755,9 @@ def _find_path_miss_hint(
 
 
 def _data_path_miss_hint(to_arg, truncated: list[dict], budget_hit: bool, partial: bool, no_index: bool) -> str:
-    """Верхний hint неокончательного промаха find_data_path (v1.45.0, Д2)."""
+    """Верхний hint неокончательного промаха find_data_path (v1.45.0, Д2). v1.50.0 (П4, У7): маршрут — обратный поиск
+    первым, затем сужение ``kinds``; совета «уменьши max_depth» нет — промах на меньшей глубине называет подсказка
+    глубины, и два совета вели друг в друга."""
     check = f"find_references_to_object({to_arg!r})"
     parts = ["found=False НЕ доказывает недостижимость."]
     if no_index:
@@ -758,10 +772,10 @@ def _data_path_miss_hint(to_arg, truncated: list[dict], budget_hit: bool, partia
             "прямая ссылка на to проверена по всем, обход — по первой странице."
         )
     if budget_hit:
-        parts.append(f"Обход уперся в бюджет узлов ({_DATA_PATH_NODE_BUDGET}): уменьши max_depth.")
+        parts.append(f"Обход уперся в бюджет узлов ({_DATA_PATH_NODE_BUDGET}).")
     if partial:
         parts.append("Таблица ссылок метаданных недоступна (partial=True): нужна пересборка индекса с метаданными.")
-    parts.append(f"Сузь kinds=[...] или проверь ссылку обратным поиском: {check}.")
+    parts.append(f"Проверь ссылку обратным поиском: {check}; либо сузь kinds=[...].")
     return " ".join(parts)
 
 
@@ -9221,7 +9235,9 @@ def make_bsl_helpers(
 
         Returns: dict with keys like name, synonym, attributes, tabular_sections,
         dimensions, resources (depends on metadata type); у задачи — ``addressing_attributes``
-        (реквизиты адресации, v1.47.0)."""
+        (реквизиты адресации, v1.47.0). v1.50.0: у общего реквизита — ``content`` (объекты с использованием: элементы
+        ``Use`` и ``Auto`` при ``AutoUse=Use``; прежде — пустые строки по числу элементов), ``content_excluded``
+        (объекты ``DontUse``) и ``auto_use`` (``Use`` | ``DontUse``; в EDT без узла — ``Use``)."""
         resolved = _resolve_object_xml(path)
         content = _ext_read_file(resolved)
         parsed = parse_metadata_xml(content)
@@ -10030,6 +10046,9 @@ def make_bsl_helpers(
             category = exact[0].get("category", "")
             obj_name = exact[0].get("object_name", "")
             descriptor = f"{category}/{obj_name}"
+            # v1.50.0 (П2): ответ по точному синониму — техническое имя объекта (подстрочный ход — ввод, как прежде).
+            if target.get("resolved_name"):
+                object_name = target["resolved_name"]
         if category and obj_name:
             try:
                 meta = parse_object_xml(descriptor)
@@ -10450,8 +10469,9 @@ def make_bsl_helpers(
     # v1.49.0 (Д2, П2): 17 категорий существования вне прежнего разбора аргумента — подписки, регламентные задания,
     # функциональные опции и 14 каталогов без модулей. Путь `Категория/Имя` и `Категория.Имя` (имя каталога; регистр,
     # пробелы и `_` не важны) у них — ссылка; голова EN единственного числа — каноническая ссылка
-    # `find_references_to_object`/`find_code_usages` (`_canonical_ref_of`). Прежние разборщики и словари их не знают:
-    # единственное число RU/EN (`ОбщаяКартинка.X`) и русское множественное в пути (`ОбщиеКартинки/X`) — не ссылка.
+    # `find_references_to_object`/`find_code_usages` (`_canonical_ref_of`). Прежние разборщики и словари их не знают.
+    # v1.50.0 (П1): единственное число RU/EN (`ОбщаяКартинка.X`) и русское множественное в пути и с точкой
+    # (`ОбщиеКартинки/X`) — тоже ссылка, их знает `_kind_head_category` (только шлюзы ссылки).
     _DESCRIPTOR_KIND_HEADS = {
         "EventSubscriptions": "EventSubscription",
         "ScheduledJobs": "ScheduledJob",
@@ -10478,23 +10498,26 @@ def make_bsl_helpers(
         пробелы и ``_`` не важны — как у пути известной категории), иначе ``''``."""
         return _DESCRIPTOR_KIND_KEYS.get(segment.casefold().replace(" ", "").replace("_", ""), "")
 
-    # v1.49.0 (Д10): головы категорий, которых нет ни в одной карте голов, — вместе с картами покрывают все 47.
-    _OTHER_CATEGORY_HEADS = {
-        "Roles": "Role",
-        "Subsystems": "Subsystem",
-        "CommonTemplates": "CommonTemplate",
-        "XDTOPackages": "XDTOPackage",
+    # v1.50.0 (П1, Д1): головы 21 категории без головы единственного числа в прежнем разборе (роли, подсистемы, общие
+    # макеты, XDTO-пакеты и 17 категорий `_DESCRIPTOR_KIND_HEADS`) — единственное число EN (`Role`, `CommonPicture`) и
+    # русские единственное и множественное (`Роль`, `Роли`, `ОбщаяКартинка`, `ОбщиеКартинки`; таблица видов
+    # `OBJECT_KIND_RU_FORMS`). Прежние разборщики и их словари не расширяются: формы знают только шлюзы ссылки.
+    _KIND_HEAD_KEYS = {
+        form.casefold().replace(" ", "").replace("_", ""): folder
+        for folder, (ru_singular, ru_plural) in _OBJECT_KIND_RU_FORMS.items()
+        for form in (_OBJECT_KIND_HEADS[folder], ru_singular, ru_plural)
     }
+
+    def _kind_head_category(head: str) -> str:
+        """v1.50.0 (П1): каталог 21 категории по голове — единственное число EN, русские единственное и множественное
+        (регистр, пробелы и ``_`` не важны — как у ``_extra_folder_category``), иначе ``''``."""
+        return _KIND_HEAD_KEYS.get(head.casefold().replace(" ", "").replace("_", ""), "")
 
     def _head_of_category(category: str) -> str:
         """v1.49.0 (Д10, Д4): голова EN единственного числа категории любой из 47 (виды со ссылочным типом, без него,
-        17 категорий вне прежнего разбора, роль, подсистема, общий макет, XDTO-пакет); неизвестная — ``''``."""
-        return (
-            _CATEGORY_TO_REF_HEAD.get(category)
-            or _NONREF_KIND_HEADS.get(category)
-            or _DESCRIPTOR_KIND_HEADS.get(category)
-            or _OTHER_CATEGORY_HEADS.get(category, "")
-        )
+        17 категорий вне прежнего разбора, роль, подсистема, общий макет, XDTO-пакет); неизвестная — ``''``.
+        v1.50.0 (П5): единая таблица видов ``OBJECT_KIND_HEADS`` (значения прежние — тест)."""
+        return _OBJECT_KIND_HEADS.get(category, "")
 
     # Имя объекта метаданных 1С — идентификатор: первый символ — буква или `_`, дальше буквы, цифры 0–9, `_`
     # (v1.44.0). Буква — `str.isalpha()`: `\w` и `[^\W\d]` в `re` шире и принимают прочие числовые символы
@@ -10563,9 +10586,9 @@ def make_bsl_helpers(
         (``Документы``, ``documents`` — ``_CALL_MANAGER_COLLECTIONS``) и точное имя каталога категории
         (``CommonModules``, ``Subsystems``, ``DefinedTypes``; регистр, пробелы и ``_`` не важны — как у пути).
         Запасного правила «+s» нормализатора категорий здесь нет: английское единственное число вида без
-        ссылочного типа (``Subsystem``, ``Role``) категорией не становится — у него нет русской пары
-        (``Подсистема.X`` — не ссылка), а единственное число видов со ссылочным типом разбирает
-        ``_split_typed_name``."""
+        ссылочного типа (``Subsystem``, ``Role``) здесь категорией не становится, а единственное число видов со
+        ссылочным типом разбирает ``_split_typed_name``. v1.50.0 (П1): единственное число и русское множественное 21
+        категории (``Subsystem.X``, ``Подсистема.X``) — ссылка через ``_kind_head_category`` после этой проверки."""
         h = head.casefold()
         category = _REF_KIND_CATEGORIES.get(h) or _CALL_MANAGER_COLLECTIONS.get(h)
         if category:
@@ -10596,7 +10619,7 @@ def make_bsl_helpers(
         finally:
             _parsing_mode.previous -= 1
 
-    def _object_ref(raw) -> tuple[str, str] | None:
+    def _object_ref(raw, *, kind_heads: bool = True) -> tuple[str, str] | None:
         """``(категория, имя)`` КОРРЕКТНОЙ ссылки на объект, иначе ``None`` (v1.44.0). Корректная ссылка — префикс
         типа в любом регистре и написании (``документ.X``, ``ДокументСсылка.X``, ``ОпределяемыйТип.X``) либо путь,
         ПЕРВЫЙ сегмент которого — категория (``Documents/X``, ``Документы/X``, путь модуля
@@ -10611,13 +10634,18 @@ def make_bsl_helpers(
         разбору (``_known_categories()`` и ``DefinedTypes``: ``CommonModules.X``, ``Subsystems.X``) —
         ``_dot_head_category``. v1.49.0 (Д2, П2): и каталог любой из 17 категорий вне прежнего разбора — подписки,
         регламентные задания, функциональные опции, 14 каталогов без модулей (``CommonPictures/X``,
-        ``CommonPictures.X``; ``_extra_folder_category``); их единственное число и русское множественное — не ссылка."""
+        ``CommonPictures.X``; ``_extra_folder_category``). v1.50.0 (П1, Д1): и единственное число RU/EN, и русское
+        множественное в пути и с точкой у 21 категории без головы единственного числа в прежнем разборе — роли,
+        подсистемы, общие макеты, XDTO-пакеты и эти 17 (``Роль.X``, ``Role.X``, ``ОбщиеКартинки/X``;
+        ``_kind_head_category``) — после прежних проверок; ``kind_heads=False`` — разбор без них (собственный разбор
+        хелперов с прежней канонизацией аргумента, ``find_functional_options``)."""
         if not isinstance(raw, str) or getattr(_parsing_mode, "previous", 0):
             return None
+        kind_head = _kind_head_category if kind_heads else (lambda _head: "")
         text = raw.strip()
         head, slash, tail = text.partition("/")
         if slash:
-            category = _path_category(head, _REF_KIND_CATEGORIES) or _extra_folder_category(head)
+            category = _path_category(head, _REF_KIND_CATEGORIES) or _extra_folder_category(head) or kind_head(head)
             segments = [part for part in tail.split("/") if part]
             name = segments[0] if segments else ""
             if name.casefold().endswith((".xml", ".mdo")):
@@ -10626,7 +10654,11 @@ def make_bsl_helpers(
             category, name = _split_typed_name(text)
             if not category:
                 kind, dot, rest = text.partition(".")
-                category, name = (_dot_head_category(kind) or _extra_folder_category(kind), rest) if dot else ("", "")
+                category, name = (
+                    (_dot_head_category(kind) or _extra_folder_category(kind) or kind_head(kind), rest)
+                    if dot
+                    else ("", "")
+                )
         if category and _is_object_name(name):
             return category, name
         return None
@@ -10651,7 +10683,8 @@ def make_bsl_helpers(
         (``Документ.``, ``документ.   ``) либо путь категории без имени (``Documents/``, ``Справочники//``).
         Не-строка и всё прочее — ``False``: ответ хелпера прежний. Проверяется ТОЛЬКО на публичной границе
         (``_public_arg_guard``): хелперы зовут друг друга функциями замыкания мимо неё. v1.49.0 (Д2): и каталог
-        17 категорий вне прежнего разбора без имени (``CommonPictures/``, ``CommonPictures.``)."""
+        17 категорий вне прежнего разбора без имени (``CommonPictures/``, ``CommonPictures.``). v1.50.0 (П1): и голова
+        21 категории (``Роль.``, ``ОбщаяКартинка.``, ``Роли/``; ``_kind_head_category``)."""
         if not isinstance(raw, str):
             return False
         text = raw.strip()
@@ -10659,10 +10692,16 @@ def make_bsl_helpers(
             return True
         head, slash, tail = text.partition("/")
         if slash:
-            category = _path_category(head, _REF_KIND_CATEGORIES) or _extra_folder_category(head)
+            category = (
+                _path_category(head, _REF_KIND_CATEGORIES) or _extra_folder_category(head) or _kind_head_category(head)
+            )
             return bool(category) and not any(tail.split("/"))
         head, dot, rest = text.partition(".")
-        return bool(dot) and not rest and bool(_ref_head_category(head) or _extra_folder_category(head))
+        return (
+            bool(dot)
+            and not rest
+            and bool(_ref_head_category(head) or _extra_folder_category(head) or _kind_head_category(head))
+        )
 
     def _module_dir_arg(raw, *, resolves_names: bool) -> bool:
         """v1.45.0 (Д8): у хелпера «путь или имя» аргумент — пустой путь или КАТАЛОГ (основной конфигурации
@@ -10694,13 +10733,16 @@ def make_bsl_helpers(
         """v1.46.0 (Д2): категория, если ``raw`` — голое слово категории: строка без ``/`` и ``.``, после
         ``strip()`` — идентификатор, и это голова точечной формы (``Documents``, ``Документы``, ``ОбщиеМодули``)
         либо голова префикса типа (``Документ``, ``Перечисление``, ``ПланОбмена``, ``Задача``); иначе ``''``.
-        Головы ``_META_TYPE_PREFIXES`` без категории (``ПодпискаНаСобытие``) словом категории не считаются."""
+        Головы ``_META_TYPE_PREFIXES`` без категории словом категории не считаются. v1.50.0 (П1): голова 21 категории
+        (``Роль``, ``ОбщаяКартинка``, ``Подсистемы``; ``_kind_head_category``) — слово категории; она проверяется ДО
+        ``_ref_head_category``, поэтому головы ``_META_TYPE_PREFIXES`` с категорией (``ПодпискаНаСобытие``,
+        ``РегламентноеЗадание``) — тоже."""
         if not isinstance(raw, str):
             return ""
         text = raw.strip()
         if "/" in text or "." in text or not _is_object_name(text):
             return ""
-        category = _dot_head_category(text) or _ref_head_category(text)
+        category = _dot_head_category(text) or _kind_head_category(text) or _ref_head_category(text)
         return "" if category == "meta" else category
 
     def _category_word_refusal(name: str, raw, example: str) -> ValueError | None:
@@ -10819,12 +10861,34 @@ def make_bsl_helpers(
                     hits.append((not key.startswith(frag), len(key), key, ref))
         return [ref for *_k, ref in sorted(hits)[:limit]]
 
+    def _name_fragment(name: str) -> str:
+        """v1.50.0 (П3, У6): фрагмент имени для совета «проверьте имя» — первые две трети, не меньше трёх букв (как у
+        ``find_path``)."""
+        return name[: max(3, len(name) * 2 // 3)]
+
+    def _search_finds(text: str) -> bool:
+        """Находит ли ``search_objects`` хоть что-то по ``text`` (внутренний вызов, одна строка)."""
+        try:
+            return bool(search_objects(text, limit=1))
+        except Exception:
+            return True  # нельзя проверить — прежний совет
+
     def _name_check_route(name: str, categories=None, exclude=()) -> str:
         """v1.49.0 (Н6): маршрут проверки имени в подсказке: с поиском по индексу — ``search_objects('<имя>')``
-        (прежний текст), без него — похожие объекты на диске или их отсутствие (исполнимо и без индекса, на любой ФС)."""
+        (прежний текст), без него — похожие объекты на диске или их отсутствие (исполнимо и без индекса, на любой ФС).
+        v1.50.0 (П3, У6): поиск по всему вводу пуст — фрагмент (``_name_fragment``): ``search_objects('<фрагмент>')``,
+        а пуст и он — «похожих имен нет: search_objects('<фрагмент>') пуст»; без индекса — похожие на диске тем же
+        правилом (сперва всё имя, затем фрагмент). Прежде совет повторял ввод, и исполненный он был пуст."""
+        fragment = _name_fragment(name)
         if _object_search_usable():
-            return f"search_objects({name!r})"
+            if _search_finds(name):
+                return f"search_objects({name!r})"
+            if fragment != name and _search_finds(fragment):
+                return f"search_objects({fragment!r})"
+            return f"похожих имен нет: search_objects({fragment!r}) пуст"
         similar = _similar_object_refs(name, categories, exclude)
+        if not similar and fragment != name:
+            similar = _similar_object_refs(fragment, categories, exclude)
         return f"похожие на диске — {', '.join(similar)}" if similar else "похожих имен на диске нет"
 
     def _nearest_answer_tail(name: str, categories=None, exclude=()) -> str:
@@ -10958,10 +11022,14 @@ def make_bsl_helpers(
         """v1.49.0 (Д2): ``_typed_ref_of``, а ссылка категории из ``_DESCRIPTOR_KIND_HEADS`` (головы у
         ``_typed_ref_of`` нет) — ``<Голова EN>.<Имя>`` (``CommonPictures/X`` → ``CommonPicture.X``). Зовут хелперы
         «ссылок» (``find_references_to_object``, ``find_code_usages``) и текст отказа шлюза; прочие потребители
-        ``_typed_ref_of`` получают прежнюю строку (у них путь этих категорий — прежний разбор)."""
+        ``_typed_ref_of`` получают прежнюю строку (у них путь этих категорий — прежний разбор). v1.50.0 (П1, Д2): голова
+        любой категории вне ``_CATEGORY_TO_REF_HEAD``/``_NONREF_KIND_HEADS`` — ``_head_of_category`` (роли, подсистемы,
+        общие макеты, XDTO-пакеты: ``Roles/X`` → ``Role.X``); зовёт и ``find_data_path`` (концы)."""
         ref = _object_ref(raw)
-        if ref is not None and ref[0] in _DESCRIPTOR_KIND_HEADS:
-            return f"{_DESCRIPTOR_KIND_HEADS[ref[0]]}.{ref[1]}"
+        if ref is not None and ref[0] not in _CATEGORY_TO_REF_HEAD and ref[0] not in _NONREF_KIND_HEADS:
+            head = _head_of_category(ref[0])
+            if head:
+                return f"{head}.{ref[1]}"
         return _typed_ref_of(raw)
 
     def _object_level_path(raw) -> bool:
@@ -12108,6 +12176,10 @@ def make_bsl_helpers(
         v1.49.0: модуль объекта на диске, которого нет в каталоге модулей сессии (добавлен после сборки индекса), —
         ``_meta.modules_not_indexed`` (ключ ``_meta`` — только при непустом списке) и дописка в ``hint``.
 
+        v1.50.0: точный синоним одного объекта (голое имя, совпадений по имени нет) — ответ по этому объекту (модули либо
+        карточка), ``name`` — техническое имя, ``hint`` «объекта с именем … нет; ответ — по точному синониму:
+        Категория/Имя» (прежде — «не найден» без ``hint``).
+
         Returns: ``{name, category, metadata, modules, hint?, _meta?:{modules_not_indexed}}`` либо ``{error}``."""
         category_arg, name = _object_arg(name, _strip_meta_prefix_arg)
         target = _asked_object_target(name, category_arg)
@@ -12122,10 +12194,14 @@ def make_bsl_helpers(
                 pass
             card_result = {"name": card_name, "category": card_category, "metadata": card_metadata, "modules": []}
             # v1.49.0 (Д1, П1): модули на диске, которых нет в индексе (общая форма, получившая модуль после сборки).
+            # v1.50.0 (П2): пометка ответа по точному синониму — и у карточки (прежде ветка `hint` цели не читала).
+            if target.get("hint"):
+                card_result["hint"] = target["hint"]
             card_disk = _modules_not_indexed(card_category, card_name, [])
             if card_disk:
                 card_result["_meta"] = {"modules_not_indexed": card_disk}
-                card_result["hint"] = _modules_not_indexed_hint(card_disk, base_path)
+                note = _modules_not_indexed_hint(card_disk, base_path)
+                card_result["hint"] = f"{card_result['hint']} {note}" if card_result.get("hint") else note
             return card_result
         exact = target["modules"]
 
@@ -17734,7 +17810,11 @@ def make_bsl_helpers(
         объект только основной в сессии на расширении — ошибка, называющая это; категория в аргументе — прежняя
         ошибка; фрагмент (голое имя, подстрочная страница непуста) — модули ОДНОГО объекта первой строки страницы
         и ``hint`` (прежде — первые 20/50 модулей разных объектов под именем спрошенного); иначе прежняя ошибка.
-        Ответ — ``{'modules': [...], 'hint'?}`` | ``{'card': …}`` | ``{'error': текст}``."""
+        v1.50.0 (П2, Д3): у голого имени перед подстрочным ходом — точный синоним одного объекта (правило 1.49.0 у
+        структуры, модулей и профиля): ответ по этому объекту, ``hint`` «… ответ — по точному синониму:
+        Категория/Имя» (начало — ``_NEAREST_HINT_LEAD``) и ``resolved_name`` — техническое имя.
+        Ответ — ``{'modules': [...], 'hint'?, 'resolved_name'?}`` | ``{'card': …, 'hint'?, 'resolved_name'?}`` |
+        ``{'error': текст}``."""
         module_category = _module_search_category(category_arg)
         modules = _find_module_page(name, category=module_category) if module_category is not None else []
         # v1.44.0: точные модули — и за потолком страницы find_module (см. `_exact_page_modules`).
@@ -17750,6 +17830,18 @@ def make_bsl_helpers(
             return {"error": _main_only_error(name, main_only)}
         if category_arg:
             return {"error": f"Объект '{name}' в категории {category_arg} не найден"}
+        # v1.50.0 (П2, Д3): точный синоним одного объекта — ответ по нему; прежде шёл подстрочный ход, и синоним без
+        # совпадения по подстроке давал «не найден».
+        synonym = _exact_synonym_object(name)
+        if synonym is not None and synonym[0]:
+            syn_category, syn_name = synonym
+            by_synonym = _asked_object_target(syn_name, syn_category)
+            if "error" not in by_synonym:
+                by_synonym["hint"] = (
+                    f"{_NEAREST_HINT_LEAD}{name.strip()!r} нет; ответ — по точному синониму: {syn_category}/{syn_name}"
+                )
+                by_synonym["resolved_name"] = syn_name
+                return by_synonym
         if modules:
             category, object_name = modules[0].get("category"), modules[0].get("object_name")
             return {
@@ -19591,10 +19683,11 @@ def make_bsl_helpers(
         # область code-скана). v1.44.0: где регистрозависимый strip префикс корректной ссылки не снял
         # ("document.X"/"DOCUMENT.X"/"документ.X"), имя — суффикс канонической ссылки: прежде
         # code-скан искал строку "документ.X" и молча давал ноль. Где strip сработал, и на не-ссылке
-        # (`document.` без имени, `Подсистема.X`) — как прежде.
+        # (`document.` без имени, `Подсистема.X`) — как прежде. v1.50.0 (П1): единственное число и русское множественное
+        # 21 категории здесь — по-прежнему не ссылка (`kind_heads=False`): собственный разбор хелпера прежний.
         stripped_name = _strip_meta_prefix(object_name)
         if (
-            _object_ref(object_name) is not None
+            _object_ref(object_name, kind_heads=False) is not None
             and canonical_ref
             and "." in canonical_ref
             and stripped_name == object_name
@@ -19879,12 +19972,14 @@ def make_bsl_helpers(
         flags_available: bool,
         *,
         case_sensitive: bool,
+        denial_hint: bool = False,
     ) -> dict:
         """Ответ ``find_roles``: явно выданные строки ПЛЮС покрытые флагом.
 
         Провенанс каждой строки назван ``granted_via``, а доступность канала —
         ``flags_available``: пустой список покрытых флагом ролей на старом индексе
-        неотличим от честного нуля, и молчать об этом нельзя.
+        неотличим от честного нуля, и молчать об этом нельзя. ``denial_hint`` (v1.50.0, П8, У5) — ``hint`` о ролях с
+        одними запретами при пустом ``roles`` (условие считает вызывающий: ``_roles_denial_hint_applies``).
         """
         # Роль бывает СМЕШАННОЙ: и явно выданное право на объект, и взведённый
         # `setForNewObjects` с исключениями. Пропустить флагованную строку как дубль
@@ -19919,7 +20014,38 @@ def make_bsl_helpers(
         }
         if any(r.get("granted_via") == _FLAG_GRANT for r in rows):
             payload["hint"] = _FLAG_COVERAGE_HINT
+        elif denial_hint and not rows:
+            payload["hint"] = _DENIAL_ONLY_HINT
         return payload
+
+    # v1.50.0 (П8, У5, Д13): объявленная граница — роль, у которой на объект только запреты, прав не выдаёт и в ответе
+    # не участвует (сборщик хранит выданные права). Текст — только о ролях, которые `find_roles` читает: права
+    # собираются из `Roles/` корня сессии (в основной — без ролей расширений, в расширении — только его роли).
+    _DENIAL_ONLY_HINT = (
+        "в ролях этой конфигурации прав на объект нет; роль, где на объект только запреты (все права false), прав не "
+        "выдает: права ролей складываются"
+    )
+
+    def _roles_denial_hint_applies(raw) -> bool:
+        """v1.50.0 (П8, У5): подсказка о ролях с одними запретами — только об объекте вида, на который в ролях бывают
+        права, существование которого ДОКАЗАНО: ссылка — объект с этим именем есть в её категории
+        (``_typed_object_exists``; путь члена ``Документ.Х.ТабличнаяЧасть`` ссылкой не является); голое имя —
+        хотя бы одна НАЙДЕННАЯ категория объекта с этим именем из видов с правами (при дрейфе — и с индексом, как в
+        ``_flags_apply_to``). Категорий не нашлось (объекта нет либо существование не проверить) — ``False``."""
+        if not isinstance(raw, str) or not raw.strip():
+            return False
+        ref = _object_ref(raw)
+        if ref is not None:
+            category, name = ref
+            return _kind_has_role_rights(_head_of_category(category)) and _typed_object_exists(category, name)
+        name = raw.strip()
+        if not _is_object_name(name):
+            return False
+        if any(_kind_has_role_rights(_head_of_category(c)) for c in _object_categories_anywhere(name)):
+            return True
+        return _index_may_know_more() and any(
+            _kind_has_role_rights(_head_of_category(c)) for c in _object_categories_anywhere(name, with_index=True)
+        )
 
     _FLAG_GRANT = "set_for_new_objects"
     _EXPLICIT_GRANT = "explicit"
@@ -20040,12 +20166,19 @@ def make_bsl_helpers(
         любое имя); ссылка на член ``Document.X.Attribute.Z`` судится по объекту X; ссылка на
         несуществующий объект — ``ValueError`` (шлюз существования).
         v1.49.0: роли по флагу — только у объекта вида, на который в ролях бывают права (``_ROLE_RIGHT_HEADS``);
-        у общего модуля, перечисления, определяемого типа, общей картинки, роли — без них (в обеих ветках)."""
+        у общего модуля, перечисления, определяемого типа, общей картинки, роли — без них (в обеих ветках).
+        v1.50.0: пустой ``roles`` у объекта такого вида, существование которого доказано (ссылка на объект своей
+        категории; голое имя — найденный объект вида с правами), — ``hint``: роль, где на объект только запреты (все
+        права ``false``), прав не выдает и в ответе не участвует (права ролей складываются; сборщик хранит выданные).
+        Права читаются из ролей корня сессии: в основной конфигурации — без ролей расширений, в расширении — только
+        его роли. Путь члена, не-ссылка без объекта, вид без прав в ролях — без подсказки, как прежде."""
         # v1.46.0 (Д3): не-ссылка, которой не соответствует ни один объект, — без ролей по флагу «для новых
         # объектов»: флаг покрывает любое имя, и ответ на несуществующее имя был неотличим от ответа по объекту.
         # Ссылка на член (`Document.X.Attribute.Z`) судится по объекту X. v1.49.0 (Д10, П6): и объект вида, на который в
         # ролях прав не бывает (общий модуль, общая картинка, роль…), — без ролей по флагу; в обеих ветках.
         no_flagged = _nonref_missing(object_name) or not _flags_apply_to(object_name)
+        # v1.50.0 (П8, У5): условие подсказки о ролях с одними запретами — по сырому аргументу, до разбора.
+        denial_hint = _roles_denial_hint_applies(object_name)
         ref_category, object_name = _object_arg(object_name, _strip_meta_prefix_arg)
         # v1.49.0 (Д4, П4): `object` и `rights` строки — одна пара; голова категории ссылки выбирает точный объект
         # запроса среди омонимов (`SessionParameters/X` — параметр сеанса, а не общая команда `X`).
@@ -20060,7 +20193,9 @@ def make_bsl_helpers(
                 flagged, flags_available = _flag_covered_roles(object_name)
                 if no_flagged:
                     flagged = []
-                return _roles_payload(object_name, idx_roles, flagged, flags_available, case_sensitive=False)
+                return _roles_payload(
+                    object_name, idx_roles, flagged, flags_available, case_sensitive=False, denial_hint=denial_hint
+                )
 
         # Fallback: glob + XML parse
         patterns = [
@@ -20121,7 +20256,9 @@ def make_bsl_helpers(
                 builder.add(r["role_name"], r["object"], right, r["file"])
         grouped_rows = builder.result()
 
-        return _roles_payload(object_name, grouped_rows, live_flagged, True, case_sensitive=True)
+        return _roles_payload(
+            object_name, grouped_rows, live_flagged, True, case_sensitive=True, denial_hint=denial_hint
+        )
 
     # ── FTS search (requires SQLite index with FTS5) ────────────
 
@@ -22608,9 +22745,10 @@ def make_bsl_helpers(
 
     def _ref_target_outside_graph(canonical: str) -> str | None:
         """Голова цели ``Голова.Имя``, которую ``canonicalize_type_ref`` не канонизирует (v1.47.0, Д19): ссылок на
-        объекты такого вида граф ссылок не хранит ни из одного источника (критерий отбора, хранилище настроек, веб- и
+        объекты такого вида граф ссылок не хранил ни из одного источника (критерий отбора, хранилище настроек, веб- и
         HTTP-сервис, внешний источник данных, общий макет, параметр сеанса...) либо префикс не распознан. Каноническая
-        цель и голое имя — ``None``."""
+        цель и голое имя — ``None``. v1.50.0 (П5, Д7): голову из ``_GRAPH_HEADS_SINCE_V19`` граф хранит с v19 — решение
+        «вне графа» по поколению и маршруту принимают вызывающие (``find_references_to_object``, ``find_data_path``)."""
         from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref as _ctr
 
         head, dot, name = (canonical or "").partition(".")
@@ -22662,6 +22800,8 @@ def make_bsl_helpers(
     _LIVE_REFERENCE_KINDS_BY_ROUTE: dict[tuple[str, str | None], frozenset[str]] = {
         ("metadata_xml", None): _LIVE_METADATA_XML_KINDS,
         ("metadata_xml", "Subsystems"): _LIVE_METADATA_XML_KINDS | {"subsystem_content"},
+        # v1.50.0 (Д9): состав общего реквизита разбирает тот же `parse_metadata_xml` — живьём сразу.
+        ("metadata_xml", "CommonAttributes"): _LIVE_METADATA_XML_KINDS | {"common_attribute_content"},
         ("command_parameter_type", None): frozenset({"command_parameter_type"}),
         ("exchange_plan_content", None): frozenset({"exchange_plan_content"}),
         ("defined_type_content", None): frozenset({"defined_type_content"}),
@@ -22761,8 +22901,9 @@ def make_bsl_helpers(
     def _flag_covered_role_refs(canonical: str, raw, effective_kinds: list[str] | None) -> list[dict]:
         """Ссылки ролей, покрывающих объект флагом ``setForNewObjects`` (раскрытие на чтении). v1.49.0 (Д10, П6): только у
         цели вида, на который в ролях бывают права, — правилом ``find_roles``: ``_flags_apply_to`` СЫРОГО аргумента
-        ``raw`` (категория ссылки, иначе категории объектов строки). Голова ``canonical`` для этого не годится:
-        русское единственное число (``ПараметрСеанса.X``) ссылкой не канонизируется, и вид с правами терял бы строки."""
+        ``raw`` (категория ссылки, иначе категории объектов строки). Голова ``canonical`` для этого не годилась:
+        русское единственное число (``ПараметрСеанса.X``) ссылкой не канонизировалось, и вид с правами терял бы строки
+        (v1.50.0, П1: теперь это ссылка — правило сырого аргумента то же)."""
         if effective_kinds is not None and "role_rights" not in effective_kinds:
             return []
         if not _flags_apply_to(raw):
@@ -22821,7 +22962,9 @@ def make_bsl_helpers(
         ``unsupported_kinds``). ``main_form``, ``list_form``, ``choice_parameter_link``, ``link_by_type`` — объявлены,
         сборщиком не производятся (вызов с ними не ломается; строк этих видов нет). ``kinds_unavailable`` (v1.47.0) —
         виды запроса, которых индекс прежнего поколения (до v18) не производит: пустой ответ по ним — «нужна
-        пересборка», а не «ссылок нет»; на v18 и живьем — ``[]``. v1.49.0 — ``characteristic_value_type``: у цели
+        пересборка», а не «ссылок нет»; на v18 и живьем — ``[]`` (v1.50.0: виды v19 — ``common_attribute_content``,
+        ``template_query`` — на индексе до v19; у индекса до v18 — вместе с видами v1.47.0; на v19 и живьем — ``[]``;
+        ``template_query`` живьем — в ``unsupported_kinds``). v1.49.0 — ``characteristic_value_type``: у цели
         ``ChartOfCharacteristicTypes.X`` — реквизиты типа «значения характеристик ПВХ» (``Characteristic.X``; реквизиты,
         ТЧ, измерения, ресурсы, реквизиты адресации, на индексе — и верхние реквизиты форм), ``line=None``, раскрытие
         на чтении (``expanded_on_read``); у прочих целей строк вида нет.
@@ -22838,10 +22981,15 @@ def make_bsl_helpers(
         объекта нет — прежний ответ и верхний ``hint``. v1.49.0: роли по флагу — только у цели вида, на который
         в ролях бывают права (не у общего модуля, перечисления, определяемого типа, общей картинки, роли).
 
-        ``target_not_indexed`` (v1.47.0) — цель вида, ссылок на объекты которого граф не хранит (критерий отбора,
-        хранилище настроек, веб- и HTTP-сервис, внешний источник данных, общий макет, параметр сеанса...) либо с
+        ``target_not_indexed`` (v1.47.0) — цель вида, ссылок на объекты которого граф не хранит, либо с
         нераспознанным префиксом: строк, кроме ролей с флагом, нет, и верхний ``hint`` ведет к
-        ``analyze_subsystem``/``find_roles``. Ключ есть только у такой цели.
+        ``analyze_subsystem``/``find_roles``. Ключ есть только у такой цели. Граница (v1.50.0): значение заполнения
+        реквизита (``FillValue``: пустая ссылка, значение перечисления, предопределенный) строкой не выдается — тип того
+        же реквизита и так дает строку ``attribute_type``. v1.50.0: с индекса v19 граф хранит цели
+        всех 47 видов (критерий отбора, хранилище настроек, веб- и HTTP-сервис, внешний источник данных, общий макет,
+        параметр сеанса, общая картинка…) — признак у голов вне таблицы видов (``Configuration.X``, опечатка в голове)
+        всегда, а у этих 21 видов — только на индексе прежнего поколения (до v19); живьем строки состава подсистем на них
+        есть, признака нет.
         """
         # Без гарда битый limit роняет индексный запрос, голый `except Exception`
         # ниже его глушит, и управление уходит в live-скан ВСЕЙ конфигурации —
@@ -22857,11 +23005,29 @@ def make_bsl_helpers(
         kinds_echo = kinds
         if kinds:
             kinds = _closed_values("find_references_to_object", "kinds", kinds, _REF_KIND_PRIORITY)
-        # v1.47.0 (Д19): голова цели вне графа ссылок — задаётся после разбора цели (ниже).
+        # v1.47.0 (Д19): голова цели вне графа ссылок — задаётся после разбора цели (ниже). v1.50.0 (П5, Д7): это голова,
+        # а не решение — маршрут (индекс или живьём) выбирается позже, решение принимает `_finish` (`_target_outside`).
         outside_head: str | None = None
 
+        def _target_outside(res: dict) -> bool:
+            """v1.50.0 (П5, Д7): цель вне графа ссылок — по фактическому маршруту ответа. Голова вне таблицы видов —
+            всегда; голова, которую граф хранит с v19 (`_GRAPH_HEADS_SINCE_V19`), — только на индексе прежнего
+            поколения (`builder_version < 19`) и у ридера без пробы поколения (прежнее правило); живьём строки состава
+            на такие цели есть — признака нет."""
+            if outside_head is None:
+                return False
+            if outside_head not in _GRAPH_HEADS_SINCE_V19:
+                return True
+            source = res["_meta"].get("source")
+            if source == "live":
+                return False
+            if source == "index":
+                generation = getattr(idx_reader, "builder_version", None)
+                return not isinstance(generation, int) or generation < 19
+            return True
+
         def _finish(res: dict) -> dict:
-            if outside_head is not None:
+            if _target_outside(res):
                 # v1.47.0 (Д19): ссылок на объекты такого вида граф не хранит — без признака ответ (роли с флагом
                 # «для новых объектов») читался бы как полный. Строки, `total` и `partial` прежние.
                 res["_meta"]["target_not_indexed"] = True
@@ -23020,10 +23186,12 @@ def make_bsl_helpers(
                 )
                 # v1.47.0 (Д6, Д7): индекс до v18 новых видов не производит — их пустота не «ссылок нет». Ридер без
                 # пробы поколения (тестовый двойник) поколения не называет — ключ пуст.
+                # v1.50.0 (Д9, Д10): объединение поколений — у индекса до v18 нет и видов v19.
                 index_generation = getattr(idx_reader, "builder_version", None)
-                if isinstance(index_generation, int) and index_generation < 18:
+                if isinstance(index_generation, int) and index_generation < 19:
+                    missing = _REF_KINDS_SINCE_V19 | (_REF_KINDS_SINCE_V18 if index_generation < 18 else frozenset())
                     result["_meta"]["kinds_unavailable"] = sorted(
-                        k for k in result["_meta"]["kinds_applied"] if k in _REF_KINDS_SINCE_V18
+                        k for k in result["_meta"]["kinds_applied"] if k in missing
                     )
                 # v15 не хранит результатов read/parse/traversal census optional
                 # домена, поэтому строки/total сохраняются как НИЖНЯЯ оценка, live
@@ -23151,6 +23319,10 @@ def make_bsl_helpers(
             расширениях (маршрут ``search_objects``), либо (v1.47.0) конец вида, которого граф ссылок не связывает:
             цель — критерий отбора или хранилище настроек, любой конец — веб- или HTTP-сервис, внешний источник
             данных (маршрут ``analyze_subsystem``/``find_roles``). ``hint`` без ``error`` — неокончательный промах.
+            v1.50.0: с индекса v19 граф хранит цели 21 вида вне прежнего графа (общая картинка, общий макет, сервисы,
+            критерий, параметр сеанса…) — их концы обходятся (узел — своей категорией; без исходящих строк конечен),
+            структурный отказ «в графе ссылок нет» у них — только на индексе прежнего поколения; концы
+            ``ОбщийМодуль.X``, ``ОбщаяФорма.X``, ``РегламентноеЗадание.X`` — прежний отказ префикса.
             v1.46.0 (Д6): узел последнего уровня (``depth + 1 == max_depth``) с полной страницей ссылок
             усечённым не считается — его дети не раскрывались бы и так, прямая ссылка проверена точечно.
             v1.49.0 (П7): промах, у которого обход дошёл до ``max_depth`` и не раскрыл узлы предельной глубины
@@ -23168,7 +23340,20 @@ def make_bsl_helpers(
         # matching the canonical ref_object prefix.
         from rlm_tools_bsl.bsl_index import _CATEGORY_TO_TYPE_PREFIX as _cat2prefix
 
-        prefix_to_category = {prefix: category for category, prefix in _cat2prefix.items()}
+        # v1.50.0 (У8, П5): карта «голова → категория» узлов — прежняя (обратная `_CATEGORY_TO_TYPE_PREFIX`) плюс 21
+        # голова, которую граф хранит с v19: узел новой головы раскрывается своей категорией (без неё
+        # `source_category=None` раскрыл бы омоним любой категории). Канонические головы вне прежней карты
+        # (`CommonModule`, `CommonForm`, `ScheduledJob`) — прежний отказ префикса. Прежняя карта — для правила стороны
+        # `from` на индексе прежнего поколения (`prior_prefix_to_category`).
+        prior_prefix_to_category = {prefix: category for category, prefix in _cat2prefix.items()}
+        prefix_to_category = {
+            **{head: category for category, head in _OBJECT_KIND_HEADS.items() if head in _GRAPH_HEADS_SINCE_V19},
+            **prior_prefix_to_category,
+        }
+        # v1.50.0 (П5, Д7): поколение индекса для структурной проверки концов — граф хранит 21 новую голову с v19; ридер
+        # без пробы поколения — прежнее правило; без ридера живого маршрута нет (`partial` ниже).
+        generation = getattr(idx_reader, "builder_version", None)
+        graph_before_v19 = idx_reader is not None and (not isinstance(generation, int) or generation < 19)
 
         try:
             max_depth_int = int(max_depth)
@@ -23190,8 +23375,10 @@ def make_bsl_helpers(
 
         # v1.44.0: путь объекта — тот же префикс типа (раньше — отказ «нужен префикс»).
         to_arg = to_object  # v1.45.0: аргумент как передан — для маршрута проверки в hint
-        from_object = _typed_ref_of(from_object)
-        to_object = _typed_ref_of(to_object)
+        # v1.50.0 (П1, Д2): каноническая ссылка любой из 47 категорий (`Subsystems/X` → `Subsystem.X`, `Роли/X` →
+        # `Role.X`); у прочих форм — прежний `_typed_ref_of`.
+        from_object = _canonical_ref_of(from_object)
+        to_object = _canonical_ref_of(to_object)
         from_canon, _ = _normalize_object_ref(from_object)
         to_canon, _ = _normalize_object_ref(to_object)
 
@@ -23212,12 +23399,17 @@ def make_bsl_helpers(
         # цель-хранилище настроек (их префиксы карта знает) давали тихое «не найдено» после обхода, а веб- и HTTP-сервис
         # и внешний источник данных — отказ «укажите префикс», хотя префикс дан. Источник-критерий и источник-хранилище
         # обходятся, как прежде: исходящие ссылки у них в графе есть. Голова, которой хелперы не знают, — отказ ниже.
+        # v1.50.0 (П5, Д7): голова, которую граф хранит с v19, — структурный отказ только на индексе прежнего поколения:
+        # сторона `to` — по карте узлов (форма 1.47.0), правило стороны `from` (веб-, HTTP-сервис, внешний источник —
+        # отказ; критерий, хранилище и прочие — обход) — по прежней карте. Голова вне таблицы видов (`Configuration.X`)
+        # карте узлов не известна и видом без ссылочного типа не является — прежний отказ префикса ниже.
         for side, canon in (("to", to_canon), ("from", from_canon)):
             head = _ref_target_outside_graph(canon)
-            if head is None:
+            if head is None or (head in _GRAPH_HEADS_SINCE_V19 and not graph_before_v19):
                 continue
             in_prefix_map = head in prefix_to_category
-            if (side == "to" and in_prefix_map) or (not in_prefix_map and head.casefold() in _NONREF_KIND_CATEGORIES):
+            in_prior_map = head in prior_prefix_to_category
+            if (side == "to" and in_prefix_map) or (not in_prior_map and head.casefold() in _NONREF_KIND_CATEGORIES):
                 error = (
                     f"конец {canon}: ссылок на объекты вида {head} в графе ссылок нет — путь к нему не строится"
                     if side == "to"
@@ -23863,6 +24055,8 @@ def make_bsl_helpers(
             "Constants": "Constant",
             "DocumentJournals": "DocumentJournal",
             "FilterCriteria": "FilterCriterion",
+            # v1.50.0 (Д9, Д15): общие реквизиты — состав и ссылки разделения.
+            "CommonAttributes": "CommonAttribute",
         }
 
         scan_categories = list(_CATEGORY_TYPE.keys())
@@ -25483,8 +25677,9 @@ def make_bsl_helpers(
         "      print(f\"  {m['module_type']}: {m['procedures_count']} проц, {m['exports_count']} эксп\")\n"
         "  # Обзор за 1 дешевый вызов → get_object_profile(name); код-скелет → get_object_modules(name).\n"
         "  # Омоним — модули ОДНОГО объекта (категории первого точного модуля). Объект без модулей (роль,\n"
-        "  #   подсистема, общая картинка…) — metadata его описателя и modules=[]; фрагмент имени — модули\n"
-        "  #   одного ближайшего объекта и hint; объект основной в сессии на расширении — error.\n"
+        "  #   подсистема, общая картинка…) — metadata его описателя и modules=[]; точный синоним — объект\n"
+        "  #   синонима и hint «по точному синониму»; фрагмент имени — модули одного ближайшего объекта и hint;\n"
+        "  #   объект основной в сессии на расширении — error.\n"
         "  # result['_meta']['modules_not_indexed'] (ключ _meta только непустым) — модули на диске, которых нет\n"
         "  #   в индексе (добавлены после сборки); hint — index update и extract_procedures(путь).",
     )
@@ -25699,7 +25894,8 @@ def make_bsl_helpers(
         "  for attr in result.get('custom_attributes', []):\n"
         "      print(f\"Реквизит: {attr['name']} ({attr.get('synonym', '')})\")\n"
         "  # Префиксы не обнаружены — error: передай custom_prefixes=['мой_']. Объект без модулей —\n"
-        "  #   modules_analyzed=0 и custom_attributes из описателя; фрагмент имени — модули одного объекта + hint.",
+        "  #   modules_analyzed=0 и custom_attributes из описателя; точный синоним — объект синонима\n"
+        "  #   (object_name — техническое имя) + hint; фрагмент имени — модули одного объекта + hint.",
     )
 
     _reg(
@@ -25765,8 +25961,8 @@ def make_bsl_helpers(
         "  #     при усечении _meta.declared_route — маршрут к полному списку.\n"
         "  # _meta.delegates — ПЕРВАЯ страница получателей из тела обработчика проведения\n"
         "  #   (_meta.delegates_total, _meta.delegates_truncated); пагинации нет, полный разбор — по hint.\n"
-        "  # На боевой Реализации: выведено 35, объявлено 54, пересечение 16 — то есть\n"
-        "  #   новое поле НЕ заменяет старое и не сливается с ним.\n"
+        "  # Выведенное и объявленное НЕ сливаются и одно другое не заменяет. Пример с одной ERP\n"
+        "  #   (РеализацияТоваровУслуг): выведено 35, объявлено 54, пересечение 16; числа зависят от конфигурации.\n"
         "  # undeclared_code_registers — выведенные из кода имена, МЕТАДАННЫМИ НЕ ОБЪЯВЛЕННЫЕ.\n"
         "  # unresolved — статически НЕРАЗРЕШИМЫЕ обращения: [{kind, evidence, file}].\n"
         "  #   kind='dynamic_name'     — имя регистра считается во время исполнения\n"
@@ -25999,7 +26195,9 @@ def make_bsl_helpers(
         "  # точные ИМЕНА ПРАВ — get_object_profile('Документ.X', sections=['roles']).\n"
         "  # Имя, которому не соответствует ни один объект, — без ролей по флагу (set_for_new_objects);\n"
         "  #   объект вида, на который в ролях прав не бывает (общий модуль, перечисление, определяемый тип,\n"
-        "  #   общая картинка, роль…), — тоже; ссылка на несуществующий объект — ValueError «объекта … нет».",
+        "  #   общая картинка, роль…), — тоже; ссылка на несуществующий объект — ValueError «объекта … нет».\n"
+        "  # roles=[] у существующего объекта вида с правами — hint: роль с одними запретами (все false) прав\n"
+        "  #   не выдает; права читаются из ролей корня сессии (основная — без ролей расширений).",
     )
 
     _reg(
@@ -26300,7 +26498,7 @@ def make_bsl_helpers(
         ],
         "FIND DATA PATH (достижим ли to_object из from_object по ссылкам МЕТАДАННЫХ):\n"
         "  # N-hop BFS по графу МЕТАДАННЫХ (ссылки), а НЕ по графу вызовов.\n"
-        "  res = find_data_path('Документ.РеализацияТоваровУслуг', 'РегистрНакопления.Продажи')\n"
+        "  res = find_data_path('Документ.АвансовыйОтчет', 'Справочник.СтраныМира')\n"
         "  if res.get('error'):\n"
         "      print(res['error'], res['hint'])  # концы — С ПРЕФИКСОМ (Справочник./Документ./…) и существующие\n"
         "  elif res['found']:\n"
@@ -26310,12 +26508,12 @@ def make_bsl_helpers(
         "      print(res.get('hint') or 'не достижим в пределах max_depth')  # hint — у КАЖДОГО неокончательного промаха\n"
         "  # Фильтр по виду ссылки: find_data_path('Документ.X', 'Справочник.Y', kinds=['attribute_type'])\n"
         "  #   (kinds=['characteristic_value_type'] — ValueError: связь типа, а не данных)\n"
-        "  # RU/EN-префикс принимается; _meta.budget_exceeded=True → обход обрезан (сузь max_depth).\n"
+        "  # RU/EN-префикс принимается; _meta.budget_exceeded=True → обход обрезан (см. res['hint']).\n"
         "  # Неокончательный промах (budget_exceeded=True или partial=True) несет hint: упор в node_budget,\n"
         "  #   таблица ссылок недоступна, индекса нет или УСЕЧЕННЫЙ узел — исходящих ссылок не меньше\n"
         "  #   страницы 1000 (_meta.truncated_nodes=[{object, refs_returned}], счет — truncated_nodes_total;\n"
-        "  #   прямая ссылка на to у него проверена точечно, обход — по первой странице). Маршрут: сузь\n"
-        "  #   kinds либо проверь ссылку обратным поиском find_references_to_object('Справочник.Y').\n"
+        "  #   прямая ссылка на to у него проверена точечно, обход — по первой странице). Маршрут: проверь\n"
+        "  #   ссылку обратным поиском find_references_to_object('Справочник.Y') либо сузь kinds.\n"
         "  #   Узел ПОСЛЕДНЕГО уровня (глубина max_depth-1) усеченным не считается: его дети не раскрывались бы\n"
         "  #   и так, а прямая ссылка проверена (budget_exceeded=False, без truncated_nodes).\n"
         "  # Промах, у которого обход дошел до max_depth и узлы предельной глубины не раскрывал, несет hint\n"
@@ -26399,7 +26597,7 @@ def make_bsl_helpers(
         "  if ctx.get('nearby_extensions'):\n"
         "      ext_path = ctx['nearby_extensions'][0]['path']\n"
         "      ovr_obj = find_ext_overrides(ext_path, 'Номенклатура')\n"
-        "  # Имя, которому не соответствует ни один объект: total=0 и hint (проверьте имя: search_objects; без индекса — похожие на диске);\n"
+        "  # Имя, которому не соответствует ни один объект: total=0 и hint (проверь имя: search_objects(имя|фрагмент); без индекса — диск);\n"
         "  #   ссылка с префиксом на несуществующий объект — ValueError «объекта … нет».\n"
         "  # Если есть индекс v9+ — предпочитай get_overrides() (мгновенно из SQLite).\n"
         "  # find_ext_overrides — для live-проверки на проектах без индекса или для верификации.\n"
@@ -26428,7 +26626,7 @@ def make_bsl_helpers(
         "  result = get_overrides('Номенклатура')\n"
         "  for ov in result['overrides']:\n"
         "      print(f\"  {ov['target_method']} <- {ov['annotation']} {ov.get('extension_name', '')}\")\n"
-        "  # Имя, которому не соответствует ни один объект: total=0 и hint (проверьте имя: search_objects; без индекса — похожие на диске);\n"
+        "  # Имя, которому не соответствует ни один объект: total=0 и hint (проверь имя: search_objects(имя|фрагмент); без индекса — диск);\n"
         "  #   ссылка с префиксом на несуществующий объект ('Справочник.Нет') — ValueError «объекта … нет».\n"
         "  # by_annotation / by_object_top / by_extension_top — это DICT {имя: количество},\n"
         "  # НЕ список записей: итерируй .items(), а срезом бери list(d.items())[:5].\n"

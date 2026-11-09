@@ -691,13 +691,15 @@ class TestPluralDotPrefix:
             world["extract_procedures"](raw)
 
     def test_singular_headless_kind_is_not_a_ref(self, world):
-        """Обе версии: английское единственное число вида без ссылочного типа (`Subsystem.X`) — не ссылка:
-        `find_references_to_object` ищет каноническую `Subsystem.Верх` как есть, структура — прежний «не найден»."""
+        """`find_references_to_object` ищет каноническую `Subsystem.Верх`. v1.50.0: прежде здесь стояло «английское
+        единственное число вида без ссылочного типа — не ссылка, структура — прежний „не найден“»; с v1.50.0
+        единственное число RU/EN 21 категории — ссылка (П1): структура — карточка подсистемы, как у пути каталога."""
         refs = world["find_references_to_object"]("Subsystem.Верх")
         assert refs["object"] == "Subsystem.Верх"
         assert world["get_object_full_structure"]("Subsystem.Верх") == world["get_object_full_structure"](
-            "НетТакогоSubsystemВерх"
-        ) | {"error": "Объект 'Subsystem.Верх' не найден"}
+            "Subsystems/Верх"
+        )
+        assert world["get_object_full_structure"]("Subsystem.Верх")["category"] == "Subsystems"
 
     @pytest.mark.parametrize(
         "dotted,path",
@@ -1098,11 +1100,14 @@ class TestMissingObject:
     )
     def test_missing_object_in_any_form_gets_the_rule(self, world, form):
         """Формы без объекта ни при одном толковании — правило не-ссылки действует: без ролей по флагу, с `hint`."""
-        if form.startswith("CommonPictures/"):
+        if form.startswith("CommonPictures/") or form in ("Role.НетТакой", "ОбщаяКартинка.НетТакой"):
             # v1.49.0: прежде здесь стояло правило не-ссылки (`roles == []` и `hint` у `get_overrides`); путь категории
             # из 17 вне прежнего разбора (`CommonPictures/…`) теперь ссылка — объекта нет: отказ шлюза.
+            # v1.50.0: прежде здесь правило не-ссылки действовало и у `Role.НетТакой`, `ОбщаяКартинка.НетТакой` —
+            # единственное число RU/EN 21 категории теперь ссылка (П1): объекта нет — отказ шлюза.
+            canon = "Role.НетТакой" if form.startswith("Role.") else "CommonPicture.НетТакой"
             for helper in ("find_roles", "get_overrides"):
-                with pytest.raises(ValueError, match=f"^{helper}: объекта CommonPicture.НетТакой нет"):
+                with pytest.raises(ValueError, match=f"^{helper}: объекта {canon} нет"):
                     world[helper](form)
             return
         assert world["find_roles"](form)["roles"] == []

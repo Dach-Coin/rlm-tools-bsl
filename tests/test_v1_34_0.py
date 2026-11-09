@@ -1427,6 +1427,8 @@ def test_default_kinds_still_names_unsupported_kinds(cf):
     default = bsl["find_references_to_object"]("Document.ТестДок")["_meta"]["unsupported_kinds"]
     # v1.47.0: прежде здесь стояли шесть видов — виды форм (`form_*`) пишет только сборщик индекса,
     # живой обход форм не разбирает и называет их здесь же.
+    # v1.50.0: прежде здесь стояли девять видов — запросы макетов СКД (`template_query`) тоже пишет только сборщик
+    # индекса, живой обход макетов не разбирает и называет вид здесь же.
     assert set(default) == {
         "choice_parameter_link",
         "event_subscription_source",
@@ -1437,6 +1439,7 @@ def test_default_kinds_still_names_unsupported_kinds(cf):
         "form_attribute_type",
         "form_main_table",
         "form_query",
+        "template_query",
     }, default
     # Явный запрос по-прежнему сужается до запрошенного.
     narrow = bsl["find_references_to_object"]("Document.ТестДок", kinds=["role_rights", "owner"])

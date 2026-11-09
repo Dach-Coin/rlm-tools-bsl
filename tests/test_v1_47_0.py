@@ -1160,6 +1160,59 @@ def _downgrade_to_v17(db_path) -> None:
         con.close()
 
 
+# v1.50.0: 21 голова вне графа ссылок до v19 и помощник прежнего поколения — копия из `tests/test_v1_50_0.py`.
+_D7_HEADS = frozenset(
+    {
+        "CommonTemplate",
+        "XDTOPackage",
+        "WebService",
+        "HTTPService",
+        "FilterCriterion",
+        "SettingsStorage",
+        "ExternalDataSource",
+        "Bot",
+        "CommandGroup",
+        "CommonAttribute",
+        "CommonPicture",
+        "DocumentNumerator",
+        "FunctionalOptionsParameter",
+        "IntegrationService",
+        "Interface",
+        "Language",
+        "Sequence",
+        "SessionParameter",
+        "StyleItem",
+        "Style",
+        "WSReference",
+    }
+)
+
+
+def _downgrade_to_v18(db_path) -> None:
+    """Копия индекса в содержимое прежнего поколения (v18): номер поколения и удаление строк, которых v18 не пишет
+    (виды `common_attribute_content`/`template_query`, ссылки разделения общих реквизитов, цели 21 головы вне графа)."""
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute("UPDATE index_meta SET value='18' WHERE key IN ('version', 'builder_version')")
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "metadata_references" in tables:
+            con.execute(
+                "DELETE FROM metadata_references WHERE ref_kind IN ('common_attribute_content', 'template_query')"
+            )
+            con.execute(
+                "DELETE FROM metadata_references WHERE ref_kind = 'linked_object' AND used_in LIKE 'CommonAttribute.%'"
+            )
+            doomed = [
+                (rowid,)
+                for rowid, ref in con.execute("SELECT rowid, ref_object FROM metadata_references")
+                if (ref or "").split(".", 1)[0] in _D7_HEADS
+            ]
+            con.executemany("DELETE FROM metadata_references WHERE rowid = ?", doomed)
+        con.commit()
+    finally:
+        con.close()
+
+
 def _v17_copy(world: World, dst_dir: Path) -> IndexReader:
     """Ридер на копии индекса мира, понижённой до v17 (сам мир не трогается)."""
     copy = _db_copy(world["db"], dst_dir / "bsl_index_v17.db")
@@ -1176,11 +1229,14 @@ _GEN_FILES = {
 
 class TestIndexGeneration18:
     def test_builder_version_is_18(self):
-        assert BI.BUILDER_VERSION == 18
+        # v1.50.0: прежде здесь стояло BUILDER_VERSION == 18 — поколение индекса v19 (строка 18 таблицы недостач
+        # проверяет `test_old_index_gaps_last_row_is_18`)
+        assert BI.BUILDER_VERSION == 19
 
     def test_old_index_gaps_last_row_is_18(self):
-        threshold, text = BI.OLD_INDEX_GAPS[-1]
-        assert threshold == BI.BUILDER_VERSION == 18
+        # v1.50.0: прежде здесь стояло OLD_INDEX_GAPS[-1] с порогом 18 == BUILDER_VERSION — последняя строка теперь 19
+        threshold, text = BI.OLD_INDEX_GAPS[-2]
+        assert threshold == 18 and BI.OLD_INDEX_GAPS[-1][0] == BI.BUILDER_VERSION
         assert text.strip()
         for word in ("callType", "форм", "журнал", "Метаданные", "переносом", "БГУ", "EDT"):
             assert word in text, word
@@ -1191,7 +1247,8 @@ class TestIndexGeneration18:
         db = IndexBuilder().build(str(base), build_calls=True)
         _downgrade_to_v17(db)
         res = IndexBuilder().update(str(base))
-        assert res["rebuild_reason"] == "schema upgrade v17->18", res
+        # v1.50.0: прежде здесь стояло "schema upgrade v17->18" — пересборка идёт в текущее поколение v19
+        assert res["rebuild_reason"] == "schema upgrade v17->19", res
         con = sqlite3.connect(str(db))
         try:
             cols = {r[1] for r in con.execute("PRAGMA table_info(extension_overrides)")}
@@ -1199,7 +1256,8 @@ class TestIndexGeneration18:
         finally:
             con.close()
         assert _V18_OVERRIDE_COLUMNS <= cols, cols
-        assert version == "18"
+        # v1.50.0: прежде здесь стояло "18" — текущее поколение v19
+        assert version == "19"
 
     def test_start_warns_on_v17_index(self, tmp_path):
         import json
@@ -2631,7 +2689,10 @@ class TestFormRefs:
             ], fmt
             # v1.47.0 (Задача 17): прежде здесь стояло `back.get("error") is None` — тихое «не найдено» после обхода;
             # ссылок на хранилища настроек граф не хранит, и конец-цель такого вида — структурный ответ.
-            assert back["found"] is False and "в графе ссылок" in back["error"], (fmt, back)
+            # v1.50.0: прежде здесь стоял этот структурный отказ — с v19 граф хранит цели хранилищ настроек (состав
+            # подсистем, права ролей), конец-цель обходится; ссылок на `Хран` в дереве нет — окончательный промах без
+            # ошибки (отказ «в графе ссылок нет» — только на индексе прежнего поколения, `TestTargetOutsideGraph`).
+            assert back["found"] is False and "error" not in back, (fmt, back)
 
 
 # ═══════════════ Задача 11 — обращения в коде: `metadata`, `form`, член менеджера (Д9–Д11) ═══════════════
@@ -4177,6 +4238,10 @@ _OUTSIDE_GRAPH_REFS = [
 
 
 class TestTargetOutsideGraph:
+    # v1.50.0: прежде здесь `idx` — индекс текущего поколения. С v19 граф хранит цели 21 головы вне прежнего графа
+    # (критерий, хранилище, сервисы, внешний источник, общий макет…), и прежние ожидания индексного маршрута держит копия
+    # индекса прежнего поколения (`_downgrade_to_v18`); `idx19` — индекс текущего поколения, `live` — новые ожидания:
+    # у голов таблицы видов признака нет (живой разбор состава подсистем на них строки даёт).
     @pytest.fixture(scope="class", params=["cf", "edt"])
     def tree(self, request, tmp_path_factory):
         root = tmp_path_factory.mktemp(f"outside_graph_{request.param}") / "cf"
@@ -4184,32 +4249,50 @@ class TestTargetOutsideGraph:
         mp = pytest.MonkeyPatch()
         mp.setenv("RLM_INDEX_DIR", str(root.parent / "idx"))
         try:
-            reader = IndexReader(IndexBuilder().build(str(root)))
+            db = IndexBuilder().build(str(root))
         finally:
             mp.undo()
-        yield {"idx": _bsl_for(root, reader), "live": _bsl_for(root)}
+        reader = IndexReader(db)
+        copy = _db_copy(str(db), root.parent / "idx_v18" / "bsl_index_v18.db")
+        _downgrade_to_v18(copy)
+        reader18 = IndexReader(copy)
+        yield {"idx": _bsl_for(root, reader18), "idx19": _bsl_for(root, reader), "live": _bsl_for(root)}
         reader.close()
+        reader18.close()
 
     @pytest.mark.parametrize("helpers", ["idx", "live"])
     def test_criterion_target_signalled(self, tree, helpers):
         res = tree[helpers]["find_references_to_object"]("КритерийОтбора.Крит")
         assert res["object"] == "FilterCriterion.Крит"
+        assert {r["kind"] for r in res["references"]} <= {"role_rights"}, res
+        if helpers == "live":
+            # v1.50.0: прежде здесь стоял признак и на живом маршруте — голова таблицы видов вне графа только у v18.
+            assert "target_not_indexed" not in res["_meta"] and "hint" not in res, res
+            return
         assert res["_meta"]["target_not_indexed"] is True, res["_meta"]
         assert "analyze_subsystem('Крит')" in res["hint"] and "find_roles('Крит')" in res["hint"], res
-        assert {r["kind"] for r in res["references"]} <= {"role_rights"}, res
 
     @pytest.mark.parametrize("helpers", ["idx", "live"])
     @pytest.mark.parametrize("ref", _OUTSIDE_GRAPH_REFS)
     def test_known_kinds_outside_graph_signalled(self, tree, helpers, ref):
         res = tree[helpers]["find_references_to_object"](ref)
+        if helpers == "live":
+            # v1.50.0: прежде здесь стоял признак и на живом маршруте — голова таблицы видов вне графа только у v18.
+            assert "target_not_indexed" not in res["_meta"] and "hint" not in res, (ref, res)
+            return
         assert res["_meta"]["target_not_indexed"] is True, (ref, res["_meta"])
         assert f"analyze_subsystem('{ref.split('.')[1]}')" in res["hint"], res
 
     def test_unknown_head_signalled(self, tree):
-        """Голова, которой разбор аргумента не знает (`ОбщийМакет`): ссылок на такой объект граф тоже не хранит."""
+        """v1.50.0: прежде здесь стояло «голова, которой разбор аргумента не знает (`ОбщийМакет`)» — с v1.50.0 это
+        ссылка на общий макет (`CommonTemplate.Макет`): на индексе прежнего поколения — признак вне графа, на v19 —
+        граф хранит цель, признака нет."""
         res = tree["idx"]["find_references_to_object"]("ОбщийМакет.Макет")
+        assert res["object"] == "CommonTemplate.Макет"
         assert res["_meta"]["target_not_indexed"] is True, res["_meta"]
         assert "analyze_subsystem('Макет')" in res["hint"], res
+        res19 = tree["idx19"]["find_references_to_object"]("ОбщийМакет.Макет")
+        assert res19["object"] == "CommonTemplate.Макет" and "target_not_indexed" not in res19["_meta"], res19
 
     @pytest.mark.parametrize("helpers", ["idx", "live"])
     def test_canonical_target_unchanged(self, tree, helpers):
@@ -4242,9 +4325,16 @@ class TestTargetOutsideGraph:
         assert [step["kind"] for step in res["path"]] == ["filter_criterion_type"]
 
     def test_data_path_unknown_head_unchanged(self, tree):
-        """Обе версии: головы, которой хелперы не знают, — прежний отказ."""
+        """v1.50.0: прежде здесь стоял отказ префикса («голова, которой хелперы не знают») — с v1.50.0 `ОбщийМакет.X` —
+        ссылка на общий макет: на индексе прежнего поколения — структурный отказ «в графе ссылок нет» (форма 1.47.0), на
+        v19 — обход (ссылок на макет в дереве нет — окончательный промах без ошибки)."""
         res = tree["idx"]["find_data_path"]("Справочник.Спр", "ОбщийМакет.Макет")
-        assert res["error"] == "endpoints must carry a recognized metadata-type prefix", res
+        assert res["error"].startswith("конец CommonTemplate.Макет: ссылок на объекты вида CommonTemplate"), res
+        res19 = tree["idx19"]["find_data_path"]("Справочник.Спр", "ОбщийМакет.Макет")
+        assert "error" not in res19 and res19["found"] is False, res19
+        assert tree["idx"]["find_data_path"]("Справочник.Спр", "НеизвестныйВид.Макет")["error"] == (
+            "endpoints must carry a recognized metadata-type prefix"
+        )
 
 
 # ═══════════════ Issue #42 — find_register_writers: документы, объявившие регистр в движениях ═══════════════

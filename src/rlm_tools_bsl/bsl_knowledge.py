@@ -883,7 +883,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "print(res['by_kind'], res['total'])",
             "Голое имя — ссылка единственной категории (_meta.resolved_ref); омоним — ValueError",
             "Filter by kind: find_references_to_object('Справочник.Х', kinds=['attribute_type'])",
-            "_meta.kinds_applied — что применено ПОСЛЕ выбора маршрута; unsupported_kinds — LIVE, на index пуст; kinds_unavailable — индекс до v18; _meta.expanded_on_read — раскрыто при чтении",
+            "_meta.kinds_applied — что применено ПОСЛЕ выбора маршрута; unsupported_kinds — LIVE, на index пуст; kinds_unavailable — индекс до v19; _meta.expanded_on_read — раскрыто при чтении",
             "Членство в подсистемах: kinds=['subsystem_content']; на устаревшем индексе состав подсистем мог измениться — проверь live (rlm_index build)",
             "code = find_code_usages('Документ.ПриобретениеТоваровУслуг')  # обращения в коде",
             "print(code['by_kind'])  # manager/ref_type/query/metadata/form; u['member']: член, ТЧ, имя формы",
@@ -1088,7 +1088,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "kinds=['attribute_type'] → фильтр по виду ссылки",
         ],
         "full": [
-            "find_data_path('Документ.РеализацияТоваровУслуг', 'РегистрНакопления.Продажи') → N-hop путь по графу МЕТАДАННЫХ (атрибуты/владелец/основание/...)",
+            "find_data_path('Документ.АвансовыйОтчет', 'Справочник.СтраныМира') → N-hop путь по графу МЕТАДАННЫХ (атрибуты/владелец/основание/...)",
             "endpoints С ПРЕФИКСОМ для ОБОИХ концов (Справочник.X/Catalog.X, Документ.Y/Document.Y); bare-имя → структурный hint без обхода",
             "каждый элемент path = РЕБРО {from, to, kind, used_in, path, line}",
             "kinds=[...] → ограничить виды ссылок (attribute_type, owner, based_on, subsystem_content, ...)",

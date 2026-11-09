@@ -8212,9 +8212,13 @@ def test_find_event_subscriptions_unrecognized_prefix_does_not_poison_ref():
         bsl, _ = _make_subs_env(tmpdir, [("ПодпискаПартии", ["DocumentObject.Партии"])])
         bare = bsl["find_event_subscriptions"]("Партии")
         assert [r["name"] for r in bare] == ["ПодпискаПартии"], bare
-        # Нераспознанный префикс не должен обнулять выдачу — падаем в обычный матчинг по имени.
-        prefixed = bsl["find_event_subscriptions"]("РегламентноеЗадание.Партии")
-        assert [r["name"] for r in prefixed] == ["ПодпискаПартии"], prefixed
+        # v1.50.0: прежде здесь стояло `РегламентноеЗадание.Партии` → ['ПодпискаПартии'] (зазор: префикс срезал
+        # `_strip_meta_prefix`, но не канонизатор). С v1.50.0 единственное число регламентного задания — ссылка (П1), и
+        # ссылка на несуществующее задание — отказ шлюза: зазора между таблицами префиксов больше нет. Голова вне всех
+        # таблиц видов — прежний разбор по имени (как на HEAD: `НеизвестныйВид.Партии` ни с чем не совпадает).
+        with pytest.raises(ValueError, match="^find_event_subscriptions: объекта ScheduledJob.Партии нет"):
+            bsl["find_event_subscriptions"]("РегламентноеЗадание.Партии")
+        assert bsl["find_event_subscriptions"]("НеизвестныйВид.Партии") == []
 
 
 def test_no_posting_handler_signal_when_handler_deleted_from_live_module():

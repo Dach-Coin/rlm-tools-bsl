@@ -701,7 +701,9 @@ class TestDescriptorCategoryRefs:
     def test_references_get_canonical_head(self, world49):
         res = world49[0]["find_references_to_object"]("CommonPictures/Картинка")
         assert res["object"] == "CommonPicture.Картинка", res
-        assert res["_meta"]["target_not_indexed"] is True, res["_meta"]
+        # v1.50.0: прежде здесь стоял `target_not_indexed is True` — с v19 граф хранит цели общих картинок (состав
+        # подсистем, права ролей), и живой разбор состава их видит: признак — только у индекса прежнего поколения.
+        assert "target_not_indexed" not in res["_meta"] and "hint" not in res, res
         assert world49[0]["find_code_usages"]("CommonPictures.Картинка")["object"] == "CommonPicture.Картинка"
 
     @pytest.mark.parametrize(
@@ -725,14 +727,18 @@ class TestDescriptorCategoryRefs:
     # ── границы (обе версии) ──
 
     def test_singular_head_keeps_previous_parse(self, world49):
+        # v1.50.0: прежде здесь стояло «не найден» у `ОбщаяКартинка.Картинка` и `Подсистема.Верх` — единственное число
+        # 21 категории без головы в прежнем разборе — ссылка (П1): ответ тот же, что у пути каталога.
         bsl = world49[0]
-        assert bsl["analyze_object"]("ОбщаяКартинка.Картинка") == {"error": "Объект 'ОбщаяКартинка.Картинка' не найден"}
-        assert bsl["analyze_object"]("Подсистема.Верх") == {"error": "Объект 'Подсистема.Верх' не найден"}
+        assert bsl["analyze_object"]("ОбщаяКартинка.Картинка") == bsl["analyze_object"]("CommonPictures/Картинка")
+        assert bsl["analyze_object"]("Подсистема.Верх") == bsl["analyze_object"]("Subsystems/Верх")
+        assert bsl["analyze_object"]("Подсистема.Верх")["category"] == "Subsystems"
 
     def test_ru_plural_path_keeps_previous_parse(self, world49):
-        assert world49[0]["analyze_object"]("ОбщиеКартинки/Картинка") == {
-            "error": "Объект 'ОбщиеКартинки/Картинка' не найден"
-        }
+        # v1.50.0: прежде здесь стояло «не найден» — русское множественное в пути 21 категории — ссылка (П1).
+        bsl = world49[0]
+        assert bsl["analyze_object"]("ОбщиеКартинки/Картинка") == bsl["analyze_object"]("CommonPictures/Картинка")
+        assert bsl["analyze_object"]("ОбщиеКартинки/Картинка")["category"] == "CommonPictures"
 
     def test_bare_extra_category_word_unchanged(self, world49):
         bsl = world49[0]
@@ -968,7 +974,8 @@ class TestFlagRolesByKind:
             "ОбщийМодуль.ОбщМод",
             "Перечисление.СтавкиНДС",
             "CommonPictures/Картинка",
-            # единственное число RU/EN — не ссылка, но объект строки — общая картинка (как у find_roles)
+            # v1.50.0: прежде здесь стояло «единственное число RU/EN — не ссылка, но объект строки — общая картинка»;
+            # с v1.50.0 это ссылка на общую картинку (П1) — вид без прав, строк по флагу по-прежнему нет
             "ОбщаяКартинка.Картинка",
             "CommonPicture.Картинка",
         ],
@@ -1012,9 +1019,9 @@ class TestFlagRolesByKind:
         ],
     )
     def test_flag_rows_kept_for_singular_of_kinds_with_rights(self, world49, ref):
-        """Обе версии: русское единственное число вида с правами ссылкой не канонизируется (граница разбора), голова
-        строки — не голова списка; вид решает объект строки — роль по флагу у `find_references_to_object`, как у
-        `find_roles` (ревью: сырая голова `canonical` роняла такие строки)."""
+        """Обе версии: роль по флагу у вида с правами — у `find_references_to_object`, как у `find_roles` (ревью: сырая
+        голова `canonical` роняла такие строки). v1.50.0: прежде здесь стояло «русское единственное число вида с
+        правами ссылкой не канонизируется (граница разбора)» — с v1.50.0 оно ссылка (П1), ответ тот же."""
         bsl, _root, route, _fmt = world49
         assert _flag_roles(bsl["find_roles"](ref)) == ["ПолныеПрава"], ref
         if route == "index":
@@ -1082,6 +1089,11 @@ class TestFlagRolesByKind:
 # ═══════════════ Задача 4 (Д9, П5) — вид ссылки characteristic_value_type ═══════════════
 
 _CVT = "characteristic_value_type"
+# v1.50.0: виды, на которые растёт закрытый набор `kinds` (индекс — `kinds_applied`; живьём — поддержанные и
+# `unsupported_kinds`); у индекса до v19 они — в `kinds_unavailable` (объединение поколений).
+_V150_INDEX_KINDS = {"common_attribute_content", "template_query"}
+_V150_LIVE_KINDS = {"common_attribute_content"}
+_V150_LIVE_UNSUPPORTED = {"template_query"}
 _CVT_ATTR_ROWS = {
     "Document.Док.Attribute.Статья.Type",
     "Document.Док.TabularSection.Товары.Attribute.Аналитика.Type",
@@ -1211,11 +1223,16 @@ class TestCharacteristicValueRefs:
         meta = res["_meta"]
         assert meta["expanded_on_read"] == ({"role_rights": 1} if route == "index" else {}), meta
         assert meta["kinds_unavailable"] == [] and meta["kinds_requested"] == []
-        assert sorted(set(meta["kinds_applied"]) - {_CVT}) == (
+        # v1.50.0: прежде здесь вычитался только `characteristic_value_type` — набор видов вырос ещё на виды v1.50.0.
+        new_kinds = _V150_INDEX_KINDS if route == "index" else _V150_LIVE_KINDS
+        assert sorted(set(meta["kinds_applied"]) - {_CVT} - new_kinds) == (
             _HEAD_APPLIED_INDEX if route == "index" else _HEAD_APPLIED_LIVE
         )
+        assert new_kinds <= set(meta["kinds_applied"])
         assert _CVT in meta["kinds_applied"] and meta["kinds_applied"] == sorted(meta["kinds_applied"])
-        assert meta["unsupported_kinds"] == ([] if route == "index" else _HEAD_UNSUPPORTED_LIVE)
+        assert meta["unsupported_kinds"] == (
+            [] if route == "index" else sorted({*_HEAD_UNSUPPORTED_LIVE, *_V150_LIVE_UNSUPPORTED})
+        )
         if route != "index":
             return
         # Индекс прежнего поколения: те же строки, вид — в `kinds_unavailable` (как прочие виды v18).
@@ -1224,7 +1241,10 @@ class TestCharacteristicValueRefs:
             helpers = _world49_helpers(bsl.root, bsl.ext_root, reader)
             old = helpers["find_references_to_object"]("Справочник.Спр2")
             assert [(r["used_in"], r["path"], r["kind"]) for r in old["references"]] == rows, old
-            assert old["_meta"]["kinds_unavailable"] == sorted({*_HEAD_V18_KINDS, _CVT}), old["_meta"]
+            # v1.50.0: прежде здесь стояли только виды v18 — у индекса до v18 нет и видов v19 (объединение поколений).
+            assert old["_meta"]["kinds_unavailable"] == sorted({*_HEAD_V18_KINDS, _CVT, *_V150_INDEX_KINDS}), old[
+                "_meta"
+            ]
         finally:
             reader.close()
 
@@ -2543,7 +2563,11 @@ class TestNameCheckWithoutSearch:
             bsl["find_roles"]("Справочник.НетТакого")
         if self._routes(bsl):
             assert str(similar.value).endswith("проверьте имя: search_objects('Сп')"), similar.value
-            assert str(none.value).endswith("проверьте имя: search_objects('НетТакого')"), none.value
+            # v1.50.0: прежде здесь стояло search_objects('НетТакого') — совет, исполнив который получишь пусто; поиск по
+            # всему вводу пуст — фрагмент (две трети имени), пуст и он — «похожих имен нет» (П3).
+            assert str(none.value).endswith("проверьте имя: похожих имен нет: search_objects('НетТак') пуст"), (
+                none.value
+            )
             return
         text = str(similar.value)
         assert "проверьте имя: похожие на диске — " in text, text

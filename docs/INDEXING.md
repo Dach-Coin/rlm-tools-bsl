@@ -207,7 +207,7 @@ FTS search:  yes
 Synonyms:    yes
 
 Index built in 344.7s
-  Index:    v18
+  Index:    v19
   Config:   УправлениеПредприятием 2.5.20.80
   Format:   cf
   Modules:  24055
@@ -367,6 +367,22 @@ $ rlm-bsl-index index drop D:\ERP\src
 собран до появления вида», а не «ссылок нет». Колонки `form_item`/`form_event` ридер читает `SELECT *`: на индексе
 v17 оба ключа строки — `None`.
 
+**v19 (v1.50.0) — пересборка ОБЯЗАТЕЛЬНА.** Порог принудительной пересборки в `update` поднят до
+`old_version < 19`: первый `index update` старого индекса пересобирает его целиком, до этого старый индекс продолжает
+работать, а `rlm_start` предупреждает строкой `OLD_INDEX_GAPS` (19). Схема прежняя (33 таблицы + FTS5, новых колонок
+нет); меняется содержимое `metadata_references` — производные НЕИЗМЕННЫХ исходников, которые полный скан по
+mtime/size не перечитал бы.
+
+| Таблица | Изменение |
+| --- | --- |
+| `metadata_references` | цель ссылок состава подсистем, прав ролей, состава и хранения ФО и основной таблицы формы — объект любого из 47 видов (строки у целей 21 вида вне прежнего графа); права ролей и состав ФО — строка на объект, а не на путь члена (вложенная подсистема — последняя в цепочке); новые виды `common_attribute_content` и `template_query`; строки `linked_object` ссылок разделения общих реквизитов |
+| `index_meta` | git-путь пересчитывает `object_attributes_count`/`predefined_items_count` (`COUNT(*)`) после ветки метаданных |
+
+Снимок входов получил домен `template_queries` (опись макетов СКД); снимок индекса прежнего поколения к новому коду не
+привязывается. Поколение v19 ридер узнаёт той же однократной пробой: на индексе v18 `find_references_to_object` называет
+новые виды в `_meta.kinds_unavailable` (у индекса v17 — вместе с видами v18), а цели 21 вида вне прежнего графа — в
+`_meta.target_not_indexed`; `find_data_path` у такого конца-цели — структурный отказ «в графе ссылок нет».
+
 **Новые SELECT-ы гейтятся по `builder_version >= 16`.** На открытом индексе v15 безусловный SELECT дал бы `sqlite3.OperationalError`, который ридер деградирует в `None`, — и целый домен (например, подписки) молча ушёл бы в живой XML-разбор ещё до пересборки. Поколение читается ОДНОКРАТНОЙ пробой при открытии ридера (прецедент — `_has_callee_key`), поэтому **гейт живёт от открытия ридера до `rlm_end`**: сессия, открытая на v15 и пережившая `rlm_index update`, до конца своей жизни останется на старом наборе SELECT-ов, хотя база уже v16. После пересборки индекса сессию нужно переоткрыть.
 
 ### index_meta
@@ -375,8 +391,8 @@ v17 оба ключа строки — `None`.
 
 | key                     | Описание                                                | Пример                             |
 | ----------------------- | ------------------------------------------------------- | ---------------------------------- |
-| `version`               | Версия схемы                                            | `18`                               |
-| `builder_version`       | Версия построителя                                      | `18`                               |
+| `version`               | Версия схемы                                            | `19`                               |
+| `builder_version`       | Версия построителя                                      | `19`                               |
 | `bsl_count`             | Количество .bsl файлов                                  | `23461`                            |
 | `paths_hash`            | MD5-хеш отсортированных путей                           | `6c4e5a0f0d506f67...`              |
 | `built_at`              | Unix-timestamp сборки или последнего `update`           | `1773740509.56`                    |
@@ -402,9 +418,9 @@ v17 оба ключа строки — `None`.
 | `has_form_elements`     | Есть ли таблица form_elements (0/1)                     | `1`                                |
 | `form_elements_count`   | Количество записей в таблице form_elements              | `250000`                           |
 | `has_object_attributes` | Есть ли таблица object_attributes (0/1)                 | `1`                                |
-| `object_attributes_count` | Количество записей в таблице object_attributes        | `72663`                            |
+| `object_attributes_count` | Количество записей в таблице object_attributes (сборка, полный скан; с v1.50.0 — и git-путь после ветки метаданных) | `72663`                            |
 | `has_predefined_items`  | Есть ли таблица predefined_items (0/1)                  | `1`                                |
-| `predefined_items_count` | Количество записей в таблице predefined_items          | `4006`                             |
+| `predefined_items_count` | Количество записей в таблице predefined_items (как `object_attributes_count`) | `4006`                             |
 
 ### modules
 
@@ -686,7 +702,7 @@ EDT-разбор ставил `1` безусловно, и на EDT-конфиг
 | `right_name`  | TEXT       | Имя права                          | `Read`, `Insert`, `Posting`       |
 | `file`        | TEXT       | Относительный путь к XML           | `Roles/Имя/Ext/Rights.xml`        |
 
-Хранятся только granted-права (`<value>true</value>`). Объект хранится с полным именем (напр. `Document.РеализацияТоваровУслуг`), reader ищет через `LIKE '%name%'` — поиск и по полному, и по короткому имени.
+Хранятся только granted-права (`<value>true</value>`). Объект хранится с полным именем (напр. `Document.РеализацияТоваровУслуг`), reader ищет через `LIKE '%name%'` — поиск и по полному, и по короткому имени. Граница (v1.50.0): роль, у которой на объект только запреты (все права `false`), строк не даёт — права ролей складываются, такая роль прав не выдаёт; `find_roles` на пустом ответе об объекте вида с правами называет это в `hint`. В `metadata_references` (вид `role_rights`) с v19 — строка на роль и ОБЪЕКТ (права на члены объекта сводятся к объекту), сырые имена прав в этой таблице прежние.
 
 Ускоряет хелперы: `find_roles()`.
 
@@ -1234,7 +1250,57 @@ Unified reverse-index всех ссылок объектов метаданны�
 хелперы называют такую цель: `find_references_to_object` — `_meta.target_not_indexed` и подсказкой
 (`analyze_subsystem`/`find_roles`), `find_data_path` — структурной ошибкой без обхода; прежде ответ был тихо неполон.
 
-Перечень `ref_kind` (закрытый набор `kinds` хелперов; порядок — приоритет сортировки `IndexReader._REF_KIND_SQL_PRIORITY`, единственная карта): `attribute_type`, `subsystem_content`, `exchange_plan_content`, `functional_option_content`, `event_subscription_source`, `role_rights`, `defined_type_content`, `characteristic_type`, `owner`, `based_on`, `default_object_form`, `default_list_form`, `command_parameter_type`, `predefined_characteristic_type`; с v1.47.0 (v18) — `document_journal_content` (`DocumentJournal.X.RegisteredDocuments`), `filter_criterion_type` (`FilterCriterion.X.Type`), `filter_criterion_content` (`FilterCriterion.X.Content`, одна строка на объект состава: элемент `Document.Y.Attribute.Z` ссылается на `Document.Y`) и `linked_object` (связующее свойство: `AccountingRegister.X.ChartOfAccounts`, `ChartOfAccounts.X.ExtDimensionTypes`, `CalculationRegister.X.ChartOfCalculationTypes` и `.Schedule`, `ChartOfCalculationTypes.X.BaseCalculationTypes`, `BusinessProcess.X.Task`; вытесняющие и ведущие виды расчёта — стандартные табличные части, а не свойства, строк не дают). Виды форм (v1.47.0, v18) — `form_attribute_type` (типы реквизитов формы на любой глубине — реквизит, колонки и дополнительные колонки, типы элементов списка значений, параметры динамического списка — и параметров формы), `form_main_table` (основная таблица динамического списка), `form_query` (объекты, названные в тексте запроса динамического списка: путь `<Вид>.X[.…]` единственного числа RU/EN, как у вида `query` в коде; комментарии и строковые литералы запроса погашены маской; одна строка на объект и текст): `source_object`/`source_category` — владелец формы (у общей формы — сама форма, `CommonForms`), `path` — файл формы, `used_in` — `<Тип>.<Объект>.Form.<Ф>.Attribute.<Р>[.Column.<К>].Type`, `….Parameter.<П>.Type`, `….Attribute.<Р>.MainTable`, `….Attribute.<Р>.QueryText` (`CommonForm.<Ф>.…`). Пишет их шаг `form_elements` тем же разбором формы (один `ET.fromstring` на форму); живой маршрут `find_references_to_object` форм не разбирает. На крупной ERP-конфигурации — около 34 тыс. строк, шаг `form_elements` дорожает на ~2 с (меньше 0,5 % полной сборки). `main_form`, `list_form`, `choice_parameter_link`, `link_by_type` объявлены, но сборщиком не производятся: тегов `MainForm`/`ListForm` в выгрузках нет, связи параметров выбора ссылаются на данные того же объекта (строк этих видов нет ни в одном индексе). С v1.49.0 — `characteristic_value_type` (реквизит типа «значения характеристик ПВХ», тип-набор `Characteristic.X`): строк в таблице у вида нет — `find_references_to_object` раскрывает их на чтении (`IndexReader.find_characteristic_value_refs`) из `object_attributes` (токен в `attr_type`; `used_in` — как у `attribute_type` того же реквизита) и `form_elements` (верхние реквизиты форм, `….Form.<Ф>.Attribute.<Р>.Type`); общий канонизатор токен отбрасывает, иначе строки на ПВХ протекли бы в состав определяемых типов и подписок.
+**v1.50.0 (v19) — цель ссылки состава и прав — объект любого из 47 видов.** Источники состава и прав — состав
+подсистем, права ролей, состав и хранение функциональных опций, основная таблица динамического списка формы —
+канонизируют цель отдельным канонизатором ссылки на объект (`bsl_xml_parsers.canonicalize_object_ref`, таблица видов
+`OBJECT_KIND_HEADS`): строки появляются и у целей 21 вида вне прежнего графа (общие картинки, элементы стиля, общие
+макеты, XDTO-пакеты, параметры сеанса, веб- и HTTP-сервисы, критерии отбора, хранилища настроек, внешние источники
+данных, общие реквизиты и прочие каталоги без модулей). Путь члена объекта в составе ФО и правах
+(`Document.X.Attribute.Y`, `Catalog.X.TabularSection.T.Attribute.Z`, `Document.X.Command.K`, измерение, ресурс,
+реквизит адресации) — строка на сам объект, одна на источник, отношение и объект: у ФО отношений два — состав
+(`….Content`) и хранение (`….Location`), и объект, который стоит в обоих, сохраняет две строки; вложенная подсистема
+(`Subsystem.A.Subsystem.B`) — ссылка на последнюю подсистему цепочки; права на саму конфигурацию (`Configuration.X`) и
+UUID-элементы состава подсистем строк не дают. Прецедент — `filter_criterion_content` (1.47.0). Таблицы `role_rights`,
+`role_exclusions`, `functional_options` и `subsystem_content` хранят сырые значения, как прежде; общий канонизатор
+типов `canonicalize_type_ref` (типы реквизитов, подписки, литералы кода) не меняется; триггеры инвалидирования прежние.
+На индексе v18 до пересборки — прежние строки (путь члена в `ref_object`, без целей вне графа). Граница: значение заполнения реквизита (`FillValue`) строкой не выдаётся — тип того же реквизита уже даёт `attribute_type`. Признак хелперов
+`_meta.target_not_indexed` у этих 21 видов — только на индексе v18, у головы вне таблицы видов — всегда; структурный
+отказ `find_data_path` у такого конца-цели — только на индексе v18 (голова вне таблицы видов — прежний отказ префикса).
+
+Перечень `ref_kind` (закрытый набор `kinds` хелперов; порядок — приоритет сортировки `IndexReader._REF_KIND_SQL_PRIORITY`, единственная карта): `attribute_type`, `subsystem_content`, `exchange_plan_content`, `functional_option_content`, `event_subscription_source`, `role_rights`, `defined_type_content`, `characteristic_type`, `owner`, `based_on`, `default_object_form`, `default_list_form`, `command_parameter_type`, `predefined_characteristic_type`; с v1.47.0 (v18) — `document_journal_content` (`DocumentJournal.X.RegisteredDocuments`), `filter_criterion_type` (`FilterCriterion.X.Type`), `filter_criterion_content` (`FilterCriterion.X.Content`, одна строка на объект состава: элемент `Document.Y.Attribute.Z` ссылается на `Document.Y`) и `linked_object` (связующее свойство: `AccountingRegister.X.ChartOfAccounts`, `ChartOfAccounts.X.ExtDimensionTypes`, `CalculationRegister.X.ChartOfCalculationTypes` и `.Schedule`, `ChartOfCalculationTypes.X.BaseCalculationTypes`, `BusinessProcess.X.Task`; вытесняющие и ведущие виды расчёта — стандартные табличные части, а не свойства, строк не дают). Виды форм (v1.47.0, v18) — `form_attribute_type` (типы реквизитов формы на любой глубине — реквизит, колонки и дополнительные колонки, типы элементов списка значений, параметры динамического списка — и параметров формы), `form_main_table` (основная таблица динамического списка), `form_query` (объекты, названные в тексте запроса динамического списка: путь `<Вид>.X[.…]` единственного числа RU/EN, как у вида `query` в коде; комментарии и строковые литералы запроса погашены маской; одна строка на объект и текст): `source_object`/`source_category` — владелец формы (у общей формы — сама форма, `CommonForms`), `path` — файл формы, `used_in` — `<Тип>.<Объект>.Form.<Ф>.Attribute.<Р>[.Column.<К>].Type`, `….Parameter.<П>.Type`, `….Attribute.<Р>.MainTable`, `….Attribute.<Р>.QueryText` (`CommonForm.<Ф>.…`). Пишет их шаг `form_elements` тем же разбором формы (один `ET.fromstring` на форму); живой маршрут `find_references_to_object` форм не разбирает. На крупной ERP-конфигурации — около 34 тыс. строк, шаг `form_elements` дорожает на ~2 с (меньше 0,5 % полной сборки). `main_form`, `list_form`, `choice_parameter_link`, `link_by_type` объявлены, но сборщиком не производятся: тегов `MainForm`/`ListForm` в выгрузках нет, связи параметров выбора ссылаются на данные того же объекта (строк этих видов нет ни в одном индексе). С v1.49.0 — `characteristic_value_type` (реквизит типа «значения характеристик ПВХ», тип-набор `Characteristic.X`): строк в таблице у вида нет — `find_references_to_object` раскрывает их на чтении (`IndexReader.find_characteristic_value_refs`) из `object_attributes` (токен в `attr_type`; `used_in` — как у `attribute_type` того же реквизита) и `form_elements` (верхние реквизиты форм, `….Form.<Ф>.Attribute.<Р>.Type`); общий канонизатор токен отбрасывает, иначе строки на ПВХ протекли бы в состав определяемых типов и подписок. С v1.50.0 (v19) — `common_attribute_content` (состав общего реквизита, `CommonAttribute.<Имя>.Content`: объекты элементов `Use`, а при `AutoUse=Use` — и `Auto`; одна строка на реквизит и объект, `line=None`; `source_category` — `CommonAttributes`) и `template_query` (объекты, названные в текстах запросов макетов СКД, — см. абзац ниже).
+
+**v1.50.0 (v19) — общие реквизиты.** Категория «только ссылок» (`_REFS_ONLY_CATEGORIES`), в категориях-триггерах
+`metadata_references`; описатель — один файл (`CommonAttributes/<Имя>.xml` выгрузки Конфигуратора без каталога, EDT —
+`CommonAttributes/<Имя>/<Имя>.mdo`), отдельного файла состава, как у плана обмена, нет. Строки: состав —
+`common_attribute_content` по явному использованию; неявный состав разделителей (`AutoUse=Use`, объект в составе не
+перечислен — у `ОбластьДанныхОсновныеДанные` состав состоит из одних исключений `DontUse`) строк не даёт (граница);
+условное разделение элемента состава (`xr:ConditionalSeparation` внутри `<xr:Item>`, в выгрузках пусто) не читается.
+Собственные свойства реквизита — `linked_object` (`CommonAttribute.<Имя>.DataSeparationValue`, `.DataSeparationUse` →
+параметры сеанса, `.ConditionalSeparation` → константа). Обновление — bulk-fallback по категории (вне pointwise
+whitelist). На индексе прежнего поколения `find_references_to_object` называет вид в `_meta.kinds_unavailable`.
+
+**v1.50.0 (v19) — запросы макетов СКД (`template_query`).** Макет СКД (схема компоновки данных) отчёта, обработки,
+объекта любой категории и общий макет называет в текстах запросов объекты, из которых берёт данные: прежде ни сборщик,
+ни код модуля отчёта этих ссылок не давали. Обнаружение — по пути: выгрузка Конфигуратора — описатель
+`<Владелец>/Templates/<Макет>.xml` (и `CommonTemplates/<Макет>.xml`) с `<TemplateType>DataCompositionSchema</TemplateType>`
+и содержимое `…/<Макет>/Ext/Template.xml`; EDT — файл `<Владелец>/Templates/<Макет>/Template.dcs` (и
+`CommonTemplates/<Макет>/Template.dcs`: имя файла и есть признак). Тексты — узлы `<query>` всех наборов-запросов
+(`xsi:type="DataSetQuery"` на любой глубине, в том числе внутри объединения наборов), объекты — тем же разбором текста,
+что у `form_query` (путь `<Вид>.X` RU/EN, комментарии `//` и строковые литералы погашены; параметры `&П`,
+`ВЫРАЗИТЬ(… КАК Справочник.X)`, виртуальные таблицы `РегистрНакопления.X.Остатки(` — объект `X`). Строка — одна на макет
+и объект по всем запросам макета (ключ — `used_in` и имя объекта без учёта регистра; в строку идёт первое написание):
+`used_in` — `<Тип>.<Объект>.Template.<Макет>.Query` (у общего макета — `CommonTemplate.<Имя>.Query`; имена наборов в
+`used_in` не входят), `source_object`/`source_category` — владелец (у общего макета — сам макет, `CommonTemplates`),
+`path` — файл содержимого, `line=None`. Битый файл — пропуск с предупреждением в журнале. Запросы, которые код модуля
+отчёта собирает или подставляет программно, — не макет (их видит `find_code_usages`); макеты других типов (табличный,
+текстовый, двоичный) не разбираются; живой маршрут `find_references_to_object` макетов не читает (вид — в
+`_meta.unsupported_kinds`, как виды форм). Шаг записи — собственный (как у видов форм): строки пишет коллектор макетов,
+а DELETE точечного обновления объекта и bulk-fallback по категории их не трогают (`AND ref_kind NOT IN (<виды форм>,
+'template_query')`). На крупной ERP-конфигурации (1,3 тыс. макетов СКД, 108 МБ) — 7,5–8,2 тыс. строк; добавка
+контура «обнаружение, разбор, опись снимка, запись» — 7–9 с CPU на сборку и на полный скан, где запросы макетов
+менялись, а полный скан при неизменном домене платит только опись снимка — 2–4 с (замер на тёплом кеше). Git-путь
+обновляет строки затронутых макетов по самой дельте; смена регистра владельца или макета (написание пути расходится
+с диском, как у шага форм) — пересчёт домена целиком.
 
 **v1.47.0 — журналы, критерии отбора, связующие свойства.** Журналы документов и критерии отбора — категории «только ссылок» (`_REFS_ONLY_CATEGORIES`: реквизитов нет, описатель даёт ссылки), обе — в категориях-триггерах `metadata_references`, обновляются bulk-fallback по категории. Связующие свойства регистров бухгалтерии и планов счетов идут точечным путём Group A, регистров расчёта, планов видов расчёта и бизнес-процессов — bulk-fallback. Прежде, например, `find_references_to_object('ПланСчетов.Хозрасчетный')` не называл использующий его регистр бухгалтерии, а документ — журнал и критерии отбора, в которые он входит. На индексе прежнего поколения `find_references_to_object` называет эти виды в `_meta.kinds_unavailable`.
 
@@ -1410,7 +1476,8 @@ ERP-конфигурации: сбор метаданных 511 с против 
 **Снимок входов (v1.48.0).** Сборка и полный скан публикуют рядом с БД служебный файл `build_inputs.v1.json.gz` —
 дайджесты входов доменов описателей: метаданных (все каталоги, пути всех файлов, кроме `.bsl`, и хеши содержимого
 описателей `.xml`/`.mdo`/`.xdto`/`.command`/`.form`/`.rights`), форм, прав, синонимов и перехватов расширений (деревья
-расширений с хешами). Следующий полный скан считает те же дайджесты по содержимому файлов и **не перечитывает домен,
+расширений с хешами); с v1.50.0 — и запросов макетов СКД (файлы содержимого макетов СКД и их описатели
+выгрузки Конфигуратора: тип макета решает обнаружение). Следующий полный скан считает те же дайджесты по содержимому файлов и **не перечитывает домен,
 входы которого не изменились**; изменившийся домен перечитывается целиком, как прежде. Совпадения размера и времени
 файла для пропуска мало: правку равной длины с прежним временем полный скан видит по хешу. Перехваты пропускаются
 только без изменённых `.bsl` основной конфигурации (их привязка читает модули и методы индекса). Хеш считается при том
@@ -1488,6 +1555,11 @@ ERP-конфигурации: сбор метаданных 511 с против 
      Git-дельте: перечитываются только затронутые каталоги форм и файлы прав.
    - Если метаданные не менялись (только `.bsl`) — таблицы метаданных
      не пересобираются, `file_paths` обновляется инкрементально.
+   - v1.50.0: после ветки метаданных (точечной или bulk-fallback) метаполя
+     `object_attributes_count`/`predefined_items_count` пересчитываются `COUNT(*)`
+     своих таблиц — как у сборки и полного скана (прежде git-путь их не писал, и
+     `index_meta` после `update` расходился со свежей сборкой; агент этого не видел:
+     `rlm_start`, `get_index_info()` и `index info` берут `COUNT(*)`).
    - `extension_overrides` пересобираются при любой BSL-дельте.
    - Level-1 metadata (`config_name`, `config_version`, `shallow_bsl_count` и др.)
      обновляется всегда, независимо от типа изменений.
@@ -1535,6 +1607,8 @@ ERP-конфигурации: сбор метаданных 511 с против 
 | `.xml`/`.mdo` в `Documents/` (NEW v16) | + `declared_register_records` |
 | `.xml`/`.mdo` в `BusinessProcesses/`, `Tasks/`, `ChartsOfAccounts/`, `ChartsOfCalculationTypes/`, `ExchangePlans/`, `DataProcessors/`, `Reports/`, `CalculationRegisters/` (v1.47.0) | `object_attributes` и `metadata_references` — все ссылки описателя (до v1.47.0 у первых пяти — только `based_on` отдельным циклом, у трёх последних — ничего); `ChartsOfAccounts` — точечным путём Group A, прочие — bulk-fallback по категории |
 | `.xml`/`.mdo` в `DocumentJournals/`, `FilterCriteria/` (v1.47.0) | `metadata_references` (source_category — категория): журнал — `document_journal_content`, критерий отбора — `filter_criterion_type` и `filter_criterion_content`, у обоих — `command_parameter_type` команд из описателя; категории «только ссылок» (`_REFS_ONLY_CATEGORIES`) — bulk-fallback по категории (вне pointwise whitelist) |
+| `.xml`/`.mdo` в `CommonAttributes/` (v1.50.0, v19) | `metadata_references` (source_category=CommonAttributes): `common_attribute_content` и `linked_object` ссылок разделения; категория «только ссылок» — bulk-fallback по категории |
+| `.dcs` (EDT), `.xml` под `<Категория>/<Объект>/Templates/` и `CommonTemplates/` (v1.50.0, v19) | `metadata_references` вида `template_query` — выборочно по самой дельте: у затронутых макетов строки удаляются по `path` (оба возможных файла содержимого) и строятся заново тем же правилом обнаружения; путь вне правила (иная глубина или имя файла) и написание владельца или макета, расходящееся с диском (смена только регистра — в дельте либо в строках индекса), — пересчёт домена целиком. Описатель владельца EDT (`.mdo`) домен не трогает: появление, удаление, переименование и смена типа макета EDT видны как изменение пути `.dcs`. Правка CF `Template.xml` макета документа или справочника (Group A) идёт и точечным путём объекта, отчёта и общего макета — bulk-fallback категории; строк макетов ни тот, ни другой не стирает |
 
 > **Правило гейта общего цикла `_ATTR_CATEGORIES` (v1.47.0).** Отдельного цикла
 > `based_on` больше нет: все его категории — в общем цикле реквизитов и ссылок
@@ -1542,7 +1616,7 @@ ERP-конфигурации: сбор метаданных 511 с против 
 > `attrs_cats = changed ∩ (_ATTR_CATEGORIES | _PREDEFINED_CATEGORIES)`, а
 > `_insert_metadata_tables_selective` БЕЗУСЛОВНО делает
 > `DELETE FROM metadata_references WHERE source_category IN (triggered) AND ref_kind NOT IN
-> (<виды форм>)` (строки видов форм обновляет шаг `form_elements`). Поэтому каждая
+> (<виды форм>, 'template_query')` (строки видов форм обновляет шаг `form_elements`, запросов СКД — шаг макетов). Поэтому каждая
 > категория `_ATTR_CATEGORIES` (и `Constants`, и категории только ссылок) ОБЯЗАНА быть в
 > `_METADATA_REFERENCES_TRIGGER_CATEGORIES` — иначе bulk-fallback не стёр бы её ссылок
 > (тест). Прежняя ловушка — гейт отдельного цикла `based_on` по `collect_attrs_categories`,

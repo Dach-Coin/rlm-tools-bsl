@@ -121,7 +121,7 @@ def _row_type_sets(row) -> list[str]:
     return _json_list(raw)
 
 
-BUILDER_VERSION = 18
+BUILDER_VERSION = 19
 
 # Недостачи индекса ПРЕЖНЕГО поколения по сравнению с текущим — одна строка на бамп.
 # rlm_start склеивает тексты всех строк с порогом выше версии индекса. Последняя строка
@@ -144,6 +144,12 @@ OLD_INDEX_GAPS: tuple[tuple[int, str], ...] = (
         "и типов-наборов выгрузки Конфигуратора; find_code_usages не видит Метаданные.<Коллекция>.X, путей форм и члена менеджера; "
         "вызов, разорванный переносом строки или пробелом, записан голым; нет движений таблиц БГУ и делегата "
         "модуля объекта, состояния регламентных заданий EDT и объектов без синонима",
+    ),
+    (
+        19,
+        "в нем нет ссылок на объекты общих картинок, элементов стиля, общих макетов, XDTO-пакетов, параметров "
+        "сеанса, сервисов и прочих видов вне графа, ссылок состава общих реквизитов и запросов макетов СКД; "
+        "состав ФО и права ролей записаны по путям членов, а не по объекту",
     ),
 )
 
@@ -1644,6 +1650,8 @@ _CATEGORY_TO_TYPE_PREFIX: dict[str, str] = {
     # v1.47.0: владелец форм — строки ссылок из форм (`_FORM_SOURCE_REF_KINDS`) называют его типом, как прочих
     # владельцев (прежде голова `used_in` была именем папки `SettingsStorages`).
     "SettingsStorages": "SettingsStorage",
+    # v1.50.0 (Д9, Д15): источник `common_attribute_content` и ссылок разделения (`CommonAttribute.<Имя>.…`).
+    "CommonAttributes": "CommonAttribute",
 }
 
 # Top-level categories that contribute rows into metadata_references.
@@ -1674,6 +1682,8 @@ _METADATA_REFERENCES_TRIGGER_CATEGORIES: frozenset[str] = frozenset(
         "FilterCriteria",
         "Reports",
         "DataProcessors",
+        # v1.50.0 (Д9, Д15): общие реквизиты — состав и ссылки разделения.
+        "CommonAttributes",
     }
 )
 
@@ -1704,7 +1714,8 @@ _ATTR_CATEGORIES: list[str] = [
 
 # v1.47.0: категории, чей описатель даёт только ссылки (реквизитов нет): журнал документов — регистрируемые
 # документы, критерий отбора — тип и состав. Каждая обязана быть в `_METADATA_REFERENCES_TRIGGER_CATEGORIES` (тест).
-_REFS_ONLY_CATEGORIES: list[str] = ["DocumentJournals", "FilterCriteria"]
+# v1.50.0 (Д9, Д15): и общие реквизиты — состав (`common_attribute_content`) и ссылки разделения (`linked_object`).
+_REFS_ONLY_CATEGORIES: list[str] = ["DocumentJournals", "FilterCriteria", "CommonAttributes"]
 
 # v16 (Задача 9): категории, которые ПОДДЕРЖИВАЮТ ввод на основании, но в
 # прежние шесть категорий `_ATTR_CATEGORIES` не входили. v1.47.0: все они — в общем
@@ -5498,6 +5509,7 @@ def _collect_metadata_tables(
     Each value is a list of tuples ready for INSERT.
     """
     from rlm_tools_bsl.bsl_xml_parsers import (
+        canonicalize_object_ref,
         canonicalize_type_ref,
         parse_command_parameter_type,
         parse_defined_type,
@@ -5681,11 +5693,15 @@ def _collect_metadata_tables(
                 rel,
             )
         )
-        # Emit metadata_references for each content object
+        # Emit metadata_references for each content object. v1.50.0 (П10, У4, Д8): цель — ОБЪЕКТ любого из 47 видов
+        # (`canonicalize_object_ref`: путь члена — объект, вложенная подсистема — последняя в цепочке); одна строка на
+        # (ФО, отношение, объект) — состав и хранение отдельно, как у критерия отбора (тип и состав).
         if _ref_allowed("FunctionalOptions"):
+            fo_seen: set[str] = set()
             for ref_str in fo_content:
-                canon = canonicalize_type_ref(ref_str)
-                if canon:
+                canon = canonicalize_object_ref(ref_str)
+                if canon and canon not in fo_seen:
+                    fo_seen.add(canon)
                     result["metadata_references"].append(
                         (
                             parsed["name"],
@@ -5702,8 +5718,7 @@ def _collect_metadata_tables(
         if loc and _ref_allowed("FunctionalOptions"):
             parts = loc.split(".")
             if len(parts) >= 2:
-                ref_obj = ".".join(parts[:2])
-                canon = canonicalize_type_ref(ref_obj)
+                canon = canonicalize_object_ref(loc)
                 if canon:
                     result["metadata_references"].append(
                         (
@@ -5827,7 +5842,9 @@ def _collect_metadata_tables(
                 )
             )
             if _ref_allowed("Subsystems"):
-                canon = canonicalize_type_ref(obj_ref)
+                # v1.50.0 (П5, Д7): цель — объект любого из 47 видов (общая картинка, элемент стиля, XDTO-пакет…);
+                # UUID-элемент состава объектом не становится.
+                canon = canonicalize_object_ref(obj_ref)
                 if canon:
                     result["metadata_references"].append(
                         (
@@ -6536,13 +6553,14 @@ def _insert_metadata_tables_selective(
 
     # Category-aware DELETE for metadata_references (v1.9.0). v1.47.0: строки форм (`_FORM_SOURCE_REF_KINDS`) пишет шаг
     # `form_elements` — правка описателя их не стирает (иначе bulk-fallback категории терял бы ссылки её форм).
+    # v1.50.0 (П7): и строки запросов СКД (`_SEPARATE_STEP_REF_KINDS`) — их пишет шаг макетов.
     triggered_ref_cats = _METADATA_REFERENCES_TRIGGER_CATEGORIES & changed_categories
     if triggered_ref_cats:
         placeholders = ",".join("?" for _ in triggered_ref_cats)
         try:
             conn.execute(
                 f"DELETE FROM metadata_references WHERE source_category IN ({placeholders}) "  # noqa: S608
-                f"AND ref_kind NOT IN {_FORM_SOURCE_REF_KINDS_SQL}",
+                f"AND ref_kind NOT IN {_SEPARATE_STEP_REF_KINDS_SQL}",
                 tuple(triggered_ref_cats),
             )
         except sqlite3.OperationalError:
@@ -7486,9 +7504,10 @@ def _refresh_object(
     )
     if opt.get("has_metadata_references_table"):
         # v1.47.0: строки форм объекта (`_FORM_SOURCE_REF_KINDS`) обновляет шаг `form_elements`, не точечный путь.
+        # v1.50.0 (П7): и строки запросов СКД его макетов (`_SEPARATE_STEP_REF_KINDS`) — шаг макетов.
         conn.execute(
             "DELETE FROM metadata_references WHERE source_category=? AND source_object=? "  # noqa: S608
-            f"AND ref_kind NOT IN {_FORM_SOURCE_REF_KINDS_SQL}",
+            f"AND ref_kind NOT IN {_SEPARATE_STEP_REF_KINDS_SQL}",
             (category, object_name),
         )
     if opt.get("has_synonyms") and opt.get("has_synonyms_table"):
@@ -8976,13 +8995,17 @@ def _role_rights_rows(granted: list[dict], role_name: str, file_path: str) -> li
 def _role_rights_to_references(
     role_rights_rows: list[tuple[str, str, str, str]],
 ) -> list[tuple]:
-    """Convert role_rights rows into metadata_references rows (one per (role, object))."""
-    from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref
+    """Convert role_rights rows into metadata_references rows (one per (role, object)).
+
+    v1.50.0 (П10, П5, Д8, Д7): цель — ОБЪЕКТ любого из 47 видов (`canonicalize_object_ref`): права на члены объекта
+    (реквизит, ТЧ, команда) — строка на сам объект, вложенная подсистема — на последнюю в цепочке; права на саму
+    конфигурацию (`Configuration.X`) объектом не становятся. Таблица `role_rights` (сырые имена прав) не меняется."""
+    from rlm_tools_bsl.bsl_xml_parsers import canonicalize_object_ref
 
     seen: set[tuple[str, str]] = set()
     out: list[tuple] = []
     for role_name, object_name, _right_name, file_path in role_rights_rows:
-        canon = canonicalize_type_ref(object_name)
+        canon = canonicalize_object_ref(object_name)
         if not canon:
             continue
         key = (role_name, canon)
@@ -9758,6 +9781,326 @@ def _replace_form_refs(conn: sqlite3.Connection, rows: list[tuple]) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# v1.50.0 (П7, У2, У9, Д10): запросы макетов СКД — вид `template_query`, собственный шаг записи
+# ---------------------------------------------------------------------------
+# Строки видов, которые пишет СОБСТВЕННЫЙ шаг (формы — шаг `form_elements`, запросы СКД — шаг макетов): DELETE
+# точечного пути и bulk-fallback по категории их не трогает — правка описателя владельца не стирает ссылок его форм и
+# макетов.
+_TEMPLATE_QUERY_REF_KIND = "template_query"
+_SEPARATE_STEP_REF_KINDS: frozenset[str] = _FORM_SOURCE_REF_KINDS | {_TEMPLATE_QUERY_REF_KIND}
+_SEPARATE_STEP_REF_KINDS_SQL = "(" + ", ".join(f"'{k}'" for k in sorted(_SEPARATE_STEP_REF_KINDS)) + ")"
+# Тип макета в описателе CF (`<Владелец>/Templates/<Макет>.xml`, `CommonTemplates/<Макет>.xml`). Свойство стоит в
+# начале описателя (после имени, синонима и комментария): читается голова файла, остаток — только если узла в ней нет.
+_DCS_TEMPLATE_TYPE_RE = re.compile(rb"<TemplateType>\s*DataCompositionSchema\s*</TemplateType>")
+_DESCRIPTOR_HEAD_BYTES = 4096
+_XSI_TYPE = "{http://www.w3.org/2001/XMLSchema-instance}type"
+
+
+def _dcs_descriptor(path: Path | str) -> bool:
+    """Описатель макета CF объявляет схему компоновки данных (``<TemplateType>DataCompositionSchema</TemplateType>``)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(_DESCRIPTOR_HEAD_BYTES)
+            if _DCS_TEMPLATE_TYPE_RE.search(head):
+                return True
+            if b"</TemplateType>" in head or len(head) < _DESCRIPTOR_HEAD_BYTES:
+                return False
+            return bool(_DCS_TEMPLATE_TYPE_RE.search(head + fh.read()))
+    except OSError:
+        return False
+
+
+def _template_entry(tdir: Path, category: str, owner: str, name: str) -> tuple[str, str, str, Path] | None:
+    """Макет СКД ``name`` в каталоге макетов ``tdir`` по правилу У9 либо ``None``: CF — описатель ``<Макет>.xml`` с
+    типом ``DataCompositionSchema`` и содержимое ``<Макет>/Ext/Template.xml``; EDT — файл ``<Макет>/Template.dcs`` (имя
+    файла и есть признак). ``owner`` пуст у общего макета — объектом строки служит сам макет."""
+    descriptor = tdir / f"{name}.xml"
+    if descriptor.is_file():
+        content = tdir / name / "Ext" / "Template.xml"
+        if _dcs_descriptor(descriptor) and content.is_file():
+            return category, owner or name, name, content
+        return None
+    dcs = tdir / name / "Template.dcs"
+    if dcs.is_file():
+        return category, owner or name, name, dcs
+    return None
+
+
+def _template_dir_entries(tdir: Path, category: str, owner: str) -> list[tuple[str, str, str, Path]]:
+    """Макеты СКД каталога макетов (``<Владелец>/Templates`` либо ``CommonTemplates``) в порядке имени — то же правило,
+    что ``_template_entry``, по одному листингу каталога (без повторных проверок существования описателя)."""
+    try:
+        with os.scandir(tdir) as it:
+            entries = list(it)
+    except OSError:
+        return []
+    descriptors: set[str] = set()
+    dirs: set[str] = set()
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                dirs.add(entry.name)
+            elif entry.name.lower().endswith(".xml") and entry.is_file():
+                descriptors.add(entry.name[:-4])
+        except OSError:
+            continue
+    out: list[tuple[str, str, str, Path]] = []
+    root = os.fspath(tdir)
+    for name in sorted(descriptors | dirs):
+        if name in descriptors:
+            if name in dirs and _dcs_descriptor(os.path.join(root, f"{name}.xml")):
+                content = os.path.join(root, name, "Ext", "Template.xml")
+                if os.path.isfile(content):
+                    out.append((category, owner or name, name, Path(content)))
+            continue
+        dcs = os.path.join(root, name, "Template.dcs")
+        if os.path.isfile(dcs):
+            out.append((category, owner or name, name, Path(dcs)))
+    return out
+
+
+def _template_query_files(base: Path) -> list[tuple[str, str, str, Path]]:
+    """Макеты СКД конфигурации ``(категория владельца, объект, макет, файл содержимого)`` — правило У9 у макетов
+    объектов любой категории (``<Категория>/<Объект>/Templates/``) и общих (``CommonTemplates/``, категория —
+    ``CommonTemplates``, объект — сам макет). Категории не перечисляются поимённо, как у ``_collect_templates``."""
+    out: list[tuple[str, str, str, Path]] = []
+    try:
+        with os.scandir(base) as it:
+            categories = sorted(entry.name for entry in it if entry.is_dir())
+    except OSError:
+        return out
+    for category in categories:
+        cat_dir = base / category
+        if category == "CommonTemplates":
+            out.extend(_template_dir_entries(cat_dir, category, ""))
+            continue
+        try:
+            with os.scandir(cat_dir) as it:
+                objects = sorted(entry.name for entry in it if entry.is_dir())
+        except OSError:
+            continue
+        cat_root = os.fspath(cat_dir)
+        for obj in objects:
+            tdir = os.path.join(cat_root, obj, "Templates")
+            if os.path.isdir(tdir):
+                out.extend(_template_dir_entries(Path(tdir), category, obj))
+    return out
+
+
+def _dcs_query_texts(path: Path) -> list[str] | None:
+    """Тексты ``<query>`` всех наборов-запросов схемы (узел с ``xsi:type`` ``DataSetQuery`` на любой глубине — и
+    ``<item>`` внутри ``DataSetUnion``), сущности XML раскрыты. Разбор — деревом файла, обход — в C (``iter``): так
+    вдвое дешевле потокового разбора с проходом каждого узла в Python (крупнейшая схема корпуса — 3 МБ). Битый или
+    нечитаемый файл — ``None`` и предупреждение в журнал."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError, LookupError, ValueError) as exc:
+        # Разбор байтами доверяет кодировке из объявления XML: неизвестное имя кодека — `LookupError`, многобайтовая
+        # кодировка — `ValueError` («multi-byte encodings are not supported»), сбой декодирования — `UnicodeError`
+        # (подкласс `ValueError`). Битый файл — пропуск, а не сбой всей сборки.
+        logger.warning("template queries: skipping malformed %s: %s", path, exc)
+        return None
+    texts: list[str] = []
+    for el in root.iter():
+        if el.get(_XSI_TYPE, "").rsplit(":", 1)[-1] != "DataSetQuery":
+            continue
+        for child in el:
+            if child.tag.rsplit("}", 1)[-1] == "query":
+                texts.append(child.text or "")
+    return texts
+
+
+def _template_query_rows(base: Path, files: list[tuple[str, str, str, Path]]) -> list[tuple]:
+    """Строки ``metadata_references`` вида ``template_query`` (У2): объекты текстов запросов — тем же разбором, что
+    у ``form_query`` (``_query_text_refs``: комментарии и литералы погашены, путь ``<Вид>.X`` RU/EN), цель —
+    ``canonicalize_object_ref``; одна строка на макет и объект по всем запросам макета — ключ
+    ``(used_in, ref_object.lower())``, первое написание; ``used_in`` — ``<Тип>.<Объект>.Template.<Макет>.Query`` (у
+    общего макета — ``CommonTemplate.<Имя>.Query``), ``path`` — файл содержимого, ``line=None``."""
+    from rlm_tools_bsl.bsl_xml_parsers import OBJECT_KIND_HEADS, canonicalize_object_ref
+
+    rows: list[tuple] = []
+    for category, obj, name, path in files:
+        texts = _dcs_query_texts(path)
+        if texts is None:
+            continue
+        if category == "CommonTemplates":
+            source, used_in = name, f"CommonTemplate.{name}.Query"
+        else:
+            source, used_in = obj, f"{OBJECT_KIND_HEADS.get(category, category)}.{obj}.Template.{name}.Query"
+        rel = path.relative_to(base).as_posix()
+        seen: set[str] = set()
+        for text in texts:
+            for ref in _query_text_refs(text):
+                canon = canonicalize_object_ref(ref)
+                if canon and canon.lower() not in seen:
+                    seen.add(canon.lower())
+                    rows.append((source, category, canon, _TEMPLATE_QUERY_REF_KIND, used_in, rel, None))
+    return rows
+
+
+def _collect_template_queries(base_path: str) -> list[tuple]:
+    """Коллектор домена запросов СКД (задача пула ``template_queries``): обнаружение и разбор."""
+    base = Path(base_path)
+    return _template_query_rows(base, _template_query_files(base))
+
+
+def _replace_template_query_refs(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    """Строки вида ``template_query`` — целиком заново (DELETE вида и вставка): один путь записи у сборки и полного
+    скана. Таблицы нет (индекс без метаданных) — ничего не делает."""
+    try:
+        conn.execute("DELETE FROM metadata_references WHERE ref_kind = ?", (_TEMPLATE_QUERY_REF_KIND,))
+        if rows:
+            _insert_ref_rows(conn, rows)
+    except sqlite3.OperationalError:
+        pass
+
+
+def _template_query_ref_rows(conn: sqlite3.Connection) -> list[tuple]:
+    """Строки вида ``template_query`` — сохранить на время перезаписи ссылок описателей (полный скан при неизменном
+    домене запросов, как ``_form_ref_rows`` у форм)."""
+    try:
+        return [
+            tuple(r)
+            for r in conn.execute(
+                "SELECT source_object, source_category, ref_object, ref_kind, used_in, path, line "
+                "FROM metadata_references WHERE ref_kind = ?",
+                (_TEMPLATE_QUERY_REF_KIND,),
+            )
+        ]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _recount_object_meta(conn: sqlite3.Connection) -> None:
+    """v1.50.0 (П11, Д11): ``object_attributes_count``/``predefined_items_count`` — ``COUNT(*)`` своих таблиц (таблица
+    есть); зовёт git-путь после ветки метаданных."""
+    for key, table in (
+        ("object_attributes_count", "object_attributes"),
+        ("predefined_items_count", "predefined_items"),
+    ):
+        try:
+            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+        except sqlite3.OperationalError:
+            continue
+        conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)", (key, str(count)))
+
+
+def _template_query_trigger(rel: str) -> bool:
+    """Путь git-дельты, который касается домена запросов СКД: ``.dcs`` и ``.xml`` под ``<Категория>/<Объект>/Templates/``
+    или ``CommonTemplates/``. Описатель владельца EDT (``.mdo``) триггером не служит: макет EDT обнаруживается по файлу
+    ``Template.dcs``, и его появление, удаление, переименование и смена типа видны как изменение пути ``.dcs``."""
+    low = rel.lower()
+    if low.endswith(".dcs"):
+        return True
+    if not low.endswith(".xml"):
+        return False
+    parts = rel.split("/")
+    return parts[0] == "CommonTemplates" or (len(parts) > 3 and parts[2] == "Templates")
+
+
+def _template_key(rel: str) -> tuple[str, str, str] | None:
+    """``(категория, владелец, макет)`` пути домена по правилу У9 (у общего макета владелец пуст) либо ``None`` — путь
+    вне правила (иная глубина или имя файла)."""
+    parts = rel.split("/")
+    if parts[0] == "CommonTemplates":
+        head, tail = ("CommonTemplates", ""), parts[1:]
+    elif len(parts) > 3 and parts[2] == "Templates":
+        head, tail = (parts[0], parts[1]), parts[3:]
+    else:
+        return None
+    if len(tail) == 1 and tail[0].lower().endswith(".xml"):
+        return (*head, tail[0][:-4])
+    if len(tail) == 3 and tail[1] == "Ext" and tail[2] == "Template.xml":
+        return (*head, tail[0])
+    if len(tail) == 2 and tail[1] == "Template.dcs":
+        return (*head, tail[0])
+    return None
+
+
+def _template_prefix(category: str, owner: str) -> str:
+    """Каталог макетов ключа ``_template_key`` относительно корня конфигурации."""
+    return "CommonTemplates" if category == "CommonTemplates" else f"{category}/{owner}/Templates"
+
+
+def _template_spelled_differently(base: Path, key: tuple[str, str, str], listing: dict[Path, set[str] | None]) -> bool:
+    """Владелец или макет ключа ``(категория, владелец, макет)`` есть на диске только в другом регистре."""
+    category, owner, name = key
+    if category != "CommonTemplates":
+        spelled = _spelling(base / category, owner, listing)
+        if spelled != "exact":
+            return spelled == "case"
+    return _spelling(base / _template_prefix(category, owner), name, listing) == "case"
+
+
+def _template_rows_spelled_differently(conn: sqlite3.Connection, base: Path, keys: set[tuple[str, str, str]]) -> bool:
+    """Выборочный ход по дельте строк ``template_query`` не сойдётся со сборкой — нужен пересчёт домена целиком (как у
+    шага форм: ``_form_dirs_from_delta``, ``_form_rows_spelled_differently``). Владелец или макет переименован только
+    регистром: на регистронезависимой ФС путь со старым написанием открывает тот же файл, и выборочный ход записал бы
+    строки обоих написаний, а обнаружение сборки берёт написание из листинга диска. Сверяются ключи дельты и строки
+    вида в индексе (Git с ``core.ignorecase`` смену регистра латиницы не видит); строка вне правила обнаружения или со
+    старым написанием пути из дельты — тоже ``True``."""
+    listing: dict[Path, set[str] | None] = {}
+    if any(_template_spelled_differently(base, key, listing) for key in keys):
+        return True
+    exact = {
+        f"{_template_prefix(category, owner)}/{name}/{tail}"
+        for category, owner, name in keys
+        for tail in ("Ext/Template.xml", "Template.dcs")
+    }
+    folded = {path.casefold() for path in exact}
+    try:
+        indexed = [
+            path
+            for (path,) in conn.execute(
+                "SELECT DISTINCT path FROM metadata_references WHERE ref_kind = ?", (_TEMPLATE_QUERY_REF_KIND,)
+            )
+        ]
+    except sqlite3.OperationalError:
+        return False
+    for path in indexed:
+        if path not in exact and path.casefold() in folded:
+            return True
+        key = _template_key(path)
+        if key is None or _template_spelled_differently(base, key, listing):
+            return True
+    return False
+
+
+def _refresh_template_queries(conn: sqlite3.Connection, base_path: str, paths: set[str]) -> None:
+    """git-путь: строки вида ``template_query`` затронутых макетов — по ``path`` (оба возможных файла содержимого) и
+    заново по правилу У9; путь вне правила и написание, расходящееся с диском (смена регистра владельца или макета,
+    ``_template_rows_spelled_differently``), — пересчёт домена целиком."""
+    base = Path(base_path)
+    keys: set[tuple[str, str, str]] = set()
+    for rel in paths:
+        key = _template_key(rel)
+        if key is None:
+            _replace_template_query_refs(conn, _collect_template_queries(base_path))
+            return
+        keys.add(key)
+    if _template_rows_spelled_differently(conn, base, keys):
+        _replace_template_query_refs(conn, _collect_template_queries(base_path))
+        return
+    for category, owner, name in sorted(keys):
+        tdir = base / _template_prefix(category, owner)
+        prefix = _template_prefix(category, owner)
+        try:
+            conn.execute(
+                "DELETE FROM metadata_references WHERE ref_kind = ? AND path IN (?, ?)",
+                (_TEMPLATE_QUERY_REF_KIND, f"{prefix}/{name}/Ext/Template.xml", f"{prefix}/{name}/Template.dcs"),
+            )
+        except sqlite3.OperationalError:
+            return
+        item = _template_entry(tdir, category, owner, name)
+        if item is not None:
+            rows = _template_query_rows(base, [item])
+            if rows:
+                _insert_ref_rows(conn, rows)
+
+
 def _form_files(base: Path) -> list[tuple[str, str, str, Path]]:
     """Формы конфигурации ``(категория, объект, форма, путь)``: ``<Категория>/<Объект>/Forms/<Форма>/`` и
     ``CommonForms/<Форма>/``; в каталоге формы канонический файл — ``Form.form`` (EDT), иначе ``Ext/Form.xml``
@@ -10263,6 +10606,9 @@ def _submit_descriptor_jobs(
         jobs["metadata"] = pool.submit(_collect_metadata_tables, base_path)
     if build_metadata and "forms" not in skip:
         jobs["forms"] = pool.submit(_collect_form_elements, base_path)
+    # v1.50.0 (П7): запросы макетов СКД — свой коллектор (только с метаданными, как формы).
+    if build_metadata and "template_queries" not in skip:
+        jobs["template_queries"] = pool.submit(_collect_template_queries, base_path)
     if "rights" not in skip:
         jobs["roles"] = [
             pool.submit(_rights_batch_data, base_path, items) for items in _rights_batches(base_path, pool.workers)
@@ -10329,7 +10675,8 @@ _GLOB_XML_CATEGORIES = frozenset(
 )
 # Файлы, которые коллекторы описателей открывают по содержимому (`.xdto` — пакеты EDT, `.command` — команды EDT).
 _INPUT_HASH_SUFFIXES = (".xml", ".mdo", ".xdto", ".command", ".form", ".rights")
-_SNAPSHOT_DOMAINS = ("descriptors", "forms", "rights", "synonyms", "overrides")
+# v1.50.0 (П7): домен запросов макетов СКД (`template_queries`) — собственный коллектор и своя опись.
+_SNAPSHOT_DOMAINS = ("descriptors", "forms", "rights", "synonyms", "overrides", "template_queries")
 
 
 def _descriptor_hash_rule(rel: str) -> bool:
@@ -10428,6 +10775,12 @@ def _input_digests(
     out["descriptors"] = digest([inv.dirs, [[rel, inv.hashes.get(rel, "")] for rel in inv.files]])
     if build_metadata:
         out["forms"] = _domain(sorted([cat, obj, form, *_hash(path)] for cat, obj, form, path in _form_files(base)))
+        # v1.50.0 (П7): опись макетов СКД — файлы содержимого и описатели CF (тип макета решает обнаружение).
+        templates = []
+        for cat, obj, name, path in _template_query_files(base):
+            descriptor = path.parent.parent.with_suffix(".xml") if path.name == "Template.xml" else None
+            templates.append([cat, obj, name, *_hash(path), *(_hash(descriptor) if descriptor else ("", ""))])
+        out["template_queries"] = _domain(sorted(templates))
     layout = "root" if (base / "Roles").is_dir() else "nested"
     rights = [[role, *_hash(path)] for role, path in _rights_file_items(base_path)]
     out["rights"] = _domain([["layout", layout], *rights]) if all(r[-1] != UNREADABLE for r in rights) else None
@@ -10506,7 +10859,14 @@ def _skipped_domains(
         return digests.get(name) is not None and stored.get(name) == digests[name]
 
     skip = {
-        domain for domain, key in (("metadata", "descriptors"), ("forms", "forms"), ("rights", "rights")) if same(key)
+        domain
+        for domain, key in (
+            ("metadata", "descriptors"),
+            ("forms", "forms"),
+            ("rights", "rights"),
+            ("template_queries", "template_queries"),
+        )
+        if same(key)
     }
     if same("synonyms"):
         skip.add("synonyms")
@@ -11185,6 +11545,8 @@ class IndexBuilder:
                 logger.info("Form elements: %d entries", len(fe_rows))
             # v1.47.0: ссылки форм — после ссылок описателей, тем же разбором формы.
             _replace_form_refs(conn, form_ref_rows)
+            # v1.50.0 (П7): запросы макетов СКД — собственный шаг, после ссылок описателей.
+            _replace_template_query_refs(conn, descriptors["template_queries"])
             conn.commit()
         conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
@@ -11398,9 +11760,14 @@ class IndexBuilder:
         # член менеджера в `metadata_code_usages`, вызовы через перенос строки, движения таблиц БГУ и
         # делегата модуля объекта, `use` заданий EDT, объекты без синонима. Полный скан по mtime/size
         # их не перечитал бы.
+        #
+        # v19 (v1.50.0) — снова производные НЕИЗМЕННЫХ исходников: цели ссылок состава подсистем, прав ролей,
+        # состава ФО и основной таблицы формы — объект любого из 47 видов (канонизатор ссылки на объект), строки
+        # прав и состава ФО — на объект, а не на путь члена; новые виды `common_attribute_content` и
+        # `template_query`, ссылки разделения общих реквизитов. Полный скан по mtime/size их не перечитал бы.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 18:
+        if old_version < 19:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -11641,7 +12008,7 @@ class IndexBuilder:
         # No-op (домены пропущены, дельты нет) оставляет навигацию и уровень конфигурации — их старт пула не окупает.
         heavy = {"rights"}
         if has_metadata:
-            heavy |= {"metadata", "forms"}
+            heavy |= {"metadata", "forms", "template_queries"}
         if has_synonyms:
             heavy.add("synonyms")
         collectors_due = bool(heavy - skip) and len(bsl_files) > _PARALLEL_MIN_BSL_FILES
@@ -11921,10 +12288,14 @@ class IndexBuilder:
                 # этот скан не перечитывает (формы, права), возвращаются: формы — сохранёнными строками, права —
                 # из итоговой role_rights (как у выборочного git-пути).
                 kept_form_refs = _form_ref_rows(conn) if "forms" in skip else []
+                # v1.50.0 (П7): строки запросов СКД неизменного домена — тем же путём, что строки форм.
+                kept_template_refs = _template_query_ref_rows(conn) if "template_queries" in skip else []
                 md_tables = descriptors["metadata"]
                 _insert_metadata_tables(conn, md_tables)
                 if kept_form_refs:
                     _insert_ref_rows(conn, kept_form_refs)
+                if kept_template_refs:
+                    _insert_ref_rows(conn, kept_template_refs)
                 if "rights" in skip:
                     _rebuild_role_rights_refs(conn)
                 # Update meta counts for new tables
@@ -12073,6 +12444,9 @@ class IndexBuilder:
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                 ("form_elements_count", str(len(fe_rows))),
             )
+        # v1.50.0 (П7): запросы макетов СКД — собственный шаг (домен перечитан); неизменный — строки сохранены выше.
+        if has_metadata and "template_queries" not in skip:
+            _replace_template_query_refs(conn, descriptors["template_queries"])
 
         # Bump builder_version to current
         conn.execute(
@@ -12437,6 +12811,9 @@ class IndexBuilder:
                     collect_templates=bool(fallback_categories),
                 )
                 _insert_metadata_tables_selective(conn, md_tables, fallback_categories)
+            # v1.50.0 (П11, Д11): метаполя Level-11 — по итоговым таблицам, как у сборки и полного скана (прежде
+            # git-путь их не писал, и `index_meta` расходился со свежей сборкой; читатели берут COUNT(*)).
+            _recount_object_meta(conn)
 
         # form_elements: only if .form files changed
         if form_changed and has_metadata:
@@ -12473,6 +12850,12 @@ class IndexBuilder:
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                 ("form_elements_count", str(fe_count)),
             )
+
+        # v1.50.0 (П7): запросы макетов СКД — по самой дельте (`.dcs`, `.xml` под `Templates/` и `CommonTemplates/`);
+        # путь вне правила обнаружения — домен целиком. Описатель владельца EDT (`.mdo`) домен не трогает.
+        template_changed = {p for p in git_changed if _template_query_trigger(p)}
+        if template_changed and has_metadata:
+            _refresh_template_queries(conn, base_path, template_changed)
 
         # object_synonyms: selective by category (only .xml/.mdo trigger).
         # Категории, обработанные pointwise (synonyms уже вставлены через
@@ -17049,6 +17432,10 @@ class IndexReader:
         # v1.49.0 (Д9, П5): реквизит типа «значения характеристик ПВХ» — строки раскрываются на чтении
         # (`find_characteristic_value_refs`), в `metadata_references` их нет.
         "characteristic_value_type": 25,
+        # v1.50.0 (Д9, П9): состав общего реквизита — объекты элементов `Use` (и `Auto` при `AutoUse=Use`).
+        "common_attribute_content": 26,
+        # v1.50.0 (Д10, П7): объекты текстов запросов макетов СКД — собственный шаг сборки.
+        "template_query": 27,
     }
 
     @_transient_safe(lambda: None)
