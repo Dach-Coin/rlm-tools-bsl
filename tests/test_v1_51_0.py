@@ -490,6 +490,7 @@ class _ReadSpy:
     def __init__(self, monkeypatch, base: Path, *, wait_warm: bool = True, timeout: float = 3.0) -> None:
         import builtins
         import io
+        import pathlib
 
         self._base = os.path.abspath(base)
         self.base = os.path.normcase(self._base)
@@ -525,6 +526,11 @@ class _ReadSpy:
         monkeypatch.setattr(os, "open", os_open)
         monkeypatch.setattr(builtins, "open", consumer(real_open))
         monkeypatch.setattr(io, "open", consumer(real_io_open))
+        # Python 3.10: `Path.open`/`read_text` открывают через `pathlib._NormalAccessor.open` — ссылку на `io.open`,
+        # взятую при импорте `pathlib` (с 3.11 — `io.open` в момент вызова): подмена `io.open` ее не видит.
+        accessor = getattr(pathlib, "_NormalAccessor", None)
+        if accessor is not None:
+            monkeypatch.setattr(accessor, "open", staticmethod(consumer(real_io_open)))
 
     def _norm(self, path) -> str | None:
         try:
