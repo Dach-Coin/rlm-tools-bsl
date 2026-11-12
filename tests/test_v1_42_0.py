@@ -4124,7 +4124,6 @@ class TestExtGraphGuards:
 
 import threading  # noqa: E402
 import time  # noqa: E402
-from pathlib import Path  # noqa: E402
 
 import rlm_tools_bsl.bsl_xml_parsers as XP  # noqa: E402
 from rlm_tools_bsl.bsl_knowledge import mask_comments_and_strings  # noqa: E402
@@ -4221,98 +4220,49 @@ class TestBuildSpeedRights:
 
 
 class TestBuildSpeedPrefetch:
-    def test_descriptor_selection(self, tmp_path):
-        wanted = [
-            "Configuration.xml",
-            "Catalogs/А.xml",
-            "Catalogs/А/Forms/Ф/Ext/Form.xml",
-            "Catalogs/Б/Б.mdo",
-            "Catalogs/Б/Forms/Ф/Form.form",
-            "Roles/Р/Ext/Rights.xml",
-            "Roles/Р2/Rights.rights",
-        ]
-        skipped = ["Catalogs/А/Ext/ObjectModule.bsl", "Catalogs/А/Templates/М/Ext/Template.xml", ".git/x.xml"]
-        for rel in wanted + skipped:
-            (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
-            (tmp_path / rel).write_text("<x/>", encoding="utf-8")
-        got = sorted(Path(p).relative_to(tmp_path).as_posix() for p in BI._prefetch_descriptor_paths(tmp_path))
-        assert got == sorted(wanted)
+    # v1.51.0: фоновый прогрев описателей координатора (`_DescriptorPrefetch`, обход `_prefetch_descriptor_paths`,
+    # чтение `_warm_file`) снят — задачи сборки греют свои файлы сами, на окно вперёд (`_WarmAhead`). Тесты отбора
+    # файлов, особых файлов, остановки чтения и прогрева каждого описателя удалены вместе с механизмом (новый примитив —
+    # tests/test_v1_51_0.py::TestWarmAhead); «сборка не оставляет потоков прогрева» и «сбой прогрева не ломает сборку»
+    # переписаны на него.
+    def test_build_leaves_no_warm_threads(self, tmp_path, monkeypatch):
+        real_open = BI._warm_open
+        opened = []
 
-    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO и /dev/zero — только POSIX")
-    def test_special_files_are_not_prefetched(self, tmp_path):
-        # open() на FIFO без писателя блокируется навсегда, у /dev/zero нет EOF: сборка не вернулась бы.
-        (tmp_path / "Catalogs").mkdir()
-        (tmp_path / "Catalogs" / "А.xml").write_text("<x/>", encoding="utf-8")
-        other = tmp_path / "unrelated"
-        other.mkdir()
-        os.mkfifo(other / "stream.xml")
-        os.symlink(other / "stream.xml", other / "fifo_link.xml")
-        os.symlink("/dev/zero", other / "zero.xml")
-        os.symlink(tmp_path / "Catalogs" / "А.xml", other / "file_link.xml")
-        os.symlink(tmp_path, other / "loop")  # ссылка на каталог: обход в нее не заходит (иначе петля)
-        got = sorted(Path(p).relative_to(tmp_path).as_posix() for p in BI._prefetch_descriptor_paths(tmp_path))
-        assert got == ["Catalogs/А.xml", "unrelated/file_link.xml"]
+        def slow_open(path):
+            opened.append(path)
+            time.sleep(0.01)  # прогрев идёт в момент окончания задач сборки
+            real_open(path)
 
-    def test_warm_stops_between_chunks(self, monkeypatch):
-        reads = [0]
-
-        class Endless:  # источник без EOF; предохранитель — чтобы сломанный код не повесил прогон
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def read(self, n):
-                reads[0] += 1
-                return b"\0" if reads[0] < 1000 else b""
-
-        monkeypatch.setattr(BI, "open", lambda *a, **k: Endless(), raising=False)
-        stop = threading.Event()
-        stop.set()
-        BI._warm_file("endless.xml", stop)
-        assert reads[0] == 1
-
-    def test_prefetch_warms_every_descriptor(self, tmp_path, monkeypatch):
-        (tmp_path / "Catalogs").mkdir()
-        for i in range(40):
-            (tmp_path / "Catalogs" / f"О{i}.xml").write_text("<x/>", encoding="utf-8")
-        seen: list[str] = []
-        lock = threading.Lock()
-
-        def warm(path, stop=None):
-            with lock:
-                seen.append(path)
-
-        monkeypatch.setattr(BI, "_warm_file", warm)
-        pf = BI._DescriptorPrefetch(str(tmp_path))
-        pf._walker.join()
-        pf._pool.shutdown(wait=True)  # дождаться очереди, не снимая ее
-        pf.close()
-        assert len(seen) == len(set(seen)) == 40
-
-    def test_build_leaves_no_prefetch_threads(self, tmp_path, monkeypatch):
-        def slow_warm(path, stop=None):
-            time.sleep(0.3)  # чтение идет в момент закрытия сборки
-
-        monkeypatch.setattr(BI, "_warm_file", slow_warm)
-        # v1.48.0: прогрев — у крупной выгрузки; закрытие проверяется на нём.
-        monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)
+        monkeypatch.setattr(BI, "_warm_open", slow_open)
+        monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)  # прогрев в координаторе — у крупной
+        monkeypatch.setenv("RLM_INDEX_WORKERS", "1")
         files = {"CommonModules/М/Ext/Module.bsl": "Процедура П()\nКонецПроцедуры\n"}
         files.update({f"Catalogs/О{i}.xml": "<x/>" for i in range(40)})
         _write_project(tmp_path, files)
         IndexBuilder().build(str(tmp_path), build_calls=False)
+        # Прогрев действительно шёл (иначе проверка ниже пуста: тест зелёный и при выключенном прогреве).
+        assert opened
         # После возврата сборки ни один файл прогревом не открыт: временный каталог можно удалять.
-        assert not [t for t in threading.enumerate() if t.name.startswith("rlm-prefetch") and t.is_alive()]
+        assert not [
+            t for t in threading.enumerate() if t.name.startswith(("rlm-warm", "rlm-prefetch")) and t.is_alive()
+        ]
 
-    def test_prefetch_failure_does_not_break_build(self, tmp_path, monkeypatch):
+    def test_warm_failure_does_not_break_build(self, tmp_path, monkeypatch):
+        calls = []
+
         def boom(*a, **k):
-            raise RuntimeError("обход упал")
+            calls.append(a)
+            raise RuntimeError("прогрев упал")
 
-        monkeypatch.setattr(BI, "_prefetch_descriptor_paths", boom)
-        monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)  # v1.48.0: прогрев — у крупной выгрузки
-        _write_project(tmp_path, {"CommonModules/М/Ext/Module.bsl": "Процедура П()\nКонецПроцедуры\n"})
+        monkeypatch.setattr(BI, "_warm_open", boom)
+        monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)
+        monkeypatch.setenv("RLM_INDEX_WORKERS", "1")
+        files = {"CommonModules/М/Ext/Module.bsl": "Процедура П()\nКонецПроцедуры\n"}
+        files.update({f"Catalogs/О{i}.xml": "<x/>" for i in range(10)})
+        _write_project(tmp_path, files)
         db = IndexBuilder().build(str(tmp_path), build_calls=False)
+        assert calls  # сбой прогрева действительно случился — сборка его пережила
         c = sqlite3.connect(str(db))
         try:
             assert c.execute("SELECT COUNT(*) FROM methods").fetchone()[0] == 1

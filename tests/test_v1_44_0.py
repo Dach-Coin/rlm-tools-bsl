@@ -1492,10 +1492,13 @@ def test_non_document_in_a_document_helper_is_named(doc_domain, with_index, help
 
 
 def test_bare_name_of_a_non_document_keeps_the_old_answer(doc_domain, with_index):
-    """Страж: голое имя не отказывается — документный хелпер ищет по нему документ, как и прежде."""
+    """Страж: голое имя не отказывается — документный хелпер ищет по нему документ, как и прежде.
+
+    v1.51.0: прежде здесь стояло `res["code_registers"] == []` — голое имя объекта другой категории (справочник
+    `Договоры`) при пустом ответе теперь отказ категории, как у ссылки (документного ответа по нему нет)."""
     _fmt, root, reader = doc_domain
-    res = _bsl_for(root, reader if with_index else None)["find_register_movements"]("Договоры")
-    assert res["code_registers"] == []
+    with pytest.raises(ValueError, match="'Договоры' — не документ, а объект категории Catalogs"):
+        _bsl_for(root, reader if with_index else None)["find_register_movements"]("Договоры")
 
 
 def test_non_string_object_name_still_fails(doc_domain):

@@ -574,8 +574,11 @@ def test_literal_outside_the_register_catalog_is_named_not_dropped(tmp_path, mon
         assert any("НетТакогоРегистра" in u["evidence"] for u in unknown)
         # Движением НЕ становится и в register_name не попадает.
         assert "НетТакогоРегистра" not in {r["name"] for r in res["code_registers"]}
-        writers = bsl["find_register_writers"]("НетТакогоРегистра")
-        assert writers["writers"] == [], writers
+        # v1.51.0: прежде здесь стояло `writers["writers"] == []` — регистра `НетТакогоРегистра` нет, и публичный вызов
+        # с пустым ответом теперь отказ «регистра с именем … нет»; писателем литерал по-прежнему не становится.
+        with pytest.raises(ValueError, match="регистра с именем 'НетТакогоРегистра' нет"):
+            bsl["find_register_writers"]("НетТакогоРегистра")
+        assert bsl["find_register_writers"].__wrapped__("НетТакогоРегистра")["writers"] == []
     finally:
         if reader:
             reader.close()

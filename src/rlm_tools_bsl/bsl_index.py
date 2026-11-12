@@ -7,12 +7,14 @@ The index is stored on disk and supports incremental updates.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import errno
 import functools
 import hashlib
 import itertools
 import json
 import logging
+import operator
 import os
 import pickle
 import re
@@ -26,7 +28,7 @@ from bisect import insort
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from pathlib import Path
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import NamedTuple
 
 from rlm_tools_bsl._git_process import run_git
@@ -5357,7 +5359,62 @@ def _owner_ref_for(category: str, object_name: str) -> str:
     return f"{_CATEGORY_TO_REF_HEAD.get(category, category)}.{object_name}"
 
 
-def _collect_templates(base: Path, read: Callable[[Path], str]) -> list[tuple]:
+# v1.51.0: пути прогрева разделов сборщика метаданных — РОВНО файлы, которые раздел читает у элемента своего цикла, в
+# порядке чтения (зовутся в потоке прогрева `_WarmAhead`; несуществующий путь прогрев пропускает сам). Правило выбора
+# там, где оно не по имени, — общая функция с разделом (`_common_command_files`, `_command_entry_files`,
+# `_find_metadata_xml`).
+_SECOND = operator.itemgetter(1)  # `(имя, описатель)` перечислителя `_iter_category_descriptors`
+
+
+def _xdto_warm_paths(fp: Path) -> tuple[Path, ...]:
+    """Пакет XDTO: описатель, у EDT (``.mdo``) — и ``Package.xdto`` рядом."""
+    return (fp, fp.parent / "Package.xdto") if fp.suffix.lower() == ".mdo" else (fp,)
+
+
+def _predefined_warm_paths(obj_dir: Path) -> tuple[Path, ...]:
+    """Предопределённые объекта: CF ``Ext/Predefined.xml``, иначе ``.mdo`` EDT (как раздел)."""
+    if not obj_dir.is_dir():
+        return ()
+    predef = obj_dir / "Ext" / "Predefined.xml"
+    return (predef,) if predef.is_file() else (obj_dir / f"{obj_dir.name}.mdo",)
+
+
+def _exchange_plan_warm_paths(plan_dir: Path) -> tuple[Path, ...]:
+    """Состав плана обмена: CF ``Ext/Content.xml`` и ``.mdo`` EDT (раздел читает оба, какие есть)."""
+    return (plan_dir / "Ext" / "Content.xml", plan_dir / f"{plan_dir.name}.mdo")
+
+
+def _defined_type_warm_paths(fp: Path) -> tuple[Path, ...]:
+    """Определяемый тип: CF ``<Имя>.xml``, EDT ``<Имя>/<Имя>.mdo`` (у файла ``.xml`` второй путь не существует)."""
+    mdo = fp / f"{fp.name}.mdo"
+    return (fp, mdo) if fp.suffix.lower() == ".xml" else (mdo,)
+
+
+def _common_command_files(fp: Path) -> list[Path]:
+    """Файл описания общей команды — элемента ``CommonCommands``: CF ``<Имя>.xml``, EDT ``<Имя>/<Имя>.mdo`` (иначе
+    ``.command``)."""
+    if fp.is_file() and fp.suffix.lower() == ".xml":
+        return [fp]
+    if fp.is_dir():
+        # EDT: <Name>/<Name>.mdo (alternative .command path)
+        for cand in (fp / f"{fp.name}.mdo", fp / f"{fp.name}.command"):
+            if cand.is_file():
+                return [cand]
+    return []
+
+
+def _common_template_warm_paths(entry: Path) -> tuple[Path, ...]:
+    """Общий макет: CF ``<Имя>.xml``, EDT ``<Имя>/<Имя>.mdo`` (у файла ``.xml`` второй путь не существует)."""
+    mdo = entry / f"{entry.name}.mdo"
+    return (entry, mdo) if entry.suffix.lower() == ".xml" else (mdo,)
+
+
+def _owner_mdo_warm_path(fp: Path) -> Path | None:
+    """``.mdo`` владельца макетов EDT (``<Категория>/<Имя>/<Имя>.mdo``, кроме общих макетов)."""
+    return fp if fp.parent.name == fp.stem and fp.parent.parent.name != "CommonTemplates" else None
+
+
+def _collect_templates(base: Path, read: Callable[[Path], str], warm: _WarmSections | None = None) -> list[tuple]:
     """Макеты конфигурации: ``(owner_ref, name, synonym, template_type, file)``.
 
     ТРИ раскладки, а не две:
@@ -5378,13 +5435,17 @@ def _collect_templates(base: Path, read: Callable[[Path], str]) -> list[tuple]:
     нагрузки не попала бы ни в один из них, и таблица протухла бы молча. Читая тип
     из описателя/``.mdo``, мы инвалидируемся тем же триггером, что и все остальные
     метаданные объекта.
+
+    ``warm`` (v1.51.0) — прогрев разделов сборщика метаданных (``_WarmSections``): каждая из трёх раскладок греет свои
+    файлы на окно вперёд; без него — без прогрева.
     """
     from rlm_tools_bsl.bsl_xml_parsers import parse_metadata_xml, parse_template_descriptor
 
+    section = warm.section if warm is not None else _no_warm_section
     rows: list[tuple] = []
 
     # 1. CF-описатели макетов объектов: <Категория>/<Объект>/Templates/<Имя>.xml
-    for fp in sorted(base.glob("*/*/Templates/*.xml")):
+    for fp in section(sorted(base.glob("*/*/Templates/*.xml"))):
         if not fp.is_file():
             continue
         parts = fp.relative_to(base).parts
@@ -5410,7 +5471,7 @@ def _collect_templates(base: Path, read: Callable[[Path], str]) -> list[tuple]:
     # 2. Общие макеты: CF-файл рядом либо EDT-каталог с .mdo
     common_dir = base / "CommonTemplates"
     if common_dir.is_dir():
-        for entry in sorted(common_dir.iterdir()):
+        for entry in section(sorted(common_dir.iterdir()), _common_template_warm_paths):
             fp = None
             if entry.is_file() and entry.suffix.lower() == ".xml":
                 fp = entry
@@ -5439,7 +5500,7 @@ def _collect_templates(base: Path, read: Callable[[Path], str]) -> list[tuple]:
     # 3. EDT: блоки <templates> внутри .mdo владельца. Подстрочный префильтр по
     # СЫРОМУ тексту — надмножественный тест, ложных отрицаний дать не может:
     # блок, объявляющий макет, буквально содержит эту подстроку.
-    for fp in sorted(base.glob("*/*/*.mdo")):
+    for fp in section(sorted(base.glob("*/*/*.mdo")), _owner_mdo_warm_path):
         if not fp.is_file() or fp.parent.name != fp.stem:
             continue
         parts = fp.relative_to(base).parts
@@ -5472,8 +5533,17 @@ def _collect_templates(base: Path, read: Callable[[Path], str]) -> list[tuple]:
     return rows
 
 
-def _collect_metadata_tables(
+def _collect_metadata_tables(base_path: str, **flags) -> dict[str, list[tuple]]:
+    """Таблицы описателей (``_metadata_tables``; флаги — те же). v1.51.0: в задаче сборки (``_warm_enabled``) каждый
+    раздел сборщика прогревает на окно вперёд ровно файлы, которые читает, в порядке чтения (``_WarmSections``);
+    выход — и при исключении — останавливает прогрев и дожидается его потоков."""
+    with _WarmSections() as warm:
+        return _metadata_tables(base_path, warm, **flags)
+
+
+def _metadata_tables(
     base_path: str,
+    warm: _WarmSections,
     *,
     collect_es: bool = True,
     collect_sj: bool = True,
@@ -5614,7 +5684,9 @@ def _collect_metadata_tables(
         return files
 
     # EventSubscriptions
-    for fp in _glob_xml("EventSubscriptions") if collect_es else []:
+    # v1.51.0: у каждого раздела — прогрев ровно его файлов в порядке чтения (`warm.section`; вне задачи сборки — тот
+    # же список без прогрева).
+    for fp in warm.section(_glob_xml("EventSubscriptions")) if collect_es else []:
         content = _read(fp)
         if not content:
             continue
@@ -5646,7 +5718,7 @@ def _collect_metadata_tables(
             result["metadata_references"].extend(_event_subscription_source_rows(parsed, rel))
 
     # ScheduledJobs
-    for fp in _glob_xml("ScheduledJobs") if collect_sj else []:
+    for fp in warm.section(_glob_xml("ScheduledJobs")) if collect_sj else []:
         content = _read(fp)
         if not content:
             continue
@@ -5675,7 +5747,7 @@ def _collect_metadata_tables(
         )
 
     # FunctionalOptions
-    for fp in _glob_xml("FunctionalOptions") if collect_fo else []:
+    for fp in warm.section(_glob_xml("FunctionalOptions")) if collect_fo else []:
         content = _read(fp)
         if not content:
             continue
@@ -5735,7 +5807,9 @@ def _collect_metadata_tables(
     # --- v16: свойства общих модулей ---
     # v1.47.0: общий перечислитель описателей (`_iter_category_descriptors`) — тот же, что у циклов реквизитов,
     # ПВХ и констант; прежнее замыкание `_iter_flat_objects` было второй реализацией того же факта.
-    for obj_name, fp in _iter_category_descriptors(base, "CommonModules") if collect_common_modules else []:
+    for obj_name, fp in (
+        warm.section(_iter_category_descriptors(base, "CommonModules"), _SECOND) if collect_common_modules else []
+    ):
         content = _read(fp)
         if not content:
             continue
@@ -5763,7 +5837,11 @@ def _collect_metadata_tables(
     # на описатель. Строка `constants` — под `collect_constants`, ссылки — под единственным гейтом
     # `_ref_allowed("Constants")` (правило «гейт ссылок ровно один»); реквизитов у константы нет.
     constants_refs = _ref_allowed("Constants")
-    for obj_name, fp in _iter_category_descriptors(base, "Constants") if collect_constants or constants_refs else []:
+    for obj_name, fp in (
+        warm.section(_iter_category_descriptors(base, "Constants"), _SECOND)
+        if collect_constants or constants_refs
+        else []
+    ):
         content = _read(fp)
         if not content:
             continue
@@ -5790,10 +5868,10 @@ def _collect_metadata_tables(
 
     # --- v16: макеты (три раскладки, а не две) ---
     if collect_templates:
-        result["templates"].extend(_collect_templates(base, _read))
+        result["templates"].extend(_collect_templates(base, _read, warm))
 
     # Enums
-    for fp in _glob_xml("Enums") if collect_enums else []:
+    for fp in warm.section(_glob_xml("Enums")) if collect_enums else []:
         content = _read(fp)
         if not content:
             continue
@@ -5811,7 +5889,7 @@ def _collect_metadata_tables(
         )
 
     # Subsystems
-    for fp in _glob_xml("Subsystems") if collect_subs else []:
+    for fp in warm.section(_glob_xml("Subsystems")) if collect_subs else []:
         content = _read(fp)
         if not content:
             continue
@@ -5859,7 +5937,7 @@ def _collect_metadata_tables(
                     )
 
     # HTTPServices
-    for fp in _glob_xml("HTTPServices") if collect_http else []:
+    for fp in warm.section(_glob_xml("HTTPServices")) if collect_http else []:
         content = _read(fp)
         if not content:
             continue
@@ -5877,7 +5955,7 @@ def _collect_metadata_tables(
         )
 
     # WebServices
-    for fp in _glob_xml("WebServices") if collect_ws else []:
+    for fp in warm.section(_glob_xml("WebServices")) if collect_ws else []:
         content = _read(fp)
         if not content:
             continue
@@ -5895,7 +5973,7 @@ def _collect_metadata_tables(
         )
 
     # XDTOPackages
-    for fp in _glob_xml("XDTOPackages") if collect_xdto else []:
+    for fp in warm.section(_glob_xml("XDTOPackages"), _xdto_warm_paths) if collect_xdto else []:
         content = _read(fp)
         if not content:
             continue
@@ -5931,7 +6009,7 @@ def _collect_metadata_tables(
             continue
         # v1.47.0: и объект выгрузки Конфигуратора без каталога (только `Категория/Имя.xml`) — прежде цикл
         # шёл по каталогам объектов и его реквизиты и ссылки в индекс не попадали.
-        for obj_name, xml_path in _iter_category_descriptors(base, category):
+        for obj_name, xml_path in warm.section(_iter_category_descriptors(base, category), _SECOND):
             content = _read(xml_path)
             if not content:
                 continue
@@ -5978,7 +6056,7 @@ def _collect_metadata_tables(
     for category in _REFS_ONLY_CATEGORIES:
         if not _ref_allowed(category):
             continue
-        for obj_name, xml_path in _iter_category_descriptors(base, category):
+        for obj_name, xml_path in warm.section(_iter_category_descriptors(base, category), _SECOND):
             content = _read(xml_path)
             if not content:
                 continue
@@ -6008,7 +6086,7 @@ def _collect_metadata_tables(
         cat_dir = base / category
         if not cat_dir.is_dir():
             continue
-        for obj_dir in sorted(cat_dir.iterdir()):
+        for obj_dir in warm.section(sorted(cat_dir.iterdir()), _predefined_warm_paths):
             if not obj_dir.is_dir():
                 continue
             obj_name = obj_dir.name
@@ -6071,7 +6149,7 @@ def _collect_metadata_tables(
     if collect_exchange_plans:
         ep_dir = base / "ExchangePlans"
         if ep_dir.is_dir():
-            for plan_dir in sorted(ep_dir.iterdir()):
+            for plan_dir in warm.section(sorted(ep_dir.iterdir()), _exchange_plan_warm_paths):
                 if not plan_dir.is_dir():
                     continue
                 plan_name = plan_dir.name
@@ -6166,7 +6244,7 @@ def _collect_metadata_tables(
 
         dt_dir = base / "DefinedTypes"
         if dt_dir.is_dir():
-            for fp in sorted(dt_dir.iterdir()):
+            for fp in warm.section(sorted(dt_dir.iterdir()), _defined_type_warm_paths):
                 if fp.is_file() and fp.suffix.lower() == ".xml":
                     # CF format: DefinedTypes/<Name>.xml
                     text = _read(fp)
@@ -6184,7 +6262,9 @@ def _collect_metadata_tables(
     if collect_pvh_types:
         # v1.47.0: тот же перечислитель описателей, что у цикла реквизитов (и ПВХ выгрузки Конфигуратора без
         # каталога — только `ChartsOfCharacteristicTypes/Имя.xml`).
-        for _obj_name, xml_path in _iter_category_descriptors(base, "ChartsOfCharacteristicTypes"):
+        for _obj_name, xml_path in warm.section(
+            _iter_category_descriptors(base, "ChartsOfCharacteristicTypes"), _SECOND
+        ):
             text = _read(xml_path)
             if not text:
                 continue
@@ -6211,17 +6291,8 @@ def _collect_metadata_tables(
         # CommonCommands
         common_cmd_dir = base / "CommonCommands"
         if common_cmd_dir.is_dir() and _ref_allowed("CommonCommands"):
-            for fp in sorted(common_cmd_dir.iterdir()):
-                cmd_files: list[Path] = []
-                if fp.is_file() and fp.suffix.lower() == ".xml":
-                    cmd_files.append(fp)
-                elif fp.is_dir():
-                    # EDT: <Name>/<Name>.mdo (alternative .command path)
-                    for cand in (fp / f"{fp.name}.mdo", fp / f"{fp.name}.command"):
-                        if cand.is_file():
-                            cmd_files.append(cand)
-                            break
-                for cfp in cmd_files:
+            for fp in warm.section(sorted(common_cmd_dir.iterdir()), _common_command_files):
+                for cfp in _common_command_files(fp):
                     text = _read(cfp)
                     if not text:
                         continue
@@ -6254,7 +6325,9 @@ def _collect_metadata_tables(
             cat_dir = base / category
             if not cat_dir.is_dir():
                 continue
-            for obj_dir in sorted(cat_dir.iterdir()):
+            for obj_dir in warm.section(
+                sorted(cat_dir.iterdir()), functools.partial(_object_command_warm_paths, category)
+            ):
                 if obj_dir.is_dir():
                     result["metadata_references"].extend(_object_command_ref_rows(base, category, obj_dir))
 
@@ -7302,6 +7375,40 @@ def _emit_predefined_refs(
         )
 
 
+def _command_entry_files(entry: Path) -> list[Path]:
+    """Файл описания команды объекта — элемента ``<Объект>/Commands``: CF ``*.xml``, EDT ``<Имя>/<Имя>.command``
+    (иначе ``.mdo``)."""
+    if entry.is_file() and entry.suffix.lower() == ".xml":
+        return [entry]
+    if entry.is_dir():
+        for cand in (entry / f"{entry.name}.command", entry / f"{entry.name}.mdo"):
+            if cand.is_file():
+                return [cand]
+    return []
+
+
+def _object_command_warm_paths(category: str, obj_dir: Path) -> list[str]:
+    """Файлы, которые читает ``_object_command_ref_rows`` у объекта, в порядке чтения (прогрев раздела команд).
+    Описатель владельца — первые варианты ``_find_metadata_xml`` по имени, без проверок существования: раздел идёт
+    после цикла реквизитов, и прочитанный там описатель прогрев пропускает без обращения к диску (``_WarmSections``);
+    отсутствующий вариант прогрев пропускает сам. Команды — одним листингом ``Commands`` (правило
+    ``_command_entry_files``)."""
+    root = os.fspath(obj_dir)
+    if not os.path.isdir(root):
+        return []
+    name = os.path.basename(root)
+    paths = [os.path.join(root, f"{name}.mdo"), f"{root}.xml"]
+    try:
+        with os.scandir(os.path.join(root, "Commands")) as it:
+            entries = sorted(entry.name for entry in it)
+    except OSError:
+        return paths
+    commands = os.path.join(root, "Commands")
+    for entry_name in entries:
+        paths.extend(os.fspath(p) for p in _command_entry_files(Path(commands, entry_name)))
+    return paths
+
+
 def _object_command_ref_rows(base: Path, category: str, obj_dir: Path) -> list[tuple]:
     """Строки ``command_parameter_type`` команд ОБЪЕКТА — общие для сборки и точечного обновления.
 
@@ -7342,15 +7449,7 @@ def _object_command_ref_rows(base: Path, category: str, obj_dir: Path) -> list[t
     if not cmd_dir.is_dir():
         return rows
     for entry in sorted(cmd_dir.iterdir()):
-        cmd_files: list[Path] = []
-        if entry.is_file() and entry.suffix.lower() == ".xml":
-            cmd_files.append(entry)
-        elif entry.is_dir():
-            for cand in (entry / f"{entry.name}.command", entry / f"{entry.name}.mdo"):
-                if cand.is_file():
-                    cmd_files.append(cand)
-                    break
-        for cfp in cmd_files:
+        for cfp in _command_entry_files(entry):
             text = _read_text(cfp)
             if not text:
                 continue
@@ -7722,6 +7821,16 @@ class _RoleGroupBuilder:
 
     Legacy-поля ``object``/``file`` (query-or-first-match) от порядка потока
     зависели и раньше — их семантика намеренно НЕ трогается.
+
+    **v1.51.0 — член запрошенного объекта (issue #45).** Член — объект прав из трёх и более сегментов
+    ``<Голова>.<Имя>.…`` с ``<Имя>`` запроса (без учёта регистра) и головой ``primary_head`` (у голого имени — любой).
+    Объект пары с ``primary_name``: точный с ``primary_head`` (у голого имени — первый точный по ключу), иначе первый
+    член по ``(object.casefold(), object)``, иначе точный другой головы (омоним у ссылки), иначе первый объект потока.
+    Ключ выборки и вытеснения — ``(ярус, object.casefold(), object, right.casefold(), right)``: ярус 0 — точный объект
+    с ``primary_head`` (у голого имени — любой точный), 1 — члены, 2 — прочие; объект запроса и его члены идут первыми
+    и чужими не вытесняются. Без ``primary_name`` ярус у всех пар 0 — порядок прежний. Кандидаты пары копятся у точных
+    объектов, у первого объекта потока и у ОДНОГО члена — минимального по ключу (пришёл член меньше — права прежнего
+    сбрасываются): память остаётся ``O(roles * details_limit)``.
     """
 
     __slots__ = ("_limit", "_order", "_groups", "_primary", "_primary_head")
@@ -7738,6 +7847,20 @@ class _RoleGroupBuilder:
         head, dot, name = object_name.partition(".")
         return bool(head and dot and name) and "." not in name and name.casefold() == self._primary
 
+    def _tier(self, object_name: str) -> int:
+        """Ярус пары (v1.51.0): 0 — точный объект с ``primary_head`` (у голого имени — любой точный), 1 — член
+        запрошенного объекта, 2 — прочее; без ``primary_name`` — 0 у всех (порядок прежний)."""
+        if self._primary is None:
+            return 0
+        parts = object_name.split(".", 2)
+        if len(parts) < 2 or not parts[0] or not parts[1] or parts[1].casefold() != self._primary:
+            return 2
+        if self._primary_head is not None and parts[0].casefold() != self._primary_head:
+            return 2  # омоним другой головы и его члены — у ссылки чужие
+        if len(parts) == 2:
+            return 0
+        return 1 if parts[2] else 2
+
     def add(self, role_name, object_name, right_name, file) -> None:
         slot = self._groups.get(role_name)
         if slot is None:
@@ -7747,31 +7870,46 @@ class _RoleGroupBuilder:
                 "rights": [],
                 "rights_set": set(),
                 "file": file,
-                # `pairs` — ОТСОРТИРОВАННЫЙ список sort-КЛЮЧЕЙ (object.casefold(),
+                # `pairs` — ОТСОРТИРОВАННЫЙ список sort-КЛЮЧЕЙ (ярус, object.casefold(),
                 # object, right.casefold(), right), а не самих пар: по нему идёт и
                 # вытеснение максимума, и итоговый порядок. `pairs_set` держит сами
-                # пары и нужен только для дедупа входного потока.
+                # пары и нужен только для дедупа входного потока. v1.51.0: ярус — `_tier`.
                 "pairs": [],
                 "pairs_set": set(),
                 "truncated": False,
                 # v1.49.0 (Д4): полные права кандидатов пары — точных объектов запроса и первого объекта потока
-                # (упорядоченный набор прав: dict); без `primary_name` не копятся.
+                # (упорядоченный набор прав: dict); без `primary_name` не копятся. v1.51.0: и ОДНОГО члена
+                # запрошенного объекта — минимального по `(object.casefold(), object)` (`member`).
                 "candidates": {},
+                "member": None,
             }
             self._groups[role_name] = slot
             self._order.append(role_name)
         if right_name not in slot["rights_set"]:
             slot["rights_set"].add(right_name)
             slot["rights"].append(right_name)
-        if self._primary is not None and (object_name == slot["object"] or self._is_primary(object_name)):
-            slot["candidates"].setdefault(object_name, {})[right_name] = None
+        tier = self._tier(object_name)
+        if self._primary is not None:
+            candidates = slot["candidates"]
+            if object_name == slot["object"] or self._is_primary(object_name):
+                candidates.setdefault(object_name, {})[right_name] = None
+            if tier == 1:
+                member = slot["member"]
+                if member is None or (object_name.casefold(), object_name) < (member.casefold(), member):
+                    # Член меньше прежнего: права прежнего не нужны (если он не первый объект потока) — прежний
+                    # больше не станет минимальным, а этот встречен впервые (иначе был бы минимальным раньше).
+                    if member is not None and member != slot["object"]:
+                        candidates.pop(member, None)
+                    slot["member"] = member = object_name
+                if object_name == member:
+                    candidates.setdefault(object_name, {})[right_name] = None
         pair = (object_name, right_name)
         if pair in slot["pairs_set"]:
             return
         if self._limit <= 0:
             slot["truncated"] = True
             return
-        key = (object_name.casefold(), object_name, right_name.casefold(), right_name)
+        key = (tier, object_name.casefold(), object_name, right_name.casefold(), right_name)
         if len(slot["pairs"]) >= self._limit:
             # Ещё одна distinct-пара за границей sample — флаг усечения поднят
             # в любом случае; вопрос лишь, ВЫТЕСНИТ ли она текущий максимум.
@@ -7779,7 +7917,7 @@ class _RoleGroupBuilder:
             if key >= slot["pairs"][-1]:
                 return
             dropped = slot["pairs"].pop()
-            slot["pairs_set"].discard((dropped[1], dropped[3]))
+            slot["pairs_set"].discard((dropped[2], dropped[4]))
         slot["pairs_set"].add(pair)
         insort(slot["pairs"], key)
 
@@ -7790,9 +7928,9 @@ class _RoleGroupBuilder:
         out: list[dict] = []
         for role_name in self._order:  # порядок ПЕРВОГО появления роли — как раньше
             slot = self._groups[role_name]
-            # Ключи накоплены УЖЕ отсортированными по (object.casefold(), object,
+            # Ключи накоплены УЖЕ отсортированными по (ярус, object.casefold(), object,
             # right.casefold(), right) — тем же порядком, которым выбирался top-k.
-            pairs = [(k[1], k[3]) for k in slot["pairs"]]
+            pairs = [(k[2], k[4]) for k in slot["pairs"]]
             by_object: dict[str, list[str]] = {}
             for obj, right in pairs:
                 by_object.setdefault(obj, []).append(right)
@@ -7814,13 +7952,18 @@ class _RoleGroupBuilder:
         return out
 
     def _pick_primary(self, slot: dict) -> str:
-        """Объект пары роли (v1.49.0, Д4): точный объект запроса с головой ``primary_head``, иначе первый точный по
-        ``(object.casefold(), object)``; точного среди совпадений роли нет — первый объект потока."""
+        """Объект пары роли (v1.49.0, Д4; v1.51.0): (1) точный объект запроса с головой ``primary_head`` (у голого
+        имени — первый точный по ``(object.casefold(), object)``); (2) первый член запрошенного объекта; (3) точный
+        объект другой головы (омоним у ссылки); (4) первый объект потока."""
         exact = sorted((o for o in slot["candidates"] if self._is_primary(o)), key=lambda o: (o.casefold(), o))
         if self._primary_head is not None:
             for obj in exact:
                 if obj.partition(".")[0].casefold() == self._primary_head:
                     return obj
+        elif exact:
+            return exact[0]
+        if slot["member"] is not None:
+            return slot["member"]
         return exact[0] if exact else slot["object"]
 
 
@@ -8932,21 +9075,30 @@ _PARALLEL_MIN_BSL_FILES = 256
 
 
 def _large_export(base_path: str) -> bool:
-    """Выгрузка крупнее порога параллельного разбора (``.bsl`` больше ``_PARALLEL_MIN_BSL_FILES``) — ей нужны фоновые
-    прогрев описателей и опись снимка. Счёт — тем же ``rglob``, что обнаружение BSL, и обрывается на первом файле сверх
-    порога: у крупной выгрузки это доли секунды, а не полный обход."""
+    """Выгрузка крупнее порога параллельного разбора (``.bsl`` больше ``_PARALLEL_MIN_BSL_FILES``): у неё пул процессов
+    в начале сборки (обход BSL — его задачей), прогрев в задачах и в последовательном режиме (``_large_sequential_warm``)
+    и фоновая опись снимка. Счёт — тем же ``rglob``, что обнаружение BSL, и обрывается на первом файле сверх порога: у
+    крупной выгрузки это доли секунды, а не полный обход."""
     found = itertools.islice(Path(base_path).rglob("*.bsl"), _PARALLEL_MIN_BSL_FILES + 1)
     return sum(1 for _ in found) > _PARALLEL_MIN_BSL_FILES
 
 
+def _discover_bsl(base_path: str) -> list[Path]:
+    """Задача пула сборки (v1.51.0): обнаружение BSL крупной выгрузки — прежний обход координатора
+    ``sorted(rglob("*.bsl"))``, тот же список и порядок; в процессе-воркере он не делит GIL с потоками координатора."""
+    return sorted(Path(base_path).rglob("*.bsl"))
+
+
 def _parse_bsl_batch(paths: list[Path], base_path: str, build_calls: bool) -> list[FileResult]:
     """Задача воркера сборки: разбор порции BSL в исходном порядке. Непрочитанный файл (``None``) в результат не
-    попадает — как прежде."""
+    попадает — как прежде. v1.51.0: модули порции прогреваются потоками на окно в размер порции (``_WarmAhead`` — в
+    воркере и у крупной выгрузки в последовательном режиме); разбор — прежний, в этом потоке."""
     results: list[FileResult] = []
-    for file_path in paths:
-        result = _process_single_file(file_path, base_path, build_calls)
-        if result is not None:
-            results.append(result)
+    with _WarmAhead(paths, window=len(paths)) as warm:
+        for file_path in warm:
+            result = _process_single_file(file_path, base_path, build_calls)
+            if result is not None:
+                results.append(result)
     return results
 
 
@@ -8969,7 +9121,8 @@ def _parse_bsl_files(paths: list[Path], base_path: str, build_calls: bool) -> li
 
 def _collector_threads() -> int:
     """Ширина внутренних пулов потоков коллекторов. В воркере сборки — один поток: бюджет CPU у задач общий
-    (``_index_workers``), а вложенный пул только спорит за GIL."""
+    (``_index_workers``), а вложенный пул только спорит за GIL. v1.51.0: при одном потоке разбор идёт по порядку, а
+    файлы задачи прогреваются на окно вперёд (``_WarmAhead``): потоки прогрева ждут открытия файла, а не CPU."""
     return 1 if in_index_worker() else min(os.cpu_count() or 4, 8)
 
 
@@ -9123,9 +9276,11 @@ def _merge_role_data(parts: Iterable[_RoleData]) -> _RoleData:
 
 
 def _rights_batch_data(base_path: str, items: list[tuple[str, Path]]) -> _RoleData:
-    """Задача воркера сборки (v1.48.0): права порции файлов в исходном порядке."""
+    """Задача воркера сборки (v1.48.0): права порции файлов в исходном порядке. v1.51.0: файлы порции прогреваются на
+    окно вперёд (``_WarmAhead`` — в воркере и у крупной выгрузки в последовательном режиме)."""
     base = Path(base_path)
-    return _merge_role_data(_rights_file_data(base, item) for item in items)
+    with _WarmAhead(items, operator.itemgetter(1)) as warm:
+        return _merge_role_data(_rights_file_data(base, item) for item in warm)
 
 
 def _collect_role_data(base_path: str) -> _RoleData:
@@ -9490,10 +9645,19 @@ def _collect_object_synonyms(
         # исполняется ДОСЛОВНО прежний цикл — тот же `pool.map` по тому же
         # `_parse_one_row`, та же проверка, тот же порядок. Sink-ветка ниже —
         # ОТДЕЛЬНАЯ и в билдер не попадает никогда.
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for parsed_row in pool.map(_parse_one_row, candidates):
-                if parsed_row is not None:
-                    all_results.append(parsed_row)
+        # v1.51.0: в один поток (воркер сборки) — тот же `_parse_one_row` по порядку кандидатов в этом потоке, а их
+        # файлы прогреваются на окно вперёд (_WarmAhead): пул из одного потока читал бы их по одному.
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for parsed_row in pool.map(_parse_one_row, candidates):
+                    if parsed_row is not None:
+                        all_results.append(parsed_row)
+        else:
+            root = os.fspath(base)
+            with _WarmAhead(candidates, lambda entry: os.path.join(root, entry[2])) as warm:
+                for parsed_row in map(_parse_one_row, warm):
+                    if parsed_row is not None:
+                        all_results.append(parsed_row)
         return all_results
 
     ok_count = 0
@@ -9827,14 +9991,14 @@ def _template_entry(tdir: Path, category: str, owner: str, name: str) -> tuple[s
     return None
 
 
-def _template_dir_entries(tdir: Path, category: str, owner: str) -> list[tuple[str, str, str, Path]]:
-    """Макеты СКД каталога макетов (``<Владелец>/Templates`` либо ``CommonTemplates``) в порядке имени — то же правило,
-    что ``_template_entry``, по одному листингу каталога (без повторных проверок существования описателя)."""
+def _template_dir_listing(tdir: Path | str) -> tuple[set[str], set[str]] | None:
+    """Один листинг каталога макетов: имена описателей ``<Имя>.xml`` (без расширения) и каталогов; не прочитан —
+    ``None``."""
     try:
         with os.scandir(tdir) as it:
             entries = list(it)
     except OSError:
-        return []
+        return None
     descriptors: set[str] = set()
     dirs: set[str] = set()
     for entry in entries:
@@ -9845,6 +10009,23 @@ def _template_dir_entries(tdir: Path, category: str, owner: str) -> list[tuple[s
                 descriptors.add(entry.name[:-4])
         except OSError:
             continue
+    return descriptors, dirs
+
+
+_UNLISTED = object()  # `_template_dir_entries` листает каталог сам
+
+
+def _template_dir_entries(
+    tdir: Path, category: str, owner: str, listing: object = _UNLISTED
+) -> list[tuple[str, str, str, Path]]:
+    """Макеты СКД каталога макетов (``<Владелец>/Templates`` либо ``CommonTemplates``) в порядке имени — то же правило,
+    что ``_template_entry``, по одному листингу каталога (без повторных проверок существования описателя). ``listing``
+    — уже снятый листинг ``_template_dir_listing`` (его же берёт прогрев задачи сборки)."""
+    if listing is _UNLISTED:
+        listing = _template_dir_listing(tdir)
+    if listing is None:
+        return []
+    descriptors, dirs = listing
     out: list[tuple[str, str, str, Path]] = []
     root = os.fspath(tdir)
     for name in sorted(descriptors | dirs):
@@ -9860,11 +10041,20 @@ def _template_dir_entries(tdir: Path, category: str, owner: str) -> list[tuple[s
     return out
 
 
-def _template_query_files(base: Path) -> list[tuple[str, str, str, Path]]:
-    """Макеты СКД конфигурации ``(категория владельца, объект, макет, файл содержимого)`` — правило У9 у макетов
-    объектов любой категории (``<Категория>/<Объект>/Templates/``) и общих (``CommonTemplates/``, категория —
-    ``CommonTemplates``, объект — сам макет). Категории не перечисляются поимённо, как у ``_collect_templates``."""
-    out: list[tuple[str, str, str, Path]] = []
+def _template_descriptors_read(tdir: Path | str, listing: tuple[set[str], set[str]] | None) -> list[str]:
+    """Описатели, которые читает ``_template_dir_entries`` по листингу ``listing`` каталога макетов (тип макета), в
+    порядке чтения: у имени есть и ``<Имя>.xml``, и каталог ``<Имя>``. Для прогрева задачи ``template_queries``."""
+    if listing is None:
+        return []
+    descriptors, dirs = listing
+    root = os.fspath(tdir)
+    return [os.path.join(root, f"{name}.xml") for name in sorted(descriptors & dirs)]
+
+
+def _template_dirs(base: Path) -> list[tuple[Path, str, str]]:
+    """Каталоги макетов конфигурации в порядке обнаружения ``_template_query_files``: ``(каталог, категория владельца,
+    владелец)`` — ``CommonTemplates`` (владельца нет) и ``<Категория>/<Объект>/Templates``."""
+    out: list[tuple[Path, str, str]] = []
     try:
         with os.scandir(base) as it:
             categories = sorted(entry.name for entry in it if entry.is_dir())
@@ -9873,7 +10063,7 @@ def _template_query_files(base: Path) -> list[tuple[str, str, str, Path]]:
     for category in categories:
         cat_dir = base / category
         if category == "CommonTemplates":
-            out.extend(_template_dir_entries(cat_dir, category, ""))
+            out.append((cat_dir, category, ""))
             continue
         try:
             with os.scandir(cat_dir) as it:
@@ -9884,7 +10074,17 @@ def _template_query_files(base: Path) -> list[tuple[str, str, str, Path]]:
         for obj in objects:
             tdir = os.path.join(cat_root, obj, "Templates")
             if os.path.isdir(tdir):
-                out.extend(_template_dir_entries(Path(tdir), category, obj))
+                out.append((Path(tdir), category, obj))
+    return out
+
+
+def _template_query_files(base: Path) -> list[tuple[str, str, str, Path]]:
+    """Макеты СКД конфигурации ``(категория владельца, объект, макет, файл содержимого)`` — правило У9 у макетов
+    объектов любой категории (``<Категория>/<Объект>/Templates/``) и общих (``CommonTemplates/``, категория —
+    ``CommonTemplates``, объект — сам макет). Категории не перечисляются поимённо, как у ``_collect_templates``."""
+    out: list[tuple[str, str, str, Path]] = []
+    for tdir, category, owner in _template_dirs(base):
+        out.extend(_template_dir_entries(tdir, category, owner))
     return out
 
 
@@ -9913,7 +10113,7 @@ def _dcs_query_texts(path: Path) -> list[str] | None:
     return texts
 
 
-def _template_query_rows(base: Path, files: list[tuple[str, str, str, Path]]) -> list[tuple]:
+def _template_query_rows(base: Path, files: Iterable[tuple[str, str, str, Path]]) -> list[tuple]:
     """Строки ``metadata_references`` вида ``template_query`` (У2): объекты текстов запросов — тем же разбором, что
     у ``form_query`` (``_query_text_refs``: комментарии и литералы погашены, путь ``<Вид>.X`` RU/EN), цель —
     ``canonicalize_object_ref``; одна строка на макет и объект по всем запросам макета — ключ
@@ -9942,9 +10142,21 @@ def _template_query_rows(base: Path, files: list[tuple[str, str, str, Path]]) ->
 
 
 def _collect_template_queries(base_path: str) -> list[tuple]:
-    """Коллектор домена запросов СКД (задача пула ``template_queries``): обнаружение и разбор."""
+    """Коллектор домена запросов СКД (задача пула ``template_queries``): обнаружение и разбор. v1.51.0: в задаче
+    сборки (``_warm_enabled``) на окно вперёд прогреваются сначала описатели макетов, которые читает обнаружение (тип
+    макета выгрузки Конфигуратора), затем файлы содержимого найденных макетов СКД; обнаружение и разбор — прежние."""
     base = Path(base_path)
-    return _template_query_rows(base, _template_query_files(base))
+    if not _warm_enabled():
+        return _template_query_rows(base, _template_query_files(base))
+    # Тот же обход, что `_template_query_files`, но листинг каждого каталога макетов снимается один раз — его берут и
+    # обнаружение (`_template_dir_entries`), и прогрев описателей (`_template_descriptors_read`).
+    dirs = [(tdir, category, owner, _template_dir_listing(tdir)) for tdir, category, owner in _template_dirs(base)]
+    files: list[tuple[str, str, str, Path]] = []
+    with _WarmAhead(dirs, lambda d: _template_descriptors_read(d[0], d[3])) as warm:
+        for tdir, category, owner, listing in warm:
+            files.extend(_template_dir_entries(tdir, category, owner, listing))
+    with _WarmAhead(files, operator.itemgetter(3)) as warm:
+        return _template_query_rows(base, warm)
 
 
 def _replace_template_query_refs(conn: sqlite3.Connection, rows: list[tuple]) -> None:
@@ -10278,10 +10490,18 @@ def _collect_form_elements(base_path: str) -> tuple[list[tuple], list[tuple]]:
     all_refs: list[tuple] = []
     if len(form_files) > 1:
         workers = _collector_threads()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for batch, refs_batch in pool.map(functools.partial(_form_rows, base), form_files):
-                all_results.extend(batch)
-                all_refs.extend(refs_batch)
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for batch, refs_batch in pool.map(functools.partial(_form_rows, base), form_files):
+                    all_results.extend(batch)
+                    all_refs.extend(refs_batch)
+        else:
+            # v1.51.0: один поток (воркер сборки) — разбор по порядку в этом потоке, файлы форм прогреваются на окно
+            # вперёд (_WarmAhead): своего пула потоков, который читал бы их параллельно, здесь нет.
+            with _WarmAhead(form_files, operator.itemgetter(3)) as warm:
+                for batch, refs_batch in map(functools.partial(_form_rows, base), warm):
+                    all_results.extend(batch)
+                    all_refs.extend(refs_batch)
     elif form_files:
         batch, refs_batch = _form_rows(base, form_files[0])
         all_results.extend(batch)
@@ -10458,105 +10678,237 @@ _FORM_ELEMENTS_INSERT = (
 
 
 # ---------------------------------------------------------------------------
-# Прогрев описателей полной сборки (холодный кеш файлов)
+# v1.51.0: прогрев на окно вперёд в задачах сборки (холодный кеш файлов)
 # ---------------------------------------------------------------------------
-# Первое открытие файла после загрузки ОС или обновления антивирусных сигнатур (проверка при
-# доступе) стоит ~12 мс, повторное ~0,1 мс; пул потоков открывает холодные файлы вдесятеро быстрее
-# (замер на 8 тыс. XML документов ERP: 11,9 мс подряд против 1,2 мс в 16 потоков). Сборщик
-# метаданных открывает описатели по одному, и на ERP это десятки тысяч открытий. Прогрев читает
-# описатели пулом ВО ВРЕМЯ разбора BSL (тот упирается в GIL, а чтение его отпускает), и к фазе
-# метаданных файлы теплые. Только чтение и отбрасывание: на состав индекса прогрев не влияет.
-_PREFETCH_WORKERS = 16
-_PREFETCH_SUFFIXES = (".xml", ".mdo", ".form", ".rights")
-# Содержимое макетов CF (Templates/<Имя>/Ext/Template.xml) сборка не читает, а по объему это
-# большая часть XML выгрузки ERP (4,3 из 5,4 ГБ).
-_PREFETCH_SKIP_NAMES = frozenset({"template.xml"})
+# Первое открытие файла после загрузки ОС или обновления сигнатур (проверка при доступе) ждёт проверки — ~12 мс против
+# ~0,1 мс повторного. Кеш проверки общий для процессов, но вытесняется объёмом: прочитанное задолго до использования к
+# сборщику не доживает. Поэтому задача сборки греет СВОИ файлы и рядом с позицией разбора: потоки открывают и закрывают
+# файлы её списка на окно вперёд (проверка идёт на открытии, чтение для прогрева не нужно), а разбор идёт в один поток,
+# как прежде, — тем же кодом, в том же порядке. Включён в воркере сборки и в координаторе крупной выгрузки в
+# последовательном режиме (признак потока `_large_sequential_warm`); иначе — пустая операция без потоков.
+_WARM_WINDOW = 64
+_WARM_THREADS = 8
+_WARM_WAKE_BATCH = 16  # на столько элементов сдвинулось окно — будится ждущий поток прогрева
+_WARM_CLAIM = 4  # элементов за один захват условия потоком прогрева
+# Только чтение; без ожидания на FIFO, даже если бы он подменил обычный файл между stat и open. Дескриптор не
+# наследуется процессами пула (PEP 446).
+_WARM_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+_warm_state = threading.local()
 
 
-def _prefetch_descriptor_paths(base: Path, stop: threading.Event | None = None):
-    """Описатели под ``base`` для прогрева: ``.xml``/``.mdo``/``.form``/``.rights``, кроме содержимого
-    макетов. Только ОБЫЧНЫЕ файлы (в том числе по ссылке на обычный файл): FIFO, устройство или
-    сокет с тем же расширением открывать нельзя — ``open()`` на FIFO без писателя блокируется
-    навсегда, и сборка не вернулась бы. В скрытые каталоги (``.git``, ``.settings``) и ссылки на
-    каталоги обход не заходит. ``stop`` проверяется на каждом каталоге."""
-    stack = [os.fspath(base)]
-    while stack:
-        if stop is not None and stop.is_set():
-            return
-        try:
-            with os.scandir(stack.pop()) as it:
-                entries = list(it)
-        except OSError:
-            continue
-        subdirs: list[str] = []
-        for entry in entries:
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    if not entry.name.startswith("."):
-                        subdirs.append(entry.path)
-                    continue
-                low = entry.name.lower()
-                if low.endswith(_PREFETCH_SUFFIXES) and low not in _PREFETCH_SKIP_NAMES and entry.is_file():
-                    yield entry.path
-            except OSError:
-                continue
-        stack.extend(reversed(subdirs))
-
-
-def _warm_file(path: str, stop: threading.Event | None = None) -> None:
-    """Прочитать файл порциями и отбросить; ``stop`` проверяется между порциями."""
+@contextlib.contextmanager
+def _large_sequential_warm() -> Iterator[None]:
+    """Признак координатора на время операции над крупной выгрузкой: задачи пула, которые исполняются в ЭТОМ потоке
+    (последовательный режим — ``RLM_INDEX_WORKERS=1``, frozen-сборка, бюджет процессов занят другой операцией,
+    процессы не запустились), прогревают свои файлы, как в воркере. Признак — у потока: две операции в одной службе
+    друг у друга его не видят."""
+    previous = getattr(_warm_state, "large_sequential", False)
+    _warm_state.large_sequential = True
     try:
-        with open(path, "rb") as f:
-            while f.read(1 << 20):
-                if stop is not None and stop.is_set():
+        yield
+    finally:
+        _warm_state.large_sequential = previous
+
+
+def _warm_enabled() -> bool:
+    """Прогрев в задачах сборки включён: воркер сборки либо координатор крупной выгрузки (``_large_sequential_warm``)."""
+    return in_index_worker() or getattr(_warm_state, "large_sequential", False)
+
+
+def _warm_open(path) -> None:
+    """Открыть и закрыть ОБЫЧНЫЙ файл (в том числе по ссылке на обычный файл): FIFO, устройство, сокет и каталог не
+    открываются — ``open()`` на FIFO без писателя не вернулся бы. ``None`` и ошибка — пропуск."""
+    if path is None:
+        return
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return
+        fd = os.open(path, _WARM_OPEN_FLAGS)
+    except (OSError, ValueError):
+        return
+    os.close(fd)
+
+
+class _WarmAhead:
+    """Прогрев упорядоченного списка на окно вперёд от позиции потребителя.
+
+    ``items`` — элементы в порядке разбора; ``paths_of(item)`` — пути элемента к прогреву (без него — сам элемент; один
+    путь или их набор, ``None`` пропускается), зовётся в потоке прогрева. Потребитель сообщает позицию: ``advance(i)`` (он у
+    элемента ``i``) или перебором самого объекта (``for item in warm`` — элементы в исходном порядке). Прогрев берёт
+    элементы по порядку списка, не дальше ``позиция + window``, пройденные потребителем пропускает. Контекстный
+    менеджер: вход запускает ``threads`` потоков ``rlm-warm-N`` — только если прогрев включён (``_warm_enabled``) и
+    элементов больше одного; выход (и исключение) останавливает прогрев, снимает невыполненное и дожидается потоков:
+    после выхода ни один файл прогревом не открыт. Сбой прогрева потребителя не касается: не запустился поток — прогрев
+    этого списка снят (задача идёт без него), прерывание при запуске — потоки остановлены и дождались до выхода, в том
+    числе тот, чей ``start()`` прервали уже после запуска."""
+
+    def __init__(
+        self,
+        items: Iterable,
+        paths_of: Callable[[object], Iterable] | None = None,
+        *,
+        window: int | None = None,
+        threads: int | None = None,
+        seen: set[str] | None = None,
+    ) -> None:
+        self._items = items if isinstance(items, list) else list(items)
+        self._paths_of = paths_of
+        self._seen = seen
+        self._window = max(1, _WARM_WINDOW if window is None else window)
+        self._threads_wanted = max(1, _WARM_THREADS if threads is None else threads)
+        self._cond = threading.Condition()
+        self._position = -1
+        self._woken = -1
+        self._next = 0
+        self._stopped = False
+        self._threads: list[threading.Thread] = []
+
+    def __enter__(self) -> _WarmAhead:
+        if len(self._items) > 1 and _warm_enabled():
+            # `__exit__` после сбоя `__enter__` не зовётся: сбой запуска потока разбирается здесь же. В список — только
+            # запущенный поток (`join` незапущенного — `RuntimeError`).
+            pending = None
+            try:
+                for n in range(min(self._threads_wanted, len(self._items))):
+                    pending = threading.Thread(target=self._run, name=f"rlm-warm-{n}", daemon=True)
+                    pending.start()
+                    self._threads.append(pending)
+                    pending = None
+            except BaseException as exc:
+                # Поток не запустился (ресурсы ОС: «can't start new thread») или запуск прервали: прогрев этого списка
+                # снимается. Сначала признак остановки, затем — в ожидание и поток, чей `start()` не вернулся, но
+                # который уже жив; не дошедший до своего кода поток увидит остановку раньше первого открытия файла.
+                # Прогрев — только оптимизация: задача идёт без него; прерывание идёт дальше, когда потоки дождались.
+                self._stop()
+                if pending is not None and pending.is_alive():
+                    self._threads.append(pending)
+                self.close()
+                if not isinstance(exc, Exception):
+                    raise
+                logger.debug("warm-ahead: thread start failed, continuing without warm", exc_info=True)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __iter__(self) -> Iterator:
+        for i, item in enumerate(self._items):
+            self.advance(i)
+            yield item
+
+    def advance(self, position: int) -> None:
+        """Потребитель дошёл до элемента ``position``: окно прогрева сдвигается."""
+        if not self._threads or position <= self._position:
+            return
+        # Запись позиции без замка (атомарна; потоки читают её под замком условия). Ждущий поток будится, когда в окне
+        # освободилась порция: на тёплом кеше прогрев всегда впереди, и будить его на каждый шаг — пробуждение и захват
+        # GIL на каждый файл; проснувшийся берёт порцию подряд.
+        self._position = position
+        if position - self._woken >= _WARM_WAKE_BATCH or position + self._window >= len(self._items) - 1:
+            with self._cond:
+                self._woken = position
+                self._cond.notify()
+
+    def _claim(self) -> range | None:
+        """Следующая порция элементов в окне (по порядку списка, не дальше ``позиция + window``): захват условия —
+        раз на порцию, а не на каждый файл."""
+        with self._cond:
+            while True:
+                if self._stopped:
+                    return None
+                if self._next < self._position:
+                    self._next = self._position  # пройденное потребителем не греется
+                if self._next >= len(self._items):
+                    return None
+                limit = min(self._position + self._window, len(self._items) - 1)
+                if self._next <= limit:
+                    start = self._next
+                    self._next = min(limit + 1, start + _WARM_CLAIM)
+                    return range(start, self._next)
+                self._cond.wait()
+
+    def _warm(self, path) -> None:
+        if path is None:
+            return
+        seen = self._seen
+        if seen is not None:
+            key = os.fspath(path)
+            if key in seen:
+                return  # уже прогрет (и прочитан) этим сборщиком: повторное открытие ничего не даёт
+            seen.add(key)
+        _warm_open(path)
+
+    def _run(self) -> None:
+        items, paths_of, warm = self._items, self._paths_of, self._warm
+        while True:
+            claimed = self._claim()
+            if claimed is None:
+                return
+            for index in claimed:
+                if self._stopped:
                     return
-    except OSError:
-        pass
-
-
-class _DescriptorPrefetch:
-    """Фоновый прогрев описателей на время сборки. ``close()`` снимает невыполненное и дожидается
-    потоков: после возврата сборки ни один файл прогревом не открыт. Сбой прогрева сборку не
-    касается — это только оптимизация."""
-
-    def __init__(self, base_path: str) -> None:
-        self._stop = threading.Event()
-        self._slots = threading.BoundedSemaphore(_PREFETCH_WORKERS * 4)
-        self._pool = ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS, thread_name_prefix="rlm-prefetch")
-        self._walker = threading.Thread(
-            target=self._walk, args=(Path(base_path),), name="rlm-prefetch-walk", daemon=True
-        )
-        self._walker.start()
-
-    def _walk(self, base: Path) -> None:
-        try:
-            for path in _prefetch_descriptor_paths(base, self._stop):
-                # Очередь ограничена: обход не обгоняет чтение на десятки тысяч заданий.
-                while not self._slots.acquire(timeout=0.5):
-                    if self._stop.is_set():
-                        return
-                if self._stop.is_set():
-                    self._slots.release()
-                    return
+                if index < self._position:
+                    continue  # потребитель уже прошёл этот элемент
                 try:
-                    self._pool.submit(self._warm, path)
-                except RuntimeError:  # пул уже закрыт
-                    self._slots.release()
-                    return
-        except Exception:
-            logger.debug("descriptor prefetch walk failed", exc_info=True)
+                    paths = items[index] if paths_of is None else paths_of(items[index])
+                    if paths is None or isinstance(paths, (str, os.PathLike)):
+                        warm(paths)
+                        continue
+                    for path in paths:
+                        if self._stopped:
+                            return
+                        warm(path)
+                except Exception:  # noqa: BLE001 — прогрев только оптимизация: его сбой разбора не касается
+                    logger.debug("warm-ahead: item %d skipped", index, exc_info=True)
 
-    def _warm(self, path: str) -> None:
-        try:
-            if not self._stop.is_set():
-                _warm_file(path, self._stop)
-        finally:
-            self._slots.release()
+    def _stop(self) -> None:
+        with self._cond:
+            self._stopped = True
+            self._cond.notify_all()
 
     def close(self) -> None:
-        self._stop.set()
-        self._walker.join()
-        self._pool.shutdown(wait=True, cancel_futures=True)
+        self._stop()
+        for thread in self._threads:
+            thread.join()
+        self._threads = []
+
+
+class _WarmSections:
+    """Прогрев сборщика по разделам (``_metadata_tables``, ``_collect_templates``): ``section(items, paths_of)``
+    останавливает прогрев прежнего раздела и греет на окно вперёд список нового (``_WarmAhead``) — перебор
+    возвращённого объекта сдвигает окно; прогрев выключен (``_warm_enabled``) — отдаёт ``items`` как есть. Файл,
+    прогретый одним разделом, другой не открывает заново (сборщик читает часть описателей дважды: у EDT раздел макетов
+    — все ``.mdo`` владельцев, у обоих форматов раздел команд — описатели владельцев после цикла реквизитов). Выход из
+    менеджера (и исключение) останавливает прогрев текущего раздела и дожидается его потоков."""
+
+    def __init__(self) -> None:
+        self._enabled = _warm_enabled()
+        self._active: _WarmAhead | None = None
+        self._seen: set[str] = set()
+
+    def __enter__(self) -> _WarmSections:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def section(self, items: Iterable, paths_of: Callable[[object], object] | None = None) -> Iterable:
+        self.close()
+        if not self._enabled:
+            return items
+        warm = _WarmAhead(items, paths_of, seen=self._seen)
+        self._active = warm.__enter__()
+        return warm
+
+    def close(self) -> None:
+        active, self._active = self._active, None
+        if active is not None:
+            active.close()
+
+
+def _no_warm_section(items: Iterable, paths_of: Callable[[object], object] | None = None) -> Iterable:
+    """``_WarmSections.section`` без прогрева: прямой вызов ``_collect_templates`` вне сборщика метаданных."""
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -10959,6 +11311,28 @@ def _snapshot_binds(snapshot: dict | None, conn: sqlite3.Connection) -> bool:
     )
 
 
+# v1.51.0: пересборка на месте очищает схему DROP каждого объекта — SQLite обходит страницы B-деревьев (внутренние,
+# листовые, переполнения) в своём порядке, и на холодном файле индекса это случайное чтение диска (замер: индекс 2,4 ГБ
+# — ~45 с против ~4 с после чтения файла подряд). Поэтому перед очисткой старый файл читается подряд.
+_DB_PREREAD_MIN_BYTES = 64 * 1024 * 1024
+_DB_PREREAD_CHUNK = 1 << 20
+
+
+def _preread_db_file(db_path: Path) -> None:
+    """Прочитать файл прежнего индекса подряд перед очисткой схемы на месте: отдельным дескриптором, только чтение
+    (соединение сборки открыто — файл делится на чтение и запись), в один буфер. Файл меньше
+    ``_DB_PREREAD_MIN_BYTES`` (свежая сборка, малый индекс) или ошибка — пропуск: это только оптимизация."""
+    try:
+        if db_path.stat().st_size < _DB_PREREAD_MIN_BYTES:
+            return
+        buffer = bytearray(_DB_PREREAD_CHUNK)
+        with open(db_path, "rb", buffering=0) as fh:
+            while fh.readinto(buffer):
+                pass
+    except OSError:
+        logger.debug("old index pre-read skipped: %s", db_path, exc_info=True)
+
+
 def _remove_stale_spools(index_dir: Path) -> None:
     """Удалить spool прерванной операции (процесс убит до ``close``): операция держит блокировку индекса, поэтому
     любой spool в его каталоге — чужой и мёртвый."""
@@ -11270,12 +11644,11 @@ class IndexBuilder:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path))
         try:
-            # Описатели прогреваются в фоне, пока идет разбор BSL (см. _DescriptorPrefetch); v1.48.0 — рядом дайджесты
-            # входов для снимка (_InputFingerprint). Оба закрываются здесь же — и при ошибке сборки. v1.48.0: только у
-            # крупной выгрузки — у малой коллекторы читают описатели сразу (последовательный режим), а фоновые потоки
-            # лишь спорят с ними за GIL; дайджесты малой считаются в конце сборки.
+            # v1.48.0: дайджесты входов для снимка (_InputFingerprint) у крупной выгрузки — в фоне, у малой — в конце
+            # сборки (фоновые потоки лишь спорят с коллекторами за GIL); закрываются здесь же — и при ошибке сборки.
+            # v1.51.0: фонового прогрева описателей координатора нет — задачи сборки греют свои файлы сами
+            # (_WarmAhead), а прочитанное координатором задолго до сборщиков к ним не доживало.
             large = _large_export(base_path)
-            prefetch = _DescriptorPrefetch(base_path) if large else None
             # Детект соседних конфигураций — один на сборку: перехваты и дайджест перехватов для снимка.
             detection = _ExtensionDetection(base_path)
             fingerprint = _InputFingerprint(
@@ -11286,21 +11659,23 @@ class IndexBuilder:
                 detection=detection,
             )
             try:
-                return self._build_into_conn(
-                    conn,
-                    base_path,
-                    db_path,
-                    build_calls,
-                    build_metadata,
-                    build_fts,
-                    build_synonyms,
-                    fingerprint,
-                    detection,
-                )
+                # v1.51.0: задачи пула, исполняемые в этом потоке (последовательный режим крупной выгрузки), греют свои
+                # файлы, как в воркере (_large_sequential_warm).
+                with _large_sequential_warm() if large else contextlib.nullcontext():
+                    return self._build_into_conn(
+                        conn,
+                        base_path,
+                        db_path,
+                        build_calls,
+                        build_metadata,
+                        build_fts,
+                        build_synonyms,
+                        fingerprint,
+                        detection,
+                        large=large,
+                    )
             finally:
                 fingerprint.close()
-                if prefetch is not None:
-                    prefetch.close()
         finally:
             conn.close()
 
@@ -11315,10 +11690,16 @@ class IndexBuilder:
         build_synonyms: bool,
         fingerprint: _InputFingerprint | None = None,
         detection: _ExtensionDetection | None = None,
+        *,
+        large: bool,
     ) -> Path:
         """Build into an already-open connection (the caller opened it and closes it in
         a finally — M1). In-place: set the marker + clear the schema before populating,
-        and clear the marker only after ANALYZE/VACUUM (success gate)."""
+        and clear the marker only after ANALYZE/VACUUM (success gate).
+
+        ``large`` (v1.51.0) — крупная выгрузка (``_large_export`` вызывающего): пул процессов заводится в начале, обход
+        BSL — его первой задачей (``_discover_bsl``), задачи описаний — сразу за ним. Малая — прежний порядок: обход в
+        координаторе, затем пустая сборка либо последовательный пул."""
         opts = {
             "has_calls": build_calls,
             "has_metadata": build_metadata,
@@ -11336,16 +11717,25 @@ class IndexBuilder:
         logger.info("Building method index for %s -> %s", base_path, db_path)
         t0 = time.time()
 
-        # Discover all .bsl files
         base = Path(base_path)
-        bsl_files = sorted(base.rglob("*.bsl"))
-        total_files = len(bsl_files)
-        logger.info("Found %d .bsl files", total_files)
 
-        if total_files == 0:
+        def found(files: list[Path]) -> tuple[int, str]:
+            """Обнаруженные BSL: журнал «Found N» и хеш путей (тот же у обоих порядков сборки)."""
+            logger.info("Found %d .bsl files", len(files))
+            return len(files), _paths_hash([Path(f).relative_to(base).as_posix() for f in files])
+
+        # Discover all .bsl files. v1.51.0: у крупной выгрузки обход — первая задача пула (ниже), здесь его нет.
+        bsl_files: list[Path] = []
+        total_files, paths_hash = 0, ""
+        if not large:
+            bsl_files = sorted(base.rglob("*.bsl"))
+            total_files, paths_hash = found(bsl_files)
+
+        if total_files == 0 and not large:
             # Empty rebuild — same in-place marker lifecycle; populate empty tables +
             # file_paths + meta only (codex round 8: must NOT skip the cleanup, else stale
             # modules/methods/calls would survive the now-unlink-free rebuild).
+            _preread_db_file(db_path)  # v1.51.0: очистка схемы — по прочитанному подряд файлу, не случайным чтением
             self._begin_inplace_rebuild(conn, opts)
             fp_rows = _collect_file_paths(base_path)
             _insert_file_paths(conn, fp_rows)
@@ -11394,23 +11784,27 @@ class IndexBuilder:
             self._finalize_build_best_effort(conn)
             return db_path
 
-        # Compute paths hash
-        rel_paths = [Path(f).relative_to(base).as_posix() for f in bsl_files]
-        paths_hash = _paths_hash(rel_paths)
-
         # v1.48.0: разбор BSL — порциями в процессах, вместе с коллекторами описателей в одном бюджете CPU;
         # результаты разбора — во временный spool рядом с индексом, а не в память. Схема очищается только после
-        # разбора: сбой разбора или коллектора оставляет прежний индекс целым.
+        # разбора: сбой разбора или коллектора оставляет прежний индекс целым. v1.51.0: процессы — по `large` (то же
+        # условие, что «.bsl больше `_PARALLEL_MIN_BSL_FILES`»: счёт вызывающего тем же `rglob`).
         workers, workers_source = resolve_index_workers()
-        if total_files <= _PARALLEL_MIN_BSL_FILES:
+        if not large:
             workers = 1
         _remove_stale_spools(db_path.parent)
         spool = ResultSpool(db_path.parent)
         try:
             with IndexTaskPool(workers, label="build") as pool:
+                # v1.51.0: у крупной выгрузки обход BSL — ПЕРВАЯ задача пула: в процессе-воркере он не делит GIL с
+                # потоками координатора, а задачи описаний (им список BSL не нужен) встают сразу за ним. Сбой обхода —
+                # ошибка операции здесь, до любых изменений БД.
+                discovery = pool.submit(_discover_bsl, base_path) if large else None
                 jobs = _submit_descriptor_jobs(
                     pool, base_path, build_metadata=build_metadata, build_synonyms=build_synonyms
                 )
+                if discovery is not None:
+                    bsl_files = pool.result(discovery)
+                    total_files, paths_hash = found(bsl_files)
                 progress = _ParseProgress(total_files, t0)
                 for blob in pool.map_ordered(
                     _parse_bsl_batch,
@@ -11434,6 +11828,8 @@ class IndexBuilder:
 
             # Write to SQLite — in-place: set the build_in_progress marker + clear the schema
             # before populating (conn is opened AND closed by the caller — M1 try/finally).
+            # v1.51.0: прежний файл индекса — сначала чтением подряд (`_preread_db_file`), затем очистка схемы.
+            _preread_db_file(db_path)
             self._begin_inplace_rebuild(conn, opts, defer_calls_indexes=True)
 
             bsl_stats = self._bulk_insert_batches(conn, spool, build_calls)
@@ -11634,17 +12030,18 @@ class IndexBuilder:
         lock = _BuildLock(db_path)
         lock.acquire()
         conn = None
-        prefetch: list[_DescriptorPrefetch] = []  # v1.47.0: прогрев полного скана (его заводит _update_locked)
+        # v1.51.0: признак крупной выгрузки (_large_sequential_warm) на время полного скана — его заводит ветка полного
+        # скана _update_locked, снимает этот finally (и при исключении).
+        operation = contextlib.ExitStack()
         try:
             # connect INSIDE the try (codex): a connect-time sqlite3.Error/OSError must
             # NOT leak the acquired lock — otherwise it stays in _active_locks and blocks
             # later builds/updates in the same process.
             conn = sqlite3.connect(str(db_path))  # M1: closed in finally
-            return self._update_locked(base_path, db_path, conn, prefetch)
+            return self._update_locked(base_path, db_path, conn, operation)
         finally:
             try:
-                for warmer in prefetch:
-                    warmer.close()
+                operation.close()
             finally:
                 if conn is not None:
                     try:
@@ -11658,15 +12055,15 @@ class IndexBuilder:
         base_path: str,
         db_path: Path,
         conn: sqlite3.Connection,
-        prefetch: list[_DescriptorPrefetch] | None = None,
+        operation: contextlib.ExitStack | None = None,
     ) -> dict:
         """Internal update with lock held and the connection opened by the caller
         (M1: ``update()`` closes it in a finally). Existing explicit ``conn.close()``
         calls before each return remain (idempotent double-close — the safety net only
         fires on an exception path).
 
-        ``prefetch`` (v1.47.0) — список вызывающего: ветка полного скана кладёт туда прогрев описателей, а
-        вызывающий закрывает его в своём ``finally``. ``None`` — без прогрева."""
+        ``operation`` (v1.51.0) — стек вызывающего на время операции: ветка полного скана крупной выгрузки кладёт туда
+        признак ``_large_sequential_warm``, а вызывающий закрывает его в своём ``finally``. ``None`` — без него."""
         t0 = time.time()
         base = Path(base_path)
 
@@ -11922,13 +12319,13 @@ class IndexBuilder:
         if fallback_reason:
             logger.info("Git fast path unavailable (%s), using full scan", fallback_reason)
 
-        # v1.47.0: прогрев описателей на время полного скана — тот же, что у полной сборки (`_DescriptorPrefetch`):
-        # полный скан перечитывает все описатели подряд (метаданные, синонимы, права, формы), и на холодном кеше
-        # файлов (после загрузки ОС или обновления сигнатур антивируса) одни метаданные крупной ERP-конфигурации шли
-        # минуты (замер: 511 с против 31 с на тёплом). Закрывает его `update()` — и при исключении. v1.48.0: только у
-        # крупной выгрузки, как у сборки: у малой опись снимка и коллекторы читают описатели сразу сами.
-        if prefetch is not None and _large_export(base_path):
-            prefetch.append(_DescriptorPrefetch(base_path))
+        # Полный скан перечитывает все описатели подряд (метаданные, синонимы, права, формы), и на холодном кеше файлов
+        # (после загрузки ОС или обновления сигнатур антивируса) одни метаданные крупной ERP-конфигурации шли минуты
+        # (замер: 511 с против 31 с на тёплом). v1.51.0: фонового прогрева описателей координатора (v1.47.0) больше нет —
+        # задачи сборщиков греют свои файлы сами, на окно вперёд (_WarmAhead): в воркере и — у крупной выгрузки — в
+        # этом потоке, когда задачи пула исполняются здесь (последовательный режим, признак снимает `update()`).
+        if operation is not None and _large_export(base_path):
+            operation.enter_context(_large_sequential_warm())
 
         # --- Fallback: full scan (original logic) ---
         bsl_files = sorted(base.rglob("*.bsl"))
@@ -15233,6 +15630,8 @@ class IndexReader:
         ``<Голова>.<object_name>`` (``primary_head`` — голова категории ссылки запроса), если он среди
         совпадений роли, иначе первое совпадение; ``rights`` — полные права ИМЕННО этого объекта (прежде —
         объединение прав всех совпадений). Все совпадения — ``matched_objects``/``rights_by_object``.
+        v1.51.0: точного нет — первый по имени член объекта запроса (``<Голова>.<object_name>.…``), иначе прежний
+        выбор; в выборке объект запроса и его члены идут первыми (ярусы ``_RoleGroupBuilder``).
 
         **v1.34.0 — literal substring, а не SQL-wildcard.** Легальные ``_``/``%`` в
         имени 1С (``тст_Смета``) раньше работали как SQL-метасимволы и давали

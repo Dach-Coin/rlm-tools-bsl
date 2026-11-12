@@ -20,6 +20,8 @@ import os
 import sqlite3
 import tempfile
 
+import pytest
+
 from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
 from rlm_tools_bsl.bsl_index import (
     IndexBuilder,
@@ -240,7 +242,11 @@ def test_find_register_movements_live_path_drops_noise():
 def test_find_register_writers_noise_name_live_path_empty():
     with tempfile.TemporaryDirectory() as tmp:
         bsl = _bsl_no_index(tmp)
-        assert bsl["find_register_writers"]("Записать")["total_writers"] == 0
+        # v1.51.0: прежде здесь стояло `["total_writers"] == 0` — регистра `Записать` нет, и публичный вызов с пустым
+        # ответом теперь отказ «регистра с именем … нет»; движением `Движения.Записать()` по-прежнему не считается.
+        with pytest.raises(ValueError, match="регистра с именем 'Записать' нет"):
+            bsl["find_register_writers"]("Записать")
+        assert bsl["find_register_writers"].__wrapped__("Записать")["total_writers"] == 0
         # sanity: the real register is still found on the same live path
         assert bsl["find_register_writers"]("ТоварыНаСкладах")["total_writers"] >= 1
 

@@ -1379,9 +1379,12 @@ _PRIOR_FORMS_HEAD = {
         "idx|find_roles": "80d5d8f112991c83",
         "idx|find_custom_modifications": "6c1c2633c3445705",
         "idx|find_enum_values": "f08c64b00750cf2c",
-        "idx|find_register_writers": "6604e7cee61aec24",
-        "idx|find_exchange_plan_content": "30b8c3865a08627b",
-        "idx|find_defined_types": "647fb9e6122199e2",
+        # v1.51.0: прежде здесь стояло '6604e7cee61aec24' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "idx|find_register_writers": "534ab4f51b400c81",
+        # v1.51.0: прежде здесь стояло '30b8c3865a08627b' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "idx|find_exchange_plan_content": "5b70f4de70fb467e",
+        # v1.51.0: прежде здесь стояло '647fb9e6122199e2' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "idx|find_defined_types": "d768db2ea3372f60",
         "idx|find_event_subscriptions": "c2f664ddeaec99a7",
         "idx|find_functional_options": "7174a09ff2c4ace9",
         "idx|get_overrides": "f222d3ed1935d673",
@@ -1409,9 +1412,12 @@ _PRIOR_FORMS_HEAD = {
         "live|find_roles": "5e84c9ad3d652ac0",
         "live|find_custom_modifications": "0165b548dadb99f5",
         "live|find_enum_values": "f08c64b00750cf2c",
-        "live|find_register_writers": "9a56eddd0671c3db",
-        "live|find_exchange_plan_content": "30b8c3865a08627b",
-        "live|find_defined_types": "647fb9e6122199e2",
+        # v1.51.0: прежде здесь стояло '9a56eddd0671c3db' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "live|find_register_writers": "f629e229c3101e80",
+        # v1.51.0: прежде здесь стояло '30b8c3865a08627b' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "live|find_exchange_plan_content": "5b70f4de70fb467e",
+        # v1.51.0: прежде здесь стояло '647fb9e6122199e2' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "live|find_defined_types": "d768db2ea3372f60",
         "live|find_event_subscriptions": "c2f664ddeaec99a7",
         "live|find_functional_options": "6ccd97071c2b31cd",
         "live|get_overrides": "59d5d2e3133570b3",
@@ -1441,9 +1447,12 @@ _PRIOR_FORMS_HEAD = {
         "idx|find_roles": "878b73b641aa369c",
         "idx|find_custom_modifications": "7027f56dfc01ce26",
         "idx|find_enum_values": "43628b1d0890162a",
-        "idx|find_register_writers": "5507ce175c19f071",
-        "idx|find_exchange_plan_content": "30b8c3865a08627b",
-        "idx|find_defined_types": "647fb9e6122199e2",
+        # v1.51.0: прежде здесь стояло '5507ce175c19f071' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "idx|find_register_writers": "59bd044746b9ca78",
+        # v1.51.0: прежде здесь стояло '30b8c3865a08627b' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "idx|find_exchange_plan_content": "d529a904b58ea500",
+        # v1.51.0: прежде здесь стояло '647fb9e6122199e2' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "idx|find_defined_types": "a054a045996ab93c",
         "idx|find_event_subscriptions": "69bfd46400dc1544",
         "idx|find_functional_options": "edf8faf013ce910a",
         "idx|get_overrides": "60a18912142b0884",
@@ -1471,9 +1480,12 @@ _PRIOR_FORMS_HEAD = {
         "live|find_roles": "4cb4557a8da794d3",
         "live|find_custom_modifications": "dbbdf4b94fcdd800",
         "live|find_enum_values": "43628b1d0890162a",
-        "live|find_register_writers": "b71ec7ddf1c63f50",
-        "live|find_exchange_plan_content": "30b8c3865a08627b",
-        "live|find_defined_types": "647fb9e6122199e2",
+        # v1.51.0: прежде здесь стояло 'b71ec7ddf1c63f50' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "live|find_register_writers": "dc5c32e1aa198d05",
+        # v1.51.0: прежде здесь стояло '30b8c3865a08627b' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "live|find_exchange_plan_content": "d529a904b58ea500",
+        # v1.51.0: прежде здесь стояло '647fb9e6122199e2' — голое имя `Док` (документ) при пустом ответе теперь отказ
+        "live|find_defined_types": "a054a045996ab93c",
         "live|find_event_subscriptions": "69bfd46400dc1544",
         "live|find_functional_options": "ed4a28e143609919",
         "live|get_overrides": "f909b6490a779d5d",

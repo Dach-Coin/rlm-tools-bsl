@@ -1905,8 +1905,10 @@ def test_find_register_movements():
 def test_find_register_movements_not_found():
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)
-        result = bsl["find_register_movements"]("НесуществующийДок")
-        assert "error" in result
+        # v1.51.0: прежде здесь стояло `assert "error" in result` (живой ответ «ObjectModule … не найден» при пустых
+        # списках) — голое имя без документа при пустом ответе теперь отказ, как ссылка на несуществующий документ.
+        with pytest.raises(ValueError, match="документа с именем 'НесуществующийДок' нет"):
+            bsl["find_register_movements"]("НесуществующийДок")
 
 
 def test_find_register_writers():
@@ -1922,8 +1924,10 @@ def test_find_register_writers():
 def test_find_register_writers_no_match():
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)
-        result = bsl["find_register_writers"]("НесуществующийРегистр")
-        assert result["total_writers"] == 0
+        # v1.51.0: прежде здесь стояло `result["total_writers"] == 0` — голое имя без регистра при пустом ответе теперь
+        # отказ «регистра с именем … нет», как ссылка на несуществующий регистр.
+        with pytest.raises(ValueError, match="регистра с именем 'НесуществующийРегистр' нет"):
+            bsl["find_register_writers"]("НесуществующийРегистр")
 
 
 def test_analyze_document_flow():
@@ -5189,7 +5193,12 @@ def test_posting_hint_route_executes_end_to_end_and_names_the_delegate():
             # РАЗВИЛКА: тут набор записей — и find_register_writers его НЕ находит. Контроль: тот же
             # хелпер НАХОДИТ прямого писателя, значит ноль ниже — не «хелпер сломан», а слепота к наборам.
             assert bsl["find_register_writers"]("ТоварыНаСкладах")["total_writers"] >= 1
-            assert bsl["find_register_writers"]("ВзаиморасчетыСКонтрагентами")["total_writers"] == 0
+            # v1.51.0: прежде здесь стояло `bsl["find_register_writers"]("ВзаиморасчетыСКонтрагентами")["total_writers"]
+            # == 0`. В стенде нет описателя этого регистра (голое имя без регистра), и публичный вызов с пустым ответом
+            # теперь отказ; слепоту хелпера к наборам записей показывает его расчёт мимо публичной границы.
+            with pytest.raises(ValueError, match="регистра с именем 'ВзаиморасчетыСКонтрагентами' нет"):
+                bsl["find_register_writers"]("ВзаиморасчетыСКонтрагентами")
+            assert bsl["find_register_writers"].__wrapped__("ВзаиморасчетыСКонтрагентами")["total_writers"] == 0
             # v1.33.0: наборы записей из МОДУЛЯ МЕНЕДЖЕРА индекс знает (source='manager_code'),
             # а из прочих модулей (здесь — общий модуль-делегат) по-прежнему НЕТ. Hint обязан
             # называть эту границу, иначе агент решит, что ноль писателей = писателей нет.

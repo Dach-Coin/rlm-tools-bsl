@@ -4141,19 +4141,26 @@ class TestBuildSpeedWithoutIndexChange:
         IndexBuilder().build(str(base), build_calls=True)
         return base
 
-    def _spy_prefetch(self, monkeypatch) -> list[str]:
-        started: list[str] = []
-        real = BI._DescriptorPrefetch
+    # v1.51.0: фоновый прогрев описателей координатора (`_DescriptorPrefetch`) снят — задачи сборщиков греют свои файлы
+    # сами (`_WarmAhead`). Тесты его запуска полным сканом и отсутствия на git-пути переписаны на новый примитив:
+    # полный скан крупной выгрузки ставит признак `_large_sequential_warm` (задачи пула в этом потоке греют, как в
+    # воркере), git-путь — нет.
+    def _spy_large_flag(self, monkeypatch) -> list[str]:
+        import contextlib
 
-        class Spy(real):
-            def __init__(self, base_path):
-                started.append(base_path)
-                super().__init__(base_path)
+        entered: list[str] = []
+        real = BI._large_sequential_warm
 
-        monkeypatch.setattr(BI, "_DescriptorPrefetch", Spy)
-        return started
+        @contextlib.contextmanager
+        def spy():
+            entered.append("large")
+            with real():
+                yield
 
-    def test_full_scan_update_prefetches_descriptors(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(BI, "_large_sequential_warm", spy)
+        return entered
+
+    def test_full_scan_update_warms_tasks_of_a_large_export(self, tmp_path, monkeypatch):
         import threading
 
         base = self._built_cf_tree(tmp_path, monkeypatch)
@@ -4162,15 +4169,16 @@ class TestBuildSpeedWithoutIndexChange:
             {"Catalogs/А/Ext/ObjectModule.bsl": "Процедура П()\nКонецПроцедуры\n"},
             {"Catalogs/А/Ext/ObjectModule.bsl": "Процедура П2()\nКонецПроцедуры\n"},
         )
-        started = self._spy_prefetch(monkeypatch)
-        # v1.48.0: прогрев — у крупной выгрузки (у малой опись снимка и коллекторы читают описатели сами).
+        entered = self._spy_large_flag(monkeypatch)
         monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)
         res = IndexBuilder().update(str(base))
         assert res["git_fast_path"] is False and res["changed"] == 1, res
-        assert started == [str(base)]
-        assert not [t for t in threading.enumerate() if t.name.startswith("rlm-prefetch") and t.is_alive()]
+        assert entered == ["large"]
+        assert not [
+            t for t in threading.enumerate() if t.name.startswith(("rlm-prefetch", "rlm-warm")) and t.is_alive()
+        ]
 
-    def test_git_fast_path_update_without_prefetch(self, tmp_path, monkeypatch):
+    def test_git_fast_path_update_without_large_export_flag(self, tmp_path, monkeypatch):
         from test_git_delta import _git_init
 
         repo = tmp_path / "repo"
@@ -4189,10 +4197,11 @@ class TestBuildSpeedWithoutIndexChange:
             {"Catalogs/А/Ext/ObjectModule.bsl": "Процедура П()\nКонецПроцедуры\n"},
             {"Catalogs/А/Ext/ObjectModule.bsl": "Процедура П2()\nКонецПроцедуры\n"},
         )
-        started = self._spy_prefetch(monkeypatch)
+        entered = self._spy_large_flag(monkeypatch)
+        monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)
         res = IndexBuilder().update(str(base))
         assert res["git_fast_path"] is True, res
-        assert started == []
+        assert entered == []  # git-путь читает только изменённое — признака крупной выгрузки нет
 
 
 # ═══════════════ Задача 17 — объект вида вне графа ссылок: честный ответ (Д19) ═══════════════

@@ -1457,7 +1457,9 @@ def test_glob_xml_categories_match_the_metadata_collector():
 
     import rlm_tools_bsl.bsl_index as BI
 
-    source = inspect.getsource(BI._collect_metadata_tables)
+    # v1.51.0: прежде здесь стояло inspect.getsource(BI._collect_metadata_tables) — тело сборщика теперь в
+    # `_metadata_tables`, а `_collect_metadata_tables` — обёртка, открывающая прогрев по разделам (`_WarmSections`).
+    source = inspect.getsource(BI._metadata_tables)
     called = set(re.findall(r'_glob_xml\("([A-Za-z]+)"\)', source))
     assert called == set(BI._GLOB_XML_CATEGORIES)
     assert "rglob" in source and source.count("def _glob_xml") == 1
@@ -1600,6 +1602,10 @@ def test_failed_build_leaves_no_input_walk_running(tmp_path, monkeypatch):
     monkeypatch.setattr(BI, "_process_single_file", broken)
     monkeypatch.setattr(BI, "_large_export", lambda _base_path: True)  # фоновая опись — у крупной выгрузки
     monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    # v1.51.0: прежде здесь стояло без RLM_INDEX_WORKERS — процессы заводились по числу `.bsl` маленькой фикстуры, и
+    # разбор шёл в координаторе. Теперь число процессов — по крупной выгрузке (пул в начале сборки), а подмена разбора
+    # в координаторе в воркерах не действует: тот же сбой — в последовательном режиме.
+    monkeypatch.setenv("RLM_INDEX_WORKERS", "1")
     with pytest.raises(ValueError, match="parser bug"):
         BI.IndexBuilder().build(str(root))
     assert not [t for t in threading.enumerate() if t.name.startswith("rlm-index-inputs") and t.is_alive()]
@@ -1987,7 +1993,9 @@ def test_small_build_runs_no_background_threads_and_publishes_the_same_snapshot(
     with monkeypatch.context() as m:
         starts = _ThreadStarts(m)
         large = _build_with(m, root, tmp_path / "large", "1")
-    assert {"rlm-prefetch-walk", "rlm-index-inputs-walk"} <= set(starts.names)
+    # v1.51.0: прежде здесь стояло {"rlm-prefetch-walk", "rlm-index-inputs-walk"} <= set(starts.names) — фонового
+    # прогрева описателей координатора больше нет (задачи сборки греют свои файлы сами), фоновая опись снимка — есть.
+    assert "rlm-index-inputs-walk" in starts.names and starts.with_prefix("rlm-prefetch") == []
     assert SNAP.load_snapshot(small)["domains"] == SNAP.load_snapshot(large)["domains"]
 
 
@@ -2079,6 +2087,9 @@ def test_build_and_full_scan_detect_nearby_configurations_once(tmp_path_factory,
 
     monkeypatch.setattr(ED, "detect_extension_context", spy)
     monkeypatch.setattr(BI, "_large_export", lambda _base_path: large)
+    # v1.51.0: прежде здесь стояло без RLM_INDEX_WORKERS — процессы сборки заводились по числу `.bsl` маленькой
+    # фикстуры (последовательно); теперь — по крупной выгрузке, и маленькому миру пул из восьми процессов не нужен.
+    monkeypatch.setenv("RLM_INDEX_WORKERS", "1")
     base, files, _db = _full_scan_world(tmp_path_factory, monkeypatch)
     assert calls == [str(base)]
     calls.clear()

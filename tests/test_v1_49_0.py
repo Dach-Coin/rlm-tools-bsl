@@ -1489,9 +1489,14 @@ class TestRegisterNameCase:
         assert "с учетом регистра" not in res["hint"], res["hint"]
 
     def test_noise_name_unchanged(self, world49):
-        """Обе версии: имя-шум (`Записать`) — ответ прежний."""
+        """Обе версии: имя-шум (`Записать`) — ответ прежний.
+
+        v1.51.0: прежде здесь публичный вызов давал этот пустой ответ — регистра `Записать` нет, и теперь он отказ
+        «регистра с именем … нет»; расчёт хелпера (мимо публичной границы) — прежний."""
         bsl, _root, route, _fmt = world49
-        res = _strip_times(bsl["find_register_writers"]("Записать"))
+        with pytest.raises(ValueError, match="регистра с именем 'Записать' нет"):
+            bsl["find_register_writers"]("Записать")
+        res = _strip_times(bsl["find_register_writers"].__wrapped__("Записать"))
         assert res == {
             "register": "Записать",
             "writers": [],

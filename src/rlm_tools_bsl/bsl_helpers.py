@@ -3274,7 +3274,9 @@ def make_bsl_helpers(
         guard = _PUBLIC_ARG_GUARDS.get(name)
         if guard is not None:
             refusal, overview, param = guard
-            fn = _public_arg_guard(name, fn, refusal, blank_as_empty=overview, param=param)
+            fn = _public_arg_guard(
+                name, fn, refusal, blank_as_empty=overview, param=param, after=_BARE_NAME_REFUSALS.get(name)
+            )
         _registry[name] = {
             "fn": fn,
             "sig": sig,
@@ -10764,12 +10766,16 @@ def make_bsl_helpers(
             "find_module('Имя') или get_object_modules('Имя')"
         )
 
-    def _public_arg_guard(name: str, fn, refusal, *, blank_as_empty: bool = False, param: str | None = None):
+    def _public_arg_guard(
+        name: str, fn, refusal, *, blank_as_empty: bool = False, param: str | None = None, after=None
+    ):
         """Публичная граница хелпера (v1.45.0, Д8): аргумент объекта — параметр ``param`` функции (по умолчанию
         первый, по ``inspect.signature``; v1.46.0 — и не первый: ``find_ext_overrides(…, object_name)``),
         позиционно или по имени; ``refusal(raw)`` — исключение отказа либо ``None``. ``blank_as_empty``
         (обзорные хелперы) заменяет строку из пробелов на ``''`` ДО разбора. Внутренние вызовы хелперов друг
-        другом идут к функции замыкания (``__wrapped__``) и стража не видят."""
+        другом идут к функции замыкания (``__wrapped__``) и стража не видят. ``after(raw, result)`` (v1.51.0) —
+        проверка ПОСЛЕ расчёта ответа (голое имя без объекта категории при пустом ответе — ``_bare_name_refusal``):
+        исключение либо ``None`` (ответ как есть)."""
         params = list(inspect.signature(fn).parameters)
         target = param or params[0]
         position = params.index(target)
@@ -10791,7 +10797,12 @@ def make_bsl_helpers(
             exc = refusal(raw)
             if exc is not None:
                 raise exc
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            if after is not None:
+                exc = after(raw, result)
+                if exc is not None:
+                    raise exc
+            return result
 
         return guarded
 
@@ -11085,24 +11096,106 @@ def make_bsl_helpers(
         return name
 
     def _category_refusal(
-        helper: str, raw: str, category: str, name: str, kind: str, *, route_path: str | None = None
+        helper: str,
+        raw: str,
+        category: str,
+        name: str,
+        kind: str,
+        *,
+        route_path: str | None = None,
+        route: str | None = None,
     ) -> ValueError:
         """Отказ хелпера одной категории на объекте другой категории (v1.44.0): категория и маршрут. Общий у
         ``_category_arg`` и секции ``flow`` профиля — та знает категорию объекта, даже когда разбор аргумента ее
         не распознает (v1.45.0). ``route_path`` (v1.46.0) — путь уже найденного описателя (``_object_card_target``):
         прежний ``_object_xml_route`` ищет описатель только на верхнем уровне каталога категории, и у вложенной
-        подсистемы его маршрут неисполним; прочие вызывающие его не передают — маршрут прежний."""
+        подсистемы его маршрут неисполним; прочие вызывающие его не передают — маршрут прежний. ``route`` (v1.51.0) —
+        готовый маршрут вместо описателя (объект только основной конфигурации в сессии на расширении: её файлы эта
+        сессия не читает)."""
         _categories, what, only, example = _CATEGORY_ARG_KINDS[kind]
         # Маршрут — описатель объекта: `parse_object_xml` читает его у любого вида, с индексом и без
         # (профиль и структура находят не все виды — общий макет, HTTP-сервис без модуля). Аргумент — литерал
         # Python (`!r`): путь корня или каталога расширения бывает с апострофом (`O'Brien/…`).
-        route = f"описание объекта — parse_object_xml({(route_path or _object_xml_route(category, name))!r})"
-        if category in _REGISTER_CATALOG_DIRS and kind != "registers":
-            route += f"; кто пишет в регистр — find_register_writers({name!r})"
+        if route is None:
+            route = f"описание объекта — parse_object_xml({(route_path or _object_xml_route(category, name))!r})"
+            if category in _REGISTER_CATALOG_DIRS and kind != "registers":
+                route += f"; кто пишет в регистр — find_register_writers({name!r})"
         return ValueError(
             f"{helper}: {raw.strip()!r} — не {what}, а объект категории {category}. Хелпер отвечает "
             f"только {only} (голое имя, {example}); {route}."
         )
+
+    # v1.51.0 (issue #46): хелперы ОДНОЙ категории — голое имя, которому нет объекта их категории, при ПУСТОМ ответе
+    # получают отказ, как ссылка на такой объект (шлюз существования 1.46.0), а не пустой ответ, похожий на
+    # окончательный. Родительный падеж вида — для текста «<вида> с именем … нет».
+    _KIND_GENITIVE = {
+        "registers": "регистра",
+        "documents": "документа",
+        "exchange_plans": "плана обмена",
+        "defined_types": "определяемого типа",
+    }
+
+    def _movements_answer_empty(result) -> bool:
+        """``find_register_movements`` ничего не нашёл: пусты все списки движений и объявленных регистров (и
+        ``declared_by_kind``) и ``modules_scanned``."""
+        return isinstance(result, dict) and all(
+            not value for key, value in result.items() if key != "_meta" and isinstance(value, (list, dict))
+        )
+
+    def _bare_name_refusal(helper: str, kind: str, empty):
+        """Проверка публичной границы ПОСЛЕ расчёта (``_public_arg_guard(after=…)``): аргумент — голое имя (строка —
+        имя объекта, ``_is_object_name``: без пробелов и разделителей; иные формы — прежний ответ), ответ пуст
+        (``empty(result)``), существование проверить можно, а объекта категорий хелпера с этим именем нет ни в
+        основной конфигурации, ни в соседних расширениях. Тогда: имя — объект другой категории (первой по имени) —
+        прежний отказ категории (``_category_refusal``) с маршрутом к его описателю (``_object_card_target``: у
+        вложенной подсистемы — её описатель, у объекта расширения — ``../cfe/…``), а у объекта только основной
+        конфигурации в сессии на расширении — маршрут ``rlm_start`` на основной; имени нет ни в одной категории —
+        «<вида> с именем … нет». Внутренние вызовы хелперов друг другом эту проверку не проходят."""
+        categories = _CATEGORY_ARG_KINDS[kind][0]
+
+        def after(raw, result):
+            if not isinstance(raw, str) or not _is_object_name(raw) or not empty(result):
+                return None
+            if _existence_unknowable() or any(_typed_object_exists(category, raw) for category in categories):
+                return None
+            others = sorted(c for c in _object_categories_anywhere(raw) if c not in categories)
+            if not others:
+                return ValueError(
+                    f"{helper}: {_KIND_GENITIVE[kind]} с именем {raw!r} нет — {_missing_where()}; проверьте имя: "
+                    f"{_name_check_route(raw)}"
+                )
+            category = others[0]
+            card = _object_card_target(raw, category)
+            if card is not None:
+                return _category_refusal(helper, raw, category, card[1], kind, route_path=card[2])
+            main_only = _main_only_object(raw, category)
+            if main_only is not None:
+                route = (
+                    f"объект основной конфигурации ({main_only[0]}/{main_only[1]}); в этом расширении его нет — анализ: "
+                    "rlm_start на основной конфигурации"
+                )
+                return _category_refusal(helper, raw, category, main_only[1], kind, route=route)
+            return _category_refusal(helper, raw, category, raw, kind)
+
+        return after
+
+    _BARE_NAME_REFUSALS = {
+        "find_register_writers": _bare_name_refusal(
+            "find_register_writers",
+            "registers",
+            lambda r: isinstance(r, dict) and not r.get("writers") and not r.get("declared_documents"),
+        ),
+        "find_register_movements": _bare_name_refusal("find_register_movements", "documents", _movements_answer_empty),
+        "find_exchange_plan_content": _bare_name_refusal(
+            "find_exchange_plan_content", "exchange_plans", lambda r: r == []
+        ),
+        # `partial` в предикат не входит: живой обход ставит его всегда, когда строки в индексе нет.
+        "find_defined_types": _bare_name_refusal(
+            "find_defined_types",
+            "defined_types",
+            lambda r: isinstance(r, dict) and r.get("types") == [] and r.get("path") == "",
+        ),
+    }
 
     def _object_xml_route(category: str, name: str) -> str:
         """Путь для маршрута ``parse_object_xml(...)``, исполнимый в этой сессии (v1.44.0): от текущего корня
@@ -13682,7 +13775,10 @@ def make_bsl_helpers(
 
         Args:
             name: Exchange plan name. v1.44.0: префикс типа в любом регистре и путь — тот же план;
-                  объект другой категории — ``ValueError`` с маршрутом.
+                  объект другой категории — ``ValueError`` с маршрутом. v1.51.0: голое имя, которому нет плана
+                  обмена ни в основной конфигурации, ни в соседних расширениях, при пустом ответе — ``ValueError``
+                  «плана обмена с именем … нет» (имя объекта другой категории — отказ категории с маршрутом к его
+                  описателю); непустой ответ (подстрока пути плана) — прежний.
 
         Returns: list of dicts with ref, auto_record."""
         name = _category_arg(name, "find_exchange_plan_content", "exchange_plans")
@@ -14335,7 +14431,11 @@ def make_bsl_helpers(
         Args:
             document_name: Document name (or fragment). v1.44.0: префикс типа в любом регистре и
                            путь (``Documents/X``, ``Документы/X``, путь модуля или описателя) — тот же
-                           документ; объект другой категории — ``ValueError`` с маршрутом.
+                           документ; объект другой категории — ``ValueError`` с маршрутом. v1.51.0: голое
+                           имя, которому нет документа ни в основной конфигурации, ни в соседних расширениях,
+                           при пустом ответе — ``ValueError`` «документа с именем … нет» (имя объекта другой
+                           категории — отказ категории с маршрутом к его описателю); внутренний вызов из
+                           ``analyze_document_flow`` и секции ``flow`` профиля — прежний.
             posting_calls_offset: Zero-based page offset for compact posting facts
                                   (record-set names and overflow call names). Detailed
                                   routes remain capped; use the exact next-page call
@@ -16531,7 +16631,13 @@ def make_bsl_helpers(
         ``writers`` своего маршрута; ``hint`` говорит, как читать список рядом с ``writers``.
 
         v1.44.0: префикс типа в любом регистре и путь (``AccumulationRegisters/X``,
-        ``РегистрыНакопления/X``) — тот же регистр; объект не-регистра — ``ValueError`` с маршрутом."""
+        ``РегистрыНакопления/X``) — тот же регистр; объект не-регистра — ``ValueError`` с маршрутом.
+
+        v1.51.0: голое имя, которому нет регистра ни в основной конфигурации, ни в соседних расширениях, при пустом
+        ответе (ни ``writers``, ни ``declared_documents``) — ``ValueError`` «регистра с именем … нет» (имя объекта другой
+        категории — отказ категории с маршрутом к его описателю), прежде — пустой ответ с подсказкой «документы-
+        регистраторы его не пишут»; непустой ответ на такое имя (таблица механизма модуля менеджера, поле набора
+        записей) — прежний."""
         register_name = _category_arg(register_name, "find_register_writers", "registers")
         runtime_hint = (
             "Статические ссылки из кода/индекса: CFE-замены и Posting=Deny здесь не применяются. "
@@ -20152,7 +20258,11 @@ def make_bsl_helpers(
         (прежде — объединение прав всех совпадений, а ``object`` — первое совпадение или, живьём, строка
         запроса). Все совпадения роли — ``matched_objects``/``rights_by_object`` (bounded sample). При
         ``details_truncated=True`` sample неполон — сужай qualified object, а не трактуй его как полный
-        список.
+        список. v1.51.0: точного объекта среди совпадений роли нет — ``object`` — первый по имени ЧЛЕН запрошенного
+        объекта (``Document.X.Attribute.Y``: у ссылки — ее категории, у голого имени — любой), и только без членов —
+        прежний выбор (омоним другой категории у ссылки, иначе первое совпадение); в sample сначала объект запроса (у
+        голого имени — точные объекты всех категорий), затем его члены, затем прочие совпадения — чужие однокоренные
+        членов объекта не вытесняют.
 
         ``case_sensitive`` честно различает ветки: индексная сравнивает
         регистроНЕзависимо (``py_lower`` с обеих сторон), live-fallback идёт через
@@ -24437,7 +24547,10 @@ def make_bsl_helpers(
         Args:
             name: e.g. 'Сумма' or 'ОпределяемыйТип.Сумма' or 'DefinedType.Сумма'. v1.44.0: префикс в
                   любом регистре и путь (``DefinedTypes/Сумма``) — тот же тип; объект другой
-                  категории — ``ValueError`` с маршрутом.
+                  категории — ``ValueError`` с маршрутом. v1.51.0: голое имя, которому нет определяемого
+                  типа ни в основной конфигурации, ни в соседних расширениях, при пустом ответе (``types=[]``,
+                  ``path=''``) — ``ValueError`` «определяемого типа с именем … нет» (имя объекта другой
+                  категории — отказ категории с маршрутом к его описателю).
 
         Returns:
             {name, types: list[str], path: str, partial: bool}.
@@ -26185,8 +26298,9 @@ def make_bsl_helpers(
         "  # ветки: индексная сравнивает регистроНЕзависимо, live-парсинг Rights.xml —\n"
         "  # регистроЗАВИСИМО.\n"
         "  # object и rights — одна пара: object — точный объект запроса (у ссылки — ее категории),\n"
-        "  # если он среди совпадений роли, иначе первое совпадение; rights — права ИМЕННО его.\n"
-        "  # Все совпадения роли и их права — r['matched_objects'], r['rights_by_object'].\n"
+        "  # иначе первый по имени член объекта запроса (Document.X.Attribute.Y), иначе первое\n"
+        "  # совпадение; rights — права ИМЕННО его. Все совпадения роли и их права —\n"
+        "  # r['matched_objects'], r['rights_by_object']: сначала объект запроса и его члены, потом прочие.\n"
         "  # details_limit=20 (жёсткий потолок 100) режет BOUNDED sample distinct-пар\n"
         "  # (object, right): r['matched_objects'], r['rights_by_object']. При\n"
         "  # r['details_truncated']=True сужай qualified object, а НЕ считай список полным.\n"
