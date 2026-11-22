@@ -1836,11 +1836,19 @@ def make_bsl_helpers(
     # ленивым вызовом detector-а.
     _ext_name_by_root: dict[str, str] = {}
 
+    _root_key_safe_cache: dict[str, str] = {}
+
     def _root_key_safe(root) -> str:
+        cache_key = str(root)
+        cached = _root_key_safe_cache.get(cache_key)
+        if cached is not None:
+            return cached
         try:
-            return _root_key(root)
+            key = _root_key(root)
         except (OSError, ValueError):
             return os.path.normcase(os.path.abspath(str(root)))
+        _root_key_safe_cache[cache_key] = key
+        return key
 
     for _raw_root, _raw_name in (extension_name_by_root or {}).items():
         if _raw_root and _raw_name:
@@ -11142,7 +11150,7 @@ def make_bsl_helpers(
             not value for key, value in result.items() if key != "_meta" and isinstance(value, (list, dict))
         )
 
-    def _bare_name_refusal(helper: str, kind: str, empty):
+    def _bare_name_refusal(helper: str, kind: str, empty, *, require_exact: bool = False, name_route=None):
         """Проверка публичной границы ПОСЛЕ расчёта (``_public_arg_guard(after=…)``): аргумент — голое имя (строка —
         имя объекта, ``_is_object_name``: без пробелов и разделителей; иные формы — прежний ответ), ответ пуст
         (``empty(result)``), существование проверить можно, а объекта категорий хелпера с этим именем нет ни в
@@ -11150,11 +11158,12 @@ def make_bsl_helpers(
         прежний отказ категории (``_category_refusal``) с маршрутом к его описателю (``_object_card_target``: у
         вложенной подсистемы — её описатель, у объекта расширения — ``../cfe/…``), а у объекта только основной
         конфигурации в сессии на расширении — маршрут ``rlm_start`` на основной; имени нет ни в одной категории —
-        «<вида> с именем … нет». Внутренние вызовы хелперов друг другом эту проверку не проходят."""
+        «<вида> с именем … нет». ``require_exact=True`` отклоняет неточное имя и при непустом ответе.
+        Внутренние вызовы хелперов друг другом эту проверку не проходят."""
         categories = _CATEGORY_ARG_KINDS[kind][0]
 
         def after(raw, result):
-            if not isinstance(raw, str) or not _is_object_name(raw) or not empty(result):
+            if not isinstance(raw, str) or not _is_object_name(raw) or (not require_exact and not empty(result)):
                 return None
             if _existence_unknowable() or any(_typed_object_exists(category, raw) for category in categories):
                 return None
@@ -11162,7 +11171,7 @@ def make_bsl_helpers(
             if not others:
                 return ValueError(
                     f"{helper}: {_KIND_GENITIVE[kind]} с именем {raw!r} нет — {_missing_where()}; проверьте имя: "
-                    f"{_name_check_route(raw)}"
+                    f"{(name_route or _name_check_route)(raw)}"
                 )
             category = others[0]
             card = _object_card_target(raw, category)
@@ -11179,15 +11188,94 @@ def make_bsl_helpers(
 
         return after
 
+    def _bare_object_refusal(helper: str, empty, *, allowed_categories=(), require_exact: bool = False):
+        """Общий страж голого имени объекта с предикатом пустоты конкретного хелпера."""
+
+        def after(raw, result):
+            if (
+                not isinstance(raw, str)
+                or not _is_object_name(raw)
+                or (not require_exact and not empty(result))
+                or _existence_unknowable()
+            ):
+                return None
+            allowed = set(allowed_categories() if callable(allowed_categories) else allowed_categories)
+            categories = _object_categories_anywhere(raw)
+            if allowed:
+                if categories & allowed or any(_typed_object_exists(category, raw) for category in allowed):
+                    return None
+            elif categories:
+                return None
+            others = sorted(categories - allowed)
+            if not others:
+                return ValueError(
+                    f"{helper}: объекта с именем {raw!r} нет — {_missing_where()}; проверьте имя: "
+                    f"{_name_check_route(raw)}"
+                )
+            category = others[0]
+            card = _object_card_target(raw, category)
+            if card is not None:
+                route = f"описание объекта — parse_object_xml({card[2]!r})"
+            else:
+                main_only = _main_only_object(raw, category)
+                if main_only is not None:
+                    route = (
+                        f"объект основной конфигурации ({main_only[0]}/{main_only[1]}); в этом расширении его нет — "
+                        "анализ: rlm_start на основной конфигурации"
+                    )
+                else:
+                    route = f"описание объекта — parse_object_xml({_object_xml_route(category, raw)!r})"
+            return ValueError(f"{helper}: {raw!r} — объект категории {category} вне области хелпера; {route}.")
+
+        return after
+
+    def _exchange_plan_name_check_route(name: str, *, fallback_to_catalog: bool = False) -> str:
+        route = _name_check_route(name, ("ExchangePlans",)) if name else ""
+        fragments = [name.casefold()]
+        shorter = _name_fragment(name).casefold()
+        if shorter != fragments[0]:
+            fragments.append(shorter)
+        if fallback_to_catalog and name:
+            fragments.append("")
+        candidates = []
+        for fragment in fragments:
+            for root in _existence_roots():
+                for key, (disk_name, _rel) in _root_descriptors("ExchangePlans", root).items():
+                    if fragment in key:
+                        candidates.append((not key.startswith(fragment), len(key), key, str(root), root, disk_name))
+            if candidates:
+                break
+        if not candidates:
+            if fallback_to_catalog:
+                return "описателей планов в доступных корнях нет; файлы текущего корня — find_files('ExchangePlans/')"
+            return route
+        if not fragment:
+            route = "пример из каталога планов обмена"
+        *_rank, root, disk_name = sorted(candidates, key=lambda item: item[:-2])[0]
+        exact_call = f"find_exchange_plan_content({'ExchangePlans/' + disk_name!r})"
+        try:
+            same_root = root.resolve() == Path(_current_root_path()).resolve()
+        except OSError:
+            same_root = root == Path(_current_root_path())
+        if same_root:
+            return f"{route}; точный вызов: {exact_call}"
+        return f"{route}; состав в его корне: rlm_start(path={str(root)!r}), затем {exact_call}"
+
     _BARE_NAME_REFUSALS = {
         "find_register_writers": _bare_name_refusal(
             "find_register_writers",
             "registers",
             lambda r: isinstance(r, dict) and not r.get("writers") and not r.get("declared_documents"),
         ),
-        "find_register_movements": _bare_name_refusal("find_register_movements", "documents", _movements_answer_empty),
+        "find_register_movements": _bare_name_refusal(
+            "find_register_movements", "documents", _movements_answer_empty, require_exact=True
+        ),
         "find_exchange_plan_content": _bare_name_refusal(
-            "find_exchange_plan_content", "exchange_plans", lambda r: r == []
+            "find_exchange_plan_content",
+            "exchange_plans",
+            lambda r: r == [],
+            require_exact=True,
+            name_route=_exchange_plan_name_check_route,
         ),
         # `partial` в предикат не входит: живой обход ставит его всегда, когда строки в индексе нет.
         "find_defined_types": _bare_name_refusal(
@@ -11195,6 +11283,31 @@ def make_bsl_helpers(
             "defined_types",
             lambda r: isinstance(r, dict) and r.get("types") == [] and r.get("path") == "",
         ),
+        "find_print_forms": _bare_object_refusal(
+            "find_print_forms",
+            lambda r: isinstance(r, dict) and not r.get("print_forms"),
+            require_exact=True,
+        ),
+        "find_based_on_documents": _bare_object_refusal(
+            "find_based_on_documents",
+            lambda r: isinstance(r, dict) and not r.get("can_create_from_here") and not r.get("can_be_created_from"),
+            allowed_categories=lambda: {"Documents", *_BASED_ON_BASIS_CATEGORIES},
+            require_exact=True,
+        ),
+        "find_roles": _bare_object_refusal("find_roles", lambda r: isinstance(r, dict) and not r.get("roles")),
+        "find_event_subscriptions": _bare_object_refusal(
+            "find_event_subscriptions",
+            lambda r: r == [] or (isinstance(r, dict) and r.get("total") == 0),
+        ),
+        "find_functional_options": _bare_object_refusal(
+            "find_functional_options", lambda r: isinstance(r, dict) and r.get("total") == 0
+        ),
+        "find_attributes": _bare_object_refusal("find_attributes", lambda r: r == []),
+        "find_predefined": _bare_object_refusal(
+            "find_predefined", lambda r: r == [], allowed_categories=lambda: _PREDEFINED_CATS
+        ),
+        "find_templates": _bare_object_refusal("find_templates", lambda r: isinstance(r, dict) and r.get("total") == 0),
+        "parse_form": _bare_object_refusal("parse_form", lambda r: r == []),
     }
 
     def _object_xml_route(category: str, name: str) -> str:
@@ -12844,7 +12957,7 @@ def make_bsl_helpers(
                     "has_more": False,
                     "_meta": {"source": "index", "reason": "not_a_document"},
                 }
-            rows = idx_reader.get_register_movements(object_name)
+            rows = _filter_code_movement_rows(idx_reader.get_register_movements(object_name))
             # Compact-профиль сохраняет zero-live fast path, когда SQLite уже знает хотя бы
             # одно прямое code-движение документа. English bridge нужен для устранения ложного
             # нуля; полный live-union при непустом снимке остается подробному helper.
@@ -13441,7 +13554,10 @@ def make_bsl_helpers(
         Returns:
             Default (limit is None): list[dict] of subscriptions.
             With limit: dict {"subscriptions": [...], "total": N, "returned": K,
-                              "has_more": bool}."""
+                              "has_more": bool}.
+            v1.52.0: несуществующее голое имя при пустом списке или ``total=0`` — ``ValueError``;
+            существующий объект без подписок и страница ``limit=0`` с ``total>0`` отказа не получают.
+            Непустой exact/partial/set/universal поиск сохраняется."""
         # Явный префикс (Документ./Document./Справочник.) → canonical ref: матчинг станет
         # category-AWARE и сойдётся с get_object_profile (он всегда ходит по canonical ref).
         # Голое имя оставляем category-blind — обратная совместимость.
@@ -13770,17 +13886,26 @@ def make_bsl_helpers(
         return results
 
     def find_exchange_plan_content(name: str) -> list[dict]:
-        """Find exchange plan content (objects registered for exchange).
-        Always parses XML at runtime (no index table).
+        """Find exchange plan content (objects registered for exchange) by live XML/MDO parsing.
 
         Args:
-            name: Exchange plan name. v1.44.0: префикс типа в любом регистре и путь — тот же план;
-                  объект другой категории — ``ValueError`` с маршрутом. v1.51.0: голое имя, которому нет плана
-                  обмена ни в основной конфигурации, ни в соседних расширениях, при пустом ответе — ``ValueError``
-                  «плана обмена с именем … нет» (имя объекта другой категории — отказ категории с маршрутом к его
-                  описателю); непустой ответ (подстрока пути плана) — прежний.
+            name: Точное имя или ссылка плана обмена. Имя разрешается без учета регистра по описателю
+                  текущего корня; неточное голое имя и glob-маска — ``ValueError`` с маршрутом проверки.
+                  Прочие не-ссылки без glob сохраняют прежний поиск по путям. План другого корня в этой
+                  сессии возвращает ``[]``.
 
         Returns: list of dicts with ref, auto_record."""
+        raw_name = name
+        exact_input = isinstance(raw_name, str) and (_is_object_name(raw_name) or _object_ref(raw_name) is not None)
+        if isinstance(raw_name, str) and any(ch in raw_name for ch in "*?[]"):
+            # Класс символов и пропуски не входят в буквальный фрагмент имени.
+            parts = re.split(r"\[[^]]*\]|[*?\[\]]", raw_name)
+            fragment = max((part.strip() for part in parts), key=len)
+            route = _exchange_plan_name_check_route(fragment, fallback_to_catalog=True)
+            raise ValueError(
+                f"find_exchange_plan_content: маска {raw_name!r} не является именем плана обмена; "
+                f"проверьте имя: {route}"
+            )
         name = _category_arg(name, "find_exchange_plan_content", "exchange_plans")
         from rlm_tools_bsl.bsl_xml_parsers import parse_exchange_plan_content as _parse_ep
 
@@ -13788,18 +13913,41 @@ def make_bsl_helpers(
             """Glob and filter out hint strings."""
             return _glob_hits(pattern)
 
-        # EDT: .mdo file of the exchange plan itself (content is inline)
-        # CF: Ext/Content.xml
-        files = (
-            _valid_files(f"ExchangePlans/{name}/*.mdo")
-            + _valid_files(f"ExchangePlans/{name}/**/*.mdo")
-            + _valid_files(f"ExchangePlans/{name}/**/*.xml")
-        )
-        if not files:
-            # Try wildcard search across all exchange plans
-            all_files = _valid_files("ExchangePlans/**/*.xml") + _valid_files("ExchangePlans/**/*.mdo")
-            name_lower = name.lower()
-            files = [f for f in all_files if name_lower in f.lower()]
+        def _legacy_files() -> list[str]:
+            found = (
+                _valid_files(f"ExchangePlans/{name}/*.mdo")
+                + _valid_files(f"ExchangePlans/{name}/**/*.mdo")
+                + _valid_files(f"ExchangePlans/{name}/**/*.xml")
+            )
+            if not found:
+                all_files = _valid_files("ExchangePlans/**/*.xml") + _valid_files("ExchangePlans/**/*.mdo")
+                name_lower = name.lower()
+                found = [f for f in all_files if name_lower in f.lower()]
+            return found
+
+        files: list[str] = []
+        if exact_input:
+            hit = _root_descriptors("ExchangePlans", Path(_current_root_path())).get(name.casefold())
+            if hit is not None:
+                disk_name, descriptor = hit
+                prefix = _current_rel_prefix_raw()
+                descriptor_path = f"{prefix}/{descriptor}" if prefix else descriptor
+                if descriptor.casefold().endswith(".mdo"):
+                    files = [descriptor_path]
+                else:
+                    content_path = f"{prefix}/ExchangePlans/{disk_name}/Ext/Content.xml"
+                    if not prefix:
+                        content_path = content_path.removeprefix("/")
+                    try:
+                        if _ext_resolve_safe(content_path).is_file():
+                            files = [content_path]
+                    except (OSError, ValueError):
+                        pass
+            elif isinstance(raw_name, str) and _is_object_name(raw_name) and _existence_unknowable():
+                files = _legacy_files()
+        else:
+            # Прежний маршрут для не-ссылок иных форм: гибриды и суффиксы путей не становятся голым именем.
+            files = _legacy_files()
 
         results: list[dict] = []
         seen_refs: set[str] = set()
@@ -14179,6 +14327,38 @@ def make_bsl_helpers(
         root = _owner_root_for(path)
         return root is not None and low in _known_registers(root)
 
+    def _is_known_code_register(name: str, path: str) -> bool:
+        """Строка ``source='code'`` ссылается на регистр, существующий в фактических корнях кода."""
+        low = name.casefold()
+        if not low or low in _MOVEMENT_METHOD_NOISE:
+            return False
+        current = _current_root_path()
+        roots = [current]
+        owner = _owner_root_for(path)
+        if owner is not None and _root_key_safe(owner) != _root_key_safe(current):
+            roots.append(owner)
+        if _current_root_role() == "extension":
+            main = _main_config_root()
+            if main:
+                if _root_key_safe(main) != _root_key_safe(current):
+                    roots.append(main)
+            elif low not in _known_registers(current):
+                return True
+        return any(low in _known_registers(root) for root in roots)
+
+    def _filter_code_movement_rows(rows: list[dict] | None, default_name: str = "") -> list[dict] | None:
+        """Отбрасывает только ложные ``code``-строки; ``None`` и порядок остальных источников сохраняются."""
+        if rows is None:
+            return None
+        return [
+            row
+            for row in rows
+            if str(row.get("source") or "code").casefold() != "code"
+            or _is_known_code_register(
+                str(row.get("register_name") or row.get("name") or default_name), str(row.get("file") or "")
+            )
+        ]
+
     def _live_main_alias_movements(document_name: str) -> list[dict]:
         """Read-time bridge for English ``RegisterRecords.X`` on old SQLite builds.
 
@@ -14218,7 +14398,7 @@ def make_bsl_helpers(
                     continue
                 seen.add(key)
                 rows.append({"register_name": register_name, "source": "code", "file": path})
-        return rows
+        return _filter_code_movement_rows(rows) or []
 
     def _live_by_name_unresolved(document_name: str) -> list[dict]:
         """Строки ``source='unresolved'`` делегата «регистр по имени» в точных модулях объекта
@@ -14341,7 +14521,7 @@ def make_bsl_helpers(
                     continue
                 seen.add(key)
                 rows.append({"register_name": register_name, "source": "code", "file": path})
-        return rows, scanned, unreadable, posting_interceptors
+        return _filter_code_movement_rows(rows) or [], scanned, unreadable, posting_interceptors
 
     def _delegate_mechanisms(document_name: str) -> tuple[list[str], list[dict]]:
         """Механизмы ERP, которые добавляет делегат модуля менеджера документа (v1.47.0, Д14) — раскрытие на чтении.
@@ -14429,13 +14609,13 @@ def make_bsl_helpers(
         Searches ObjectModule code for 'Движения.RegisterName' pattern.
 
         Args:
-            document_name: Document name (or fragment). v1.44.0: префикс типа в любом регистре и
+            document_name: Document name or exact reference. v1.44.0: префикс типа в любом регистре и
                            путь (``Documents/X``, ``Документы/X``, путь модуля или описателя) — тот же
-                           документ; объект другой категории — ``ValueError`` с маршрутом. v1.51.0: голое
-                           имя, которому нет документа ни в основной конфигурации, ни в соседних расширениях,
-                           при пустом ответе — ``ValueError`` «документа с именем … нет» (имя объекта другой
-                           категории — отказ категории с маршрутом к его описателю); внутренний вызов из
-                           ``analyze_document_flow`` и секции ``flow`` профиля — прежний.
+                           документ; объект другой категории — ``ValueError`` с маршрутом. v1.52.0: неточное
+                           голое имя на публичной границе — ``ValueError`` независимо от найденных соседей;
+                           точный документ без ObjectModule не получает движения соседа. Внутренний вызов из
+                           ``analyze_document_flow`` и секции ``flow`` профиля — прежний. Строки ``code``
+                           сверяются с полным именем регистра в каталоге фактического корня кода.
             posting_calls_offset: Zero-based page offset for compact posting facts
                                   (record-set names and overflow call names). Detailed
                                   routes remain capped; use the exact next-page call
@@ -14478,7 +14658,7 @@ def make_bsl_helpers(
         result: dict
         # Fast path: SQLite index
         if idx_reader is not None:
-            idx_movements = idx_reader.get_register_movements(document_name)
+            idx_movements = _filter_code_movement_rows(idx_reader.get_register_movements(document_name))
             if idx_movements is not None:
                 idx_movements = _merge_movement_rows(idx_movements, _live_main_alias_movements(document_name))
                 (
@@ -14563,7 +14743,8 @@ def make_bsl_helpers(
             and info.object_name
             and info.object_name.casefold() == exact_document_name
         ]
-        modules = exact_modules or _find_by_type_page("Documents", document_name)
+        exact_document_exists = bool(exact_modules) or _typed_object_exists("Documents", document_name)
+        modules = exact_modules if exact_document_exists else _find_by_type_page("Documents", document_name)
         obj_modules = [m for m in modules if m.get("module_type") == "ObjectModule"]
 
         if not obj_modules:
@@ -14641,7 +14822,7 @@ def make_bsl_helpers(
             else set()
         )
         active_code_rows, suppressed_main, replacement_meta = _apply_cfe_posting_replacement(
-            live_code_rows, cfe_interceptors, suppressible_main_rows
+            _filter_code_movement_rows(live_code_rows) or [], cfe_interceptors, suppressible_main_rows
         )
         code_registers: dict[str, dict] = {}
         for row in active_code_rows:
@@ -16425,7 +16606,7 @@ def make_bsl_helpers(
         )
         for rel_path in candidates:
             for movement in _MOVEMENTS_LIVE_RE.finditer(_live_code_only(bodies.get(rel_path) or "")):
-                if movement.group(1).lower() in _MOVEMENT_METHOD_NOISE:
+                if not _is_known_code_register(movement.group(1), rel_path):
                     continue
                 movement_key = (
                     rel_path.replace("\\", "/").casefold(),
@@ -16636,8 +16817,10 @@ def make_bsl_helpers(
         v1.51.0: голое имя, которому нет регистра ни в основной конфигурации, ни в соседних расширениях, при пустом
         ответе (ни ``writers``, ни ``declared_documents``) — ``ValueError`` «регистра с именем … нет» (имя объекта другой
         категории — отказ категории с маршрутом к его описателю), прежде — пустой ответ с подсказкой «документы-
-        регистраторы его не пишут»; непустой ответ на такое имя (таблица механизма модуля менеджера, поле набора
-        записей) — прежний."""
+        регистраторы его не пишут»; непустой ``manager_table`` без объекта-регистра сохраняется.
+
+        v1.52.0: ``source='code'`` публикуется только для полного имени регистра из каталога фактического
+        корня кода; поле набора и префикс более длинного имени строк не дают. Не-code источники не фильтруются."""
         register_name = _category_arg(register_name, "find_register_writers", "registers")
         runtime_hint = (
             "Статические ссылки из кода/индекса: CFE-замены и Posting=Deny здесь не применяются. "
@@ -16648,7 +16831,7 @@ def make_bsl_helpers(
         result: dict | None = None
         # Fast path: SQLite index
         if idx_reader is not None:
-            idx_writers = idx_reader.get_register_writers(register_name)
+            idx_writers = _filter_code_movement_rows(idx_reader.get_register_writers(register_name), register_name)
             if idx_writers is not None:
                 # v1.46.0 (Д7): строка таблицы движений — на ВХОЖДЕНИЕ, поэтому пара (документ, источник, файл)
                 # приходила столько раз, сколько упоминаний в модуле, а `total_writers` считал вхождения. Теперь —
@@ -16699,9 +16882,8 @@ def make_bsl_helpers(
         needle = f"движения.{register_name}".lower()
         matched = _parallel_prefilter(doc_modules, needle, base_path)
 
-        # Tail (?!\s*\() rejects the method-call form Движения.Записать() so a reverse lookup by
-        # a noise name yields nothing; a real register is never immediately followed by '('.
-        movement_re = re.compile(r"Движения\." + re.escape(register_name) + r"(?!\s*\()", re.IGNORECASE)
+        # Полное имя: `Продажи` не совпадает с `ПродажиПодытог`; вызов метода коллекции остается шумом.
+        movement_re = re.compile(r"Движения\." + re.escape(register_name) + r"(?!\w)(?!\s*\()", re.IGNORECASE)
         writers: list[dict] = []
         for rel, info in matched:
             try:
@@ -16713,13 +16895,12 @@ def make_bsl_helpers(
                 if movement_re.search(line):
                     lines.append(i)
             if lines:
-                writers.append(
-                    {
-                        "document": info.object_name or "",
-                        "file": rel,
-                        "lines": lines,
-                    }
-                )
+                writer = {
+                    "document": info.object_name or "",
+                    "file": rel,
+                    "lines": lines,
+                }
+                writers.extend(_filter_code_movement_rows([writer], register_name) or [])
 
         return {
             "register": register_name,
@@ -17057,6 +17238,9 @@ def make_bsl_helpers(
         (``_object_categories``: модули, индекс, выгрузка, расширения), а объект ОДНОЙ другой
         категории ввода на основании (``_BASED_ON_BASIS_CATEGORIES``) есть, — ответ по этому
         объекту (``_meta.resolved_ref`` в написании объекта); нескольких — ``ValueError``.
+        v1.52.0: неточное голое имя на публичной границе — ``ValueError`` даже при непустых связях
+        соседей; существующий поддерживаемый объект без связей возвращает прежние пустые корзины.
+        Имя объекта вне документов и ``_BASED_ON_BASIS_CATEGORIES`` — отказ категории с маршрутом.
 
         Returns: dict with document, can_create_from_here, can_be_created_from.
         ``via`` — БЕЗУСЛОВНЫЙ ключ КАЖДОЙ строки (v1.37.0): ``direct`` (прямой обход кода
@@ -17072,6 +17256,7 @@ def make_bsl_helpers(
         # v1.44.0: путь (`Documents/X`, `Catalogs/X`, `Справочники/X`, путь файла) — как префикс типа:
         # прежде он шел в разбор как голое имя `Documents/X` (уверенный ноль), а путь файла давал
         # документ `xml`/`bsl`/`mdo`.
+        strict_bare_input = isinstance(document_name, str) and _is_object_name(document_name)
         document_name = _typed_ref_of(document_name)
         canon, _forms = _normalize_object_ref((document_name or "").strip())
         bare_input = bool(canon) and "." not in canon
@@ -17117,6 +17302,9 @@ def make_bsl_helpers(
                     exact_document_exists = False
                 else:
                     exact_document_exists = True
+            if not exact_document_exists:
+                # Основная рядом доказывает identity, хотя её модули эта сессия не читает.
+                exact_document_exists = _typed_object_exists("Documents", document_name)
             # Под прежним разбором (дочерний вызов документного композита с аргументом-не-ссылкой) голое имя —
             # документ, как в 1.43.0.
             if not exact_document_exists and bare_input and not getattr(_parsing_mode, "previous", 0):
@@ -17129,7 +17317,11 @@ def make_bsl_helpers(
                 # «Документа нет» решает тот же союз: документ, который видит индекс (описатель
                 # убран из выгрузки после сборки; имя в другом регистре на ФС Linux), остаётся
                 # документом, как до v1.44.0, — иначе ответ молча ушёл бы к омониму.
-                cats = _object_categories(document_name)
+                cats = (
+                    _object_categories_anywhere(document_name, with_index=True)
+                    if strict_bare_input
+                    else _object_categories(document_name)
+                )
                 others = [] if "Documents" in cats else sorted(c for c in cats if c in _BASED_ON_BASIS_CATEGORIES)
                 if len(others) > 1:
                     raise ValueError(
@@ -17138,10 +17330,19 @@ def make_bsl_helpers(
                         f"find_based_on_documents('{_CATEGORY_TO_REF_HEAD[others[0]]}.{document_name}')."
                     )
                 if others:
-                    # Ссылка и `document` — в написании объекта из выгрузки, а не аргумента.
-                    document_name = _object_spelling(others[0], document_name)
+                    category = others[0]
+                    card = _object_card_target(document_name, category) if strict_bare_input else None
+                    main_only = (
+                        _main_only_object(document_name, category) if strict_bare_input and card is None else None
+                    )
+                    if card is not None:
+                        document_name = card[1]
+                    elif main_only is not None:
+                        document_name = main_only[1]
+                    else:
+                        document_name = _object_spelling(category, document_name)
                     result["document"] = document_name
-                    canon = f"{_CATEGORY_TO_REF_HEAD[others[0]]}.{document_name}"
+                    canon = f"{_CATEGORY_TO_REF_HEAD[category]}.{document_name}"
                     is_document_input = False
                     resolved_ref = canon
             if is_document_input:
@@ -18173,10 +18374,13 @@ def make_bsl_helpers(
         «не литерал в этом модуле», а не «пустое представление». Порядок строк —
         порядок в коде; кавычки 1С декодируются.
 
-        **v1.43.0.** Объект — ТОЧНЫЙ (префикс типа ``Документ.X``/``Documents/X`` —
-        категория); подстрочный маршрут остался только для фрагмента имени, которого как
-        объекта нет вовсе — раньше он подмешивал команды однокоренных документов, а
-        документ без модуля менеджера получал чужие. ``_meta.delegates`` — прежний список
+        **v1.43.0.** Объект — ТОЧНЫЙ (префикс типа ``Документ.X``/``Documents/X`` — категория).
+        Подстрочный маршрут для фрагмента доступен только внутренним вызовам: v1.52.0 отклоняет
+        неточное голое имя на публичной границе. Существующий объект любой из 47 категорий без
+        ManagerModule возвращает пустой список, а не команды соседа. При вызове с голым именем
+        объекта, существующего только в основной конфигурации, ``hint`` в сессии расширения
+        ведет через ``rlm_start(path=…)`` на основную.
+        ``_meta.delegates`` — прежний список
         вызовов, которым модуль объекта передаёт ВЕСЬ список; хелпер их РАСКРЫВАЕТ: до
         ``_PF_DELEGATE_MAX_DEPTH`` переходов, только тот же список команд, точный модуль
         получателя (код расширения — своё расширение, затем основная; код основной — только
@@ -18199,6 +18403,8 @@ def make_bsl_helpers(
         индекса) — подсказка называет его с ``read_procedure('<путь>', 'ДобавитьКомандыПечати')`` и
         ``index update``, путь — в ``_meta.modules_not_indexed`` (прежде — «Модуля менеджера в каталоге модулей
         сессии нет.»)."""
+        raw_object_name = object_name
+        bare_object = isinstance(raw_object_name, str) and _is_object_name(raw_object_name)
         want_cat, bare = _object_arg(object_name, _split_object_arg)  # не-ссылка — прежним `_split_object_arg`
         object_name = _strip_meta_prefix(bare)
         rows: list[dict] = []
@@ -18218,19 +18424,26 @@ def make_bsl_helpers(
                 mgr_modules = [m for m in any_category if (m.get("category") or "") == cat]
                 if mgr_modules:
                     break
-        if not mgr_modules and not _object_exists(want_cat, object_name):
-            # Фрагмент имени (такого объекта нет вовсе) — прежний подстрочный маршрут; заданная
-            # категория сохраняется. СУЩЕСТВУЮЩИЙ объект без модуля менеджера сюда не попадает:
-            # иначе документ без печати получил бы команды однокоренного документа.
-            modules = (
-                _find_by_type_page(want_cat or "Documents", object_name)
-                if _module_search_category(want_cat) is not None
-                else []
+        if not mgr_modules:
+            object_ref = _object_ref(raw_object_name)
+            exact_object_exists = (
+                _object_exists(want_cat, object_name)
+                or (bare_object and bool(_object_categories_anywhere(raw_object_name)))
+                or (object_ref is not None and _typed_object_exists(*object_ref))
             )
-            mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
-            if not mgr_modules and not want_cat:
-                modules = _find_module_page(object_name)
+            if not exact_object_exists:
+                # Фрагмент имени (такого объекта нет вовсе) — прежний подстрочный маршрут; заданная
+                # категория сохраняется. СУЩЕСТВУЮЩИЙ объект без модуля менеджера сюда не попадает:
+                # иначе документ без печати получил бы команды однокоренного документа.
+                modules = (
+                    _find_by_type_page(want_cat or "Documents", object_name)
+                    if _module_search_category(want_cat) is not None
+                    else []
+                )
                 mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
+                if not mgr_modules and not want_cat:
+                    modules = _find_module_page(object_name)
+                    mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
 
         seen_ids: set[str] = set()
         expanded: list[dict] = []
@@ -18322,6 +18535,13 @@ def make_bsl_helpers(
                 or ("Documents" if "Documents" in cats else cats[0])
             )
             _attach_print_route(result, category, object_name, [m["path"] for m in mgr_modules], bodies)
+        if not rows and bare_object:
+            main_only = _main_only_object(object_name)
+            if main_only is not None and _object_card_target(object_name) is None:
+                result["hint"] = (
+                    _main_only_error(object_name, main_only)
+                    + f"; повтор: rlm_start(path={_main_config_root()!r}), затем find_print_forms({main_only[1]!r})"
+                )
         return result
 
     # ── Form XML parsing helper ──────────────────────────────────
@@ -18339,7 +18559,9 @@ def make_bsl_helpers(
 
         Returns: list of dicts grouped by form, each with:
             category, object_name, form_name, file, module_path,
-            handlers, commands, attributes."""
+            handlers, commands, attributes. v1.52.0: несуществующее голое имя при ``[]`` —
+            ``ValueError``; существующий объект любой категории без форм либо без совпадения
+            по ``form_name``/``handler`` возвращает законный ``[]``, непустой форменный поиск прежний."""
         if object_name is None:
             # Пустую строку отвергает проверка ниже, как в 1.43.0; пробельный ввод — не ссылка, ответ прежний.
             raise ValueError("object_name is required, e.g. parse_form('РеализацияТоваровУслуг')")
@@ -19293,7 +19515,9 @@ def make_bsl_helpers(
 
         v1.47.0: в индексе — реквизиты и обработок, отчётов, бизнес-процессов, задач, планов обмена, счетов, видов
         расчёта и регистров расчёта (прежде только шести категорий): поиск по ``name`` находит и их, а ответ по
-        ``object_name`` идёт из индекса (тип — нормализованным списком, как у прочих категорий)."""
+        ``object_name`` идёт из индекса (тип — нормализованным списком, как у прочих категорий).
+        v1.52.0: несуществующее голое ``object_name`` при пустом ответе — ``ValueError``; существующий
+        объект без реквизитов и объект любой другой категории без данных возвращают законный ``[]``."""
         limit, _w = _coerce_bound(limit, 500, "limit", _FIND_ATTRIBUTES_SIG)
         _warn_bound(_w)
         # v1.46.0 (Д4, П1): неизвестный вид — отказ (прежде тихий ноль; колонка табличной части — `ts_attribute`,
@@ -19476,7 +19700,10 @@ def make_bsl_helpers(
 
         v1.41.0: имя объекта в ``name`` (пустой ответ) — ``ValueError`` с маршрутом
         ``object_name=`` вместо молчаливого нуля; решение — по нормализованному ``limit``,
-        голое имя — только при поиске по таблице индекса (как у ``find_attributes``)."""
+        голое имя — только при поиске по таблице индекса (как у ``find_attributes``).
+        v1.52.0: несуществующее голое ``object_name`` при пустом ответе — ``ValueError``; объект
+        вне ``_PREDEFINED_CATS`` — отказ категории с маршрутом, а поддерживаемый объект без
+        предопределенных элементов — законный ``[]``."""
         limit, _w = _coerce_bound(limit, 500, "limit", _FIND_PREDEFINED_SIG)
         _warn_bound(_w)
         rows = _find_predefined_rows(name, object_name, limit)
@@ -19768,7 +19995,9 @@ def make_bsl_helpers(
         непустого object_name), ``returned`` (len(xp)+len(cp)), ``has_more``
         (per-bucket). Пустой code-обзор сохраняет бюджет 20 модулей; если каталог
         больше, пагинированный ответ помечен ``partial=True`` и ``total`` считается
-        только по проверенному code-срезу.
+        только по проверенному code-срезу. v1.52.0: несуществующее голое имя при ``total=0`` —
+        ``ValueError``; существующий объект вне ФО, ``include_code=False`` и страница ``limit=0``
+        с ``total>0`` законны и отказа не дают.
 
         **Имя опции — ОБЩИЙ ключ обеих корзин (v1.36.0):** и ``xml_options[i]["name"]``,
         и ``code_options[i]["name"]`` — строка с именем ФО, поэтому общий цикл
@@ -20252,7 +20481,9 @@ def make_bsl_helpers(
 
         Returns: ``{object, roles: [{role_name, object, rights, file,
         matched_objects, rights_by_object, details_truncated}], match,
-        case_sensitive}``. v1.49.0: ``object`` и ``rights`` строки — одна пара: ``object`` — точный
+        case_sensitive}``. v1.52.0: несуществующее голое имя при пустом ``roles`` — ``ValueError``;
+        существующий объект любой категории без выданных прав возвращает законный пустой список,
+        а непустой substring-поиск с фактическим объектом каждой строки сохраняется. v1.49.0: ``object`` и ``rights`` строки — одна пара: ``object`` — точный
         объект запроса (у ссылки — её категории; у голого имени — первый точный по имени), если он
         среди совпадений роли, иначе первое совпадение; ``rights`` — полные права ИМЕННО этого объекта
         (прежде — объединение прав всех совпадений, а ``object`` — первое совпадение или, живьём, строка
@@ -24840,13 +25071,16 @@ def make_bsl_helpers(
                    ПУСТУЮ страницу при сохранённом ``total``.
 
         Returns:
-            ``{templates, total, truncated, source, partial, _meta}``.
+            ``{templates, total, truncated, source, partial, _meta}``. v1.52.0: если отсутствие
+            объекта с переданным голым ``owner`` доказано и ``total=0``, возникает ``ValueError``.
+            Существующий владелец без макетов получает пустой список. При ``limit=0`` и ``total>0``
+            возвращается пустая страница с полным счетчиком.
 
         **Живого скана здесь НЕТ, и это объявлено, а не умалчивается.** Под
         ``*/Templates/*`` на боевой конфигурации 27 978 файлов, и разовый проход по
-        ним стоил бы дороже всего остального релиза вместе взятого. Без индекса
-        хелпер возвращает пустой ответ с ``source='unavailable'``, ``partial=True``
-        и названной причиной — так же, как ``find_data_path``.
+        ним стоил бы дороже всего остального релиза вместе взятого. Без индекса обзорный
+        вызов и запрос существующего владельца возвращают пустой ответ с ``source='unavailable'``,
+        ``partial=True`` и названной причиной — так же, как ``find_data_path``.
         """
         out: dict = {
             "templates": [],
@@ -26543,6 +26777,7 @@ def make_bsl_helpers(
         "business",
         ["обмен", "exchange", "план обмена", "синхрониз", "регистрац"],
         "FIND EXCHANGE PLAN CONTENT:\n"
+        "  # Только точное имя/ссылка; фрагмент или glob — ValueError с маршрутом поиска.\n"
         "  content = find_exchange_plan_content('ОбменУправлениеПредприятием')\n"
         "  for item in content:\n"
         "      print(f\"  {item['ref']} auto_record={item['auto_record']}\")",

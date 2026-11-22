@@ -162,7 +162,9 @@ def test_unknown_name_on_index_is_an_empty_list(forms_tree, monkeypatch):
     root, _missing = forms_tree
     reader = _index_for_forms(root, monkeypatch)
     try:
-        assert _bsl_for(root, reader)["parse_form"]("НетТакогоОбъекта") == []
+        # v1.52.0: прежнее ожидание `[]` — несуществующее голое имя теперь отказ.
+        with pytest.raises(ValueError, match="parse_form: объекта с именем 'НетТакогоОбъекта' нет"):
+            _bsl_for(root, reader)["parse_form"]("НетТакогоОбъекта")
     finally:
         reader.close()
 
@@ -184,7 +186,9 @@ def test_index_session_does_not_walk_the_whole_tree(forms_tree, monkeypatch, wit
         return _g
 
     try:
-        assert _bsl_for(root, reader, glob_wrap=spy)["parse_form"]("НетТакогоОбъекта") == []
+        # v1.52.0: прежнее ожидание `[]`; отказ после вычисления не добавляет широкий обход.
+        with pytest.raises(ValueError, match="parse_form: объекта с именем 'НетТакогоОбъекта' нет"):
+            _bsl_for(root, reader, glob_wrap=spy)["parse_form"]("НетТакогоОбъекта")
         assert not [p for p in seen if p.startswith("**/Forms/")], seen
     finally:
         reader.close()

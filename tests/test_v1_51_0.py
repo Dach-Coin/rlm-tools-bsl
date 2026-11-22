@@ -1593,10 +1593,16 @@ def _expected9(fmt: str) -> dict[str, tuple[str, str]]:
     # Без индекса писатели — только `Движения.X` модулей объектов (таблицы механизмов модуля менеджера видит индекс):
     # ответ пуст, а регистра с таким именем нет.
     missing("live", "find_register_writers", "ДвиженияСерийТоваров", main_where)
-    # Фрагмент: с индексом — точное имя, пустой ответ; без индекса `Движения.Ре` находит `Движения.Рег` — ответ прежний.
+    # До 1.52.0 живой `Движения.Ре` находил `Движения.Рег`; теперь полное имя обязательно на обоих маршрутах.
     missing("index", "find_register_writers", "Ре", main_where)
-    # С индексом фрагмент документа — пустой ответ (без индекса — ответ по подстроке, прежний).
+    # С индексом фрагмент документа — пустой ответ. v1.52.0: точное имя обязательно и на живом маршруте.
     missing("index", "find_register_movements", "ДокДв", main_where)
+    missing("live", "find_register_movements", "ДокДв", main_where)
+    # v1.52.0: ложное поле набора, префикс имени регистра и подстрока плана больше не делают ответ непустым.
+    for session in ("index", "live"):
+        missing(session, "find_register_writers", "Сумма", main_where)
+        missing(session, "find_exchange_plan_content", "Обм", main_where)
+    missing("live", "find_register_writers", "Ре", main_where)
     ext_where = "ни в этом расширении, ни в основной конфигурации"
     missing("ext_with_main", "find_defined_types", "НетТакогоОбъекта", ext_where)
     other("ext_with_main", "find_defined_types", "КнигаПокупок", "Reports", main_only=True)
@@ -1629,9 +1635,8 @@ class TestBareNameCategoryRefusal:
                 assert got["error"].startswith(text), (key, got["error"])
 
     def test_every_other_call_answers_as_head(self, bare9):
-        """(в — вторая часть, г, д, е, ж, з, к, л) Все прочие вызовы матрицы — ответ HEAD: существующий объект, непустой
-        ответ на имя без объекта (таблица механизма, поле набора, подстрока плана обмена), объект только расширения,
-        ссылки, не-ссылки иных форм, сессия на расширении без основной, композиты и `find_enum_values`."""
+        """Все вызовы вне новых классов — ответ HEAD: существующие объекты, manager_table, ссылки,
+        не-ссылки иных форм, сессия расширения без основной, композиты и `find_enum_values`."""
         from _head_answers_v1_51_0 import _HEAD9
 
         head = _HEAD9[bare9["fmt"]]
@@ -1647,13 +1652,14 @@ class TestBareNameCategoryRefusal:
         assert changed == []
 
     def test_explicit_answers_that_stay(self, bare9):
-        """(в, г, д) Литералы ключевых ответов, которые не меняются: подстрока плана обмена, таблица механизма модуля
-        менеджера (индекс) и поле набора, подсказка регистра без писателей и объявивших."""
+        """Сохраняются manager_table и подсказка существующего регистра без писателей и объявивших."""
         idx, live = bare9["index"], bare9["live"]
         for bsl in (idx, live):
-            assert bsl["find_exchange_plan_content"]("Обм") == [{"ref": "Catalog.Спр", "auto_record": True}]
-            sum_writers = bsl["find_register_writers"]("Сумма")
-            assert [w["document"] for w in sum_writers["writers"]] == ["ДокПоле"], sum_writers
+            # v1.52.0: прежние ожидания — состав плана по `Обм` и писатель `ДокПоле` по полю `Сумма`.
+            with pytest.raises(ValueError, match="плана обмена с именем 'Обм' нет"):
+                bsl["find_exchange_plan_content"]("Обм")
+            with pytest.raises(ValueError, match="регистра с именем 'Сумма' нет"):
+                bsl["find_register_writers"]("Сумма")
             empty = bsl["find_register_writers"]("Пустой")
             assert empty["writers"] == [] and empty["declared_documents"] == []
             assert empty["hint"].endswith("документы-регистраторы его не пишут."), empty["hint"]

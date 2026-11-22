@@ -19,3 +19,10 @@ docker-compose.yml
 evals/ab_results/
 docs/plans/
 tmp/
+AGENTS.md
+.vscode/
+.kilo/
+.claude/
+.zcode/
+.codex/
+.kimi-code/

@@ -1390,7 +1390,9 @@ _PRIOR_FORMS_HEAD = {
         "idx|get_overrides": "f222d3ed1935d673",
         "idx|find_ext_overrides": "1438b8e3245dc601",
         "idx|find_attributes": "218a9fe599e5de3b",
-        "idx|find_predefined": "4eceefa0f0e75652",
+        # v1.52.0: прежде здесь стояло '4eceefa0f0e75652' — голое имя `Док` (документ) у find_predefined
+        # теперь отказ «вне области хелпера» с маршрутом к описателю
+        "idx|find_predefined": "afe1cd6423075594",
         "idx|find_templates": "b544f73f557f2f48",
         "idx|parse_form": "4eceefa0f0e75652",
         "idx|extract_procedures": "b2877df6762d13f7",
@@ -1423,7 +1425,9 @@ _PRIOR_FORMS_HEAD = {
         "live|get_overrides": "59d5d2e3133570b3",
         "live|find_ext_overrides": "1438b8e3245dc601",
         "live|find_attributes": "218a9fe599e5de3b",
-        "live|find_predefined": "4eceefa0f0e75652",
+        # v1.52.0: прежде здесь стояло '4eceefa0f0e75652' — голое имя `Док` (документ) у find_predefined
+        # теперь отказ «вне области хелпера» с маршрутом к описателю
+        "live|find_predefined": "afe1cd6423075594",
         "live|find_templates": "3799a44c91ba3430",
         "live|parse_form": "4eceefa0f0e75652",
         "live|extract_procedures": "b2877df6762d13f7",
@@ -1458,7 +1462,9 @@ _PRIOR_FORMS_HEAD = {
         "idx|get_overrides": "60a18912142b0884",
         "idx|find_ext_overrides": "1438b8e3245dc601",
         "idx|find_attributes": "667c9e3c1dd515a3",
-        "idx|find_predefined": "4eceefa0f0e75652",
+        # v1.52.0: прежде здесь стояло '4eceefa0f0e75652' — голое имя `Док` (документ) у find_predefined
+        # теперь отказ «вне области хелпера» с маршрутом к описателю
+        "idx|find_predefined": "f1f25733ec7c028f",
         "idx|find_templates": "e6b0f16aba1ada09",
         "idx|parse_form": "4eceefa0f0e75652",
         "idx|extract_procedures": "46e70683b90b4cbb",
@@ -1491,7 +1497,9 @@ _PRIOR_FORMS_HEAD = {
         "live|get_overrides": "f909b6490a779d5d",
         "live|find_ext_overrides": "1438b8e3245dc601",
         "live|find_attributes": "667c9e3c1dd515a3",
-        "live|find_predefined": "4eceefa0f0e75652",
+        # v1.52.0: прежде здесь стояло '4eceefa0f0e75652' — голое имя `Док` (документ) у find_predefined
+        # теперь отказ «вне области хелпера» с маршрутом к описателю
+        "live|find_predefined": "f1f25733ec7c028f",
         "live|find_templates": "3799a44c91ba3430",
         "live|parse_form": "4eceefa0f0e75652",
         "live|extract_procedures": "46e70683b90b4cbb",
@@ -3090,9 +3098,14 @@ class TestDeclaredBoundaries:
 
     @pytest.mark.parametrize("arg", list(_EMPTY_ROLES_HEAD_OBJECT))
     def test_empty_roles_without_boundary_hint(self, world50, arg):
-        """Обе версии: путь члена, не-ссылка без объекта, вид без прав в ролях, голое имя без объекта — ответ HEAD."""
+        """Путь члена, не-ссылка и вид без прав сохраняют ответ; несуществующее голое имя — новый отказ."""
         for route, case_sensitive in (("idx", False), ("live", True)):
-            assert _strip_times(world50[route]["find_roles"](arg)) == _empty_roles_head(arg, case_sensitive), route
+            if arg == "НетТакогоОбъекта":
+                # v1.52.0: прежнее ожидание — `_empty_roles_head(arg, case_sensitive)`.
+                with pytest.raises(ValueError, match="find_roles: объекта с именем 'НетТакогоОбъекта' нет"):
+                    world50[route]["find_roles"](arg)
+            else:
+                assert _strip_times(world50[route]["find_roles"](arg)) == _empty_roles_head(arg, case_sensitive), route
 
     def test_extension_session_hint(self, world50, tmp_path):
         bsl = _extension_alone(world50, tmp_path)

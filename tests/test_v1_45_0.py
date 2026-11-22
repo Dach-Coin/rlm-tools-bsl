@@ -1844,24 +1844,37 @@ _MS_EXT_OM = "../cfe/Р/Documents/Д/Ext/ObjectModule.bsl"
 def _doc_descriptor(name: str) -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
         f'  <Document uuid="00000000-0000-0000-0000-0000000000d1"><Properties><Name>{name}</Name></Properties>'
         "</Document>\n"
         "</MetaDataObject>\n"
     )
 
 
+def _register_descriptor(name: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+        f"<AccumulationRegister><Properties><Name>{name}</Name></Properties></AccumulationRegister>"
+        "</MetaDataObject>\n"
+    )
+
+
 def _ms_tree(root: Path) -> Path:
+    # v1.52.0: строкам source='code' нужны описатели регистров в корне модуля (Д1) — без них
+    # РегОсн/РегРасш отфильтрованы как незаявленные.
     return _ext_tree(
         root,
         {
             "Documents/Д.xml": _doc_descriptor("Д"),
+            "AccumulationRegisters/РегОсн.xml": _register_descriptor("РегОсн"),
             _MS_MAIN_OM: (
                 "Процедура ОбработкаПроведения(Отказ, Режим)\n\tДвижения.РегОсн.Записывать = Истина;\nКонецПроцедуры\n"
             ),
         },
         {
             "Р": {
+                "AccumulationRegisters/РегРасш.xml": _register_descriptor("РегРасш"),
                 "Documents/Д/Ext/ObjectModule.bsl": (
                     "Процедура Р_Доп()\n\tДвижения.РегРасш.Записывать = Истина;\nКонецПроцедуры\n"
                 ),
@@ -2313,11 +2326,10 @@ class TestPrintFormsRoute:
     def test_fragment_keeps_substring_route(self, tmp_path, fmt):
         root, _paths = _pf_tree(tmp_path, fmt)
         bsl = _bsl_for(root)
-        res = bsl["find_print_forms"]("СПеч")
-        assert [p["name"] for p in res["print_forms"]] == ["Накладная"], res
-        assert "hint" not in res and set(res["_meta"]) == {"delegates"}, res
-        missing = bsl["find_print_forms"]("НетТакого")
-        assert missing == {"object": "НетТакого", "print_forms": [], "_meta": {"delegates": []}}, missing
+        # v1.52.0: прежние ожидания — `Накладная` по фрагменту и пустой dict по несуществующему имени.
+        for arg in ("СПеч", "НетТакого"):
+            with pytest.raises(ValueError, match=f"find_print_forms: объекта с именем {arg!r} нет"):
+                bsl["find_print_forms"](arg)
 
 
 # ═══════════════ Задача 16 (Д21, Д22, Д23) — наборы подписок, проведение у непроводимого, раскрытие ═══════════════

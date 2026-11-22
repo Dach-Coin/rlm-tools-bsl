@@ -693,9 +693,9 @@ def test_print_forms_without_delegates_keep_the_old_meta(pf_tree):
 
 
 def test_print_forms_fragment_still_uses_substring_route(pf_tree):
-    """Точного объекта нет — прежний подстрочный маршрут (поведение фрагмента не меняется)."""
-    names = {r["name"] for r in _bsl_for(pf_tree)["find_print_forms"]("Длинный")["print_forms"]}
-    assert names == {"Чужая"}
+    # v1.52.0: прежнее ожидание — команда `Чужая` из `ТестДлинный`; теперь неточное голое имя отклоняется.
+    with pytest.raises(ValueError, match="find_print_forms: объекта с именем 'Длинный' нет"):
+        _bsl_for(pf_tree)["find_print_forms"]("Длинный")
 
 
 @pytest.mark.parametrize("arg", ["Пустой", "Documents/Пустой", "Документ.Пустой", "БезМенеджера"])

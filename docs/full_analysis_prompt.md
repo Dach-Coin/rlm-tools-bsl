@@ -129,8 +129,9 @@ Replace `<path>` with the actual path to your 1C source code (EDT or CF format).
    - Статистика: сколько пакетов, сколько из них с типами
 
 4. **Планы обмена**:
-   - Список всех планов обмена (через find_by_type)
-   - Для основного плана обмена (например, ОбменУправлениеПредприятием): полный состав — какие объекты входят и с каким режимом авторегистрации
+   - Собери список планов по описателям через glob_files('ExchangePlans/*.xml') для CF или glob_files('ExchangePlans/*/*.mdo') для EDT. Найди их BSL-модули через find_by_type('ExchangePlans')
+   - Для состава основного плана передай в find_exchange_plan_content точное имя или ссылку ExchangePlans/<Имя>. Покажи, какие объекты входят и с каким режимом авторегистрации
+   - Сравни ответы на точное имя, фрагмент и glob-маску. Перехвати ValueError внутри батча и выполни предложенный маршрут проверки имени
    - Регламентные задания, связанные с обменом (фильтр по 'Обмен|Exchange|Синхрониз|Загруз|Выгруз')
 
 5. **Связи между компонентами**:
@@ -162,8 +163,8 @@ This prompt specifically targets the 4 new integration helpers from v1.4.0 and v
 | HTTP services | `find_http_services()` | name, root_url, templates with methods |
 | Web services | `find_web_services()` | name, namespace, operations with params |
 | XDTO packages | `find_xdto_packages()` | name, namespace, types (EDT only) |
-| Exchange plans | `find_exchange_plan_content(name)` | ref, auto_record for each object |
-| Exchange plan list | `find_by_type('ExchangePlans')` | BSL modules of exchange plans |
+| Состав плана обмена | `find_exchange_plan_content(name)` | Точное имя или ссылка в корне плана → `ref` и `auto_record`. Маска или голое имя, для которого доказано отсутствие точного плана → `ValueError` с маршрутом проверки имени |
+| Список планов обмена | `glob_files()` и `find_by_type('ExchangePlans')` | Описатели планов и их BSL-модули |
 | Related jobs | `find_scheduled_jobs()` + filter | jobs related to exchange/sync |
 | Integration recipe | `help('http')`, `help('обмен')` | recipe displayed correctly |
 | Strategy injection | `get_strategy(query='интеграция')` | BUSINESS RECIPE injected |
@@ -676,12 +677,12 @@ Replace `<path>` with the actual path to your 1C source code (EDT or CF format).
    - Найди обработчик ПередЗаписью или ПослеЗаписи (scope="ext_info") в handlers
    - read_procedure(form['module_path'], handler_name) → прочитай тело обработчика (module_path уже в ответе parse_form!)
    - find_callers_context(handler_name) → кто ещё вызывает эту процедуру
-   - find_register_movements('РеализацияТоваровУслуг') → регистры, куда пишет документ
+   - find_register_movements('РеализацияТоваровУслуг') → отдельно движения, найденные в коде, и объявленный состав
    - Покажи связь: событие формы → обработчик (через module_path) → бизнес-логика → регистры
 
 8. **Статистика из индекса**:
    - get_index_info() → form_elements_count
-   - parse_form('') с пустым именем не должен работать (проверка валидации)
+   - Сравни ответы parse_form на пустое имя, несуществующий объект и неизвестную форму существующего документа. Перехвати ValueError внутри батча и запиши результат каждого вызова
    - Сколько всего обработчиков, команд, атрибутов в form_elements_count
 
 9. **CommonForms (если доступны)**:
@@ -712,6 +713,7 @@ This prompt verifies the form XML parsing helper from v1.6.0: `parse_form()` wit
 |------|-----------------|----------------|
 | Index diagnostics | `get_index_info()` | builder_version=10, has_form_elements=True, count>0 |
 | Form overview | `parse_form(object_name)` | Grouped output: handlers/commands/attributes per form |
+| Границы поиска форм | `parse_form()` | Пустое имя или голое имя, для которого доказано отсутствие объекта → `ValueError`. Неизвестная форма существующего объекта → `[]` |
 | Handler scope | `parse_form()` handlers | scope="form", "ext_info", "element" — no empty strings |
 | Reverse lookup | `parse_form(handler='...')` | Finds binding for a BSL procedure |
 | Commands | `parse_form()` commands | name→action mapping (CF and EDT) |

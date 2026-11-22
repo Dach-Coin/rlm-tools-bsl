@@ -1633,8 +1633,9 @@ def test_find_roles():
 def test_find_roles_not_found():
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)
-        result = bsl["find_roles"]("НесуществующийОбъект")
-        assert len(result["roles"]) == 0
+        # v1.52.0: прежнее ожидание — пустой список ролей; несуществующее голое имя теперь отказ.
+        with pytest.raises(ValueError, match="find_roles: объекта с именем 'НесуществующийОбъект' нет"):
+            bsl["find_roles"]("НесуществующийОбъект")
 
 
 def test_parse_cf_event_subscription():
@@ -1783,6 +1784,17 @@ def _make_full_fixture(tmpdir):
     with open(os.path.join(job_dir, "ЗагрузкаКурсов.xml"), "w", encoding="utf-8") as f:
         f.write(SCHEDULED_JOB_CF_XML)
 
+    # v1.52.0: движения из кода сверяются с реальными описателями регистров.
+    for name in ("ТоварыНаСкладах", "РасчетыСПоставщиками"):
+        register_dir = os.path.join(tmpdir, "AccumulationRegisters")
+        os.makedirs(register_dir, exist_ok=True)
+        with open(os.path.join(register_dir, f"{name}.xml"), "w", encoding="utf-8") as f:
+            f.write(
+                '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+                f"<AccumulationRegister><Properties><Name>{name}</Name></Properties></AccumulationRegister>"
+                "</MetaDataObject>"
+            )
+
     # Configuration.xml
     with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
         f.write("<Configuration/>")
@@ -1857,8 +1869,9 @@ def test_find_event_subscriptions_overview_is_unchanged():
 def test_find_event_subscriptions_no_match():
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)
-        result = bsl["find_event_subscriptions"]("НесуществующийДокумент")
-        assert len(result) == 0
+        # v1.52.0: прежнее ожидание — пустой список; несуществующее голое имя теперь отказ.
+        with pytest.raises(ValueError, match="find_event_subscriptions: объекта с именем 'НесуществующийДокумент' нет"):
+            bsl["find_event_subscriptions"]("НесуществующийДокумент")
 
 
 def test_find_scheduled_jobs_all():
@@ -2046,8 +2059,9 @@ def test_find_based_on_documents_exact_name_excludes_prefix_homonym(with_index):
                 ("Реализация", "back_scan")
             ]
 
-            fragment_result = bsl["find_based_on_documents"]("ЗаказКл")
-            assert "ЧужойАкт" in {row["document"] for row in fragment_result["can_create_from_here"]}, fragment_result
+            # v1.52.0: прежнее ожидание — `ЧужойАкт` из `ЗаказКлиента`; фрагмент теперь отклоняется.
+            with pytest.raises(ValueError, match="find_based_on_documents: объекта с именем 'ЗаказКл' нет"):
+                bsl["find_based_on_documents"]("ЗаказКл")
         finally:
             if reader is not None:
                 reader.close()
@@ -2056,9 +2070,9 @@ def test_find_based_on_documents_exact_name_excludes_prefix_homonym(with_index):
 def test_find_based_on_documents_no_manager():
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)
-        result = bsl["find_based_on_documents"]("НесуществующийДок")
-        assert len(result["can_create_from_here"]) == 0
-        assert len(result["can_be_created_from"]) == 0
+        # v1.52.0: прежнее ожидание — обе корзины пусты; несуществующее голое имя теперь отказ.
+        with pytest.raises(ValueError, match="find_based_on_documents: объекта с именем 'НесуществующийДок' нет"):
+            bsl["find_based_on_documents"]("НесуществующийДок")
 
 
 # --- #3 (v1.28.0): union с декларативным <BasedOn> из metadata_references ---
@@ -2378,8 +2392,9 @@ def test_find_print_forms():
 def test_find_print_forms_not_found():
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)
-        result = bsl["find_print_forms"]("НесуществующийДок")
-        assert len(result["print_forms"]) == 0
+        # v1.52.0: прежнее ожидание — пустой список печати; несуществующее голое имя теперь отказ.
+        with pytest.raises(ValueError, match="find_print_forms: объекта с именем 'НесуществующийДок' нет"):
+            bsl["find_print_forms"]("НесуществующийДок")
 
 
 # === Task 7: find_register_movements ERP framework fallback ===
@@ -4055,6 +4070,17 @@ def _make_profile_fixture(tmpdir, *, with_index=True, glob_counter=None, read_co
         f.write(BSL_CODE)
     with open(os.path.join(obj, "ManagerModule.bsl"), "w", encoding="utf-8") as f:
         f.write(_MANAGER_BSL)
+    # v1.52.0: сеяным `code`-строкам регистра нужны реальные описатели — Д1 сверяет source='code'
+    # с каталогом регистров на диске, без описателя строки отфильтрованы.
+    for name in ("Продажи", "Себестоимость"):
+        register_dir = os.path.join(tmpdir, "AccumulationRegisters")
+        os.makedirs(register_dir, exist_ok=True)
+        with open(os.path.join(register_dir, f"{name}.xml"), "w", encoding="utf-8") as f:
+            f.write(
+                '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+                f"<AccumulationRegister><Properties><Name>{name}</Name></Properties></AccumulationRegister>"
+                "</MetaDataObject>"
+            )
     with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
         f.write("<Configuration/>")
     helpers, resolve_safe = make_helpers(tmpdir)
@@ -4891,6 +4917,33 @@ def _make_posting_env(
     ext_root = os.path.join(tmpdir, "cfe", "ExtPosting")
     os.makedirs(base, exist_ok=True)
 
+    def _declare_registers(root, names):
+        # v1.52.0: только регистры, которые фикстуры считают реальными движениями.
+        for name in names:
+            category = os.path.join(root, "AccumulationRegisters")
+            os.makedirs(category, exist_ok=True)
+            with open(os.path.join(category, f"{name}.xml"), "w", encoding="utf-8") as f:
+                f.write(
+                    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><AccumulationRegister>'
+                    f"<Properties><Name>{name}</Name></Properties></AccumulationRegister></MetaDataObject>"
+                )
+
+    _declare_registers(
+        base,
+        (
+            "ТоварыНаСкладах",
+            "ТолькоВMainHandler",
+            "ИзMainHelper",
+            "PostBuildMain",
+            "MainEnglishRegister",
+            # v1.52.0: английская прямая запись RegisterRecords.Sales и регистр, писемый из двух
+            # CFE-модулей, — описатель основной виден любому корню модуля (Д1 проверяет текущий
+            # корень + корень владельца файла).
+            "Sales",
+            "ОдинРегистрИзДвухCFE",
+        ),
+    )
+
     if with_movements_doc:
         docs = {**docs, "СлужебныйДокСДвижениями": _WITH_MOVEMENTS}
     # Делегат из _DELEGATED существует ПО-НАСТОЯЩЕМУ: без него маршрут из hint нельзя пройти до
@@ -5004,6 +5057,19 @@ def _make_posting_env(
         os.makedirs(ext_root, exist_ok=True)
         with open(os.path.join(ext_root, "Configuration.xml"), "w") as f:
             f.write("<Configuration/>")
+        _declare_registers(
+            ext_root,
+            (
+                "ТоварыНаСкладах",
+                "ПрямойРегистрCFE",
+                "РегистрТолькоCFE",
+                "MainEnglishRegister",
+                "PostBuildCFE",
+                # v1.52.0: положительный факт CFE-движения обязан быть известным — описатель в
+                # корне расширения (Д1), иначе строка отфильтрована как шум.
+                "ЕдинственныйРегистрCFE",
+            ),
+        )
         for doc, body in (ext_docs or {}).items():
             ext_dir = os.path.join(ext_root, "Documents", doc, "Ext")
             os.makedirs(ext_dir, exist_ok=True)
@@ -8860,7 +8926,11 @@ def test_fo_malformed_content_is_ignored_safely(tmp_path):
     _write_fo(tmpdir, "ФО_Битый", ["БезТочки", "Document.Заказ"])
     bsl = _fo_bsl(tmpdir)
     assert _fo_names(bsl["find_functional_options"]("Заказ", include_code=False)) == ["ФО_Битый"]
-    assert bsl["find_functional_options"]("БезТочки", include_code=False)["xml_options"] == []
+    # v1.52.0: прежде голое `БезТочки` (элемент битого content) давало пустой xml_options;
+    # пустой ответ на несуществующее голое имя теперь отказ Д3. Разбор content при этом
+    # по-прежнему безопасен — строка выше прошла по тому же ФО с битым членом.
+    with pytest.raises(ValueError, match="^find_functional_options: объекта с именем 'БезТочки' нет"):
+        bsl["find_functional_options"]("БезТочки", include_code=False)
 
 
 def test_fo_cf_and_edt_deep_member_ref_are_equivalent(tmp_path):
@@ -8880,14 +8950,17 @@ def test_fo_cf_and_edt_deep_member_ref_are_equivalent(tmp_path):
         _write_descriptor(str(d), "Documents", "ПриобретениеТоваровУслуг")
         bsl = _fo_bsl(str(d))
         owner = bsl["find_functional_options"]("Документ.ПриобретениеТоваровУслуг", include_code=False)
-        foreign_bare = bsl["find_functional_options"]("ЗаказПоставщику", include_code=False)
+        # v1.52.0: прежде голое `ЗаказПоставщику` (имя реквизита, не объекта) давало []; пустой ответ
+        # на несуществующее голое имя теперь отказ Д3 — в обоих форматах одинаково.
+        with pytest.raises(ValueError, match="^find_functional_options: объекта с именем 'ЗаказПоставщику' нет"):
+            bsl["find_functional_options"]("ЗаказПоставщику", include_code=False)
         # v1.46.0: прежде здесь стояло `foreign_typed == []`; документа `ЗаказПоставщику` нет (это имя реквизита), и
         # ссылку на несуществующий объект шлюз существования (Д3) отвергает — в обоих форматах одинаково.
         with pytest.raises(ValueError, match="^find_functional_options: объекта Document.ЗаказПоставщику нет"):
             bsl["find_functional_options"]("Документ.ЗаказПоставщику", include_code=False)
-        results.append((_fo_names(owner), _fo_names(foreign_bare)))
+        results.append(_fo_names(owner))
 
-    assert results[0] == (["ФО_Глубокий"], [])
+    assert results[0] == ["ФО_Глубокий"]
     assert results[0] == results[1]
 
 

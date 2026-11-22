@@ -3323,7 +3323,10 @@ class TestLiveCatalogPrewarm:
         assert scans, "прогрев не выполнился — тест вырожден"
         assert touched == [], "прогрев не имеет права запускать metadata/synonym фазу"
         # ... а обычный потребитель metadata её по-прежнему запускает.
-        bsl["find_attributes"](object_name="ТестДок")
+        # v1.52.0: объекта `ТестДок` в фикстуре нет, и пустой ответ find_attributes теперь
+        # отказ Д3 — ПОСЛЕ тела хелпера; metadata-фаза выполняется, предусловие доказуемо.
+        with pytest.raises(ValueError, match="^find_attributes: объекта с именем 'ТестДок' нет"):
+            bsl["find_attributes"](object_name="ТестДок")
         assert touched, "предусловие: metadata-фаза вообще достижима в этой фикстуре"
 
     def test_prewarm_starts_only_after_real_inline_backend_owns_sandbox(

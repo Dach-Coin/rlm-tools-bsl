@@ -967,15 +967,20 @@ class TestMissingObject:
         assert [r["role_name"] for r in res["roles"] if r["granted_via"] == "set_for_new_objects"] == ["Роль1"]
 
     def test_bare_missing_name_has_no_set_rows(self, world):
+        # v1.52.0: прежде голые отсутствующие имена давали пустой ответ без строк `set`;
+        # пустой ответ на несуществующее голое имя теперь отказ Д3 — сфабрикованных строк
+        # тем более нет. Существующее голое `Док` отвечает как прежде.
         for value in ("Нет", "До"):
-            rows = world["find_event_subscriptions"](value)
-            assert not [r for r in rows if r.get("scope") == "set"], rows
+            with pytest.raises(ValueError, match="^find_event_subscriptions: объекта с именем"):
+                world["find_event_subscriptions"](value)
         assert [r["name"] for r in world["find_event_subscriptions"]("Док") if r.get("scope") == "set"] == ["ПодпНабор"]
         flow = world["analyze_document_flow"]("Нет")
         assert not [r for r in flow["event_subscriptions"] if r.get("scope") == "set"], flow["event_subscriptions"]
 
     def test_bare_missing_name_has_no_flag_roles(self, world):
-        assert world["find_roles"]("Нет")["roles"] == []
+        # v1.52.0: прежде голое отсутствующее имя давало пустые роли; теперь отказ Д3.
+        with pytest.raises(ValueError, match="^find_roles: объекта с именем"):
+            world["find_roles"]("Нет")
         assert [r["role_name"] for r in world["find_roles"]("Док")["roles"]] == ["Роль1"]
 
     def test_overrides_missing_bare_name_has_hint(self, world):
@@ -1141,11 +1146,16 @@ class TestMainRootInExtensionSession:
         with pytest.raises(ValueError, match="имя категории"):
             world["find_references_to_object"]("Documents")
         assert plain["find_event_subscriptions"]("Нет"), "фикстура: в сессии без корня основной строка набора есть"
-        assert not [r for r in world["find_event_subscriptions"]("Нет") if r.get("scope") == "set"]
+        # v1.52.0: прежде сессия расширения с основной давала пустой ответ без строк `set`;
+        # несуществующее голое имя теперь отказ Д3 (шлюз смотрит в основную).
+        with pytest.raises(ValueError, match="^find_event_subscriptions: объекта с именем 'Нет' нет"):
+            world["find_event_subscriptions"]("Нет")
         # `Спр` есть в основной — правило не-ссылки не срабатывает, роли по флагу прежние.
         assert world["find_roles"]("Спр") == plain["find_roles"]("Спр")
         assert [r["role_name"] for r in plain["find_roles"]("Спр")["roles"]] == ["Расш1_Роль"]
-        assert world["find_roles"]("Нет")["roles"] == []
+        # v1.52.0: прежде пустые роли на отсутствующее имя; теперь отказ Д3.
+        with pytest.raises(ValueError, match="^find_roles: объекта с именем 'Нет' нет"):
+            world["find_roles"]("Нет")
 
     @pytest.mark.parametrize("world", WORLD_EXT_ALONE, indirect=True)
     def test_extension_without_main_has_no_gate(self, world):

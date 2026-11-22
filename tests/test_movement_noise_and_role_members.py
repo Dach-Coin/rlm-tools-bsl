@@ -55,6 +55,18 @@ def _build_index(tmpdir: str, doc_name: str = "РеализацияТоваро�
         f.write("// doc\n")
     with open(os.path.join(doc, "ManagerModule.bsl"), "w", encoding="utf-8") as f:
         f.write("// mgr\n")
+    # v1.52.0: code-строка сохраняется только для регистра, существующего в каталоге фактического корня.
+    for category, kind, name in (
+        ("AccumulationRegisters", "AccumulationRegister", "ТоварыНаСкладах"),
+        ("AccumulationRegisters", "AccumulationRegister", "Продажи"),
+    ):
+        register_dir = os.path.join(tmpdir, category)
+        os.makedirs(register_dir, exist_ok=True)
+        with open(os.path.join(register_dir, f"{name}.xml"), "w", encoding="utf-8") as f:
+            f.write(
+                '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+                f"<{kind}><Properties><Name>{name}</Name></Properties></{kind}></MetaDataObject>"
+            )
     with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
         f.write("<Configuration/>")
     return str(IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True))
@@ -217,6 +229,13 @@ def _bsl_no_index(tmpdir: str) -> dict:
     os.makedirs(doc)
     with open(os.path.join(doc, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
         f.write(_LIVE_DOC_BODY)
+    register_dir = os.path.join(tmpdir, "AccumulationRegisters")
+    os.makedirs(register_dir)
+    with open(os.path.join(register_dir, "ТоварыНаСкладах.xml"), "w", encoding="utf-8") as f:
+        f.write(
+            '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><AccumulationRegister>'
+            "<Properties><Name>ТоварыНаСкладах</Name></Properties></AccumulationRegister></MetaDataObject>"
+        )
     with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
         f.write("<Configuration/>")
     helpers, resolve_safe = make_helpers(tmpdir)

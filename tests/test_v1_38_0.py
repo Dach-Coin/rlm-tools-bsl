@@ -724,8 +724,9 @@ def test_valid_category_absent_from_the_tree_is_an_empty_list_not_an_error(tmp_p
     assert bsl["find_module"](category="BusinessProcesses") == []
     assert bsl["find_by_type"]("BusinessProcesses") == []
     # И безусловные внутренние вызовы find_by_type("Documents") не падают.
-    assert "can_create_from_here" in bsl["find_based_on_documents"]("НетТакого")
-    assert "print_forms" in bsl["find_print_forms"]("НетТакого")
+    # v1.52.0: прежние публичные вызовы получают отказ; внутренние функции замыкания сохраняют прежний ответ.
+    assert "can_create_from_here" in bsl["find_based_on_documents"].__wrapped__("НетТакого")
+    assert "print_forms" in bsl["find_print_forms"].__wrapped__("НетТакого")
 
 
 def test_form_module_is_a_documented_filter_including_common_forms(tmp_path):

@@ -561,6 +561,19 @@ DOCUMENT_OBJECT_MODULE = """\
 КонецПроцедуры
 """
 
+
+def _declare_movement_registers(root):
+    """v1.52.0: helper-side фильтр принимает code-строки только реальных регистров."""
+    for name in ("ТоварыНаСкладах", "ВзаиморасчетыСКлиентами"):
+        category = root / "AccumulationRegisters"
+        category.mkdir(parents=True, exist_ok=True)
+        (category / f"{name}.xml").write_text(
+            '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><AccumulationRegister>'
+            f"<Properties><Name>{name}</Name></Properties></AccumulationRegister></MetaDataObject>",
+            encoding="utf-8",
+        )
+
+
 DOCUMENT_MANAGER_MODULE = """\
 Процедура ЗарегистрироватьУчетныеМеханизмы(Менеджер)
     МеханизмыДокумента.Добавить("ТоварыНаСкладах");
@@ -578,6 +591,7 @@ def test_register_movements_build(tmp_path, monkeypatch):
     doc_dir = tmp_path / "Documents" / "Реализация" / "Ext"
     doc_dir.mkdir(parents=True)
     (doc_dir / "ObjectModule.bsl").write_text(DOCUMENT_OBJECT_MODULE, encoding="utf-8-sig")
+    _declare_movement_registers(tmp_path)
     (doc_dir / "ManagerModule.bsl").write_text(DOCUMENT_MANAGER_MODULE, encoding="utf-8-sig")
 
     (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
@@ -610,6 +624,7 @@ def test_find_register_movements_fast_path(tmp_path, monkeypatch):
     doc_dir = tmp_path / "Documents" / "Реализация" / "Ext"
     doc_dir.mkdir(parents=True)
     (doc_dir / "ObjectModule.bsl").write_text(DOCUMENT_OBJECT_MODULE, encoding="utf-8-sig")
+    _declare_movement_registers(tmp_path)
 
     (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
 
@@ -670,6 +685,7 @@ def test_register_movements_code_filter(tmp_path, monkeypatch):
     doc_dir = tmp_path / "Documents" / "ТестДок" / "Ext"
     doc_dir.mkdir(parents=True)
     (doc_dir / "ObjectModule.bsl").write_text(DOCUMENT_OBJECT_MODULE, encoding="utf-8-sig")
+    _declare_movement_registers(tmp_path)
     (doc_dir / "ManagerModule.bsl").write_text(DOCUMENT_MANAGER_MODULE, encoding="utf-8-sig")
 
     (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
@@ -778,6 +794,7 @@ def test_register_movements_fast_path_parity(tmp_path, monkeypatch):
     doc_dir = tmp_path / "Documents" / "ПаритетДок" / "Ext"
     doc_dir.mkdir(parents=True)
     (doc_dir / "ObjectModule.bsl").write_text(DOCUMENT_OBJECT_MODULE, encoding="utf-8-sig")
+    _declare_movement_registers(tmp_path)
     (doc_dir / "ManagerModule.bsl").write_text(_MANAGER_MODULE_ADAPTED, encoding="utf-8-sig")
 
     (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
