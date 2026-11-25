@@ -773,9 +773,9 @@ EDT-разбор ставил `1` безусловно, и на EDT-конфиг
 каждый существующий счётчик (`erp_mechanisms`, `manager_tables`, `adapted`) и ответ
 `find_register_writers`.
 
-Читают её в обе стороны: `find_register_movements(document)` — состав документа
+Читают её в обе стороны: `find_register_movements(document_name)` — состав документа
 (`IndexReader.get_declared_register_records`, `declared_registers`), а с v1.47.0
-`find_register_writers(register)` — документы, объявившие регистр
+`find_register_writers(register_name)` — документы, объявившие регистр
 (`IndexReader.get_declaring_documents`, ключ `declared_documents`, issue #42): по имени регистра
 среди четырёх видов (`register_ref` = `<Вид>Register.<Имя>`, без учёта регистра букв — как у
 `get_register_writers`: с v1.49.0 `py_lower` с обеих сторон, прежде `COLLATE NOCASE` складывал только латиницу;
@@ -1012,13 +1012,13 @@ Windows регистр не различается вовсе, на Linux — р
 
 Синонимы (бизнес-имена) объектов 1С из XML-метаданных. Строится по умолчанию, отключается флагом `--no-synonyms`. Поиск через `search_objects()` использует UDF `py_lower()` для кириллического case-insensitive LIKE.
 
-| Колонка       | Тип        | Описание                                      | Пример                                      |
-| ------------- | ---------- | --------------------------------------------- | ------------------------------------------- |
-| `id`          | INTEGER PK | Идентификатор                                 | `1`                                         |
-| `object_name` | TEXT       | Техническое имя объекта                       | `АвансовыйОтчет`                            |
-| `category`    | TEXT       | Категория (English)                           | `Documents`                                 |
-| `synonym`     | TEXT       | Хранимый синоним с префиксом вида (ради поиска по виду; наружу — без него, v1.46.0) | `Документ: Авансовый отчет`                 |
-| `file`        | TEXT       | Относительный путь к metadata-файлу           | `Documents/АвансовыйОтчет/Ext/Document.xml` |
+| Колонка       | Тип        | Описание                                                                            | Пример                                                                                      |
+| ------------- | ---------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `id`          | INTEGER PK | Идентификатор                                                                       | `1`                                                                                         |
+| `object_name` | TEXT       | Техническое имя объекта                                                             | `АвансовыйОтчет`                                                                            |
+| `category`    | TEXT       | Категория (English)                                                                 | `Documents`                                                                                 |
+| `synonym`     | TEXT       | Хранимый синоним с префиксом вида (ради поиска по виду; наружу — без него, v1.46.0) | `Документ: Авансовый отчет`                                                                 |
+| `file`        | TEXT       | Относительный путь к metadata-файлу (описатель объекта)                             | `Documents/АвансовыйОтчет.xml` (CF) или `Documents/АвансовыйОтчет/АвансовыйОтчет.mdo` (EDT) |
 
 Индексы: `idx_synonyms_object` (object_name NOCASE), `idx_synonyms_synonym` (synonym NOCASE).
 
@@ -1922,15 +1922,15 @@ AND ref_kind NOT IN (<виды форм>)`. До v1.47.0 этот DELETE был 
 | ------------------------------- | ------------------------------------------------------------------ | --------------------------------------- |
 | `extract_procedures(path)`      | `SELECT` из `methods` (мгновенно)                                  | Regex-парсинг .bsl                      |
 | `find_exports(path)`            | `SELECT WHERE is_export=1` (мгновенно)                             | Фильтр `extract_procedures`             |
-| `find_callers_context(proc)`    | `JOIN calls+methods+modules` (мгновенно)                           | Параллельный scan+grep .bsl             |
-| `find_event_subscriptions(obj)` | `SELECT` из `event_subscriptions` (мгновенно)                      | XML-парсинг `EventSubscriptions/**`     |
+| `find_callers_context(proc_name)` | `JOIN calls+methods+modules` (мгновенно)                           | Параллельный scan+grep .bsl             |
+| `find_event_subscriptions(object_name)` | `SELECT` из `event_subscriptions` (мгновенно)                      | XML-парсинг `EventSubscriptions/**`     |
 | `find_scheduled_jobs(name)`     | `SELECT` из `scheduled_jobs` (мгновенно)                           | XML-парсинг `ScheduledJobs/**`          |
-| `find_functional_options(obj)`  | `SELECT` из `functional_options` (мгновенно)                       | XML-парсинг `FunctionalOptions/**`      |
-| `find_enum_values(name)`        | `SELECT` из `enum_values` (мгновенно)                              | Glob + XML-парсинг `Enums/**`           |
+| `find_functional_options(object_name)` | `SELECT` из `functional_options` (мгновенно)                       | XML-парсинг `FunctionalOptions/**`      |
+| `find_enum_values(enum_name)`   | `SELECT` из `enum_values` (мгновенно)                              | Glob + XML-парсинг `Enums/**`           |
 | `analyze_subsystem(name)`       | `SELECT` из `subsystem_content` в ОБЕ стороны (`get_subsystem_lookup`, один проход) | Glob + XML-парсинг `Subsystems/**`, только прямой вопрос |
-| `find_roles(obj)`               | `SELECT` из `role_rights` (мгновенно)                              | Парсинг Rights.xml / .rights            |
-| `find_register_movements(doc)`  | `SELECT DISTINCT` из `register_movements` (мгновенно)              | Grep по ObjectModule + ManagerModule    |
-| `find_register_writers(reg)`    | `SELECT` из `register_movements` и `declared_register_records` (мгновенно) | Параллельный поиск по ObjectModule + описатели документов |
+| `find_roles(object_name)`       | `SELECT` из `role_rights` (мгновенно)                              | Парсинг Rights.xml / .rights            |
+| `find_register_movements(document_name)` | `SELECT DISTINCT` из `register_movements` (мгновенно)              | Grep по ObjectModule + ManagerModule    |
+| `find_register_writers(register_name)` | `SELECT` из `register_movements` и `declared_register_records` (мгновенно) | Параллельный поиск по ObjectModule + описатели документов |
 | `glob_files(pattern)`           | `SELECT` из `file_paths` (мгновенно, для поддерживаемых паттернов) | `pathlib.Path.glob()` — полный обход FS |
 | `tree(path)`                    | `SELECT` из `file_paths` + Python-форматирование (мгновенно)       | Рекурсивный `iterdir()`                 |
 | `find_files(name)`              | `SELECT` из `file_paths` с ранжированием (мгновенно при попадании; при нуле попаданий — FS-fallback, может сканировать на большой базе) | `os.walk()` + in-memory поиск           |
@@ -1941,8 +1941,8 @@ AND ref_kind NOT IN (<виды форм>)`. До v1.47.0 этот DELETE был 
 | `find_attributes(name)`        | `SELECT` из `object_attributes` (мгновенно)                         | Live XML-парсинг                        |
 | `find_predefined(name)`        | `SELECT` из `predefined_items` (мгновенно)                          | Live XML-парсинг                        |
 | `find_exchange_plan_content(name)` | Live XML/MDO-парсинг точного плана; таблица не используется | Live XML/MDO-парсинг точного плана (CF/EDT) |
-| `find_references_to_object(obj)` | `SELECT` из `metadata_references` (v12+, мгновенно)               | Live XML-парсинг с `partial=True`       |
-| `find_code_usages(obj)`        | `SELECT` из `metadata_code_usages` (v13+, мгновенно)               | Limited `safe_grep` с `partial=True` (нужен rebuild) |
+| `find_references_to_object(object_ref)` | `SELECT` из `metadata_references` (v12+, мгновенно)                | Live XML-парсинг с `partial=True`       |
+| `find_code_usages(object_ref)`  | `SELECT` из `metadata_code_usages` (v13+, мгновенно)               | Limited `safe_grep` с `partial=True` (индекс обновляет пользователь — `rlm-bsl-index index build`) |
 | `find_defined_types(name)`     | `SELECT` из `defined_types` (v12+, мгновенно)                       | Live XML-парсинг с `partial=True`       |
 | `parse_form(object_name)`      | `SELECT` из `form_elements` (мгновенно)                             | Glob + XML-парсинг                      |
 

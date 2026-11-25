@@ -1445,8 +1445,8 @@ class Sandbox:
             if "parse_object_xml" in code:
                 hints.append(
                     "HINT: parse_object_xml auto-resolves directory paths and 'fake' .mdo/.xml paths. "
-                    "Call parse_object_xml('Documents/Name') — it tries Documents/Name/Name.mdo (EDT) "
-                    "and Documents/Name/Ext/Document.xml (CF) automatically."
+                    "Call parse_object_xml('Documents/Name') — it tries Documents/Name.xml and "
+                    "Documents/Name/Ext/Document.xml (CF), Documents/Name/Name.mdo (EDT) automatically."
                 )
             if "read_procedure" in code:
                 hints.append(

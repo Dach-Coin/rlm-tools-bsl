@@ -58,7 +58,7 @@ Step 2 — READ: understand the code
   find_exports(path) → exported API of a module
 
 Step 3 — TRACE: follow the call chains
-  find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
+  find_callers_context(proc_name, module_hint) → who calls this procedure (1 уровень; context — на файловом маршруте)
   find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. module_hint: точно — rel_path=find_module('X')[i]['path']; 'Документ.X'/голое имя — ОБЪЕКТ.
   safe_grep(pattern, name_hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
@@ -66,15 +66,15 @@ Step 3 — TRACE: follow the call chains
 Step 4 — ANALYZE: get the full picture
   get_object_full_structure(name) → INSTANT: метаданные + ТЧ + реквизиты + предопределённые + раскрытые перечисления + список форм. Используй ВМЕСТО parse_object_xml + find_attributes + find_predefined.
   analyze_object(name) → metadata + all modules + procedures
-  analyze_document_flow(doc_name) → subscriptions + register movements + jobs
+  analyze_document_flow(document_name) → subscriptions + register movements + jobs
   find_custom_modifications(object_name) → find non-standard code by prefix
-  find_register_movements(doc_name) → Posting/CFE-фильтрованные кандидаты (main — снимок индекса; сначала is_postable; при пустом code_registers смотри posting_handler_present + hint)
+  find_register_movements(document_name) → Posting/CFE-фильтрованные кандидаты (main — снимок индекса; сначала .get('is_postable') is False; при пустом code_registers смотри posting_handler_present + hint)
   CAUTION: analyze_document_flow and analyze_object scan many files — on large configs (10K+)
   they may be slow (>60s). Prefer calling individual helpers separately if timeout occurs.
 
 Step 5 — EXTENSIONS: check if behavior is modified
   get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top=dict{имя:N}/unique_* полны iff partial=False; иначе lower bound, см. _meta. target_method_line=None валидно
-  read_procedure(path, name, include_overrides=True) → original + extension body
+  read_procedure(path, proc_name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
   NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.
   BUT: if find_module returned a path starting with '../' — it is an extension file; pass it directly
@@ -84,23 +84,24 @@ Step 5 — EXTENSIONS: check if behavior is modified
 == STEP 4 EXTENDED (по перформансу) ==
 
 INSTANT (индексный путь, OK для batch 5-10 в одном rlm_execute):
-  find_register_writers(reg_name)        → статические reverse-кандидаты
-  find_register_movements(doc_name)      → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса
-  find_event_subscriptions(obj)          → подписки на события (event_filter + limit опционально)
+  find_register_writers(register_name)   → статические reverse-кандидаты
+  find_register_movements(document_name) → Posting/CFE-фильтрованные кандидаты; main-строки — снимок индекса
+  find_event_subscriptions(object_name)  → подписки на события (event_filter + limit опционально)
   find_scheduled_jobs(name='')           → регламентные задания
-  find_roles(obj_name)                   → broad substring (члены/однокоренные); exact — qualified+index
+  find_roles(object_name)                → broad substring (члены/однокоренные); exact — qualified+index
   find_defined_types(name)               → раскрытие ОпределяемогоТипа
   find_enum_values(enum_name)            → INSTANT с индексом; LIVE fallback на чтение Enum.xml без индекса
   get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
 
 HYBRID (часть из индекса, часть live — ОДИН вызов в batch, не больше 2-3):
-  find_functional_options(obj_name,limit=10) → ФО объекта; широкий XML-обзор: find_functional_options('',include_code=False,include_content=False,limit=50), детали состава по file
+  find_functional_options(object_name,limit=10) → ФО объекта; широкий XML-обзор: find_functional_options('',include_code=False,include_content=False,limit=50), детали состава по file
 
 LIVE (читают тела процедур / parse XML — медленно, особенно без индекса):
-  find_based_on_documents(doc_name)      → read_procedure(ОбработкаЗаполнения, ДобавитьКомандыСозданияНаОсновании) — НЕ batch массово
-  find_print_forms(obj_name)             → read_procedure(ДобавитьКомандыПечати) — медленно на CommonModules
+  find_based_on_documents(document_name) → read_procedure(ОбработкаЗаполнения, ДобавитьКомандыСозданияНаОсновании) — НЕ batch массово
+  find_print_forms(object_name)          → read_procedure(ДобавитьКомандыПечати) — медленно на CommonModules
   analyze_object(name)                   → читает ВСЕ модули объекта
-  analyze_document_flow(doc)             → объединяет subscriptions + registers + jobs + based_on + print
+  analyze_document_flow(document_name)   → объединяет subscriptions + registers + jobs + based_on + print
+  find_unresolved_calls(layer='all')     → с расширениями строит живой слой вызовов (секунды): не смешивать с тяжелыми; layer='main' — без слоя, path= лишь сужает выдачу
 
 CAUTION: на конфигах 10K+ файлов analyze_* могут быть >60с. Батчь LIVE-хелперы по одному; INSTANT — по 5-10.""",
     "batching": """\
@@ -179,8 +180,8 @@ LLM (if available):
    НЕ выводи из него ни источник, ни CFE-охват, ни полноту.
 9. Сигналы СВЕЖЕСТИ — МАТРИЦА, а не иерархия: ни один не главнее других, потому
    что все они про РАЗНОЕ. Читай по строкам «сигнал → что доказывает → действие»:
-     index_status=missing/incomplete → индекса нет или он неполон → собери его;
-     index_status=stale_content      → содержимое разошлось с диском → index update;
+     index_status=missing/incomplete → индекса нет или он неполон → сообщи пользователю (rlm-bsl-index index build);
+     index_status=stale_content      → содержимое разошлось с диском → сообщи пользователю (rlm-bsl-index index update);
      index_status=stale_age          → КАЛЕНДАРЬ; итог выборочной сверки содержимого —
                                        в rlm_start.index.warnings (совпала или не
                                        проводится — граф вызовов авторитетен)
@@ -190,7 +191,7 @@ LLM (if available):
                                        а дрейф виден лишь по каталогам категорий —
                                        новый .bsl в объекте оставляет 'ok';
      index_coverage=disabled         → домен НЕ строился (--no-metadata/--no-synonyms)
-                                       → пересобери с нужной опцией; свежесть тут ни
+                                       → сообщи пользователю пересобрать с нужной опцией; свежесть тут ни
                                        при чём, 'ok' рядом с ним нормален;
      index_coverage=unavailable |
      wider_than_current              → строки годны, полнота НЕ доказана → пользуйся,
@@ -221,26 +222,26 @@ DISAMBIGUATION_PAIRS: list[dict] = [
     },
     {
         "pair": ("find_call_hierarchy", "find_callers_context"),
-        "summary": "multi-level tree vs single level + context",
-        "when_a": "N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации. module_hint=rel_path привязывает корень к ОДНОМУ модулю → exact (рёбра по callee_key, _meta.root_exact/exact_rows).",
-        "when_b": "1 уровень callers + контекст вызова (line/text). Быстрее.",
+        "summary": "multi-level tree vs single level; context — только на файловом маршруте",
+        "when_a": "N уровней (1-3) дерево вызывающих (caller_name, is_export, module_path, line, level). Один вызов вместо итерации. module_hint=rel_path привязывает корень к ОДНОМУ модулю → exact (ребра по callee_key, _meta.root_exact/exact_rows).",
+        "when_b": "1 уровень callers + метаданные вызывающего (caller_name, caller_is_export, file, line); context — только на файловом маршруте. Быстрее.",
         "rule": "Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy. Точная форма hint — rel_path=find_module('X')[i]['path']; 'Документ.X'/голое имя — лишь ОБЪЕКТ.",
         "tags": ["callers", "trace"],
     },
     {
         "pair": ("find_callers", "find_callers_context"),
         "summary": "compact first page vs full API with pagination",
-        "when_a": "COMPACT FIRST PAGE: тонкая обёртка, default limit=20, без _meta/has_more, плоский [{file, line, text}]. Quick view; если callers > max_files — остаток молча отбрасывается.",
-        "when_b": "ПОЛНЫЙ API: caller_name, object_name, category, is_export + _meta с total_callers/has_more и пагинация (offset/limit).",
+        "when_a": "COMPACT FIRST PAGE: тонкая обертка, default max_files=20, без _meta/has_more, плоский [{file, line, text}]. Quick view; если callers > max_files — остаток молча отбрасывается.",
+        "when_b": "ПОЛНЫЙ API: caller_name, caller_is_export, object_name, file, line + _meta с total_callers/has_more и пагинация (offset/limit).",
         "rule": "Под капотом — один и тот же поиск (find_callers вызывает find_callers_context). Бери find_callers для быстрого «где зовётся»; для аудита/полного списка — find_callers_context.",
         "tags": ["callers", "trace"],
     },
     {
         "pair": ("find_register_movements", "analyze_document_flow"),
         "summary": "registers only vs registers+subscriptions+jobs+based_on",
-        "when_a": "только регистры, признак is_postable.",
+        "when_a": "только регистры; is_postable=False есть только у непроводимых документов (проверяй .get('is_postable') is False).",
         "when_b": "подписки + регистры + задания + ввод на основании.",
-        "rule": "Если документ непроводимый (is_postable=False) — analyze_document_flow всё равно даёт подписки.",
+        "rule": "Если документ непроводимый (.get('is_postable') is False) — analyze_document_flow все равно дает подписки.",
         "tags": ["posting", "registers", "document"],
     },
     {
@@ -268,7 +269,7 @@ DISAMBIGUATION_PAIRS: list[dict] = [
     {
         "pair": ("find_register_movements", "find_register_writers"),
         "summary": "document → Posting/CFE-filtered candidates vs register → static candidates",
-        "when_a": "документ → какие регистры пишет (есть is_postable).",
+        "when_a": "документ → какие регистры пишет (is_postable=False есть только у непроводимых: .get('is_postable') is False).",
         "when_b": "регистр → документы: запись в коде и объявившие (declared_documents).",
         "rule": "find_register_movements применяет Posting/CFE; main-строка остается снимком и после изменения кода требует проверки живого модуля.",
         "tags": ["registers", "document"],
@@ -286,7 +287,7 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "summary": "metadata-XML references vs in-code usages",
         "when_a": "find_references_to_object — ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов, владелец, основание ввода, подсистемы, права, ФО, ПВХ, DefinedType, журналы, критерии отбора, связующие свойства, формы. Код модулей НЕ сканирует.",
         "when_b": 'find_code_usages — ОБРАЩЕНИЯ В КОДЕ: Документы.X.Член (manager), "ДокументСсылка.X" (ref_type), запросы Документ.X.ТЧ (query), Метаданные.Документы.X (metadata), пути форм "Документ.X.Форма.Ф" (form). Метаданные-XML НЕ сканирует.',
-        "rule": "Это РАЗНЫЕ слои. «Где объявлен/связан» → find_references_to_object. «Где используется в коде» → find_code_usages. Нужны оба — find_references_to_object(obj, include_code=True). Доступ к реквизитам через локальные переменные — вне охвата find_code_usages; охват кода расширений зависит от маршрута и назван в _meta.extensions_included.",
+        "rule": "Это РАЗНЫЕ слои. «Где объявлен/связан» → find_references_to_object. «Где используется в коде» → find_code_usages. Нужны оба — find_references_to_object(object_ref, include_code=True). Доступ к реквизитам через локальные переменные — вне охвата find_code_usages; охват кода расширений зависит от маршрута и назван в _meta.extensions_included.",
         "tags": ["references", "code", "usages"],
     },
     {
@@ -294,7 +295,7 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "summary": "лёгкий индексный скелет vs тяжёлый разбор тел",
         "when_a": "get_object_modules — все модули объекта + дерево #Область + агрегаты + флаги перехватов. Дёшев на индексном пути: НЕ читает тела (extract_procedures) и НЕ парсит XML. include_methods=False (дефолт) — только области.",
         "when_b": "analyze_object — читает ВСЕ тела процедур каждого модуля + parse_object_xml метаданных. Тяжёлый (на 10K+ конфигах >60с).",
-        "rule": "Сначала get_object_modules (карта кода объекта). analyze_object — только когда реально нужны тела всех процедур сразу; иначе ныряй точечно read_procedure(path, name).",
+        "rule": "Сначала get_object_modules (карта кода объекта). analyze_object — только когда реально нужны тела всех процедур сразу; иначе ныряй точечно read_procedure(path, proc_name).",
         "tags": ["modules", "skeleton", "composite", "code"],
     },
     {
@@ -314,11 +315,11 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         ),
         "rule": (
             "Это ТРИ разных вопроса, а не расхождение. Обзор «кто вообще трогает объект и его члены» "
-            "→ find_roles. Факт точной ссылки/членства → find_references_to_object(qualified, "
+            "→ find_roles. Факт точной ссылки/членства → find_references_to_object(object_ref, "
             "kinds=['role_rights']) при индексе. Точные ИМЕНА ПРАВ на объект и его члены → "
             "get_object_profile('Документ.X', sections=['roles']) при индексе (right_names / "
             "rights_by_object / details_truncated — bounded sample). Bare-name в двух точных "
-            "маршрутах запрещён; без индекса оба точных маршрута недоступны."
+            "маршрутах запрещен; без индекса оба точных маршрута недоступны."
         ),
         "tags": ["roles", "rights", "references"],
     },
@@ -358,8 +359,8 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "pair": ("find_references_to_object", "find_functional_options"),
         "summary": "обе эмиссии одного ref_kind vs только состав опции",
         "when_a": (
-            "find_references_to_object(ref, kinds=['functional_option_content']) → под ОДНИМ "
-            "ref_kind лежат ДВЕ эмиссии: <Content> функциональной опции и её <Location> "
+            "find_references_to_object(object_ref, kinds=['functional_option_content']) → под ОДНИМ "
+            "ref_kind лежат ДВЕ эмиссии: <Content> функциональной опции и ее <Location> "
             "(объект-хранилище)."
         ),
         "when_b": (
@@ -380,7 +381,7 @@ DISAMBIGUATION_PAIRS: list[dict] = [
             "ридера, строка = {name}. Дёшево, но это НЕ перепись."
         ),
         "when_b": (
-            "find_functional_options(name) сам выбирает index или live для XML-корзины плюс "
+            "find_functional_options(object_name) сам выбирает index или live для XML-корзины плюс "
             "делает live code-scan вызовов ПолучитьФункциональнуюОпцию(); на bare-имени — union "
             "омонимов."
         ),
@@ -395,7 +396,7 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "pair": ("find_references_to_object", "find_event_subscriptions"),
         "summary": "домен подписки по source_types vs поиск по фрагменту",
         "when_a": (
-            "find_references_to_object(ref, kinds=['event_subscription_source']) строится из "
+            "find_references_to_object(object_ref, kinds=['event_subscription_source']) строится из "
             "НЕПУСТОГО source_types плюс раскрытых НА ЧТЕНИИ наборов типов (v1.38.0), поэтому "
             "universal-подписки (без источника вовсе) в домен не входят."
         ),

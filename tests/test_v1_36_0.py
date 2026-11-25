@@ -2590,7 +2590,8 @@ def test_functional_options_registered_sig_exact():
     # правится ВМЕСТЕ с подписью: заморозка длины на то и заведена.
     # v1.38.0 (Задача 0, бюджет): 447 -> 384 — проза переехала в
     # небюджетируемый `recipe` (имена ключей ниже не тронуты).
-    assert len(sig) == 384
+    # v1.53.0: 384 -> 387 — параметр назван как в def (obj_name -> object_name).
+    assert len(sig) == 387
     for marker in (
         "include_content=True",
         "synonym,location,file,content?|content_size?",
@@ -3461,7 +3462,8 @@ def test_agent_facing_routes_match_subsystem_and_fo_contracts():
     slim_workflow = STRATEGY_SECTIONS["workflow"]
     full = K._STRATEGY_HEADER
     perf_route = (
-        "find_functional_options(obj_name,limit=10) → ФО объекта; широкий "
+        # v1.53.0: параметр назван как в def (прежде ожидался obj_name).
+        "find_functional_options(object_name,limit=10) → ФО объекта; широкий "
         "XML-обзор: find_functional_options('',include_code=False,"
         "include_content=False,limit=50), детали состава по file"
     )

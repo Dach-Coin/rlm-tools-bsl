@@ -8548,7 +8548,9 @@ def test_typed_non_document_based_on_without_metadata_index_is_partial():
         result = bsl["find_based_on_documents"]("Справочник.Контрагент")
         assert result["partial"] is True
         assert result["_meta"]["reason"] == "metadata_references_unavailable"
-        assert "пересобери индекс" in result["hint"]
+        # Прежде ожидался императив агенту «пересобери индекс»: с 1.53.0 индекс меняет только
+        # пользователь, и подсказка адресует ему CLI.
+        assert "попроси пользователя пересобрать индекс (rlm-bsl-index index build)" in result["hint"]
 
 
 @pytest.mark.parametrize("failure", ["missing", "error"])

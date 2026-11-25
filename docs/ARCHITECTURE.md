@@ -350,44 +350,51 @@ read-only ACL на исходники, firewall/container policy — см. ра�
     modules = find_module("ГрафикПлатежей")
     reg = [m for m in modules if m['category'] == 'InformationRegisters']
     exports = find_exports(reg[0]['path'])
+    export_names = [e['name'] for e in exports]
     # Вывод: 11 экспортных методов (ManagerModule)
 
 Агент → rlm_execute (вызов 2):
     for proc in export_names:
-        L1 = find_callers_context(proc)          # кто вызывает
+        print(proc)
+        L1 = find_callers_context(proc)          # 1-я страница (limit=50); при has_more=True — добор с offset
         for c1 in L1['callers']:
+            print(f"  → {c1['category']}.{c1['object_name']}.{c1['caller_name']}")
             L2 = find_callers_context(c1['caller_name'], module_hint=c1['object_name'])
             for c2 in L2['callers']:
+                print(f"    → {c2['category']}.{c2['object_name']}.{c2['caller_name']}")
                 L3 = find_callers_context(c2['caller_name'], module_hint=c2['object_name'])
-                print(f"→ {c1} → {c2} → {c3}")
-    # Вывод: полный граф 3 уровня для 8 из 11 методов
+                for c3 in L3['callers']:
+                    print(f"      → {c3['category']}.{c3['object_name']}.{c3['caller_name']}")
+    # Вывод: срез графа до 3 уровней (1-я страница, до 50 вызывающих на узел) для 8 из 11 методов;
+    # при has_more=True остальные страницы добираются с offset (для многоуровневого дерева и добора узлов — help('find_call_hierarchy'))
     # Таймаут на инфраструктурных методах (ПроведениеДокументов → 150+ документов)
 
 Агент → rlm_execute (вызов 3):
     # Дослать оставшиеся 3 метода — кэши прогреты, мгновенно
-    # Вывод: граф для оставшихся методов
+    # Вывод: срез графа для оставшихся методов
 ```
 
 Результат (фрагмент):
 ```
 УстановитьБлокировкиДанныхДляРасчетаГрафика
-  → AccumulationRegisters.ЭтапыПроизводства.ПередЗаписью             [конечная]
-  → AccumulationRegisters.РасчетыСПоставщиками.ПередЗаписью          [конечная]
-  → AccumulationRegisters.РасчетыСКлиентами.ПередЗаписью             [конечная]
-  → AccumulationRegisters.РасчетыПоФинансовымИнструментам.ПередЗаписью [конечная]
-  → AccumulationRegisters.ДенежныеСредстваКВыплате.ПередЗаписью      [конечная]
+  → AccumulationRegisters.ЭтапыПроизводства.ПередЗаписью
+  → AccumulationRegisters.РасчетыСПоставщиками.ПередЗаписью
+  → AccumulationRegisters.РасчетыСКлиентами.ПередЗаписью
+  → AccumulationRegisters.РасчетыПоФинансовымИнструментам.ПередЗаписью
+  → AccumulationRegisters.ДенежныеСредстваКВыплате.ПередЗаписью
 
 РассчитатьГрафикПлатежейПоФинансовымИнструментам
-  → InformationRegisters.ГрафикТраншейКредитовИДепозитов.ПриЗаписи   [конечная]
-  → InformationRegisters.ГрафикОплатУслугПоАренде.ПриЗаписи          [конечная]
-  → InformationRegisters.ГрафикОплатКредитовИДепозитов.ПриЗаписи     [конечная]
-  → Catalogs.ВариантыГрафиковКредитовИДепозитов.ПриЗаписи            [конечная]
-  → AccumulationRegisters.РасчетыПоФинансовымИнструментам.ПриЗаписи  [конечная]
+  → InformationRegisters.ГрафикТраншейКредитовИДепозитов.ПриЗаписи
+  → InformationRegisters.ГрафикОплатУслугПоАренде.ПриЗаписи
+  → InformationRegisters.ГрафикОплатКредитовИДепозитов.ПриЗаписи
+  → Catalogs.ВариантыГрафиковКредитовИДепозитов.ПриЗаписи
+  → AccumulationRegisters.РасчетыПоФинансовымИнструментам.ПриЗаписи
 
 РассчитатьГрафикПлатежейПоРасчетамСКлиентами
   → CommonModules.ОперативныеВзаиморасчетыСервер.ВыполнитьОтложенноеРаспределение
-    → ExchangePlans.Полный.ПослеЗагрузкиДанных → ...ПередЗаписью
-  → AccumulationRegisters.РасчетыСКлиентами.ПриЗаписи                [конечная]
+    → ExchangePlans.Полный.ПослеЗагрузкиДанных
+      → …ПередЗаписью
+  → AccumulationRegisters.РасчетыСКлиентами.ПриЗаписи
 ```
 
 **Итого: 3 вызова `rlm_execute`, 0 вызовов LLM.** Файлы целиком не читались — в контекст попали только print-результаты. Кэширование `extract_procedures` и результатов поиска позволило обработать 11 методов с тремя уровнями глубины на конфигурации из 23 000+ файлов.

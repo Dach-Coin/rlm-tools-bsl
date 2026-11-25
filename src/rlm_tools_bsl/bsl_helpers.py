@@ -8468,7 +8468,12 @@ def make_bsl_helpers(
             meta["reasons"] = reasons
             meta["hint"] = (
                 "ответ неполон: сузь module_hint (точное имя объекта либо rel_path) "
-                "или собери индекс (rlm_index build)."
+                # Пересборка помогает только без индекса; с индексом причина неполноты — в reasons.
+                + (
+                    "или попроси пользователя собрать индекс (rlm-bsl-index index build)."
+                    if not meta["index_used"]
+                    else "— подробности в _meta.reasons."
+                )
             )
         if cover["scan_error"]:
             meta["scan_error"] = cover["scan_error"]
@@ -9180,7 +9185,6 @@ def make_bsl_helpers(
             raise FileNotFoundError(f"Path not found: {path!r}")
 
         parts = base.split("/")
-        xml_name = _CATEGORY_XML_NAMES.get(parts[0].lower() if parts else "")
         last_segment = parts[-1] if parts else ""
 
         any_resolvable = False
@@ -9220,14 +9224,29 @@ def make_bsl_helpers(
             raise PermissionError(f"Access denied: path {path!r} escapes sandbox and extension roots")
 
         if ends_with_xml or ends_with_mdo:
-            # v1.18.0 Фикс 4b: ведём подсказку форматом дампа (CF -> Ext/*.xml первым).
-            edt_hint = f"'{base}/{last_segment}.mdo' (EDT)"
-            cf_hint = f"'{base}/Ext/{xml_name or '<Type>'}.xml' (CF)"
-            fmt_hints = f"{cf_hint} / {edt_hint}" if _dump_format == "cf" else f"{edt_hint} / {cf_hint}"
+            # v1.18.0 Фикс 4b: ведём подсказку форматом дампа (CF -> CF-пути первыми). Подсказка
+            # строится от КАТАЛОГА объекта: хвосты `/Ext/<Type>` и `<Obj>/<Obj>.mdo|.xml` сняты,
+            # тип для `<Type>.xml` взят из родительского сегмента объекта, а не из `parts[0]`.
+            hint_base, hint_name = base, last_segment
+            if len(parts) >= 4 and parts[-2].lower() == "ext":
+                hint_base, hint_name = "/".join(parts[:-2]), parts[-3]
+            elif len(parts) >= 3 and parts[-1].lower() == parts[-2].lower():
+                hint_base, hint_name = "/".join(parts[:-1]), parts[-2]
+            category_parts = hint_base.split("/")
+            hint_category = category_parts[-2].lower() if len(category_parts) >= 2 else category_parts[0].lower()
+            hint_xml_name = _CATEGORY_XML_NAMES.get(hint_category)
+            cf_candidates = [f"{hint_base}.xml", f"{hint_base}/Ext/{hint_xml_name or '<Type>'}.xml"]
+            # Уже переданный путь среди альтернатив не повторяется: он и так не нашелся.
+            cf_alternatives = [c for c in cf_candidates if c.lower() != normalized.lower()] or cf_candidates
+            cf_hint = " или ".join(f"'{c}'" for c in cf_alternatives) + " (CF)"
+            edt_candidate = f"{hint_base}/{hint_name}.mdo"
+            edt_hint = f"'{edt_candidate}' (EDT)" if edt_candidate.lower() != normalized.lower() else ""
+            ordered_hints = [cf_hint, edt_hint] if _dump_format == "cf" else [edt_hint, cf_hint]
+            fmt_hints = " / ".join(h for h in ordered_hints if h)
             raise FileNotFoundError(
                 f"Path not found: {path!r}. "
                 f"Возможно вы передали '{path}' (фейковый файл). "
-                f"Попробуйте '{base}' (директория) или {fmt_hints}."
+                f"Попробуйте '{hint_base}' (директория) или {fmt_hints}."
             )
         raise FileNotFoundError(
             f"Path not found: {path!r}. Use find_module('{last_segment}') to discover the correct path."
@@ -17547,7 +17566,7 @@ def make_bsl_helpers(
                 result["hint"] = (
                     "Связи BasedOn для типизированного не-документа читаются из metadata_references. "
                     "Таблица недоступна или индекс не подключен, поэтому пустые списки здесь неполны; "
-                    "пересобери индекс и повтори вызов."
+                    "попроси пользователя пересобрать индекс (rlm-bsl-index index build) и повтори вызов."
                 )
 
         # v16 (Задача 9): `declared` — ОБЪЯВЛЕНА ЛИ СВЯЗЬ ПЛАТФОРМОЙ.
@@ -20201,7 +20220,11 @@ def make_bsl_helpers(
                 return "Пустой обзор проверяет первые 20 BSL-модулей; укажи object_name для полного code-скана."
             parts: list[str] = []
             if code_status["scope_partial"]:
-                return "code-скан упёрся в бюджет модулей: сузь запрос либо собери индекс (rlm_index build)."
+                # code_options всегда сканирует код живьем: индекс на эту ветку не влияет.
+                return (
+                    "code-скан уперся в бюджет модулей или потолок совпадений: сузь запрос (точное имя "
+                    "объекта); code_options всегда сканирует код живьем, xml_total точен."
+                )
             if code_status["failed_files"] or code_status["scan_error"]:
                 parts.append("часть модулей прочитать не удалось")
             if not code_status["catalog_complete"]:
@@ -24136,7 +24159,7 @@ def make_bsl_helpers(
             "index generation unprovable during the query (rebuild/update in progress) — "
             "answer built by a limited live scan; repeat the call once indexing settles"
             if idx_reader is not None and rows is not None
-            else "metadata_code_usages table missing — rebuild the index (rlm_index) for fast, complete code-usage search"
+            else "metadata_code_usages table missing — ask the user to rebuild the index (rlm-bsl-index index build) for fast, complete code-usage search"
         )
         if idx_reader is not None and rows is not None:
             result["_meta"]["index_proof"] = index_proof
@@ -25124,8 +25147,9 @@ def make_bsl_helpers(
             out["hint"] = (
                 "Макеты живут в таблице `templates` индекса v16+. Без индекса скан "
                 "не выполняется: под */Templates/* на боевой конфигурации ~28 000 файлов. "
-                "Собери индекс (`rlm_index(action='build', ...)`) либо, если конфигурация в "
-                "формате CF, ищи описатель файлом: find_files('<ИмяМакета>.xml')."
+                "Сообщи пользователю о необходимости собрать индекс (rlm-bsl-index index build; "
+                "сам rlm_index не вызывай) либо, если конфигурация в формате CF, ищи описатель "
+                "файлом: find_files('<ИмяМакета>.xml')."
             )
             return out
 
@@ -25202,7 +25226,7 @@ def make_bsl_helpers(
         "count_matches(pattern, file_types='bsl', path='', regex=False, ignore_case=True, top=20, "
         "group_by='category') -> {files_matched, occurrences, top:[dict], groups:[dict], truncated, "
         "source, extensions_included, ...}"
-        "  # АГРЕГАТ вместо тел; вне bsl/mdo/xml — обход файлов, до десятков с",
+        "  # АГРЕГАТ вместо тел; вне bsl/mdo/xml — обход файлов",
         "discovery",
         ["сколько", "count", "инвентаризац", "посчитать", "во всей конфигурации", "how many"],
         "COUNT MATCHES (инвентаризация по ВСЕЙ конфигурации):\n"
@@ -25338,8 +25362,8 @@ def make_bsl_helpers(
     _reg(
         "extract_procedures",
         extract_procedures,
-        "extract_procedures(path|object_name) -> [{name, type, line, end_line, is_export, params(list), overridden_by?}]  "
-        "# path ИЛИ имя объекта; неоднозначно → ValueError",
+        "extract_procedures(path) -> [{name, type, line, end_line, is_export, params(list), overridden_by?}]  "
+        "# path: rel_path или object_name; неоднозначно → ValueError",
         "code",
         None,
         "EXTRACT PROCEDURES:\n"
@@ -25348,9 +25372,15 @@ def make_bsl_helpers(
         "  # автоматически по паре (category, module_type).\n"
         "  # Неоднозначное имя → ValueError; за прозрачным разрешением по имени\n"
         "  # с _meta (какой модуль выбран и почему) иди в get_module_outline.\n"
-        "  procs = extract_procedures('Заказ')\n"
-        "  for p in procs:\n"
-        "      print(p['name'], p['line'], p['is_export'], p['params'])",
+        "  obj = 'РеализацияТоваровУслуг'\n"
+        "  mods = find_module(obj, category='Documents', module_type='ObjectModule')\n"
+        "  om = next((m['path'] for m in mods if (m['object_name'] or '').lower() == obj.lower()), '')\n"
+        "  if not om:\n"
+        "      print('Не найдено')\n"
+        "  else:\n"
+        "      procs = extract_procedures(om)  # или имя объекта, если однозначно\n"
+        "      for p in procs:\n"
+        "          print(p['name'], p['line'], p['is_export'], p['params'])",
     )
     _reg(
         "find_exports",
@@ -25371,8 +25401,8 @@ def make_bsl_helpers(
     _reg(
         "read_procedure",
         read_procedure,
-        "read_procedure(path, proc_name(str|list), include_overrides=False) -> str | None  "
-        "# list имен → {proc_name: str|None|{error}}; в MCP-сессии с номерами строк",
+        "read_procedure(path, proc_name, include_overrides=False) -> str | None  "
+        "# str|list → {proc_name: str|None|{error}}; в MCP-сессии с номерами строк",
         "code",
         ["read", "чтени", "читать", "содержим", "content", "тело", "body"],
         "READ PROCEDURE BODY:\n"
@@ -25390,7 +25420,7 @@ def make_bsl_helpers(
         "      else:\n"
         "          print(body)\n"
         "  # Если расширения перехватили метод — читать с перехватами:\n"
-        "  full = read_procedure(path, 'ProcName', include_overrides=True)\n"
+        "      full = read_procedure(path, 'ProcName', include_overrides=True)\n"
         "  # full = оригинал + секции '=== Перехвачен &Аннотация в расширении X ===' (у перехвата из\n"
         "  #   формы — 'Перехвачен После (callType формы: событие E …)') + тело метода расширения;\n"
         "  #   секция без тела — строка-пометка, почему тела нет (обработчика в модуле нет и т.п.)\n"
@@ -25400,15 +25430,17 @@ def make_bsl_helpers(
         "  #   Без индекса перехваты берутся живым обходом расширений.\n"
         "  # BATCH: несколько методов одного модуля одним вызовом (модуль парсится ОДИН раз;\n"
         "  #   упавший элемент изолирован своим {error} и батч не рушит) → dict по имени:\n"
-        "  bodies = read_procedure(path, ['ОбработкаПроведения', 'ПриЗаписи'])  # {name: str|None|{error}}\n"
-        "  for name, b in bodies.items():\n"
-        "      if isinstance(b, dict) and 'error' in b: continue  # упавший элемент изолирован\n"
-        "      print(name, 'найден' if b else 'нет тела')",
+        "      bodies = read_procedure(path, ['ОбработкаПроведения', 'ПриЗаписи'])  # {name: str|None|{error}}\n"
+        "      for name, b in bodies.items():\n"
+        "          if isinstance(b, dict) and 'error' in b: continue  # упавший элемент изолирован\n"
+        "          print(name, 'найден' if b else 'нет тела')",
     )
     _reg(
         "find_callers_context",
         find_callers_context,
-        "find_callers_context(proc(str|list), module_hint, 0, 50) -> {callers: [{file, caller_name, line, call_kind, ...}], _meta: {total_callers, returned, offset, has_more, exact_available, target_exact, exact_rows, fallback_rows}}  # list имён → {proc: {callers,_meta}|{error}}",
+        "find_callers_context(proc_name, module_hint='', offset=0, limit=50) -> {callers: [{file, caller_name, "
+        "caller_is_export, line, call_kind, ...}], _meta: {total_callers, returned, offset, has_more, exact_available, "
+        "target_exact, exact_rows, fallback_rows}}  # str|list → {name: {callers,_meta}|{error}}",
         "code",
         ["caller", "call graph", "граф", "вызов", "вызыва", "кто вызывает", "find_callers"],
         "BUILD CALL GRAPH:\n"
@@ -25430,15 +25462,17 @@ def make_bsl_helpers(
         "  #   модуля (и точные ребра заимствованного модуля расширения); строки «по имени» из чужих модулей\n"
         "  #   не приходят. На индексе до v18 `Модуль.` ⏎ `Метод(` (перенос или пробел после точки) записан\n"
         "  #   голым вызовом — точная строка своего модуля бывает таким вызовом: проверь строку line и предыдущую.\n"
-        "  # СТРАНИЦА: на индексе offset/limit/total_callers — в СТРОКАХ; на FS-маршруте\n"
-        "  #   (_meta.exact_available=False) offset/limit/has_more — в ФАЙЛАХ-кандидатах, а total_callers —\n"
-        "  #   строки ЭТОЙ страницы: листай offset += limit, пока has_more. Добор — с тем же module_hint.\n"
+        "  # СТРАНИЦА: на индексе offset/limit/total_callers — в СТРОКАХ; на файловом маршруте\n"
+        "  #   (нет индекса или графа вызовов, напр. --no-calls) offset/limit/has_more — в ФАЙЛАХ-кандидатах,\n"
+        "  #   а total_callers — строки ЭТОЙ страницы: листай offset += limit, пока has_more. На старом индексе\n"
+        "  #   v13 exact_available=False, но строки и пагинация остаются индексными, без поля context.\n"
+        "  #   Добор — с тем же module_hint.\n"
         "  # BATCH: вместо цикла по экспортам — один вызов со списком имён → {name: {callers,_meta}|{error}}.\n"
         "  #   module_hint/offset/limit — ОБЩИЕ на все имена; упавший элемент изолирован своим {error}:\n"
-        "  by_name = find_callers_context([e['name'] for e in exports], '', 0, 50)\n"
-        "  for name, data in by_name.items():\n"
-        "      if 'error' in data: continue  # упавший элемент изолирован, батч цел\n"
-        "      print(name, '<-', len(data['callers']), 'callers')\n"
+        "      by_name = find_callers_context([e['name'] for e in exports], '', 0, 50)\n"
+        "      for name, data in by_name.items():\n"
+        "          if 'error' in data: continue  # упавший элемент изолирован, батч цел\n"
+        "          print(name, '<-', len(data['callers']), 'callers')\n"
         "  # ДОВЕРИЕ к ребрам: _meta.exact_rows — ребра, привязанные ТОЧНО (по callee_key);\n"
         "  # _meta.fallback_rows — эвристические, по ИМЕНИ метода (возможны однофамильцы).\n"
         "  # _meta.exact_available — поддерживает ли схема индекса точный режим;\n"
@@ -25499,29 +25533,56 @@ def make_bsl_helpers(
         "  #   include_triggers ребра «его зовет платформа» НЕ добавит (такого edge_type нет), но\n"
         "  #     ПОКАЖЕТ CFE-перехват самого обработчика (&Перед/&После/&Вместо) — это полезно.\n"
         "  # depth=1..3 (по умолчанию 2). Только direction='callers'.\n"
-        "  res = find_call_hierarchy('ОтразитьВУчете', direction='callers', depth=2)  # метод, который РЕАЛЬНО зовут из кода\n"
-        "  if 'error' in res:\n"
-        "      print(res['hint'])  # callees/both пока не поддержаны\n"
+        "  obj = 'РеализацияТоваровУслуг'\n"
+        "  mods = find_module(obj, category='Documents', module_type='ObjectModule')\n"
+        "  om = next((m['path'] for m in mods if (m['object_name'] or '').lower() == obj.lower()), '')\n"
+        "  name = 'ВременныеТаблицыДанныхДокумента'\n"
+        "  methods = {p['name'].lower(): p['is_export'] for p in extract_procedures(om)} if om else {}\n"
+        "  res = {}\n"
+        "  if not om:\n"
+        "      print('Не найден модуль объекта:', obj)\n"
+        "  elif not methods.get(name.lower()):\n"
+        "      print('В модуле объекта нет экспортного метода:', name)\n"
         "  else:\n"
-        "      for node in res['tree']:\n"
-        "          for c in node['callers']:\n"
-        "              print(f\"  L{c['level']} {c['caller_name']} <- {c['object_name']} ({c['module_path']}:{c['line']})\")\n"
-        "      for t in res['truncated_targets']:  # callers>200 на узле — дерево неполное\n"
-        "          print(f\"  TRUNCATED: {t['name']} (L{t['level']}): {t['returned']}/{t['total']}\")\n"
-        "          # остаток — с ПОДСКАЗКОЙ УЗЛА (target_hint), не '': без нее запрос идет по имени и листает\n"
-        "          #   ДРУГОЙ список. FS-маршрут (exact_available=False): offset/limit/has_more — в ФАЙЛАХ,\n"
-        "          #   total — строки страницы; листай offset += 200, пока has_more.\n"
-        "          node = next(n for n in res['tree'] if n['name'] == t['name'] and n['callers'][0]['level'] == t['level'])\n"
-        "          rest = find_callers_context(t['name'], node['target_hint'] or '', offset=200, limit=200)\n"
+        "      res = find_call_hierarchy(name, module_hint=om, depth=2)\n"
+        "      # Узлы с callers>200 усечены (truncated_targets). Добор — по (имя, target_hint) КАЖДОГО узла:\n"
+        "      #   без подсказки узла запрос идет по имени и листает ДРУГОЙ список. Листай страницы, пока\n"
+        "      #   has_more; единица смещения: индекс — строки, файловый маршрут (нет индекса или графа\n"
+        "      #   вызовов, напр. --no-calls) — файлы-кандидаты. Добираются вызывающие уже раскрытых узлов\n"
+        "      #   res['tree']; для спуска глубже от добранных строк нужен отдельный вызов find_call_hierarchy.\n"
+        "      # Сводка — первой, превью ограничено по символам: все данные остаются в res['tree'] и paged.\n"
+        "      paged = {}\n"
+        "      for t in res['truncated_targets']:\n"
+        "          for n in res['tree']:\n"
+        "              hint = n['target_hint'] or ''\n"
+        "              key = (n['name'], hint)\n"
+        "              if n['name'] != t['name'] or key in paged:\n"
+        "                  continue\n"
+        "              rows = paged.setdefault(key, [])\n"
+        "              off = 0\n"
+        "              page = find_callers_context(t['name'], hint, offset=off, limit=200)\n"
+        "              while page['_meta']['has_more']:\n"
+        "                  off += 200\n"
+        "                  page = find_callers_context(t['name'], hint, offset=off, limit=200)\n"
+        "                  rows.extend(page['callers'])\n"
+        "      paged_nonempty = [(k, v) for k, v in paged.items() if v]\n"
+        "      print(f\"visited={res['visited']}, nodes={len(res['tree'])}, truncated={len(res['truncated_targets'])}\")\n"
+        '      print(f"PAGED nodes: {len(paged_nonempty)} (+{sum(len(v) for _, v in paged_nonempty)} callers к раскрытым узлам, без спуска глубже; все в res и paged)")\n'
+        "      lines = []\n"
+        "      for node in res['tree'][:10]:\n"
+        "          lines.append(f\"{node['name']} [{node['target_hint'] or ''}]: {len(node['callers'])} callers\")\n"
+        "          for c in node['callers'][:5]:\n"
+        "              lines.append(f\"  L{c['level']} {c['caller_name']} <- {c['object_name']} ({c['module_path']}:{c['line']})\")\n"
+        "      for (nm, hint), rows in paged_nonempty[:10]:\n"
+        "          lines.append(f\"  PAGED {nm} [{hint}]: +{len(rows)}, sample={[(c['caller_name'], c['file']) for c in rows[:3]]}\")\n"
+        "      preview = '\\n'.join(lines)\n"
+        "      print(preview[:12000] + ('\\n... (все данные в res и paged)' if len(preview) > 12000 else ''))\n"
         "  # ТОЧНОСТЬ (exact-режим): для ОДНОИМЕННЫХ методов (один и тот же метод в сотнях объектов)\n"
         "  #   передай ТОЧНЫЙ module_hint (rel_path) — привяжет КОРЕНЬ к одному модулю и уберет\n"
         "  #   ложные звенья от однофамильцев. NB: у платформенных обработчиков (см. выше) hint не\n"
         "  #   добавит отсутствующий ПЛАТФОРМЕННЫЙ вход; для ЯВНЫХ BSL-вызовов их рёбра остаются.\n"
-        "  #   Hint нужен для одноименных методов, которые РЕАЛЬНО зовут из кода:\n"
-        "  om = [m for m in find_module('РеализацияТоваровУслуг') if m['module_type'] == 'ObjectModule'][0]\n"
-        "  res = find_call_hierarchy('ЗаполнитьДокумент', module_hint=om['path'], depth=2)\n"
-        "  #   ФОРМЫ hint и их ОХВАТ: rel_path — ТОЧНАЯ, однозначная форма; бери её готовой:\n"
-        "  #     module_hint=find_module('X')[i]['path'] — привязывает корень к ОДНОМУ модулю.\n"
+        "  #   ФОРМЫ hint и их ОХВАТ: rel_path — ТОЧНАЯ, однозначная форма. Возьми path из строки\n"
+        "  #     find_module для модуля, в котором объявлен метод.\n"
         "  #     'Документ.X'/'Document.X' и голый object_name задают уровень ОБЪЕКТА, и exact\n"
         "  #     включается ТОЛЬКО когда имя внутри объекта уникально. Когда нет — два РАЗНЫХ отказа:\n"
         "  #       - голый hint: корень берётся ПРОИЗВОЛЬНЫМ модулем объекта (может оказаться формой\n"
@@ -25529,18 +25590,18 @@ def make_bsl_helpers(
         "  #       - типизированный 'Документ.X': сужения не происходит ВОВСЕ, и в ответ могут попасть\n"
         "  #         неквалифицированные вызовы одноимённого метода ДРУГИХ объектов.\n"
         "  #   Экспортному методу общего модуля hint НЕ нужен, ЕСЛИ его имя уникально во всей БД\n"
-        "  #   (exact включится сам); если root_exact=False — имя неуникально, передай module_hint=find_module('X')[i]['path'].\n"
+        "  #   (exact включится сам); при root_exact=False передай rel_path модуля с объявлением метода.\n"
         "  #   Глубже 1-го уровня обход идёт по rel_path найденного caller'а → exact автоматически.\n"
         "  # ДОВЕРИЕ к рёбрам — читай _meta:\n"
         "  #   _meta.exact_available — поддерживает ли схема индекса точный режим (callee_key);\n"
         "  #   _meta.root_exact      — включился ли exact на корне (иначе корень по имени, возможны однофамильцы);\n"
         "  #   _meta.exact_rows/fallback_rows — сколько рёбер точные vs эвристические (по имени);\n"
-        "  #   node['meta'].target_exact — разрешилась ли ЦЕЛЬ узла в один модуль, а не точность его ребер;\n"
-        "  #   ребра узла — node['meta'].exact_rows/fallback_rows: точно — exact_rows>0 и fallback_rows==0,\n"
+        "  #   node['meta']['target_exact'] — разрешилась ли ЦЕЛЬ узла в один модуль, а не точность его ребер;\n"
+        "  #   ребра узла — node['meta']['exact_rows']/fallback_rows: точно — exact_rows>0 и fallback_rows==0,\n"
         "  #   по имени — exact_rows==0, иначе смешанно; node['target_key'] = rel_path::метод.\n"
         "  # Одноимённые методы без hint возвращают список носителей — выбирай по object_name/category.\n"
         "  #   _meta.node_budget_exceeded=True — широкий корень упёрся в visited_cap, дерево частичное\n"
-        "  #     (по уровням): передай module_hint=om['path'], чтобы и сузить, и ускорить обход.\n"
+        "  #     (по уровням): передай module_hint=om, чтобы сузить и ускорить обход.\n"
         "  # Для глубины 1 эффективнее обычный find_callers_context().\n"
         "  # НЕЭКСПОРТНЫЙ узел: вызывающие — только из своего модуля (вызов без точки); ложная точная строка\n"
         "  #   своего модуля возможна у `Модуль.` ⏎ `Метод(` — сборщик пишет его голым (проверь line и предыдущую).\n"
@@ -25552,10 +25613,11 @@ def make_bsl_helpers(
         "  #   Для ОбработкаПроведения из ТРИГГЕРОВ придет разве что CFE-перехват обработчика\n"
         "  #   расширением: ребра «его зовет платформа» не существует. (Явные BSL-вызовы, если\n"
         "  #   они есть, приходят обычными callers — триггеры к ним отношения не имеют.)\n"
-        "  res = find_call_hierarchy('ОбработкаПроведения', module_hint=om['path'], include_triggers=True)\n"
-        "  for node in res['tree']:\n"
-        "      for t in node.get('triggers', []):\n"
-        "          print(f\"  TRIGGER {t['edge_type']}: {t['source_name']} ({t['detail']}) resolved={t['resolved']}\")\n"
+        "  if 'обработкапроведения' in methods:\n"
+        "      trigger_res = find_call_hierarchy('ОбработкаПроведения', module_hint=om, include_triggers=True)\n"
+        "      for node in trigger_res['tree']:\n"
+        "          for t in node.get('triggers', []):\n"
+        "              print(f\"  TRIGGER {t['edge_type']}: {t['source_name']} ({t['detail']}) resolved={t['resolved']}\")\n"
         "  #   resolved=True — привязан по стабильному target_key; False — совпал по имени (recall).\n"
         "  # ВИД РЕБРА: c['call_kind']='background' — вызывающий ЗАПУСКАЕТ процедуру по имени\n"
         "  #   (ФоновыеЗадания.Выполнить, ДлительныеОперации.*), строка — место запуска; 'call' — вызов.\n"
@@ -25651,22 +25713,26 @@ def make_bsl_helpers(
         "  #   ambiguous_module | target_only_in_extension | target_in_other_extension |\n"
         "  #   unsupported_name_form; dynamic_name и receiver_unknown — только по явному reasons.\n"
         "  # layer='main' | 'extensions' | '<имя расширения>'; path — префикс файла вызывающего.\n"
+        "  # СТОИМОСТЬ: при layer='all' с расширениями первый вызов строит живой слой вызовов расширений\n"
+        "  #   (секунды). path= фильтрует строки расширений УЖЕ ПОСЛЕ построения слоя — обойти построение на\n"
+        "  #   первом вызове позволяет layer='main' (path= лишь сужает выдачу). Не смешивай с другими тяжелыми\n"
+        "  #   вызовами в одном rlm_execute.\n"
         "  # Проверяются ТОЛЬКО обращения с адресатом в тексте кода. Вызовы без точки\n"
         "  #   (платформенные функции, контекст формы) и методы значений (Объект.ТЧ.Добавить)\n"
         "  #   не проверяются: их число — not_checked. Неизвестная голова A.B может\n"
         "  #   быть удаленным модулем или значением: reasons=['receiver_unknown'].\n"
         "  # partial=True — причины в _meta.reasons.\n"
-        "  # Основной слой: индекс v17 с графом; старый — index update,\n"
-        "  #   --no-calls — index build без этого флага. Расширения — живьем.\n"
+        "  # Основной слой: индекс v17+ с графом; старый индекс или --no-calls — обновление и пересборка\n"
+        "  #   пользователем в терминале (rlm-bsl-index index update / index build). Расширения — живьем.\n"
         "  # Имя, занятое переменной/реквизитом формы/ТЧ, обращением к модулю не считается.",
     )
     _reg(
         "find_definition",
         find_definition,
-        "find_definition(name(str|list), module_hint='', limit=50) -> {name, definitions:[{file, line, end_line, "
+        "find_definition(name, module_hint='', limit=50) -> {name, definitions:[{file, line, end_line, "
         "type, is_export, params, category, object_name, module_type, owner}], total, truncated, partial, "
         "_meta:{index_used, unique, slow_fallback, source, extensions_included, total_exact, ...}}  "
-        "# list → {имя: ответ}",
+        "# str|list → {имя: ответ}",
         "code",
         [
             "definition",
@@ -25693,7 +25759,7 @@ def make_bsl_helpers(
         "  # дальше (ТОЛЬКО при _meta.unique): read_procedure(d['definitions'][0]['file'], 'ОбработкаПроведения')\n"
         "  #   NB: у платформенного обработчика вызов от ПЛАТФОРМЫ в граф не попадает, поэтому ПУСТЫЕ\n"
         "  #   обратные ссылки — это НОРМА, а не мертвый код (ЯВНЫЙ вызов из BSL, если он есть, найдется).\n"
-        "  #   Но ЧЕМ он пишет движения, так не узнать: читай тело и трассируй ДЕЛЕГАТА (rlm_help('проведение')).\n"
+        "  #   Но ЧЕМ он пишет движения, так не узнать: читай тело и трассируй ДЕЛЕГАТА (help('find_register_movements')).\n"
         "  # _meta.hint_applied — фильтр по hint применён к запросу (НЕ «hint изменил счёт»);\n"
         "  #   total/truncated — потолок limit; _meta.slow_fallback=True — был кириллический py_lower-rescan\n"
         "  #   индексного ридера (имя передано в нижнем регистре); на live-ветках он ВСЕГДА False —\n"
@@ -25710,9 +25776,9 @@ def make_bsl_helpers(
     _reg(
         "get_module_outline",
         get_module_outline,
-        "get_module_outline(path|object_name, include_methods=True, no_live=False) -> {path, category, object_name, owner, "
+        "get_module_outline(path, include_methods=True, no_live=False) -> {path, category, object_name, owner, "
         "module_type, totals:{methods, exports, regions, loc=Σ строк методов}, outline:[{region, line, end_line, totals:{methods, "
-        "exports}, children:[...], methods:[...]}], orphan_methods, _meta:{index_used, fallback_reason, "
+        "exports}, children:[...], methods:[...]}], orphan_methods?, _meta:{index_used, fallback_reason, "
         "skipped_live?, resolved_from_name, chosen_module?, candidates?, ambiguous?}}",
         "code",
         [
@@ -25737,8 +25803,9 @@ def make_bsl_helpers(
         "      o = get_module_outline(mods[0]['path'], include_methods=False)  # только области + агрегаты\n"
         "      for r in o['outline']:\n"
         "          print(r['region'], r['totals'])  # {'methods': N, 'exports': M}\n"
-        "      # затем нырнуть в нужную область с include_methods=True или read_procedure(path, name)\n"
-        "  # totals модуля: {methods, exports, regions, loc}; orphan_methods — код вне любой #Область.\n"
+        "      # затем нырнуть в нужную область с include_methods=True или read_procedure(path, proc_name)\n"
+        "  # totals модуля: {methods, exports, regions, loc}; orphan_methods (есть только при\n"
+        "  #   include_methods=True) — код вне любой #Область.\n"
         "  # loc — СУММА строк МЕТОДОВ (от объявления до КонецПроцедуры включительно), а НЕ строк\n"
         "  #   файла: код уровня модуля и комментарии между методами не входят. Строки файла —\n"
         "  #   code_metrics(path)['total_lines'], без пустых и комментариев — ['code_lines'].\n"
@@ -25751,17 +25818,17 @@ def make_bsl_helpers(
     _reg(
         "find_callers",
         find_callers,
-        "find_callers(proc, module_hint='', max_files=20) -> [{file, line, text}]  # compact-страница find_callers_context: без _meta/has_more",
+        "find_callers(proc_name, module_hint='', max_files=20) -> [{file, line, text}]  # compact-страница find_callers_context: без _meta/has_more",
         "code",
         ["compact callers", "плоский список вызовов", "только пути вызовов"],
         "COMPACT FIRST PAGE OF CALLERS (для quick view: 3 поля вместо 7, без пагинации):\n"
-        "  hits = find_callers(proc, hint, max_files=20)\n"
+        "  hits = find_callers('ИмяПроцедуры', '', max_files=20)\n"
         "  for h in hits:\n"
         "      print(h['file'], 'line:', h['line'], h['text'])\n"
         "  # Когда брать find_callers vs find_callers_context:\n"
         "  #   find_callers          → quick view, первые max_files (default 20). Без has_more —\n"
         "  #                           если callers > max_files, остаток молча отбрасывается.\n"
-        "  #   find_callers_context  → полный API: caller_name, object_name, category, is_export\n"
+        "  #   find_callers_context  → полный API: caller_name, caller_is_export, object_name, file, line\n"
         "  #                           + _meta с total_callers/has_more и пагинация (offset/limit).\n"
         "  # Под капотом find_callers вызывает find_callers_context — поиск тот же, но контракт\n"
         "  # урезан. Для аудита/полного списка — всегда find_callers_context.",
@@ -25823,10 +25890,12 @@ def make_bsl_helpers(
         ],
         "READ METADATA:\n"
         "  # Accepts directory or XML path — auto-resolves:\n"
-        "  meta = parse_object_xml('Documents/РеализацияТоваровУслуг')  # directory\n"
-        "  meta = parse_object_xml('Documents/Name/Ext/Document.xml')   # direct XML\n"
+        "  meta = parse_object_xml('Documents/РеализацияТоваровУслуг')  # директория — предпочтительно (CF и EDT)\n"
+        "  # Явные пути — альтернативы, выбери одну для формата своей выгрузки:\n"
+        "  meta = parse_object_xml('Documents/РеализацияТоваровУслуг.xml')  # CF: <Category>/<Name>.xml\n"
+        "  meta = parse_object_xml('Documents/РеализацияТоваровУслуг/РеализацияТоваровУслуг.mdo')  # EDT\n"
         "  # Также принимает 'фейковый' .mdo-путь — авто-нормализует base:\n"
-        "  meta = parse_object_xml('Documents/X.mdo')   # => Documents/X/X.mdo (EDT) или Ext/Document.xml (CF)\n"
+        "  meta = parse_object_xml('Documents/X.mdo')   # => Documents/X.xml (CF) или Documents/X/X.mdo (EDT)\n"
         "  # Если ничего не найдено — FileNotFoundError с явной подсказкой про директорию.\n"
         "  for key in meta:\n"
         "      print(key, ':', meta[key])",
@@ -25890,15 +25959,18 @@ def make_bsl_helpers(
     _reg(
         "find_enum_values",
         find_enum_values,
-        "find_enum_values(enum_name(str|list)) -> {name, synonym, values: [{name, synonym}]} | {error}  "
-        "# list имён → {enum_name: {...}|{error}}",
+        "find_enum_values(enum_name) -> {name, synonym, values: [{name, synonym}]} | {error}  "
+        "# str|list → {enum_name: {...}|{error}}",
         "xml",
         ["перечислен", "enum", "значени перечислени"],
         "FIND ENUM VALUES:\n"
         "  result = find_enum_values('СтатусыЗаказовКлиентов')\n"
-        "  print(f\"{result['name']} ({result['synonym']})\")\n"
-        "  for v in result['values']:\n"
-        "      print(f\"  {v['name']}: {v['synonym']}\")\n"
+        "  if 'error' in result:\n"
+        "      print(result['error'])\n"
+        "  else:\n"
+        "      print(f\"{result['name']} ({result['synonym']})\")\n"
+        "      for v in result['values']:\n"
+        "          print(f\"  {v['name']}: {v['synonym']}\")\n"
         "  # Точное имя — первым; 'Перечисление.X' — только точное (нет — error); фрагмент — ближайшее по\n"
         "  #   подстроке и result['hint'] (сверь name); голое имя объекта другой категории — ValueError.\n"
         "  # BATCH: несколько перечислений одним вызовом → {enum_name: {...}|{error}};\n"
@@ -26033,7 +26105,7 @@ def make_bsl_helpers(
     _reg(
         "get_object_full_structure",
         get_object_full_structure,
-        "get_object_full_structure(name) -> {object_name, category, synonym, posting, attributes, "
+        "get_object_full_structure(name, category_hint=None) -> {object_name, category, synonym, posting, attributes, "
         "tabular_sections:[{name, synonym, columns}], dimensions, resources, predefined_items, "
         "enum_values_for_typed_refs:{Enum.X:[{name,synonym}]}, forms:[str], templates:[dict], value_type, "
         "_meta:{index_used, fallback_reason:str|None, ts_synonyms_available}}"
@@ -26161,7 +26233,7 @@ def make_bsl_helpers(
     _reg(
         "analyze_document_flow",
         analyze_document_flow,
-        "analyze_document_flow(doc_name) -> {document, metadata, event_subscriptions, register_movements, related_scheduled_jobs, based_on, print_forms}  # + is_postable/hint для непроводимых",
+        "analyze_document_flow(document_name) -> {document, metadata, event_subscriptions, register_movements, related_scheduled_jobs, based_on, print_forms}  # + is_postable/hint для непроводимых",
         "composite",
         ["lifecycle", "жизненн", "flow", "end-to-end", "полный анализ", "как работает"],
         "FULL DOCUMENT LIFECYCLE:\n"
@@ -26219,7 +26291,7 @@ def make_bsl_helpers(
         "  # Бюджет живого прохода ОБЪЯВЛЕН: _meta.live_scan = {files_total,\n"
         "  #   files_read, files_parsed, failed_files, truncated}; на индексном маршруте\n"
         "  #   ключ равен None — прохода не было, а не «нет данных».\n"
-        "  # live_scan.truncated=True — перечисление уперлось в потолок: ответ неполон.\n"
+        "  # _meta['live_scan']['truncated']=True — перечисление уперлось в потолок: ответ неполон.\n"
         "  # _meta.extensions_included=False: соседние расширения (CFE) НЕ наложены.\n"
         "  # Это не значит «только основная конфигурация»: текущий корень сам может\n"
         "  # быть расширением, и тогда прочитан именно он.",
@@ -26227,7 +26299,7 @@ def make_bsl_helpers(
     _reg(
         "find_custom_modifications",
         find_custom_modifications,
-        "find_custom_modifications(obj, custom_prefixes=None) -> custom procedures, regions, attributes",
+        "find_custom_modifications(object_name, custom_prefixes=None) -> custom procedures, regions, attributes",
         "composite",
         ["custom", "нетипов", "доработк", "модификац", "modification"],
         "FIND CUSTOM MODIFICATIONS:\n"
@@ -26248,9 +26320,10 @@ def make_bsl_helpers(
     _reg(
         "find_event_subscriptions",
         find_event_subscriptions,
-        "find_event_subscriptions(obj, custom_only=False, event_filter=None, limit=None, include_source_types=False)"
+        "find_event_subscriptions(object_name='', custom_only=False, event_filter=None, limit=None, "
+        "include_source_types=False)"
         " -> list[dict] | {subscriptions, total, returned, has_more} (limit)"
-        "  # при непустом obj строка несёт scope=exact|set|partial|universal, matched_via, matched_types,"
+        "  # при непустом object_name: scope=exact|set|partial|universal, matched_via, matched_types,"
         " matched_sets, event_reachable?; source_types — по include_source_types=True",
         "business",
         ["подписк", "subscription", "событи", "event", "BeforeWrite", "OnWrite", "ПриЗаписи", "ПередЗаписью"],
@@ -26291,7 +26364,7 @@ def make_bsl_helpers(
     _reg(
         "find_register_movements",
         find_register_movements,
-        "find_register_movements(doc_name, posting_calls_offset=0) -> {code_registers:[dict], suppressed_main_code_registers?:[dict],"
+        "find_register_movements(document_name, posting_calls_offset=0) -> {code_registers:[dict], suppressed_main_code_registers?:[dict],"
         " erp_mechanisms/manager_tables/adapted_registers:[str], is_postable?, posting_handler_present?,"
         " declared_registers/declared_total/declared_truncated, undeclared_code_registers, unresolved,"
         " hint?, partial?, _meta?}"
@@ -26327,6 +26400,9 @@ def make_bsl_helpers(
         "  # modules_scanned — ObjectModule документа, чьи движения учтены: основной конфигурации\n"
         "  #   первым, затем прочитанные модули расширений; partial=True — часть CFE не прочитана\n"
         "  #   (_meta.extension_modules_unreadable). При пустом code_registers смотри posting_handler_present + hint.\n"
+        "  # Имя документа: точное голое имя, ссылка ('Документ.X') или путь 'Documents/X'. Неточное голое имя,\n"
+        "  #   несуществующий документ или объект другой категории — ValueError; в EXTENSION-сессии без основной\n"
+        "  #   конфигурации рядом проверка существования отключена — пустой результат.\n"
         "  # hint: пояснение вида делегата — у ПЕРВОГО делегата этого вида, у следующих — только шаги.\n"
         "  # source у строки code_registers:\n"
         "  #   'code'         — прямое Движения.X в ObjectModule документа либо делегат\n"
@@ -26371,18 +26447,19 @@ def make_bsl_helpers(
         "      #   не попадает (callers=0 — норма, а не мертвый код; ЯВНЫЙ BSL-вызов он все же покажет).\n"
         "      print('Обработчик есть, прямых Движения.X нет — разбор тела в hint:')\n"
         "      print(result['hint'])\n"
-        "\n"
-        "FIND STATIC WRITER CANDIDATES:\n"
-        "  result = find_register_writers('ТоварыНаСкладах')\n"
-        "  # CFE/Posting проверь через find_register_movements(document); свежесть main-строки — по живому файлу\n"
-        "  for w in result['writers']:\n"
-        "      detail = w.get('lines') or w.get('source', '')\n"
-        "      print(f\"  {w['document']} ({detail})\")",
+        "  # Обратное направление (кто еще пишет в регистр) — подробнее help('find_register_writers'):\n"
+        "  regs = [r['name'] for r in result.get('code_registers', [])]\n"
+        "  if regs:\n"
+        "      writers_res = find_register_writers(regs[0])\n"
+        "      # CFE/Posting проверь через find_register_movements(document_name); свежесть main-строки — по живому файлу\n"
+        "      for w in writers_res['writers']:\n"
+        "          detail = w.get('lines') or w.get('source', '')\n"
+        "          print(f\"  {w['document']} ({detail})\")",
     )
     _reg(
         "find_register_writers",
         find_register_writers,
-        "find_register_writers(reg_name) -> {writers:[{document,source|lines,file}],declared_documents,runtime_filtered,hint}",
+        "find_register_writers(register_name) -> {writers:[{document,source|lines,file}],declared_documents,runtime_filtered,hint}",
         "business",
         ["писатели регистра", "кто пишет", "register writer", "writer"],
         "FIND STATIC WRITER CANDIDATES:\n"
@@ -26407,7 +26484,7 @@ def make_bsl_helpers(
     _reg(
         "find_based_on_documents",
         find_based_on_documents,
-        "find_based_on_documents(doc_name) -> {can_create_from_here, can_be_created_from}  # строка: via=direct|metadata|back_scan, category, line, declared (True|False|None=сверка невозможна)",
+        "find_based_on_documents(document_name) -> {can_create_from_here, can_be_created_from}  # строка: via=direct|metadata|back_scan, category, line, declared (True|False|None=сверка невозможна)",
         "business",
         ["основани", "ввод на основании", "создать на основании", "based on", "filling", "заполнени"],
         "FIND BASED-ON DOCUMENTS (ввод на основании):\n"
@@ -26422,13 +26499,18 @@ def make_bsl_helpers(
         "      print(f\"  <- {d['type']}\")\n"
         "  # Если у документа нет ДобавитьКомандыСозданияНаОсновании (типичный кейс — Письма в ДО3),\n"
         "  # хелпер автоматически делает back_scan по ОбработкаЗаполнения других Documents и находит\n"
-        "  # документы, у которых наш doc_name упомянут как ДокументСсылка.<doc_name>.\n"
+        "  # документы, у которых наш document_name упомянут как ДокументСсылка.<document_name>.\n"
         "  # Записи back_scan помечены via='back_scan', их line — строка упоминания\n"
-        "  #   ДокументСсылка.<doc_name> (модули объекта в раскладках CF и EDT); декларативные <BasedOn> из индекса\n"
+        "  #   ДокументСсылка.<document_name> (модули объекта в раскладках CF и EDT); декларативные <BasedOn> из индекса\n"
         "  # (в т.ч. Catalog-основания, невидимые для FS-скана Documents/*) — via='metadata'\n"
         "  # (несут d['category'] и canonical d['ref']).\n"
         "  # Голое имя не-документа (v1.44.0): отвечает объект его категории, ссылка — в\n"
         "  #   result['_meta']['resolved_ref']; объект в нескольких категориях — ValueError.\n"
+        "  # Поддерживаются документы и категории оснований (справочники и др.). Омонимы голого имени:\n"
+        "  #   документ имеет приоритет; документа с таким именем нет — берется единственная подходящая\n"
+        "  #   категория оснований, при нескольких — ValueError. Неточное или несуществующее голое имя и\n"
+        "  #   объект вне поддерживаемых категорий — ValueError; в EXTENSION-сессии без основной\n"
+        "  #   конфигурации рядом проверка существования отключена — пустые списки.\n"
         "  # Строки УНИКАЛЬНЫ (v1.36.0): тип, проверяемый в двух ветках ОбработкаЗаполнения,\n"
         "  #   приходит ОДНОЙ строкой — раньше он приходил дважды и агент завышал счет\n"
         "  #   оснований (на боевом документе 10 строк на 5 типов).\n"
@@ -26438,7 +26520,7 @@ def make_bsl_helpers(
     _reg(
         "find_print_forms",
         find_print_forms,
-        "find_print_forms(obj_name) -> {print_forms: [{name, presentation|None, presentation_source, delegate}], hint?, _meta:{delegates}}",
+        "find_print_forms(object_name) -> {print_forms: [{name, presentation|None, presentation_source, delegate}], hint?, _meta:{delegates}}",
         "business",
         ["печат", "print", "макет", "template", "накладн"],
         "FIND PRINT FORMS:\n"
@@ -26453,10 +26535,14 @@ def make_bsl_helpers(
         "  # _meta.delegates — вызовы, которым передан ВЕСЬ список команд; хелпер их РАСКРЫВАЕТ\n"
         "  #   (до 3 переходов, тот же список, точный модуль получателя): строки делегата идут\n"
         "  #   после своих, file — модуль делегата, команда с тем же name — первое вхождение.\n"
-        "  # Что не раскрыто и почему — _meta.delegates_expanded[i].status: expanded | other_list\n"
+        "  # Что не раскрыто и почему — _meta['delegates_expanded'][i]['status']: expanded | other_list\n"
         "  #   | module_not_found | procedure_not_found | cycle | depth_limit | unsupported_receiver\n"
         "  #   (ключ есть, только когда делегаты есть).\n"
-        "  # Имя — ТОЧНЫЙ объект ('Документ.X' сужает категорию); фрагмент — подстрочный поиск.\n"
+        "  # Имя — ТОЧНОЕ имя объекта или ссылка ('Документ.X' сужает категорию). Неточное голое имя и\n"
+        "  #   несуществующий объект — ValueError с маршрутом проверки имени. Ищет ДобавитьКомандыПечати\n"
+        "  #   в ManagerModule любой категории (у объекта без ManagerModule или без команд печати — пустой\n"
+        "  #   список, отказа по категории нет). В EXTENSION-сессии без основной конфигурации рядом проверка\n"
+        "  #   существования отключена — пустой список.\n"
         "  # Пусто у СУЩЕСТВУЮЩЕГО объекта — hint и _meta.command_candidates [{kind: journal_command |\n"
         "  #   object_command, owner, command, module_path}]: команды журналов документов, где он\n"
         "  #   зарегистрирован, затем самого объекта (и его описателей в соседних расширениях; module_path —\n"
@@ -26470,7 +26556,7 @@ def make_bsl_helpers(
     _reg(
         "find_functional_options",
         find_functional_options,
-        "find_functional_options(obj_name, include_code=True, limit=None, include_content=True) -> "
+        "find_functional_options(object_name, include_code=True, limit=None, include_content=True) -> "
         "{object,xml_options:[{name,synonym,location,file,content?|content_size?}],"
         "code_options:[{name,option_name,file,line}],total,xml_total,code_total,returned?,has_more?,partial?,"
         "_meta:{source,xml_source,code_source,...}}"
@@ -26480,7 +26566,7 @@ def make_bsl_helpers(
         "FIND FUNCTIONAL OPTIONS:\n"
         "  # With index: XML options instant. Code grep still runs live.\n"
         "  # xml_total — это и есть ответ на вопрос «сколько ФО у объекта».\n"
-        "  # Пустой obj_name (обзор) сканирует 20 BSL-модулей и при большем\n"
+        "  # Пустой object_name (обзор) сканирует 20 BSL-модулей и при большем\n"
         "  # каталоге ставит partial=True — ноль в code_options там ничего не доказывает.\n"
         "  result = find_functional_options('РеализацияТоваровУслуг')\n"
         "  for fo in result['xml_options']:\n"
@@ -26501,8 +26587,11 @@ def make_bsl_helpers(
         "  # ~12K: строки без content, но с content_size — по нему видно, куда нырять за составом\n"
         "  for fo in page['xml_options']:\n"
         "      print(fo['name'], fo['content_size'])\n"
-        "  # состав КОНКРЕТНОЙ опции — по ее файлу из той же строки:\n"
-        "  detail = parse_object_xml(page['xml_options'][0]['file'])['content']\n"
+        "  # состав КОНКРЕТНОЙ опции — по ее файлу из той же строки (read_file работает и в CF, и в EDT;\n"
+        "  #   parse_object_xml возвращает content только для EDT):\n"
+        "  if page['xml_options']:\n"
+        "      fo = page['xml_options'][0]\n"
+        "      detail = read_file(fo['file'])\n"
         "  #   (limit=1 вернул бы ПЕРВУЮ опцию обзора, а не выбранную тобой)\n"
         "  # ПРОВЕНАНС (v1.37.0) — ТРИ ключа, потому что источник смешанный ПО ПОСТРОЕНИЮ:\n"
         "  #   при рабочем индексе XML приходит из SQLite, а code_options — из ЖИВОГО дерева.\n"
@@ -26518,7 +26607,7 @@ def make_bsl_helpers(
     _reg(
         "find_roles",
         find_roles,
-        "find_roles(obj_name, details_limit=20) -> {roles:[{role_name, rights:[str], object, file, granted_via, ...}], match, case_sensitive, flags_available}  # BROAD substring; granted_via=set_for_new_objects — ВЕРХНЯЯ оценка",
+        "find_roles(object_name, details_limit=20) -> {roles:[{role_name, rights:[str], object, file, granted_via, ...}], match, case_sensitive, flags_available}  # BROAD substring; granted_via=set_for_new_objects — ВЕРХНЯЯ оценка",
         "business",
         ["роль", "role", "прав", "right", "доступ", "access", "разрешен"],
         "FIND ROLES AND RIGHTS:\n"
@@ -26545,7 +26634,23 @@ def make_bsl_helpers(
         "  #   объект вида, на который в ролях прав не бывает (общий модуль, перечисление, определяемый тип,\n"
         "  #   общая картинка, роль…), — тоже; ссылка на несуществующий объект — ValueError «объекта … нет».\n"
         "  # roles=[] у существующего объекта вида с правами — hint: роль с одними запретами (все false) прав\n"
-        "  #   не выдает; права читаются из ролей корня сессии (основная — без ролей расширений).",
+        "  #   не выдает; права читаются из ролей корня сессии (основная — без ролей расширений).\n"
+        "  # Полный список ролей текущего корня (у ролей нет .bsl); pfx — префикс из предупреждения об обертке:\n"
+        "  pfx, by_k = '', {}\n"
+        "  fs = [(e, p) for e in ('xml', 'mdo') for p in glob_files(f'**/Roles/**/*.{e}')]\n"
+        "  for _, nm in sorted(\n"
+        "      (len(s), s[1][:-4] if len(s) == 2 else s[1])\n"
+        "      for e, p in fs if p.startswith(pfx + 'Roles/')\n"
+        "      for s in [p[len(pfx):].split('/')]\n"
+        "      if (len(s) == 2 and e == 'xml') or (len(s) == 3 and s[2].lower() == s[1].lower() + '.mdo')\n"
+        "      or (len(s) == 4 and s[2].lower() == 'ext' and e == 'xml' and s[3].lower() not in ('predefined.xml', 'rights.xml'))\n"
+        "  ):\n"
+        "      by_k.setdefault(nm.casefold(), nm)\n"
+        "  roles = sorted(by_k.values())\n"
+        "  if not roles and not pfx and (w := sorted({p.split('/Roles/', 1)[0] + '/' for _, p in fs if '/Roles/' in p})):\n"
+        "      print(\"В корне pfx='' ролей не найдено — похоже на обертку; задай pfx из\", w[:10])\n"
+        "  else:\n"
+        "      print(len(roles), roles[:20])",
     )
 
     _reg(
@@ -26569,7 +26674,7 @@ def make_bsl_helpers(
     _reg(
         "code_metrics",
         code_metrics,
-        "code_metrics(path) -> {total_lines, code_lines, comment_lines, procedures_count, avg_proc_size, max_nesting}",
+        "code_metrics(path) -> {total_lines, code_lines, comment_lines, exports_count, procedures_count, avg_proc_size, max_nesting}",
         "code",
         ["метрик", "metric", "размер", "size", "complex", "сложност", "статистик", "statistic"],
         "CODE METRICS:\n"
@@ -26584,8 +26689,8 @@ def make_bsl_helpers(
         "search_methods",
         search_methods,
         "search_methods(query, limit=30) -> [{name, type, is_export, params(list), module_path, object_name, rank, owner}]"
-        "  # main FTS — trigram: запрос короче 3 символов по ОСНОВНОМУ индексу не ищется вовсе,"
-        " а при расширениях ответ будет пуст либо ТОЛЬКО из их методов — для поиска по main бери от 3 символов",
+        "  # main FTS — trigram: запрос короче 3 символов по основному индексу не ищется,"
+        " при расширениях ответ пуст либо только из их методов — по main бери от 3 символов",
         "discovery",
         ["поиск метод", "search", "fts", "full-text", "найти метод", "подстрок"],
         "SEARCH METHODS BY NAME (FTS5, requires pre-built index with --no-fts NOT set):\n"
@@ -26600,7 +26705,7 @@ def make_bsl_helpers(
     _reg(
         "search_objects",
         search_objects,
-        "search_objects(query, limit=50, count_only=False) -> [{object_name, category, synonym, file, owner}] "
+        "search_objects(query='', limit=50, count_only=False) -> [{object_name, category, synonym, file, owner}] "
         "| count_only: {total, source, extensions_included, partial, ...}  # поиск по БИЗНЕС-ИМЕНИ",
         "discovery",
         ["synonym", "синоним", "бизнес", "search_objects", "объект", "business"],
@@ -26616,8 +26721,8 @@ def make_bsl_helpers(
         "  # provenance читай по source/extensions_included, полноту — по partial/total_exact;\n"
         "  # legacy scope и truncated для этого НЕ годятся. _meta.index_coverage говорит,\n"
         "  # что известно про synonym-домен индекса: build_unproven | disabled |\n"
-        "  # wider_than_current | unavailable | not_used. В v15 полнота optional-домена\n"
-        "  # НЕ доказуема, поэтому индексный count честно остается partial.\n"
+        "  # wider_than_current | unavailable | not_used. Полнота optional-домена индекса не доказана\n"
+        "  # (build_unproven), поэтому индексный count честно остается partial.\n"
         "  # count_only считает ОБЪЕКТЫ, в том числе без модулей (find_by_type считает МОДУЛИ —\n"
         "  #   общая форма без модуля есть здесь и нет там); на индексе total_exact=False и\n"
         "  #   partial=True всегда: полноту домена синонимов индекс не доказывает — index_coverage.",
@@ -26625,11 +26730,11 @@ def make_bsl_helpers(
     _reg(
         "search_regions",
         search_regions,
-        "search_regions(query, limit=200, count_only=False, group_by=None) -> [{name, line, end_line, module_path, object_name|None, category|None, owner}] "
+        "search_regions(query='', limit=200, count_only=False, group_by=None) -> [{name, line, end_line, module_path, object_name|None, category|None, owner}] "
         "| count_only: {total, source, truncated, scope} + total_main/total_extensions при CFE "
         "| group_by='name'|'category': {groups:[{key,count}], groups_total, groups_returned, truncated, group_by, source, scope}"
         "  # limit режет по ORDER BY name — агрегаты только через group_by;"
-        " 0 совпадений НЕ доказывает отсутствие: подстрока без стемминга — проверь словоформу/корень",
+        " 0 НЕ доказывает отсутствие: подстрока без стемминга — проверь словоформу/корень",
         "discovery",
         ["область", "region", "search_regions", "#Область"],
         "FIND CODE REGIONS:\n"
@@ -26662,9 +26767,9 @@ def make_bsl_helpers(
     _reg(
         "search_module_headers",
         search_module_headers,
-        "search_module_headers(query, limit=200, count_only=False) -> [{module_path, object_name|None, category|None, header_comment, header_truncated, owner}] "
+        "search_module_headers(query='', limit=200, count_only=False) -> [{module_path, object_name|None, category|None, header_comment, header_truncated, owner}] "
         "| {total, with_text, source, truncated, scope} + total_main/total_extensions при CFE"
-        "  # подстрока без стемминга: 0 совпадений НЕ доказывает отсутствие — проверь словоформу/корень",
+        "  # подстрока без стемминга: 0 НЕ доказывает отсутствие — проверь словоформу/корень",
         "discovery",
         ["заголовок", "header", "комментарий", "search_module_headers"],
         "FIND MODULES BY HEADER COMMENT:\n"
@@ -26690,7 +26795,7 @@ def make_bsl_helpers(
         "search(query, scope='all', limit=30) -> [{text, source_type, object_name, path, path_kind, owner, detail}]",
         "discovery",
         ["поиск", "search", "найти", "unified", "discovery", "искать"],
-        "UNIFIED SEARCH across methods, synonyms, regions, headers:\n"
+        "UNIFIED SEARCH across methods, objects, regions, headers, attributes, predefined:\n"
         "  # Broad first pass:\n"
         "  results = search('себестоимость')\n"
         "  # Квота на источник; свободные места отдаются другим. len(results) == limit → сузь scope.\n"
@@ -26701,6 +26806,8 @@ def make_bsl_helpers(
         "  search('себестоимость', scope='objects')    # only 1C objects by synonym\n"
         "  search('себестоимость', scope='regions')    # only #Область\n"
         "  search('себестоимость', scope='headers')    # only module headers\n"
+        "  search('Организация', scope='attributes')   # only attribute names -> types\n"
+        "  search('РеализуемыеАктивы', scope='predefined')  # only predefined items\n"
         "  # Browse mode (empty query, specific scope, set limit for full list):\n"
         "  search('', scope='objects', limit=20000)  # browse objects (default limit=30)",
     )
@@ -26713,8 +26820,9 @@ def make_bsl_helpers(
         "CHECK INDEX CAPABILITIES:\n"
         "  info = get_index_info()\n"
         "  if info.get('status') != 'ok':\n"
-        "      print('No index — все хелперы работают через filesystem fallback (медленнее).')\n"
-        "      print('USER может построить индекс командой rlm_index(action=\\'build\\') — НЕ вызывай эту команду сам.')\n"
+        "      print('Индекс недоступен. Почти все хелперы читают исходники напрямую. "
+        "Для find_templates нужен индекс.')\n"
+        "      print('Попроси пользователя собрать индекс в терминале: rlm-bsl-index index build \"<путь>\" (сам rlm_index не вызывай).')\n"
         "  else:\n"
         "      print(f\"Index v{info['builder_version']} ({info['methods']} methods)\")\n"
         "      caps = []\n"
@@ -26810,7 +26918,7 @@ def make_bsl_helpers(
         "  # Metadata refs + in-code usages in one call:\n"
         "  full = find_references_to_object('Документ.X', include_code=True)\n"
         "  print(f\"meta={full['total']} code={full['code_total']} {full['code_by_kind']}\")\n"
-        "  # On v11 indexes (no metadata_references table) — partial=True via live scan\n"
+        "  # На индексах до v12 (нет таблицы metadata_references) — partial=True живым сканом\n"
         "  # Голое имя ('Валюты') — ссылка единственной категории объекта (_meta.resolved_ref='Catalog.Валюты');\n"
         "  #   омоним разных категорий — ValueError с перечнем; объекта нет — total=0 и hint.\n"
         "  # Ссылка на несуществующий объект ('Справочник.Нет') — ValueError «объекта … нет» с маршрутом\n"
@@ -26834,7 +26942,7 @@ def make_bsl_helpers(
         "{found, from, to, path:[{from, to, kind, used_in, path, line}]|None, depth, partial, hint?, "
         "_meta:{max_depth, nodes_expanded, node_budget, budget_exceeded, kinds}} "
         "| {found:False, error, hint, ...}  "
-        "# endpoints — С ПРЕФИКСОМ (Справочник.X/Документ.Y)",
+        "# endpoints — С ПРЕФИКСОМ",
         "navigation",
         [
             "путь данных",
@@ -26891,7 +26999,7 @@ def make_bsl_helpers(
         "      print(f\"  {u['kind']:8s} {u['path']}:{u['line']}{tail}\")\n"
         "  # kind: 'manager' (Документы.X.Член) | 'ref_type' (\"ДокументСсылка.X\") | 'query' (Документ.X.ТЧ)\n"
         "  #   | 'metadata' (Метаданные.Документы.X) | 'form' (\"Документ.X.Форма.Ф\"); member — член, ТЧ, имя формы\n"
-        "  # _meta.kinds_unavailable не пуст — индекс собран до этих видов (rlm_index update).\n"
+        "  # _meta.kinds_unavailable не пуст — индекс собран до этих видов: сообщи пользователю (rlm-bsl-index index update).\n"
         "  # Голое имя — ссылка единственной категории (_meta.resolved_ref); омоним — ValueError; нет — hint.\n"
         "  # Ссылка на несуществующий объект ('Документ.Нет') — ValueError «объекта … нет» (search_objects).\n"
         "  # Filter: find_code_usages('Документ.X', kind='query') — работает на ИНДЕКСНОМ\n"
@@ -26910,7 +27018,9 @@ def make_bsl_helpers(
         ["определяемый тип", "defined type", "ОпределяемыйТип"],
         "FIND DEFINED TYPES (раскрытие ОпределяемогоТипа):\n"
         "  dt = find_defined_types('ДенежнаяСуммаНеотрицательная')\n"
-        "  print(dt['types'])  # -> ['Number'] or ['Catalog.X', 'Document.Y', ...]",
+        "  print(dt['types'])  # -> ['Number'] or ['Catalog.X', 'Document.Y', ...]\n"
+        "  # Неточное голое имя, несуществующий тип или объект другой категории — ValueError; в EXTENSION-сессии\n"
+        "  #   без основной конфигурации рядом проверка отключена — types=[].",
     )
 
     _reg(
@@ -26966,9 +27076,9 @@ def make_bsl_helpers(
         get_overrides,
         "get_overrides(object_name='', method_name='', limit=200, offset=0) -> {overrides, total, offset,"
         " returned, has_more, truncated, partial, source, by_annotation/by_object_top/by_extension_top="
-        "dict{имя:N}, unique_objects/unique_methods=N имён, unique_object_methods=N пар,"
+        "dict{имя:N}, unique_objects/unique_methods=N имен, unique_object_methods=N пар,"
         " unique_extensions=N, config_level_overrides=N}"
-        "  # stats full iff partial=False; row.extension_file — исполним",
+        "  # stats full iff partial=False; row['extension_file'] — исполним",
         "extension",
         ["перехват", "override", "расширен", "extension", "вместо", "после", "перед"],
         "GET OVERRIDES:\n"
@@ -26999,19 +27109,26 @@ def make_bsl_helpers(
         "  # нет — там это расхождение версий основной конфигурации и расширения. Либо это\n"
         "  # строка без source-привязки.\n"
         "  # ПУТЬ ДО ФАЙЛА расширения — ОДИН ключ, и он ИСПОЛНИМ в этой же сессии (v1.37.0):\n"
-        "  #   body = read_procedure(ov['extension_file'], ov['extension_method'])\n"
-        "  # Прежние три поля описывают путь, но НЕ адресуют файл: source_path — от корня\n"
-        "  #   ОСНОВНОЙ конфигурации (в EXTENSION-индексе пусто), ext_module_path — от корня\n"
-        "  #   РАСШИРЕНИЯ, extension_root — абсолютный. extension_file = '../'-путь от корня\n"
-        "  #   сессии; он же равен find_module(...)['path'] для того же физического файла.\n"
-        "  #   Пустая строка = корень недостижим из этой сессии; КЛЮЧ присутствует всегда.\n"
+        "  #   extension_file = '../'-путь от корня сессии; он же равен find_module(...)['path']\n"
+        "  #   для того же физического файла. Пустая строка = корень недостижим из этой сессии;\n"
+        "  #   КЛЮЧ присутствует всегда. Прежние три поля описывают путь, но НЕ адресуют файл:\n"
+        "  #   source_path — от корня ОСНОВНОЙ конфигурации (в EXTENSION-индексе пусто),\n"
+        "  #   ext_module_path — от корня РАСШИРЕНИЯ, extension_root — абсолютный.\n"
         "  # ext_line (= line) — строка АННОТАЦИИ (&Перед/&После/&Вместо) в модуле расширения;\n"
         "  #   объявление метода расширения — ниже (у перехвата из формы, где задан form_event,\n"
         "  #   аннотации нет: line — само объявление; None — обработчика, названного формой, в модуле\n"
         "  #   нет или модуль не прочитан). Тело: read_procedure(ov['extension_file'],\n"
         "  #   ov['extension_method']), а не чтение файла с ext_line.\n"
-        "  # To read extension method body:\n"
-        "  body = read_procedure(path, 'MethodName', include_overrides=True)\n"
+        "  # ЧТЕНИЕ — двумя раздельными маршрутами (ov — строка result['overrides']):\n"
+        "  #   1) тело метода расширения — работает и в MAIN-, и в EXTENSION-сессии;\n"
+        "  #   2) оригинал вместе с перехватами — только при непустых ov['source_path'] и ov['target_method']\n"
+        "  #      (в EXTENSION-индексе ov['source_path'] пуст: базовый модуль там недоступен — читай маршрут 1).\n"
+        "  for ov in result['overrides']:\n"
+        "      if ov['extension_file']:  # пуст = корень расширения недостижим из этой сессии\n"
+        "          body = read_procedure(ov['extension_file'], ov['extension_method'])\n"
+        "  for ov in result['overrides']:\n"
+        "      if ov['source_path'] and ov['target_method']:\n"
+        "          orig = read_procedure(ov['source_path'], ov['target_method'], include_overrides=True)\n"
         "  # NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths\n"
         "  # raise PermissionError. BUT: high-level BSL helpers (read_procedure, extract_procedures,\n"
         "  # parse_object_xml, find_attributes, find_predefined, search) accept '../' paths returned by\n"

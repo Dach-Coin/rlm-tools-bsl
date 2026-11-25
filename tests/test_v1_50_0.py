@@ -1406,11 +1406,14 @@ _PRIOR_FORMS_HEAD = {
         "live|get_object_profile": "4ac60e707c5f7462",
         "live|analyze_object": "d1f645da20129943",
         "live|find_print_forms": "5e6493d35ab59dd2",
-        "live|find_based_on_documents": "a484176923661afb",
+        # v1.53.0: прежде 'a484176923661afb' — hint без индекса адресует пользователю CLI, а не агенту rlm_index
+        "live|find_based_on_documents": "dae7b45b2720a9cc",
         "live|find_register_movements": "907251c4bb20bf45",
-        "live|analyze_document_flow": "72c1c703e89e97ca",
+        # v1.53.0: прежде '72c1c703e89e97ca' — поток включает hint find_based_on_documents (тот же текст)
+        "live|analyze_document_flow": "d731ffae50db358a",
         "live|find_references_to_object": "845c1f43d7dafba2",
-        "live|find_code_usages": "bf28d668236219fb",
+        # v1.53.0: прежде 'bf28d668236219fb' — _meta.hint без таблицы кода адресует пользователю CLI
+        "live|find_code_usages": "dab9ec7fb4e764da",
         "live|find_roles": "5e84c9ad3d652ac0",
         "live|find_custom_modifications": "0165b548dadb99f5",
         "live|find_enum_values": "f08c64b00750cf2c",
@@ -1428,7 +1431,8 @@ _PRIOR_FORMS_HEAD = {
         # v1.52.0: прежде здесь стояло '4eceefa0f0e75652' — голое имя `Док` (документ) у find_predefined
         # теперь отказ «вне области хелпера» с маршрутом к описателю
         "live|find_predefined": "afe1cd6423075594",
-        "live|find_templates": "3799a44c91ba3430",
+        # v1.53.0: прежде '3799a44c91ba3430' — hint без индекса адресует пользователю CLI, а не агенту rlm_index
+        "live|find_templates": "692a8602678d1ffa",
         "live|parse_form": "4eceefa0f0e75652",
         "live|extract_procedures": "b2877df6762d13f7",
         "live|find_exports": "b2877df6762d13f7",
@@ -1478,11 +1482,14 @@ _PRIOR_FORMS_HEAD = {
         "live|get_object_profile": "e450261e91487b0d",
         "live|analyze_object": "9ac40af342bf677d",
         "live|find_print_forms": "5e6493d35ab59dd2",
-        "live|find_based_on_documents": "a484176923661afb",
+        # v1.53.0: прежде 'a484176923661afb' — hint без индекса адресует пользователю CLI, а не агенту rlm_index
+        "live|find_based_on_documents": "dae7b45b2720a9cc",
         "live|find_register_movements": "89b1bd4742c2c60f",
-        "live|analyze_document_flow": "7aaa38de9741fff5",
+        # v1.53.0: прежде '7aaa38de9741fff5' — поток включает hint find_based_on_documents (тот же текст)
+        "live|analyze_document_flow": "ef177912cc7d4e74",
         "live|find_references_to_object": "845c1f43d7dafba2",
-        "live|find_code_usages": "867afd9c6e53af39",
+        # v1.53.0: прежде '867afd9c6e53af39' — _meta.hint без таблицы кода адресует пользователю CLI
+        "live|find_code_usages": "75a060bd3aa6f457",
         "live|find_roles": "4cb4557a8da794d3",
         "live|find_custom_modifications": "dbbdf4b94fcdd800",
         "live|find_enum_values": "43628b1d0890162a",
@@ -1500,7 +1507,8 @@ _PRIOR_FORMS_HEAD = {
         # v1.52.0: прежде здесь стояло '4eceefa0f0e75652' — голое имя `Док` (документ) у find_predefined
         # теперь отказ «вне области хелпера» с маршрутом к описателю
         "live|find_predefined": "f1f25733ec7c028f",
-        "live|find_templates": "3799a44c91ba3430",
+        # v1.53.0: прежде '3799a44c91ba3430' — hint без индекса адресует пользователю CLI, а не агенту rlm_index
+        "live|find_templates": "692a8602678d1ffa",
         "live|parse_form": "4eceefa0f0e75652",
         "live|extract_procedures": "46e70683b90b4cbb",
         "live|find_exports": "d8900e02586cb90c",
@@ -1714,8 +1722,10 @@ _LEGACY_PARSING_HEAD = {
         "idx|find_templates": "a1edc6ebc13e9e03",
         "live|find_functional_options": "6a2e37ddc4dd9b34",
         "live|find_event_subscriptions": "112a471e4665f855",
-        "live|find_based_on_documents": "c3a1097551fd00fd",
-        "live|find_templates": "d630ed434eff3065",
+        # v1.53.0: прежде 'c3a1097551fd00fd' и 'd630ed434eff3065' — hint-ы без индекса адресуют
+        # пользователю CLI, а не агенту rlm_index
+        "live|find_based_on_documents": "2a2f8352bb13b490",
+        "live|find_templates": "b358d9d0d2c28a16",
     },
     "edt": {
         "idx|find_functional_options": "2710f01126f01611",
@@ -1724,8 +1734,9 @@ _LEGACY_PARSING_HEAD = {
         "idx|find_templates": "a1edc6ebc13e9e03",
         "live|find_functional_options": "e749d77418eedbe3",
         "live|find_event_subscriptions": "112a471e4665f855",
-        "live|find_based_on_documents": "c3a1097551fd00fd",
-        "live|find_templates": "d630ed434eff3065",
+        # v1.53.0: прежде 'c3a1097551fd00fd' и 'd630ed434eff3065' — те же два hint, см. cf
+        "live|find_based_on_documents": "2a2f8352bb13b490",
+        "live|find_templates": "b358d9d0d2c28a16",
     },
 }
 

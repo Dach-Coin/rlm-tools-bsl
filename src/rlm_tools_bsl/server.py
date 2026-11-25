@@ -1582,20 +1582,25 @@ def _rlm_start(
                 _db_exists = False
             except OSError:
                 _db_exists = True
+            # Путь источника — в кавычках (пробелы), каталог индексов — АБСОЛЮТНЫЙ: при
+            # относительном RLM_INDEX_DIR сервер и терминал с другим рабочим каталогом
+            # разрешают его в разные места. Сборку запускает только пользователь: агенту
+            # rlm_index недоступен по политике, а `path=` схема тула для build запрещает.
+            _root, _root_rule = describe_index_root()
+            _root_abs = _root.absolute()
             if _db_exists:
                 idx_warnings.append(
                     f"Индекс по пути {db_path} есть, но прочитать его не удалось: "
-                    "файл поврежден или недоступен. Пересоберите: "
-                    f"rlm_index(action='build', path='{resolved}')."
+                    "файл поврежден или недоступен. Попросите пользователя пересобрать индекс в "
+                    f'терминале: rlm-bsl-index index build "{resolved}" с тем же каталогом индексов '
+                    f'RLM_INDEX_DIR="{_root_abs}" ({_root_rule}); агент rlm_index не вызывает.'
                 )
             else:
-                _root, _root_rule = describe_index_root()
                 idx_warnings.append(
-                    f"Индекс не найден: {db_path}. Корень индексов — {_root} "
-                    f"({_root_rule}). Собрать: rlm_index(action='build', "
-                    f"path='{resolved}') или в терминале 'rlm-bsl-index index "
-                    f"build {resolved}'. Корень индексов определяется переменной "
-                    "RLM_INDEX_DIR в конфигурации MCP-сервера."
+                    f"Индекс не найден: {db_path}. Корень индексов — {_root_abs} "
+                    f"({_root_rule}). Сборка — только пользователем в терминале: "
+                    f'rlm-bsl-index index build "{resolved}" с тем же '
+                    f'RLM_INDEX_DIR="{_root_abs}" (агент rlm_index не вызывает).'
                 )
         index_block = {
             "loaded": index_loaded,
