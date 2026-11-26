@@ -19,8 +19,12 @@ from rlm_tools_bsl.bsl_index import (
     BUILDER_VERSION,
     IndexBuilder,
     IndexReader,
+    _CALLERS_PAGE_TAIL,
     _callee_match_clause,
     _callee_short_expr,
+    _exact_callers_base_select,
+    _exact_callers_page_sql,
+    _graph_kind_clause,
     _make_callee_key,
     _normalize_module_hint,
 )
@@ -983,12 +987,116 @@ class TestCalleeShortIndex:
             blob = _plan_blob(c, f"SELECT COUNT(*) FROM calls WHERE ({sql})", [param])
             assert "idx_calls_callee_short" in blob, blob
 
-            # exact-mode WHERE → MULTI-INDEX OR over callee_key + short index
+            # exact-mode page from the SAME builder the reader sends: the key branch goes by
+            # idx_calls_callee_key, the «no key, short name matched» branch — by the short index.
+            # (The former single OR is not planned here any more: SQLite 3.54.1 runs it as a full
+            # scan, which is why production stopped sending it — see _exact_callers_page_sql.)
             msql, mparam = _callee_match_clause("ОбщийМетод", "c.callee_name")
-            where = f"WHERE (c.callee_key = ? OR (c.callee_key IS NULL AND {msql}))"
-            blob2 = _plan_blob(c, f"SELECT c.id FROM calls c {where}", ["k", mparam])
+            blob2 = _plan_blob(c, _exact_callers_page_sql("", msql, ""), ["k", mparam, 1, 0])
             assert "idx_calls_callee_short" in blob2, blob2
             assert "idx_calls_callee_key" in blob2, blob2
+
+    def test_exact_page_two_branches_keep_rows_and_pin_tie_order(self, tmp_path):
+        # UNION ALL of the two branches must return exactly the row set of the former single OR — for
+        # every edge-kind filter — in a PINNED order. Ties on (rel_path, line) used to come out in
+        # whatever order the plan produced: exact edge first under multi-index OR, source order under a
+        # scan. find_path judges a step by the first edge of the line, so the order is a contract now:
+        # the exact edge first, then by calls.id. The ties cover every kind — exact written first in the
+        # source, heuristic written first, two heuristic rows, two exact rows. Chain members make the
+        # kind filter bite: `ОМ2.Метод1` is dropped from the graph, `Менеджер.Метод1` is kept only for a
+        # manager-module target.
+        om = "CommonModules/ОМ/Ext/Module.bsl"
+        d1 = "Documents/Д1/Ext/ObjectModule.bsl"
+        d2 = "Documents/Д2/Ext/ObjectModule.bsl"
+        mixed_exact_first, mixed_heuristic_first = 3, 4
+        _write_project(
+            tmp_path,
+            {
+                om: "Процедура Метод1() Экспорт\nКонецПроцедуры\n",
+                d1: (
+                    "Процедура П()\n"
+                    "    ОМ.Метод1();\n"
+                    "    ОМ.Метод1(); Значение.Метод1();\n"  # точное и эвристическое: в исходнике точное первым
+                    "    Значение.Метод1(); ОМ.Метод1();\n"  # то же наоборот: эвристическое первым
+                    "    Значение.Метод1();\n"
+                    "    ОМ.Метод1();\n"
+                    "КонецПроцедуры\n"
+                ),
+                d2: (
+                    "Процедура П()\n"
+                    "    ОМ.Метод1();\n"
+                    "    Значение.Метод1(); Другое.Метод1();\n"  # два эвристических на одной строке
+                    "    ОМ.Метод1(); ом.метод1();\n"  # два точных на одной строке
+                    "    Объект.ОМ2.Метод1(); СведенияОбОбъекте.Менеджер.Метод1();\n"  # члены цепочки
+                    "КонецПроцедуры\n"
+                ),
+            },
+        )
+        db_path = IndexBuilder().build(str(tmp_path), build_calls=True)
+        key = _make_callee_key(om, "Метод1")
+        match_sql, name = _callee_match_clause("Метод1", "c.callee_name")
+        base = _exact_callers_base_select("")
+        # (фильтр вида ребра; сколько строк он оставляет: точных, без ключа, членов цепочки; строк с двумя рёбрами)
+        variants = [
+            ("", 7, 5, 2, 5),
+            (_graph_kind_clause("c.", False), 7, 5, 0, 4),  # оба члена цепочки вне графа
+            (_graph_kind_clause("c.", True), 7, 5, 1, 4),  # `Менеджер.Метод1` — кандидат по имени
+        ]
+
+        def rows_of(c, sql, limit, offset):
+            cur = c.execute(sql, (key, name, limit, offset))
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r, strict=True)) for r in cur]
+
+        def by_id(r):
+            return r["edge_id"]
+
+        def pinned(r):
+            return (r["rel_path"], r["call_line"], r["edge_callee_key"] is None, r["edge_id"])
+
+        with _conn(db_path) as c:
+            # the member clause of the kind filter calls py_casefold; the reader registers it the same way
+            c.create_function("py_casefold", 1, lambda s: s.casefold() if s is not None else None)
+            for kind_ok, exact, keyless, members, ties in variants:
+                # former statement of get_callers, verbatim
+                former = (
+                    base
+                    + f"WHERE (c.callee_key = ? OR (+c.callee_key IS NULL AND {match_sql})){kind_ok}"
+                    + _CALLERS_PAGE_TAIL
+                )
+                page = _exact_callers_page_sql("", match_sql, kind_ok)
+                # the pin itself must stay in the statement: without it SQLite still happens to put the
+                # exact edge first (branch order + stable sort), so behaviour alone cannot catch removal
+                assert page.endswith(
+                    ") ORDER BY rel_path, call_line, edge_callee_key IS NULL, edge_id LIMIT ? OFFSET ?"
+                ), page
+                former_rows = rows_of(c, former, -1, 0)
+                full = rows_of(c, page, -1, 0)
+                # обе ветки непусты и есть строки с двумя рёбрами, иначе проверки ниже вакуумны
+                assert sum(1 for r in former_rows if r["edge_callee_key"] is not None) == exact, kind_ok
+                assert sum(1 for r in former_rows if r["edge_callee_key"] is None) == keyless + members, kind_ok
+                per_line: dict[tuple, int] = {}
+                for r in former_rows:
+                    per_line[(r["rel_path"], r["call_line"])] = per_line.get((r["rel_path"], r["call_line"]), 0) + 1
+                assert sum(1 for n in per_line.values() if n == 2) == ties, kind_ok
+                # набор строк — ровно как у прежнего OR
+                assert sorted(full, key=by_id) == sorted(former_rows, key=by_id), kind_ok
+                # порядок закреплен: точное ребро первым, затем по идентификатору строки
+                expected = sorted(former_rows, key=pinned)
+                assert full == expected, kind_ok
+                for limit, offset in ((-1, 0), (50, 0), (3, 0), (3, 3), (2, 5), (1, 8), (2, 12)):
+                    want = expected[offset:] if limit < 0 else expected[offset : offset + limit]
+                    assert rows_of(c, page, limit, offset) == want, (kind_ok, limit, offset)
+        # the contract as seen from outside: on a line holding both calls the exact edge comes first,
+        # whichever call is written first in the source
+        reader = IndexReader(db_path)
+        try:
+            res = reader.get_callers("Метод1", om, 0, 50)
+        finally:
+            reader.close()
+        for line in (mixed_exact_first, mixed_heuristic_first):
+            pair = [r["edge_exact"] for r in res["callers"] if r["file"] == d1 and r["line"] == line]
+            assert pair == [True, False], (line, pair)
 
     def test_collate_nocase_in_clause(self):
         # The COLLATE NOCASE is load-bearing (planner ignores the case-insensitive

@@ -1070,7 +1070,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "if 'error' in res (find_path): имя многозначно (определено в >1 модуле) без своего hint → добавь to_hint/from_hint = res['candidates'][i]['file'] (это rel_path — ТОЧНАЯ форма); проверяй ПЕРЕД found/budget_exceeded",
             "find_path('МетодА', 'МетодБ') → есть ли путь вызовов from→to (forward)",
-            "found=False + _meta.budget_exceeded → обход обрезан: res['hint'] — исполнимый добор; сузь max_depth/дай hint",
+            "found=False + _meta.budget_exceeded → обход обрезан: res['hint'] — исполнимый добор; сузь max_depth или дай from_hint/to_hint=rel_path",
             "find_call_hierarchy('Метод', include_triggers=True) → callers + триггеры (подписки/формы/рег.задания/CFE)",
         ],
         "full": [

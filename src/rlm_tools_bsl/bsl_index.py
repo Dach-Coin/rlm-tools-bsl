@@ -999,6 +999,56 @@ def _callee_match_clause(proc_name: str, col: str = "callee_name") -> tuple[str,
     return (f"{_callee_short_expr(col)} = ? COLLATE NOCASE", proc_name)
 
 
+def _exact_callers_base_select(kind_col: str) -> str:
+    """SELECT-часть страницы точного режима ``get_callers``: строка ребра + её метод и модуль.
+
+    ``edge_id`` (``calls.id``) наружу не отдается — он нужен только порядку строк на одной линии."""
+    return (
+        "SELECT c.line AS call_line, c.callee_name, c.callee_key AS edge_callee_key, c.id AS edge_id, "
+        "m.name AS caller_name, "
+        "m.is_export AS caller_is_export, mod.rel_path, mod.object_name, "
+        f"mod.category, mod.module_type{kind_col} "
+        "FROM calls c JOIN methods m ON m.id = c.caller_id "
+        "JOIN modules mod ON mod.id = m.module_id "
+    )
+
+
+# Хвост страницы по одному условию (неэкспортная цель): порядок и пагинация.
+_CALLERS_PAGE_TAIL = " ORDER BY mod.rel_path, call_line LIMIT ? OFFSET ?"
+
+
+def _exact_callers_page_sql(kind_col: str, match_sql: str, kind_ok: str) -> str:
+    """Страница точного режима ``get_callers``; параметры по порядку: ключ цели, имя, LIMIT, OFFSET.
+
+    Только для экспортной цели: неэкспортную зовут лишь по ключу, ей хватает одного SELECT. Точные
+    ребра (``callee_key = ключ``) и эвристика по имени (ключа нет, совпало короткое имя) идут двумя
+    ветками ``UNION ALL`` — по ``callee_key`` множества не пересекаются. Один запрос вида
+    ``(callee_key = ? OR (callee_key IS NULL AND <имя> = ? COLLATE NOCASE))`` SQLite 3.54.1 выполняет
+    перебором всей таблицы ``calls``: терм с явным ``COLLATE NOCASE`` внутри OR он больше не пускает в
+    multi-index OR (на ERP-индексе ~1.2 с на запрос вместо единиц миллисекунд). Ветки планируются
+    порознь, поэтому их индексы доступны и на 3.54.1; план каждой — обычный выбор планировщика по
+    статистике (на боевых индексах обе идут по своим). Унарный «+» у ``IS NULL`` не дает ветке по имени
+    брать idx_calls_callee_key (строк без ключа — около половины таблицы).
+
+    Порядок при равных ``rel_path`` и ``line`` закреплен: точное ребро первым, затем ``calls.id``.
+    Прежде он зависел от плана — у multi-index OR точное ребро шло первым, у перебора первым шел
+    вызов, который в исходнике стоит раньше. От него зависит ``edge_exact`` первой строки страницы, а
+    по нему ``find_path`` судит о точности шага.
+    """
+    base = _exact_callers_base_select(kind_col)
+    # Обертка нужна ради порядка: у compound SELECT с LIMIT порядок задается только именами столбцов
+    # результата, а «точное ребро первым» — выражение над ними.
+    return (
+        "SELECT * FROM ("
+        + base
+        + f"WHERE c.callee_key = ?{kind_ok}"
+        + " UNION ALL "
+        + base
+        + f"WHERE +c.callee_key IS NULL AND {match_sql}{kind_ok}"
+        + ") ORDER BY rel_path, call_line, edge_callee_key IS NULL, edge_id LIMIT ? OFFSET ?"
+    )
+
+
 # v1.42.0: член цепочки `<…>.Менеджер.М(` — вызов метода МЕНЕДЖЕРА объекта, известного только во
 # время выполнения (диспетчеры подключаемых команд БСП: `СведенияОбОбъекте.Менеджер.ДобавитьКомандыПечати(…)`).
 # Ключа у такой строки нет (адресат статически не определен), но это настоящий вызов, и отсекать его,
@@ -15049,28 +15099,22 @@ class IndexReader:
             exact_key = None if name_only else self._resolve_target_key(proc_name, module_hint)
             if exact_key is not None:
                 kind_ok = _kind_ok("c.", _is_manager_module_key(exact_key))
-                base_select = (
-                    "SELECT c.line AS call_line, c.callee_name, c.callee_key AS edge_callee_key, "
-                    "m.name AS caller_name, "
-                    "m.is_export AS caller_is_export, mod.rel_path, mod.object_name, "
-                    f"mod.category, mod.module_type{kind_col} "
-                    "FROM calls c JOIN methods m ON m.id = c.caller_id "
-                    "JOIN modules mod ON mod.id = m.module_id "
-                )
+                base_select = _exact_callers_base_select(kind_col)
                 # v1.45.0 (Д5): неэкспортную процедуру зовут только по имени без точки внутри своего
                 # модуля (и из заимствованного модуля расширения — точное ребро слоя): у такой цели
                 # строки без ключа «по имени» — вызовы ДРУГИХ процедур (общих модулей, значений).
                 non_export = self._is_non_export_target(exact_key, proc_name)
-                # Унарный «+» у `callee_key IS NULL` (здесь и в подсчете ниже) запрещает брать по этому
-                # терму индекс, значения он не меняет. SQLite без stat4 оценивает IS NULL средним stat1 и
-                # не знает, что строк без ключа — половина таблицы: на статистике индексов ERP планировщик
-                # иначе выбирал idx_calls_callee_key и перебирал все строки без ключа (~1 с на запрос)
-                # вместо единиц строк по idx_calls_callee_short.
+                # Унарный «+» у `callee_key IS NULL` (в странице через _exact_callers_page_sql и в
+                # подсчете ниже) запрещает брать по этому терму индекс, значения он не меняет. SQLite без
+                # stat4 оценивает IS NULL средним stat1 и не знает, что строк без ключа — половина
+                # таблицы: на статистике индексов ERP планировщик иначе выбирал idx_calls_callee_key и
+                # перебирал все строки без ключа (~1 с на запрос) вместо единиц строк по
+                # idx_calls_callee_short.
                 if non_export:
-                    where = f"WHERE c.callee_key = ?{kind_ok}"
+                    query = base_select + f"WHERE c.callee_key = ?{kind_ok}" + _CALLERS_PAGE_TAIL
                     where_params: tuple = (exact_key,)
                 else:
-                    where = f"WHERE (c.callee_key = ? OR (+c.callee_key IS NULL AND {match_sql})){kind_ok}"
+                    query = _exact_callers_page_sql(kind_col, match_sql, kind_ok)
                     where_params = (exact_key, match_param)
 
                 # По callee_key членов цепочки и вычисляемых запусков нет по инварианту
@@ -15089,7 +15133,6 @@ class IndexReader:
                     fallback_rows = fb_cnt_row["cnt"] if fb_cnt_row else 0
                 total_callers = exact_rows + fallback_rows
 
-                query = base_select + where + " ORDER BY mod.rel_path, call_line LIMIT ? OFFSET ?"
                 rows = self._conn.execute(query, (*where_params, limit, offset)).fetchall()
                 callers = [
                     {
