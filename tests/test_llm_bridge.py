@@ -401,6 +401,77 @@ def test_openai_max_tokens_from_env(monkeypatch):
     assert mock_client.chat.completions.create.call_args.kwargs["max_tokens"] == 2048
 
 
+def test_openai_retries_with_completion_tokens_when_max_tokens_is_unsupported(monkeypatch):
+    from openai import OpenAI
+
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if "max_tokens" in body:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "unsupported_parameter",
+                        "param": "max_tokens",
+                        "message": "Use max_completion_tokens.",
+                    }
+                },
+            )
+        return httpx.Response(200, json=_completion([{"message": {"content": "ok"}, "finish_reason": "stop"}]))
+
+    monkeypatch.setenv("RLM_LLM_MAX_TOKENS", "4096")
+    monkeypatch.setenv("RLM_LLM_EXTRA_BODY", '{"reasoning_effort":"low","max_completion_tokens":1}')
+    with OpenAI(
+        api_key="key", base_url="http://x/v1", http_client=httpx.Client(transport=httpx.MockTransport(respond))
+    ) as client:
+        monkeypatch.setattr("openai.OpenAI", lambda **kwargs: client)
+        query = _make_openai_query("http://x/v1", "key", "m")
+
+        assert query("first", context="shared context") == "ok"
+        assert make_llm_query_batched(query)(["second", "third"], "shared context") == ["ok", "ok"]
+
+    assert len(requests) == 4
+    assert requests[0]["max_tokens"] == 4096
+    assert "max_completion_tokens" not in requests[0]
+    assert requests[0]["messages"] == requests[1]["messages"]
+    for body in requests:
+        assert body["model"] == "m"
+        assert body["reasoning_effort"] == "low"
+    for body in requests[1:]:
+        assert "max_tokens" not in body
+        assert body["max_completion_tokens"] == 4096
+
+
+@pytest.mark.parametrize(
+    ("code", "param"),
+    [("unsupported_parameter", "temperature"), ("invalid_value", "max_tokens")],
+)
+def test_openai_propagates_unrelated_bad_request_without_retry(monkeypatch, code, param):
+    from openai import BadRequestError, OpenAI
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(400, json={"error": {"code": code, "param": param, "message": "Invalid request."}})
+
+    with OpenAI(
+        api_key="key", base_url="http://x/v1", http_client=httpx.Client(transport=httpx.MockTransport(respond))
+    ) as client:
+        monkeypatch.setattr("openai.OpenAI", lambda **kwargs: client)
+        query = _make_openai_query("http://x/v1", "key", "m")
+
+        with pytest.raises(BadRequestError) as error:
+            query("test")
+
+    assert error.value.code == code
+    assert error.value.param == param
+    assert len(requests) == 1
+
+
 def test_anthropic_max_tokens_from_env(monkeypatch):
     """Лимит действует на ОБА провайдера, не только на OpenAI-совместимый."""
     monkeypatch.setenv("RLM_LLM_MAX_TOKENS", "4096")
