@@ -21,7 +21,7 @@ ENV_EXTRA_BODY = "RLM_LLM_EXTRA_BODY"
 
 # Ключи, которыми владеет сборщик запроса. Пришедшие из RLM_LLM_EXTRA_BODY молча
 # передрались бы с явными аргументами SDK, поэтому отбрасываются с предупреждением.
-_EXTRA_BODY_RESERVED = frozenset({"model", "messages", "max_tokens", "stream"})
+_EXTRA_BODY_RESERVED = frozenset({"model", "messages", "max_tokens", "max_completion_tokens", "stream"})
 
 # finish_reason, которые сами по себе объясняют пустой content. Рекомендация про
 # бюджет reasoning к ним НЕ относится (провайдер вправе прислать content_filter
@@ -402,7 +402,7 @@ def _make_openai_query(
     окружения» (поэтому позиционные вызовы с тремя аргументами не ломаются).
     """
     try:
-        from openai import OpenAI
+        from openai import BadRequestError, OpenAI
     except ImportError:
         raise ImportError(
             "openai package is required for RLM_LLM_BASE_URL support. "
@@ -414,8 +414,14 @@ def _make_openai_query(
     _model = model
     _max_tokens = max_tokens if max_tokens is not None else _resolved_max_tokens()
     _extra_body = extra_body if extra_body is not None else _resolved_extra_body()
+    token_options = {"max_tokens": _max_tokens}
+    if _extra_body:
+        token_options["extra_body"] = _extra_body
+    # Передача через extra_body работает и с версиями SDK без одноимённого аргумента.
+    completion_options = {"extra_body": {**(_extra_body or {}), "max_completion_tokens": _max_tokens}}
 
     def llm_query(prompt: str, context: str = "") -> str:
+        nonlocal token_options
         if not prompt:
             raise ValueError("prompt cannot be empty")
 
@@ -425,11 +431,15 @@ def _make_openai_query(
         else:
             messages.append({"role": "user", "content": prompt})
 
-        request_options = {"model": _model, "messages": messages, "max_tokens": _max_tokens}
-        if _extra_body:
-            request_options["extra_body"] = _extra_body
-
-        response = _client.chat.completions.create(**request_options)
+        # У каждого запроса свой снимок параметров, в том числе при параллельном батче.
+        current_options = token_options
+        try:
+            response = _client.chat.completions.create(model=_model, messages=messages, **current_options)
+        except BadRequestError as exc:
+            if "max_tokens" not in current_options or exc.code != "unsupported_parameter" or exc.param != "max_tokens":
+                raise
+            response = _client.chat.completions.create(model=_model, messages=messages, **completion_options)
+            token_options = completion_options
         return _openai_answer(response)
 
     return llm_query
